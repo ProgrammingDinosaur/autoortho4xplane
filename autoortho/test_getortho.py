@@ -16,7 +16,7 @@ import getortho
 
 #getortho.ISPC = False
 maptypes_all = ['Null', 'BI', 'GO2', 'NAIP', 'Arc', 'EOX', 'USGS', 'Firefly']
-maptypes = ['Null', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly']
+maptypes = ['Null', 'BI', 'GO2', 'NAIP', 'EOX', 'USGS', 'Firefly']
 
 
 @pytest.fixture

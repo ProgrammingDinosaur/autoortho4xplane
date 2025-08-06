@@ -105,8 +105,11 @@ file_cache_size = 30
 # Max size of memory cache in GB. Minimum of 2GB.
 cache_mem_limit = 4
 
+# Max size of memory cache in GB. Minimmum of 2GB.
+cache_mem_limit = 4
+
 [windows]
-prefer_winfsp = False
+prefer_winfsp = True
 """
 
     def __init__(self, conf_file=None):

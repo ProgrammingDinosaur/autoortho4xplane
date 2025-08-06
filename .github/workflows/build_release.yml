@@ -44,7 +44,7 @@ jobs:
         make lin_bin VERSION=${{ env.VERNAME }}
 
     - name: Save artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: linbin
         path: autoortho_lin_*.bin
@@ -69,7 +69,7 @@ jobs:
    
     - uses: actions/setup-python@v3
       with:
-        python-version: '3.10'
+        python-version: '3.12'
 
     - name: Setup 
       run: |
@@ -88,7 +88,7 @@ jobs:
         make win_zip ZIP="7z a" VERSION=${{ env.VERNAME }}
 
     - name: Save artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: winbin
         path: |

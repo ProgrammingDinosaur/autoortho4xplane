@@ -13,12 +13,13 @@ import traceback
 import subprocess
 import configparser
 import platform
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from packaging import version
 
 import logging
 log = logging.getLogger(__name__)
 
-import PySimpleGUI as sg
+import FreeSimpleGUI as sg
 
 import downloader
 from version import __version__
@@ -53,6 +54,12 @@ class ConfigUI(object):
             sg.theme('DarkAmber')
 
         self.scenery_q = queue.Queue()
+        
+        # Thread pool for parallel downloads
+        self.download_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="scenery_dl")
+        self.active_downloads = {}  # regionid -> future mapping
+        self.download_progress = {}  # regionid -> progress dict
+        self.download_lock = threading.Lock()  # For thread-safe updates
 
         if platform.system() == 'Windows':
             self.icon_path =os.path.join(CUR_PATH, 'imgs', 'ao-icon.ico')
@@ -97,7 +104,7 @@ class ConfigUI(object):
         scenery_path = self.cfg.paths.scenery_path
         showconfig = self.cfg.general.showconfig
         maptype = self.cfg.autoortho.maptype_override
-        maptypes = ['', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly'] 
+        maptypes = ['', 'BI', 'GO2','NAIP', 'EOX', 'USGS', 'Firefly'] 
 
         sg.theme('DarkAmber')
 
@@ -171,6 +178,25 @@ class ConfigUI(object):
                 #    metadata={'section':self.cfg.cache}
                 #),
             ],
+            [sg.HorizontalSeparator(pad=5)],
+            [
+                sg.Text('Memory cache limit in GB'),
+                sg.Slider(
+                    range=(2,64,1),
+                    default_value=self.cfg.cache.cache_mem_limit, 
+                    key='cache_mem_limit',
+                    size=(40,15),
+                    orientation='horizontal',
+                    metadata={'section':self.cfg.cache}
+                )
+            ],
+            [sg.HorizontalSeparator(pad=5)],
+            [
+            sg.Checkbox('Prefer WinFSP over Dokan (Windows only)', key='prefer_winfsp',
+            default=self.cfg.windows.prefer_winfsp,
+            metadata={'section':self.cfg.windows}
+               )
+               ],
             #[
             #    sg.Checkbox('Cleanup cache on start', key='clean_on_start',
             #        default=self.cfg.cache.clean_on_start,
@@ -335,6 +361,8 @@ class ConfigUI(object):
                     self.show_errs.clear()
 
                 self.update_logs()
+                self._check_completed_downloads()
+                self._update_progress_display()
                 self.window.refresh()
         finally:
             log.info("GUI exiting...")
@@ -346,6 +374,9 @@ class ConfigUI(object):
 
     def stop(self):
         self.running = False
+        # Shutdown the download executor
+        if hasattr(self, 'download_executor'):
+            self.download_executor.shutdown(wait=True)
         self.unmount_sceneries()
         self.window.close()
 
@@ -363,51 +394,138 @@ class ConfigUI(object):
             except:
                 continue
 
-            self.scenery_dl = True
-            t = threading.Thread(target=self.region_progress, args=(regionid,))
-            t.start()
-            
-            button = self.window[f"scenery-{regionid}"]
-            try:
-                button.update("Working")
-                self.dl.download_dir = self.cfg.paths.download_dir
-               
-                region = self.dl.regions.get(regionid)
-                if not region.install_release():
-                    print("Errors detected!")
-                    status = downloader.cur_activity.get('status')
-                    self.status.update(status)
-                    self.show_errs.append(status)
-                    button.update("Retry?")
-                    button.update(disabled=False)
+            # Check if this region is already being downloaded
+            with self.download_lock:
+                if regionid in self.active_downloads:
+                    log.info(f"Region {regionid} is already being downloaded")
                     continue
                 
-                button.update(visible=False)
-                updates = self.window[f"updates-{regionid}"]
-                updates.update("Updated!")
-                self.status.update(f"Done!")
+                # Submit the download task to the thread pool
+                future = self.download_executor.submit(self._download_scenery, regionid)
+                self.active_downloads[regionid] = future
+                
+                # Initialize progress tracking for this region
+                self.download_progress[regionid] = {
+                    'status': 'Starting download...',
+                    'pcnt_done': 0,
+                    'MBps': 0
+                }
 
-            except Exception as err:
-                button.update("ERROR!")
-                tb = traceback.format_exc()
-                self.status.update(err)
-                self.warnings.append(f"Failed to setup scenery {regionid}")
-                self.warnings.append(str(err))
-                self.show_errs.append(str(tb))
-                log.error(tb)
-            finally:
-                self.scenery_dl = False
-            t.join()
+        # Check for completed downloads
+        self._check_completed_downloads()
+
+    def _download_scenery(self, regionid):
+        """Download and install a scenery region (runs in thread pool)"""
+        try:
+            button = self.window[f"scenery-{regionid}"]
+            button.update("Working")
+            self.dl.download_dir = self.cfg.paths.download_dir
+            
+            region = self.dl.regions.get(regionid)
+            
+            # Create progress callback for this region
+            def progress_callback(progress_data):
+                with self.download_lock:
+                    self.download_progress[regionid] = progress_data
+            
+            if not region.install_release(progress_callback=progress_callback):
+                print("Errors detected!")
+                with self.download_lock:
+                    status = self.download_progress[regionid].get('status', 'Unknown error')
+                self.status.update(status)
+                self.show_errs.append(status)
+                button.update("Retry?")
+                button.update(disabled=False)
+                return False
+            
+            button.update(visible=False)
+            updates = self.window[f"updates-{regionid}"]
+            updates.update("Updated!")
+            return True
+
+        except Exception as err:
+            button = self.window[f"scenery-{regionid}"]
+            button.update("ERROR!")
+            tb = traceback.format_exc()
+            self.warnings.append(f"Failed to setup scenery {regionid}")
+            self.warnings.append(str(err))
+            self.show_errs.append(str(tb))
+            log.error(tb)
+            return False
+
+    def _check_completed_downloads(self):
+        """Check for completed downloads and update UI accordingly"""
+        with self.download_lock:
+            completed_regions = []
+            for regionid, future in self.active_downloads.items():
+                if future.done():
+                    completed_regions.append(regionid)
+                    try:
+                        result = future.result()
+                        if result:
+                            self.status.update(f"Completed: {regionid}")
+                        else:
+                            self.status.update(f"Failed: {regionid}")
+                    except Exception as err:
+                        log.error(f"Error in download thread for {regionid}: {err}")
+                        self.status.update(f"Error: {regionid}")
+            
+            # Remove completed downloads from active list
+            for regionid in completed_regions:
+                del self.active_downloads[regionid]
+                if regionid in self.download_progress:
+                    del self.download_progress[regionid]
+
+    def _update_progress_display(self):
+        """Update the progress display for all active downloads"""
+        with self.download_lock:
+            active_count = len(self.active_downloads)
+            if active_count > 0:
+                active_regions = list(self.active_downloads.keys())
+                if active_count == 1:
+                    regionid = active_regions[0]
+                    progress = self.download_progress.get(regionid, {})
+                    status = progress.get('status', 'Working...')
+                    pcnt_done = progress.get('pcnt_done', 0)
+                    MBps = progress.get('MBps', 0)
+                    if pcnt_done > 0:
+                        self.status.update(f"{regionid}: {pcnt_done:.1f}% ({MBps:.1f} MB/s)")
+                    else:
+                        self.status.update(f"{regionid}: {status}")
+                else:
+                    # Multiple downloads - show summary
+                    total_progress = 0
+                    for regionid in active_regions:
+                        progress = self.download_progress.get(regionid, {})
+                        total_progress += progress.get('pcnt_done', 0)
+                    avg_progress = total_progress / active_count if active_count > 0 else 0
+                    self.status.update(f"Downloading {active_count} regions (avg: {avg_progress:.1f}%)")
+            elif not hasattr(self, '_last_status_was_download') or self._last_status_was_download:
+                self.status.update("Ready")
+                self._last_status_was_download = False
+            
+            if active_count > 0:
+                self._last_status_was_download = True
 
     
     def region_progress(self, regionid):
-        r = self.dl.regions.get(regionid)
-        while self.scenery_dl:
-            status = downloader.cur_activity.get('status')
-            pcnt_done = downloader.cur_activity.get('pcnt_done', 0)
-            MBps = downloader.cur_activity.get('MBps', 0)
-            self.status.update(f"{status}")
-            time.sleep(1)
+        """Update progress display for a specific region"""
+        with self.download_lock:
+            progress = self.download_progress.get(regionid, {})
+            status = progress.get('status', 'Unknown')
+            pcnt_done = progress.get('pcnt_done', 0)
+            MBps = progress.get('MBps', 0)
+            
+            # Update status bar with current active downloads
+            active_count = len(self.active_downloads)
+            if active_count > 0:
+                active_regions = list(self.active_downloads.keys())
+                if active_count == 1:
+                    self.status.update(f"Downloading {active_regions[0]}: {status}")
+                else:
+                    self.status.update(f"Downloading {active_count} regions: {', '.join(active_regions[:2])}{'...' if active_count > 2 else ''}")
+            else:
+                self.status.update("Ready")
 
 
     def save(self):

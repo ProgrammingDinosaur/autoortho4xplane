@@ -171,7 +171,7 @@ class Package(object):
         #return(str(self.__dict__))
 
 
-    def download(self):
+    def download(self, progress_callback=None):
         retries = 0
         if self.downloaded:
             log.info(f"Already downloaded.")
@@ -180,8 +180,14 @@ class Package(object):
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir)
 
+        # Store progress callback for use in _show_progress
+        self.progress_callback = progress_callback
+
         for url in self.remote_urls:
-            cur_activity['status'] = f"Downloading {url}"
+            if progress_callback:
+                progress_callback({'status': f"Downloading {url}", 'pcnt_done': 0, 'MBps': 0})
+            else:
+                cur_activity['status'] = f"Downloading {url}"
 
             posible_destpath = ""
             filename = os.path.basename(url)
@@ -244,11 +250,21 @@ class Package(object):
         if not elapsed:
             return
         MBps = (total_fetched/1048576) / elapsed
-        cur_activity['pcnt_done'] = pcnt_done
-        cur_activity['MBps'] = MBps
+        
+        progress_data = {
+            'pcnt_done': pcnt_done,
+            'MBps': MBps,
+            'status': f"Downloading {self.dl_url}\n{pcnt_done:.2f}%   {MBps:.2f} MBps"
+        }
+        
+        if hasattr(self, 'progress_callback') and self.progress_callback:
+            self.progress_callback(progress_data)
+        else:
+            # Fallback to global cur_activity for backward compatibility
+            cur_activity.update(progress_data)
+            
         if block_num % 1000 == 0:
             print(f"\r{pcnt_done:.2f}%   {MBps:.2f} MBps", end='')
-        cur_activity['status'] = f"Downloading {self.dl_url}\n{pcnt_done:.2f}%   {MBps:.2f} MBps"
 
     def check(self):
         log.info(f"Checking {self.name}")
@@ -465,7 +481,7 @@ class Release(object):
         self.parsed = True
 
     
-    def download(self):
+    def download(self, progress_callback=None):
         if self.downloaded:
             log.info(f"Already downloaded {self.name}")
             return True
@@ -479,10 +495,10 @@ class Release(object):
             #    log.info(f"Local file exists and is valid.")
             #    continue 
 
-            v.download()
+            v.download(progress_callback)
             if not v.check():
                 log.warning(f"{k} failed checks.  Retrying ...")
-                v.download()
+                v.download(progress_callback)
                 if not v.check():
                     log.error(f"{k} failed again.  Exiting!")
                     return False
@@ -607,7 +623,7 @@ class Region(object):
         log.debug(f"SORTED: {releases}")
         return releases[0]
 
-    def install_release(self, ver=None):
+    def install_release(self, ver=None, progress_callback=None):
 
         if ver is None:
             rel = self.get_latest_release()
@@ -623,7 +639,7 @@ class Region(object):
             self.releases.pop(self.local_rel.ver)
             self.local_rel = None
 
-        if not rel.download():
+        if not rel.download(progress_callback):
             log.error(f"Failed to download release {rel}")
             return False
 
