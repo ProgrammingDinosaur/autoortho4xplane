@@ -550,6 +550,15 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#fuse-errors-ands-trange-behaviors-on-arch-based-systems" class="md-nav__link">
+    <span class="md-ellipsis">
+      FUSE errors ands trange behaviors on ARCH based systems.
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#on-linux-this-does-not-startgives-a-fuse-error" class="md-nav__link">
     <span class="md-ellipsis">
       On Linux this does not start/gives a FUSE error
@@ -883,6 +892,15 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#fuse-errors-ands-trange-behaviors-on-arch-based-systems" class="md-nav__link">
+    <span class="md-ellipsis">
+      FUSE errors ands trange behaviors on ARCH based systems.
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#on-linux-this-does-not-startgives-a-fuse-error" class="md-nav__link">
     <span class="md-ellipsis">
       On Linux this does not start/gives a FUSE error
@@ -1113,6 +1131,10 @@ unless other issues are seen.</p>
 uses.  For example:</p>
 <pre><code>SSL_CERT_DIR=/etc/ssl/certs ./autoortho_lin.bin
 </code></pre>
+<p>Note - Possibly fixed in 1.1.0 and newer See <a href="https://github.com/ProgrammingDinosaur/autoortho4xplane/issues/11">Issue #11</a></p>
+<h3 id="fuse-errors-ands-trange-behaviors-on-arch-based-systems">FUSE errors ands trange behaviors on ARCH based systems.</h3>
+<p>Arch and some other systems keep FUSE2 and FUSE3 seperate when it comes to their userspace binaries (the part AutoOrtho calls to mount and map folders). Other systems like Debian based platforms (e.g. Linux Mint, Ubuntu, Etc) just use FUSE3 binaries/libraries for both FUSE2 and FUSE3 support risking breaking compatability for select usecases. Luckely AutoOrtho is not one of these, but this leaves Arch support broken for now. A solution has been identified in a python FUSE support project that expands support to FUSE3 nativly.
+Until resolved - a Debian based release might be your best bet. The Linux version of X-Plane 12 itself is developed on LTS releases of ubuntu, so that or their Linux Mint counterparts might be a safe starting point if you must have ortho under linux.</p>
 <h3 id="on-linux-this-does-not-startgives-a-fuse-error">On Linux this does not start/gives a FUSE error</h3>
 <p>Make sure that your <code>/etc/fuse.conf</code> files is set to <code>user_allow_other</code>.  You may need to uncomment a line.</p>
 <h3 id="the-program-crashed-and-now-i-get-an-error-when-autoortho-attempts-to-mount">The program crashed and now I get an error when AutoOrtho attempts to mount</h3>
