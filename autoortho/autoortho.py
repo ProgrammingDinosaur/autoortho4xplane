@@ -172,6 +172,8 @@ class AOMount:
     def __init__(self, cfg):
         self.cfg = cfg
         self.mount_threads = []
+        self.active_mounts = {}
+        self._mount_lock = threading.RLock()
 
 
 
@@ -253,11 +255,18 @@ class AOMount:
                     import autoortho_fuse
                     import mfusepy
                     mfusepy._libfuse = ctypes.CDLL(libpath)
-                    autoortho_fuse.run(
-                            autoortho_fuse.AutoOrtho(root),
-                            mount,
-                            nothreads
-                    )
+                    ao = autoortho_fuse.AutoOrtho(root)
+                    with self._mount_lock:
+                        self.active_mounts[mount] = ao
+                    try:
+                        autoortho_fuse.run(
+                                ao,
+                                mount,
+                                nothreads
+                        )
+                    finally:
+                        with self._mount_lock:
+                            self.active_mounts.pop(mount, None)
             elif platform.system() == 'Darwin':
                 # systemtype, libpath = macsetup.find_mac_libs()
                 systemtype = "macOS"
@@ -266,26 +275,60 @@ class AOMount:
                     import autoortho_fuse
                     import mfusepy
                     # mfusepy._libfuse = ctypes.CDLL(libpath)
-                    autoortho_fuse.run(
-                            autoortho_fuse.AutoOrtho(root),
-                            mount,
-                            nothreads
-                    )
+                    ao = autoortho_fuse.AutoOrtho(root)
+                    with self._mount_lock:
+                        self.active_mounts[mount] = ao
+                    try:
+                        autoortho_fuse.run(
+                                ao,
+                                mount,
+                                nothreads
+                        )
+                    finally:
+                        with self._mount_lock:
+                            self.active_mounts.pop(mount, None)
             else:
                 # Linux
                 with setupmount(mountpoint, "Linux-FUSE") as mount:
                     log.info("Running in FUSE mode.")
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
                     import autoortho_fuse
-                    autoortho_fuse.run(
-                            autoortho_fuse.AutoOrtho(root),
-                            mount,
-                            nothreads
-                    )
+                    ao = autoortho_fuse.AutoOrtho(root)
+                    with self._mount_lock:
+                        self.active_mounts[mount] = ao
+                    try:
+                        autoortho_fuse.run(
+                                ao,
+                                mount,
+                                nothreads
+                        )
+                    finally:
+                        with self._mount_lock:
+                            self.active_mounts.pop(mount, None)
 
         except Exception as err:
             log.error(f"Exception detected when running FUSE mount: {err}.  Exiting...")
             time.sleep(5)
+
+    def switch_map_provider(self, provider: str) -> bool:
+        """Switch map provider across all active mounts safely.
+
+        Returns True if at least one mount accepted the change.
+        """
+        accepted = False
+        with self._mount_lock:
+            mounts = list(self.active_mounts.values())
+        for ao in mounts:
+            try:
+                ok = ao.switch_provider(provider)
+                accepted = accepted or bool(ok)
+            except Exception:
+                continue
+        if accepted:
+            log.info(f"Switched provider to {provider} across {len(mounts)} mounts (where supported)")
+        else:
+            log.warning("Provider switch requested but no mounts accepted the change")
+        return accepted
 
     def unmount(self, mountpoint):
         log.info(f"Shutting down {mountpoint}")
@@ -334,6 +377,10 @@ class AOMountUI(AOMount, config_ui.ConfigUI):
     def unmount_sceneries(self):
         """Unmount sceneries using AOMount functionality"""
         return AOMount.unmount_sceneries(self)
+
+    # Bridge for UI -> mount manager provider switch
+    def switch_map_provider(self, provider: str) -> bool:
+        return AOMount.switch_map_provider(self, provider)
 
 
 def main():

@@ -27,6 +27,7 @@ from aoimage import AoImage
 
 from aoconfig import CFG
 from aostats import STATS, StatTracker, set_stat, inc_stat, get_stat
+from utils.constants import MAPTYPES as SUPPORTED_MAPTYPES
 
 from utils.apple_token_service import apple_token_service
 
@@ -1299,6 +1300,61 @@ class TileCacher(object):
                 log.debug(f"Still have {t.refs} refs for {tile_id}")
 
         return True
+
+    def switch_provider(self, new_provider: str) -> bool:
+        """Safely switch the active map provider at runtime.
+
+        - Updates maptype override atomically
+        - Resets Apple token when switching to APPLE
+        - Evicts cached tiles with zero refs to avoid mixing imagery
+        - Leaves in-flight and referenced tiles untouched
+        """
+        try:
+            if not new_provider:
+                log.warning("Switch provider called with empty provider; ignoring")
+                return False
+
+            new_provider = str(new_provider).upper().strip()
+            if new_provider not in SUPPORTED_MAPTYPES:
+                log.warning(f"Unsupported provider '{new_provider}' requested; ignoring")
+                return False
+
+            with self.tc_lock:
+                if self.maptype_override == new_provider:
+                    log.info(f"Provider already set to {new_provider}; nothing to do")
+                    return True
+
+                log.info(f"Switching map provider to {new_provider}")
+                self.maptype_override = new_provider
+
+                if new_provider == "APPLE":
+                    try:
+                        apple_token_service.reset_apple_maps_token()
+                    except Exception as _err:
+                        log.debug(f"Apple token reset failed (non-fatal): {_err}")
+
+                # Evict zero-ref tiles so subsequent opens won’t reuse old-provider tiles
+                keys_to_delete = []
+                for tile_key, tile in self.tiles.items():
+                    try:
+                        if getattr(tile, 'refs', 0) <= 0:
+                            keys_to_delete.append(tile_key)
+                    except Exception:
+                        continue
+
+                for tile_key in keys_to_delete:
+                    try:
+                        tile = self.tiles.pop(tile_key, None)
+                        if tile is not None:
+                            tile.close()
+                    except Exception:
+                        pass
+
+                log.info(f"Provider switched to {new_provider}. Evicted {len(keys_to_delete)} idle tiles.")
+                return True
+        except Exception as err:
+            log.error(f"Failed to switch provider to {new_provider}: {err}")
+            return False
 
 # ============================================================
 # Module-level cleanup helpers

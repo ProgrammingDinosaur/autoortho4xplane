@@ -611,6 +611,18 @@ class ConfigUI(QMainWindow):
             "Select a specific map provider or leave empty for auto-selection"
         )
         maptype_layout.addWidget(self.maptype_combo)
+        # Add 'Switch Map' button next to provider select
+        self.switch_map_btn = StyledButton("Switch Map")
+        self.switch_map_btn.setToolTip(
+            "Apply the selected map provider immediately without restarting."
+        )
+        try:
+            # Only enabled when running (mounts active)
+            self.switch_map_btn.setEnabled(False)
+        except Exception:
+            pass
+        self.switch_map_btn.clicked.connect(self.on_switch_map)
+        maptype_layout.addWidget(self.switch_map_btn)
         maptype_layout.addStretch()
         options_layout.addLayout(maptype_layout)
 
@@ -1390,6 +1402,11 @@ class ConfigUI(QMainWindow):
         self.mount_sceneries(blocking=False)
         self.verify()
         self.running = True  # Set running state
+        try:
+            if hasattr(self, 'switch_map_btn'):
+                self.switch_map_btn.setEnabled(True)
+        except Exception:
+            pass
         self.update_status_bar("Running")
         self.showMinimized()
 
@@ -1437,6 +1454,31 @@ class ConfigUI(QMainWindow):
             )
         else:
             self.update_status_bar("Configuration saved")
+
+    def on_switch_map(self):
+        """Apply selected provider to running mounts safely."""
+        provider = self.maptype_combo.currentText()
+        if not provider:
+            QMessageBox.warning(self, "Switch Map", "Please select a map provider first.")
+            return
+        self.update_status_bar(f"Switching provider to {provider}...")
+        ok = False
+        try:
+            if hasattr(self, 'switch_map_provider'):
+                ok = bool(self.switch_map_provider(provider))
+        except Exception as err:
+            log.error(f"Switch Map failed: {err}")
+            ok = False
+
+        if ok:
+            self.update_status_bar(f"Map provider switched to {provider}")
+        else:
+            QMessageBox.information(
+                self,
+                "Switch Map",
+                "Provider switch could not be applied now. It may require the mounts to be running or a restart."
+            )
+            self.update_status_bar("Provider switch not applied")
 
     def on_clean_cache(self, for_exit=False):
         """Handle Clean Cache button click

@@ -95,6 +95,14 @@ class AutoOrtho(Operations):
         #self.read_lock = threading.Lock()
         self._lock = threading.RLock()
 
+    def switch_provider(self, new_provider: str) -> bool:
+        """Expose safe provider switch to callers (UI/mount manager)."""
+        try:
+            return self.tc.switch_provider(new_provider)
+        except Exception as err:
+            log.error(f"AutoOrtho switch_provider failed: {err}")
+            return False
+
 
     # Helpers
     # =======
