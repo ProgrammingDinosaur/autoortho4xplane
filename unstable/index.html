@@ -460,6 +460,30 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#macos-setup" class="md-nav__link">
+    <span class="md-ellipsis">
+      MacOS Setup
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="MacOS Setup">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#steps_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Steps:
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#configuring-your-scenery_packsini" class="md-nav__link">
     <span class="md-ellipsis">
       Configuring your scenery_packs.ini
@@ -706,6 +730,30 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#macos-setup" class="md-nav__link">
+    <span class="md-ellipsis">
+      MacOS Setup
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="MacOS Setup">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#steps_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      Steps:
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#configuring-your-scenery_packsini" class="md-nav__link">
     <span class="md-ellipsis">
       Configuring your scenery_packs.ini
@@ -779,7 +827,7 @@
 </ul>
 <h3 id="steps">Steps:</h3>
 <ol>
-<li>Download the most recent packaged release (autortho_lin_####.bin) <a href="https://github.com/kubilus1/autoortho/releases/latest">from here</a></li>
+<li>Download the most recent packaged release (autortho_lin_####.bin) <a href="https://github.com/ProgrammingDinosaur/autoortho/releases/latest">from here</a></li>
 <li>Make executable if needed <code>chmod +x autoortho_lin.bin</code> </li>
 <li>Run the program <code>./autoortho_lin.bin</code></li>
 <li>Configure your settings and paths for your system </li>
@@ -811,7 +859,7 @@
 </ul>
 <h3 id="zip-file-steps">Zip File Steps:</h3>
 <ol>
-<li>Download the most recent packaged release (autoortho_win_####.zip) <a href="https://github.com/kubilus1/autoortho/releases/latest">from here</a></li>
+<li>Download the most recent packaged release (autoortho_win_####.zip) <a href="https://github.com/ProgrammingDinosaur/autoortho/releases/latest">from here</a></li>
 <li>Extract the downloaded directory.</li>
 <li>Run <code>autoortho_win.exe</code> from within the extracted dir.</li>
 <li>Configure your settings and paths for your system </li>
@@ -824,7 +872,7 @@
 <p>Alternatively, there is now an installer that can be used.  This is
 experimental ATM:</p>
 <ol>
-<li>Download the most recent packaged release (AutoOrtho_####.exe) <a href="https://github.com/kubilus1/autoortho/releases/latest">from here</a></li>
+<li>Download the most recent packaged release (AutoOrtho_####.exe) <a href="https://github.com/ProgrammingDinosaur/autoortho/releases/latest">from here</a></li>
 <li>Run the program.</li>
 <li>If there is a prior install you will be prompted to uninstall first.  Do
    this.</li>
@@ -833,6 +881,26 @@ experimental ATM:</p>
 <li>Download and setup an ortho set from the 'Scenery' tab.</li>
 <li>Click 'Run' to run the program</li>
 <li>Configure your scenery_packs.ini file appropriately </li>
+<li>Run X-Plane and choose a location for an ortho set you have downloaded</li>
+</ol>
+<h2 id="macos-setup">MacOS Setup</h2>
+<p>Assumptions:</p>
+<ul>
+<li>You have installed X-Plane 11.50+</li>
+<li>You have an Apple Silicon Computer (AutoOrtho Mac only supports arm64)</li>
+<li>FUSE is installed, MacFuse and Fuse-T are supported. </li>
+</ul>
+<h3 id="steps_1">Steps:</h3>
+<ol>
+<li>If you haven't install MacFuse or Fuse-T. Fuse-T was used for testing the mac binary but both should work.</li>
+<li>Download the most recent packaged release (autortho_mac_####.zip) <a href="https://github.com/ProgrammingDinosaur/autoortho/releases/latest">from here</a></li>
+<li>Unzip on the location you want.</li>
+<li>Run the program <code>AutoOrtho.App</code></li>
+<li><strong>Important</strong> This program is currently unsigned, a warning will appear on first run, you need to go into Settings -&gt; Privacy and Security -&gt; Allow <code>AutoOrtho.App</code> execution -&gt; Open Anyway.</li>
+<li>Configure your settings and paths for your system </li>
+<li>Download and setup an ortho set from the 'Scenery' tab.</li>
+<li>Click 'Run' to run the program</li>
+<li>Configure your scenery_packs.ini file appropriately</li>
 <li>Run X-Plane and choose a location for an ortho set you have downloaded</li>
 </ol>
 <hr />
