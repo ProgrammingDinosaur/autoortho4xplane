@@ -82,6 +82,8 @@ fetch_threads = 32
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.
 using_custom_tiles = False
+# Shows the downloaded tiles info before loading into a flight.
+show_downloaded_tiles = False
 
 [pydds]
 # ISPC or STB for dds file compression

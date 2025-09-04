@@ -294,6 +294,18 @@ class Chunk(object):
                     log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
                     return
                 os.replace(temp_filename, self.cache_path)
+
+                # Show Downloaded Tiles - Message
+
+                if os.path.abspath(self.cache_dir) == os.path.abspath(CFG.paths.cache_dir):
+                    from tile_printer import send_tile_msg
+                    tile_filename = os.path.basename(self.cache_path)
+                    size_mb = len(data) / (1024 * 1024)
+                    msg = f"{tile_filename} ({size_mb:.2f} MB)"
+                    send_tile_msg(msg)
+
+                # End of Show Downloaded Tiles - Message
+
                 return
             except FileExistsError:
                 try:

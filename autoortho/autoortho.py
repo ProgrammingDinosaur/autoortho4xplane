@@ -39,7 +39,6 @@ class MountError(Exception):
 class AutoOrthoError(Exception):
     pass
 
-
 @contextmanager
 def setupmount(mountpoint, systemtype):
     mountpoint = os.path.expanduser(mountpoint)
@@ -402,6 +401,7 @@ def main():
     args = parser.parse_args()
 
     CFG = aoconfig.CFG
+
     if args.configure or (CFG.general.showconfig and not args.headless):
         # Show cfgui at start
         run_headless = False
@@ -445,6 +445,20 @@ def main():
             app = QApplication(sys.argv)
             cfgui = AOMountUI(CFG)
             cfgui.show()
+
+            # Show Downloaded Tiles - Call
+
+            if getattr(CFG.autoortho, "show_downloaded_tiles", False):
+                from tile_printer import start_tile_printer
+                start_tile_printer()
+                try:
+                    from tile_printer import send_tile_msg
+                    send_tile_msg("MINIMIZE_WINDOW")
+                except Exception:
+                    pass
+
+            # End of Show Downloaded Tiles - Call
+            
             app.exec()
         else:
             cfgui = AOMountUI(CFG)

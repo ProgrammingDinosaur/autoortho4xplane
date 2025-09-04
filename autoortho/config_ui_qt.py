@@ -472,7 +472,10 @@ class ConfigUI(QMainWindow):
         self.save_button.clicked.connect(self.on_save)
 
         self.quit_button = StyledButton("Quit")
-        self.quit_button.clicked.connect(self.close)
+
+        # Show Downloaded Tiles - Close (when trying to close AutoOrtho)
+        self.quit_button.clicked.connect(lambda: ( __import__('tile_printer').stop_tile_printer(), self.close() ))
+        # End of Show Downloaded Tiles - Close (when trying to close AutoOrtho)
 
         button_layout.addStretch()
         button_layout.addWidget(self.run_button)
@@ -712,6 +715,22 @@ class ConfigUI(QMainWindow):
 
         self.using_custom_tiles_check.stateChanged.connect(self.on_using_custom_tiles_check)
         options_layout.addWidget(self.using_custom_tiles_check)
+
+        # Show Downloaded Tiles - Checkbox
+
+        self.show_downloaded_tiles_check = QCheckBox("Show Downloaded Tiles")
+        self.show_downloaded_tiles_check.setChecked(
+            getattr(self.cfg.autoortho, "show_downloaded_tiles", False)
+        )
+        self.show_downloaded_tiles_check.setObjectName('show_downloaded_tiles')
+        self.show_downloaded_tiles_check.setToolTip(
+            "Enable this to display a window that shows the filename and size of each downloaded tile, as well as the total downloaded size.\n"
+            "NOTE: The window does not show/popup automatically when X-Plane is loading sceneries, you must Alt-Tab/open the window manually."
+        )
+        self.show_downloaded_tiles_check.stateChanged.connect(self.on_show_downloaded_tiles_check)
+        options_layout.addWidget(self.show_downloaded_tiles_check)
+
+        # End of Show Downloaded Tiles - Checkbox
 
 
         layout.addWidget(options_group)
@@ -1422,6 +1441,16 @@ class ConfigUI(QMainWindow):
         self.update_status_bar("Running")
         self.showMinimized()
 
+        # Show Downloaded Tile - Minimize Window
+
+        try:
+            from tile_printer import send_tile_msg
+            send_tile_msg("MINIMIZE_WINDOW")
+        except Exception:
+            pass
+
+        # End of Show Downloaded Tile - Minimize Window
+
     def on_save(self):
         """Handle Save button click"""
         # Check if the directory exists
@@ -1706,6 +1735,7 @@ class ConfigUI(QMainWindow):
 
         self.cfg.cache.auto_clean_cache = self.auto_clean_cache_check.isChecked()
         self.cfg.autoortho.using_custom_tiles = self.using_custom_tiles_check.isChecked()
+        self.cfg.autoortho.show_downloaded_tiles = self.show_downloaded_tiles_check.isChecked()
 
         # Windows specific
         if self.system == 'windows' and hasattr(self, 'winfsp_check'):
@@ -1771,6 +1801,17 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.using_custom_tiles = True
 
         self.refresh_settings_tab()
+
+    # Show Downloaded Tiles - Check State
+
+    def on_show_downloaded_tiles_check(self, state):
+        from tile_printer import start_tile_printer, stop_tile_printer
+        if state == 2:
+            start_tile_printer()
+        else:
+            stop_tile_printer()
+
+    # End of Show Downloaded Tiles - Check State
 
     def apply_simheaven_compat(self, use_simheaven_overlay=False):
         """
