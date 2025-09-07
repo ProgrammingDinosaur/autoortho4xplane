@@ -33,7 +33,7 @@ def _sender():
                         pass
                     sock = None
                 import time
-                time.sleep(0.5)  # Wait before retrying
+                time.sleep(0.5)
 
 def send_tile_msg(msg):
     try:

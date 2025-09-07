@@ -20,7 +20,7 @@ import winsetup
 import macsetup
 import flighttrack
 
-from utils.constants import MAPTYPES
+from utils.constants import MAPTYPES, system_type
 from version import __version__
 
 import logging
@@ -38,6 +38,7 @@ class MountError(Exception):
 
 class AutoOrthoError(Exception):
     pass
+
 
 @contextmanager
 def setupmount(mountpoint, systemtype):
@@ -265,7 +266,7 @@ class AOMount:
         root = os.path.expanduser(root)
 
         try:
-            if platform.system() == 'Windows':
+            if system_type == 'windows':
                 systemtype, libpath = winsetup.find_win_libs()
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
@@ -278,7 +279,7 @@ class AOMount:
                             mount.split('/')[-1],
                             nothreads
                     )
-            elif platform.system() == 'Darwin':
+            elif system_type == 'darwin':
                 # systemtype, libpath = macsetup.find_mac_libs()
                 systemtype = "macOS"
                 with setupmount(mountpoint, systemtype) as mount:
@@ -331,11 +332,11 @@ class AOMount:
         if os.path.ismount(mountpoint):
             try:
                 import subprocess
-                if platform.system() == 'Darwin':
+                if system_type == 'darwin':
                     log.info(f"Force unmounting {mountpoint} via diskutil")
                     subprocess.run(["diskutil", "unmount", "force", mountpoint],
                                 check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                elif platform.system() == 'Linux':
+                elif system_type == 'linux':
                     log.info(f"Force unmounting {mountpoint} via fusermount -u -z")
                     if shutil.which("fusermount"):
                         subprocess.run(["fusermount", "-u", "-z", mountpoint],
@@ -343,7 +344,7 @@ class AOMount:
                     else:
                         subprocess.run(["umount", "-l", mountpoint],
                                     check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                elif platform.system() == 'Windows':
+                elif system_type == 'windows':
                     log.info(f"Force unmounting {mountpoint} via winsetup.force_unmount")
                     try:
                         winsetup.force_unmount(mountpoint)  # implement this in winsetup for both backends
@@ -401,7 +402,6 @@ def main():
     args = parser.parse_args()
 
     CFG = aoconfig.CFG
-
     if args.configure or (CFG.general.showconfig and not args.headless):
         # Show cfgui at start
         run_headless = False
@@ -445,20 +445,6 @@ def main():
             app = QApplication(sys.argv)
             cfgui = AOMountUI(CFG)
             cfgui.show()
-
-            # Show Downloaded Tiles - Call
-
-            if getattr(CFG.autoortho, "show_downloaded_tiles", False):
-                from tile_printer import start_tile_printer
-                start_tile_printer()
-                try:
-                    from tile_printer import send_tile_msg
-                    send_tile_msg("MINIMIZE_WINDOW")
-                except Exception:
-                    pass
-
-            # End of Show Downloaded Tiles - Call
-            
             app.exec()
         else:
             cfgui = AOMountUI(CFG)

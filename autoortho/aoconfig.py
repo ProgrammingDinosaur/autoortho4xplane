@@ -4,7 +4,8 @@ import os
 import ast
 import pprint
 import configparser
-import platform
+from types import SimpleNamespace
+from utils.constants import system_type
 
 import logging
 log = logging.getLogger(__name__)
@@ -82,8 +83,8 @@ fetch_threads = 32
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.
 using_custom_tiles = False
-# Shows the downloaded tiles info before loading into a flight.
-show_downloaded_tiles = False
+# Shows the loaded tiles info, such as filename and size, in a simple GUI window.
+show_loaded_tiles = False
 
 [pydds]
 # ISPC or STB for dds file compression
@@ -109,8 +110,6 @@ xplane_udp_port = 49000
 # Max size of the image disk cache in GB. Minimum of 10GB
 file_cache_size = 30
 # Max size of memory cache in GB. Minimum of 2GB.
-cache_mem_limit = 4
-# Max size of memory cache in GB. Minimmum of 2GB.
 cache_mem_limit = 4
 # Auto clean cache on AutoOrtho exit
 auto_clean_cache = False
@@ -167,7 +166,7 @@ prefer_winfsp = True
             sceneries = os.listdir(self.ao_scenery_path)
             log.info(f"Found sceneries: {sceneries}")
         
-        if platform.system() == "Darwin":
+        if system_type == "darwin":
             try:
                 if ".DS_Store" in sceneries:
                     sceneries.remove(".DS_Store")

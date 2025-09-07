@@ -14,7 +14,7 @@ import webbrowser
 import requests
 from packaging import version
 import utils.resources_rc
-from utils.constants import MAPTYPES
+from utils.constants import MAPTYPES, system_type
 from utils.mappers import map_kubilus_region_to_simheaven_region
 
 from PySide6.QtWidgets import (
@@ -252,7 +252,7 @@ class ConfigUI(QMainWindow):
         self.cfg = cfg
         self.ready = threading.Event()
         self.ready.clear()
-        self.system = platform.system().lower()
+        self.system = system_type
 
         self.dl = downloader.OrthoManager(
             self.cfg.paths.scenery_path,
@@ -472,10 +472,10 @@ class ConfigUI(QMainWindow):
         self.save_button.clicked.connect(self.on_save)
 
         self.quit_button = StyledButton("Quit")
-
-        # Show Downloaded Tiles - Close (when trying to close AutoOrtho)
+        
+        # Show Loaded Tiles - Close (when trying to close AutoOrtho)
         self.quit_button.clicked.connect(lambda: ( __import__('tile_printer').stop_tile_printer(), self.close() ))
-        # End of Show Downloaded Tiles - Close (when trying to close AutoOrtho)
+        # End of Show Loaded Tiles - Close (when trying to close AutoOrtho)
 
         button_layout.addStretch()
         button_layout.addWidget(self.run_button)
@@ -716,21 +716,22 @@ class ConfigUI(QMainWindow):
         self.using_custom_tiles_check.stateChanged.connect(self.on_using_custom_tiles_check)
         options_layout.addWidget(self.using_custom_tiles_check)
 
-        # Show Downloaded Tiles - Checkbox
+        # Show Loaded Tiles - Checkbox
 
-        self.show_downloaded_tiles_check = QCheckBox("Show Downloaded Tiles")
-        self.show_downloaded_tiles_check.setChecked(
-            getattr(self.cfg.autoortho, "show_downloaded_tiles", False)
+        self.show_loaded_tiles_check = QCheckBox("Show Loaded Tiles Info")
+        self.show_loaded_tiles_check.setChecked(
+            getattr(self.cfg.autoortho, "show_loaded_tiles", False)
         )
-        self.show_downloaded_tiles_check.setObjectName('show_downloaded_tiles')
-        self.show_downloaded_tiles_check.setToolTip(
-            "Enable this to display a window that shows the filename and size of each downloaded tile, as well as the total downloaded size.\n"
-            "NOTE: The window does not show/popup automatically when X-Plane is loading sceneries, you must Alt-Tab/open the window manually."
+        self.show_loaded_tiles_check.setObjectName('show_loaded_tiles')
+        self.show_loaded_tiles_check.setToolTip(
+            "Enable this to display a window that shows the filename, count and size of downloaded/retrieved tiles, errors found, as well as the total tiles count/size.\n"
+            "NOTE: The window does not show/popup automatically when X-Plane is loading sceneries, you must alt-tab/open the window manually.\n"
+            "It is recommended to alt-tab/open the window before X-Plane starts loading the scenaries in order to avoid freezes/heavy loading times."
         )
-        self.show_downloaded_tiles_check.stateChanged.connect(self.on_show_downloaded_tiles_check)
-        options_layout.addWidget(self.show_downloaded_tiles_check)
+        self.show_loaded_tiles_check.stateChanged.connect(self.on_show_loaded_tiles_check)
+        options_layout.addWidget(self.show_loaded_tiles_check)
 
-        # End of Show Downloaded Tiles - Checkbox
+        # End of Show Loaded Tiles - Checkbox
 
 
         layout.addWidget(options_group)
@@ -1432,6 +1433,14 @@ class ConfigUI(QMainWindow):
         """Handle Run button click"""
         self.save_config()
         self.cfg.load()
+        # Preflight check: prompt to unmount previous mounts if detected
+        try:
+            if not self.preflight_mount_check_and_prompt():
+                self.update_status_bar("Run cancelled by user")
+                return
+        except Exception:
+            # Non-fatal; continue
+            pass
         self.update_status_bar("Mounting sceneries...")
         self.run_button.setEnabled(False)
         self.run_button.setText("Running")
@@ -1441,15 +1450,13 @@ class ConfigUI(QMainWindow):
         self.update_status_bar("Running")
         self.showMinimized()
 
-        # Show Downloaded Tile - Minimize Window
+        # Show Loaded Tiles - Call
 
-        try:
-            from tile_printer import send_tile_msg
-            send_tile_msg("MINIMIZE_WINDOW")
-        except Exception:
-            pass
+        if getattr(self.cfg.autoortho, "show_loaded_tiles", False):
+            from tile_printer import start_tile_printer
+            start_tile_printer()
 
-        # End of Show Downloaded Tile - Minimize Window
+        # End of Show Loaded Tiles - Call
 
     def on_save(self):
         """Handle Save button click"""
@@ -1735,7 +1742,7 @@ class ConfigUI(QMainWindow):
 
         self.cfg.cache.auto_clean_cache = self.auto_clean_cache_check.isChecked()
         self.cfg.autoortho.using_custom_tiles = self.using_custom_tiles_check.isChecked()
-        self.cfg.autoortho.show_downloaded_tiles = self.show_downloaded_tiles_check.isChecked()
+        self.cfg.autoortho.show_loaded_tiles = self.show_loaded_tiles_check.isChecked()
 
         # Windows specific
         if self.system == 'windows' and hasattr(self, 'winfsp_check'):
@@ -1790,6 +1797,63 @@ class ConfigUI(QMainWindow):
         self.ready.set()
         self.refresh_scenery()
 
+    def preflight_mount_check_and_prompt(self):
+        """Detect lingering mounts and prompt user to unmount/clean.
+
+        Returns True if it's OK to proceed with Run, False if user cancels.
+        """
+        try:
+            lingering = []
+            for scenery in self.cfg.scenery_mounts:
+                mount = scenery.get('mount')
+                if not mount:
+                    continue
+                try:
+                    if os.path.ismount(mount):
+                        lingering.append(mount)
+                except Exception:
+                    continue
+            if not lingering:
+                return True
+
+            msg = (
+                "Previous AutoOrtho mounts are still active:\n\n"
+                + "\n".join(lingering)
+                + "\n\nDo you want AutoOrtho to unmount them now?"
+            )
+            reply = QMessageBox.question(
+                self,
+                "Existing Mounts Detected",
+                msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+
+            # Attempt unmount via AOMount implementation if available
+            try:
+                self.unmount_sceneries()
+            except Exception:
+                pass
+
+            # Brief wait loop for unmount completion
+            import time as _time
+            deadline = _time.time() + 10
+            while _time.time() < deadline:
+                if not any(os.path.ismount(x) for x in lingering):
+                    break
+                _time.sleep(0.3)
+            if any(os.path.ismount(x) for x in lingering):
+                QMessageBox.warning(
+                    self,
+                    "Unmount Incomplete",
+                    "Some mounts could not be unmounted automatically."
+                )
+            return True
+        except Exception:
+            return True
+
     def on_using_custom_tiles_check(self, state):
         """Handle using custom tiles check"""
         if state == False: 
@@ -1802,16 +1866,18 @@ class ConfigUI(QMainWindow):
 
         self.refresh_settings_tab()
 
-    # Show Downloaded Tiles - Check State
+    # Show Loaded Tiles - Check State
 
-    def on_show_downloaded_tiles_check(self, state):
+    def on_show_loaded_tiles_check(self, state):
         from tile_printer import start_tile_printer, stop_tile_printer
+        if not self.running:
+            return
         if state == 2:
             start_tile_printer()
         else:
             stop_tile_printer()
 
-    # End of Show Downloaded Tiles - Check State
+    # End of Show Loaded Tiles - Check State
 
     def apply_simheaven_compat(self, use_simheaven_overlay=False):
         """
