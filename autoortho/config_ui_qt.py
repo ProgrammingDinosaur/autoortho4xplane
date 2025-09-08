@@ -24,11 +24,12 @@ from PySide6.QtWidgets import (
     QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox
 )
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QTimer, QSize
+    Qt, QThread, Signal, QTimer, QSize, QUrl
 )
 from PySide6.QtGui import (
     QPixmap, QIcon
 )
+from PySide6.QtWebEngineWidgets import QWebEngineView
 
 import downloader
 from version import __version__
@@ -460,6 +461,7 @@ class ConfigUI(QMainWindow):
         self.create_scenery_tab()
         self.create_settings_tab()
         self.create_logs_tab()
+        self.create_map_tab()
 
         # Button layout
         button_layout = QHBoxLayout()
@@ -485,6 +487,27 @@ class ConfigUI(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
+
+    def create_map_tab(self):
+        """Create the flight map tab (served by FastAPI)"""
+        try:
+            map_widget = QWidget()
+            layout = QVBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            map_widget.setLayout(layout)
+
+            self.map_view = QWebEngineView()
+            try:
+                port = int(self.cfg.flightdata.webui_port)
+            except Exception:
+                port = 8080
+            url = QUrl(f"http://localhost:{port}/map")
+            self.map_view.load(url)
+
+            layout.addWidget(self.map_view)
+            self.tabs.addTab(map_widget, "Tile Manager")
+        except Exception as e:
+            log.warning(f"Failed to initialize Map tab: {e}")
 
     def create_setup_tab(self):
         """Create the setup configuration tab"""

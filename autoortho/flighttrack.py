@@ -9,8 +9,11 @@ from aoconfig import CFG
 import logging
 log = logging.getLogger(__name__)
 
-from flask import Flask, render_template, url_for, request, jsonify
-from flask_socketio import SocketIO, send, emit
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+import socketio
+from fastapi.staticfiles import StaticFiles
 
 from xp_udp import DecodePacket, RequestDataRefs
 
@@ -19,9 +22,14 @@ from aostats import STATS
 
 RUNNING=True
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app)
+# FastAPI app and templates
+app = FastAPI()
+templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), 'templates'))
+# Provide Flask-like url_for in templates
+templates.env.globals['url_for'] = lambda name, **params: app.url_path_for(name, **params)
+
+# Socket.IO ASGI server
+sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 
 
 class FlightTracker(object):
@@ -130,75 +138,83 @@ class FlightTracker(object):
 
 ft = FlightTracker()
 
-@socketio.on('connect')
-def connect():
-    log.info(f'client connected {request.sid}')
+# Socket.IO events (async)
+@sio.event
+async def connect(sid, environ, auth):
+    log.info(f'client connected {sid}')
 
-@socketio.on('disconnect')
-def disconnect():
-    log.info(f'client disconnected {request.sid}')
+@sio.event
+async def disconnect(sid):
+    log.info(f'client disconnected {sid}')
 
-@socketio.on('handle_latlon')
-def handle_latlon():
+@sio.on('handle_latlon')
+async def handle_latlon(sid):
     log.info("Handle lat lon.")
     while True:
         lat = ft.lat
         lon = ft.lon
-        #lat, lon, alt, hdg, spd = ft.get_info()
         log.debug(f"emit: {lat} X {lon}")
-        socketio.emit('latlon', {"lat":lat,"lon":lon})
-        socketio.sleep(2)
+        await sio.emit('latlon', {"lat": lat, "lon": lon}, to=sid)
+        await sio.sleep(2)
 
-@socketio.on("handle_metrics")
-def handle_metrics():
+@sio.on("handle_metrics")
+async def handle_metrics(sid):
     log.info("Handle metrics.")
     while True:
-        socketio.emit('metrics', STATS or {"init": 1})
-        socketio.sleep(5)
+        await sio.emit('metrics', STATS or {"init": 1}, to=sid)
+        await sio.sleep(5)
 
-@app.route('/get_latlon')
-def get_latlon():
+# HTTP routes via FastAPI
+@app.get('/get_latlon', name='get_latlon')
+async def get_latlon_route():
     lat = ft.lat
     lon = ft.lon
-    #lat, lon, alt, hdg, spd = ft.get_info()
     log.debug(f"{lat} X {lon}")
-    return jsonify({"lat":lat,"lon":lon})
+    return JSONResponse({"lat": lat, "lon": lon})
 
-@app.route("/")
-def index():
-    return render_template(
-        "index.html"
-    )
+@app.get("/", response_class=HTMLResponse, name='index')
+async def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
-@app.route("/map")
-def map():
-    return render_template(
-        "map.html",
-        mapkey = ""
-    )
+@app.get("/map", response_class=HTMLResponse, name='map')
+async def map_view(request: Request):
+    return templates.TemplateResponse("map.html", {"request": request, "mapkey": ""})
 
-@app.route("/stats")
-def stats():
-    #graphs = [ x for x in STATS.keys() ]
-    return render_template(
-        "stats.html",
-        graphs=STATS
-    )
+@app.get("/stats", response_class=HTMLResponse, name='stats')
+async def stats_view(request: Request):
+    return templates.TemplateResponse("stats.html", {"request": request, "graphs": STATS})
 
-@app.route("/metrics")
-def metrics():
-    return STATS
+@app.get("/metrics", name='metrics')
+async def metrics():
+    return JSONResponse(STATS)
+
+# Mount Socket.IO over FastAPI as a single ASGI app
+asgi_app = socketio.ASGIApp(sio, other_asgi_app=app)
+
+# Static files (for external JS/CSS)
+_static_dir = os.path.join(os.path.dirname(__file__), 'static')
+try:
+    if os.path.isdir(_static_dir):
+        app.mount('/static', StaticFiles(directory=_static_dir), name='static')
+except Exception as _e:
+    log.debug(f"Static mount skipped: {_e}")
 
 def run():
-    #app.run(host='0.0.0.0', port=CFG.flightdata.webui_port, debug=CFG.general.debug, threaded=True, use_reloader=False)
     log.info("Start flighttracker...")
-    socketio.run(app, host='0.0.0.0', port=int(CFG.flightdata.webui_port))
+    import uvicorn
+    uvicorn.run(
+        asgi_app,
+        host='0.0.0.0',
+        port=int(CFG.flightdata.webui_port),
+        log_level='debug' if getattr(CFG.general, 'debug', False) else 'info',
+    )
     log.info("Exiting flighttracker ...") 
 
 def main():
     ft.start()
     try:
-        app.run(host='0.0.0.0', debug=False, threaded=True, use_reloader=False)
+        import uvicorn
+        uvicorn.run(asgi_app, host='0.0.0.0', port=int(CFG.flightdata.webui_port))
     except KeyboardInterrupt:
         print("Shutdown requested.")
     finally:

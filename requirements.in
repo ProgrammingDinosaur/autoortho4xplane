@@ -8,3 +8,5 @@ packaging
 requests
 geocoder
 pytest
+fastapi
+uvicorn
