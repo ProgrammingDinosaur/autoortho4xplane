@@ -28,6 +28,8 @@ from aoconfig import CFG
 from aostats import STATS, StatTracker, set_stat, inc_stat, get_stat
 from utils.constants import system_type
 from utils.apple_token_service import apple_token_service
+from utils.utils import coord_from_sleepy_tilename
+from utils.tile_db_service import tile_db_service
 
 
 MEMTRACE = False
@@ -1159,6 +1161,7 @@ class TileCacher(object):
 
         self.tiles = {}
         self.open_count = {}
+        self.open_tiles_by_dsf = {}
 
         self.maptype_override = CFG.autoortho.maptype_override
         if self.maptype_override:
@@ -1233,7 +1236,11 @@ class TileCacher(object):
                             t = self.tiles.pop(i)
                             t.close()
                             t = None
-                            del(t)
+                            lat, lon = coord_from_sleepy_tilename(t.row, t.col, t.tilename_zoom)
+                            del t
+                            self.open_tiles_by_dsf[(lat, lon)] -= 1
+                            if self.open_tiles_by_dsf[(lat, lon)] <= 0:
+                                del self.open_tiles_by_dsf[(lat, lon)]
                 cur_mem = process.memory_info().rss
 
 
@@ -1258,7 +1265,11 @@ class TileCacher(object):
 
     def _open_tile(self, row, col, map_type, zoom):
         if self.maptype_override and self.maptype_override != "Use tile default":
-            map_type = self.maptype_override
+            if self.maptype_override == "Use tile settings":
+                lat, lon = coord_from_sleepy_tilename(row, col, zoom)
+                map_type = tile_db_service.get_tile_maptype(lat, lon)
+            else:
+                map_type = self.maptype_override
         idx = self._to_tile_id(row, col, map_type, zoom)
 
         log.debug(f"Get_tile: {idx}")
@@ -1284,9 +1295,13 @@ class TileCacher(object):
                 inc_stat('tile_mem_hits')
 
             tile.refs += 1
+        lat, lon = coord_from_sleepy_tilename(row, col, zoom)
+        if self.open_tiles_by_dsf.get((lat, lon)) is None:
+            self.open_tiles_by_dsf[(lat, lon)] = 1
+        else:
+            self.open_tiles_by_dsf[(lat, lon)] += 1
         return tile
 
-    
     def _close_tile(self, row, col, map_type, zoom):
         tile_id = self._to_tile_id(row, col, map_type, zoom)
         with self.tc_lock:
@@ -1306,7 +1321,11 @@ class TileCacher(object):
                 t = self.tiles.pop(tile_id)
                 t.close()
                 t = None
-                del(t)
+                del t
+                lat, lon = coord_from_sleepy_tilename(row, col, zoom)
+                self.open_tiles_by_dsf[(lat, lon)] -= 1
+                if self.open_tiles_by_dsf[(lat, lon)] <= 0:
+                    del self.open_tiles_by_dsf[(lat, lon)]
             else:
                 log.debug(f"Still have {t.refs} refs for {tile_id}")
 

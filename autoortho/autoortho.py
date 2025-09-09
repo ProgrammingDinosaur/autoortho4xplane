@@ -188,7 +188,7 @@ def diagnose(CFG):
     log.info(f"Checking maptypes:")
     import getortho
     for maptype in MAPTYPES:
-        if maptype == "Use tile default":
+        if maptype == "Use tile default" or maptype == "Use tile settings":
             continue
         with tempfile.TemporaryDirectory() as tmpdir:
             c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)

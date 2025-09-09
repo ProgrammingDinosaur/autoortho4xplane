@@ -650,6 +650,7 @@ class ConfigUI(QMainWindow):
         maptype_label.setToolTip(
             "Force AutoOrtho to use a specific imagery source:\n"
             "• Use tile default: Use source based on the tile default. For example display ARC if using custom ARC tiles.\n"
+            "• Use tile settings: Use source based on your tile settings in the tile manager.\n"
             "• BI (Bing): High quality, good worldwide coverage\n"
             "• NAIP: Very high quality for USA only\n"
             "• EOX: Good for Europe and some other regions\n"
