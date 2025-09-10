@@ -5,7 +5,7 @@ import threading
 from aoconfig import CFG
 
 
-DB_NAME = "tile_db.sqlite"
+DB_NAME = "tiles.ao"
 
 
 class TileDBService:

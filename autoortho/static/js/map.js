@@ -19,6 +19,10 @@
     const availableMaptypes = new Array(); // list of maptypes
     const selectionUI = { container: null, select: null };
     const pendingOverrides = new Map(); // key: "lat,lon" -> maptype string (user-staged)
+    const MODE_MAPTYPE = 'maptype';
+    const MODE_CACHE = 'cache';
+    let currentMode = MODE_MAPTYPE;
+    const modeUI = { container: null, maptypeBtn: null, cacheBtn: null };
 
     let recenter_call = true;
     let availableTilesParsed = [];
@@ -51,6 +55,9 @@
         const styleEl2 = document.createElement('style');
         styleEl2.textContent = '.ao-help-btn{width:34px;height:34px;border-radius:50%;background:#1d71d1;color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,0.25);font:14px/1 Arial,Helvetica,sans-serif;font-weight:bold}.ao-help-btn:hover{background:#5183bd}.ao-help-panel{position:fixed;top:0;right:0;height:100%;width:360px;max-width:85vw;background:#ffffff;color:#111;transform:translateX(100%);transition:transform .25s ease-in-out, box-shadow .25s ease-in-out;z-index:4000;box-shadow:0 0 0 rgba(0,0,0,0)}.ao-help-panel.open{transform:translateX(0);box-shadow:-2px 0 12px rgba(0,0,0,0.25)}.ao-help-panel .ao-help-header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #e5e5e5;background:#f8f8f8}.ao-help-panel .ao-help-title{margin:0;font:600 16px/1.2 Arial,Helvetica,sans-serif;color:#1d71d1}.ao-help-panel .ao-help-close{border:none;background:transparent;font:700 18px/1 Arial,Helvetica,sans-serif;color:#666;cursor:pointer}.ao-help-panel .ao-help-close:hover{color:#000}.ao-help-panel .ao-help-content{padding:14px;overflow:auto;height:calc(100% - 50px)}.ao-help-panel .ao-help-content h2{font:600 18px/1.2 Arial,Helvetica,sans-serif;color:#333;margin:10px 0}.ao-help-panel .ao-help-content p{margin:8px 0 12px;color:#333}.ao-help-panel .ao-help-content ul{padding-left:18px;margin:8px 0 12px}.ao-help-panel .ao-help-content code{background:#f0f3f7;color:#0b3d91;padding:2px 4px;border-radius:3px;font-family:Menlo,Consolas,monospace;font-size:12px}.ao-help-panel .ao-help-content pre{background:#0b0f14;color:#e3e9f3;padding:10px;border-radius:6px;overflow:auto}';
         document.head.appendChild(styleEl2);
+        const styleEl3 = document.createElement('style');
+        styleEl3.textContent = '.mode-switch{background:rgba(255,255,255,0.95);padding:4px;border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,0.2);display:inline-flex;gap:4px;align-items:center}.mode-btn{border:1px solid #d0d7de;border-radius:4px;background:#f6f8fa;color:#24292f;cursor:pointer;padding:4px 8px;font:12px Arial,Helvetica,sans-serif}.mode-btn.active{background:#1d71d1;color:#fff;border-color:#1d71d1}.mode-btn:focus{outline:none}.mode-legend{margin-left:8px;font:12px Arial,Helvetica,sans-serif;color:#333}';
+        document.head.appendChild(styleEl3);
     }
 
     // Create a Leaflet control with dropdown for selected tiles
@@ -88,6 +95,11 @@
             '    <li>You can select single tiles by clicking on them with the left mouse button.</li>'+
             '    <li>You can deselect tiles by holding the Shift key while selecting.</li>'+
             '    <li>Selected tiles are highlighted in orange.</li>'+
+            '  </ul>'+
+            '  <h2>Modes</h2>'+
+            '  <ul>'+
+            '    <li><b>Maptype</b>: assign imagery providers per tile.</li>'+
+            '    <li><b>Cache</b>: visualize/manage cached tiles (coming soon).</li>'+
             '  </ul>'+
             '  <h2>Changing the maptype</h2>'+
             '  <p>Once you have at least one tile selected, you can change the maptype by selecting a new maptype from the dropdown menu.</p>'+
@@ -146,6 +158,43 @@
     });
     (new HelpControl({ position: 'topright' })).addTo(map);
 
+    // Mode switch control (Maptype | Cache)
+    function setMode(mode) {
+        if (mode !== MODE_MAPTYPE && mode !== MODE_CACHE) return;
+        currentMode = mode;
+        if (modeUI.maptypeBtn && modeUI.cacheBtn) {
+            if (mode === MODE_MAPTYPE) {
+                modeUI.maptypeBtn.classList.add('active');
+                modeUI.cacheBtn.classList.remove('active');
+            } else {
+                modeUI.cacheBtn.classList.add('active');
+                modeUI.maptypeBtn.classList.remove('active');
+            }
+        }
+        updateSelectionUIVisibility();
+        scheduleRebuild();
+    }
+
+    const ModeControl = L.Control.extend({
+        onAdd: function () {
+            const container = L.DomUtil.create('div', 'mode-switch');
+            const btnMap = L.DomUtil.create('button', 'mode-btn active', container);
+            btnMap.type = 'button';
+            btnMap.textContent = 'Maptype';
+            const btnCache = L.DomUtil.create('button', 'mode-btn', container);
+            btnCache.type = 'button';
+            btnCache.textContent = 'Cache';
+            modeUI.container = container;
+            modeUI.maptypeBtn = btnMap;
+            modeUI.cacheBtn = btnCache;
+            L.DomEvent.disableClickPropagation(container);
+            btnMap.addEventListener('click', function (ev) { ev.preventDefault(); setMode(MODE_MAPTYPE); });
+            btnCache.addEventListener('click', function (ev) { ev.preventDefault(); setMode(MODE_CACHE); });
+            return container;
+        }
+    });
+    (new ModeControl({ position: 'topright' })).addTo(map);
+
     async function fetchTileMaptype(latDeg, lonDeg) {
         const key = cellKey(latDeg, lonDeg);
         if (pendingOverrides.has(key)) return pendingOverrides.get(key);
@@ -170,6 +219,12 @@
         return data.maptypes;
     }
 
+    // Placeholder for future cache status API
+    async function fetchTileCacheStatus(latDeg, lonDeg) {
+        // TODO: replace with backend call when available
+        return '\u2014'; // em dash placeholder
+    }
+
     function populateDropdownOptions() {
         if (!selectionUI.select) return;
         while (selectionUI.select.firstChild) selectionUI.select.removeChild(selectionUI.select.firstChild);
@@ -189,7 +244,7 @@
 
     function updateSelectionUIVisibility() {
         if (!selectionUI.container) return;
-        selectionUI.container.style.display = selectedCells.size > 0 ? 'block' : 'none';
+        selectionUI.container.style.display = (selectedCells.size > 0 && currentMode === MODE_MAPTYPE) ? 'block' : 'none';
     }
 
     // ---- Mouse interaction overrides ---------------------------------------
@@ -451,20 +506,27 @@
                 });
                 rect.addTo(gridCellsLayer);
 
-                // Add centered label for each 1x1° cell (default 'BI' then update)
+                // Add centered label for each 1x1° cell; text depends on mode
                 const centerLat = lat + 0.5;
                 const centerLon = normalizeLon(lon + 0.5);
                 const pLL = map.latLngToLayerPoint(L.latLng(lat, normalizeLon(lon)));
                 const pUR = map.latLngToLayerPoint(L.latLng(lat + 1, normalizeLon(lon + 1)));
                 const wPx = Math.max(1, Math.abs(pUR.x - pLL.x));
                 const hPx = Math.max(1, Math.abs(pUR.y - pLL.y));
+                const defaultText = (currentMode === MODE_MAPTYPE) ? 'DFLT' : '\u2014';
                 const labelMarker = L.marker([centerLat, centerLon], {
-                    icon: L.divIcon({ className: 'grid-label', html: 'DFLT', iconSize: [wPx, hPx], iconAnchor: [wPx / 2, hPx / 2] }),
+                    icon: L.divIcon({ className: 'grid-label', html: defaultText, iconSize: [wPx, hPx], iconAnchor: [wPx / 2, hPx / 2] }),
                     interactive: false
                 }).addTo(gridLabelsLayer);
-                fetchTileMaptype(lat, normalizeLon(lon)).then(function (mt) {
-                    labelMarker.setIcon(L.divIcon({ className: 'grid-label', html: mt, iconSize: [wPx, hPx], iconAnchor: [wPx / 2, hPx / 2] }));
-                });
+                if (currentMode === MODE_MAPTYPE) {
+                    fetchTileMaptype(lat, normalizeLon(lon)).then(function (mt) {
+                        labelMarker.setIcon(L.divIcon({ className: 'grid-label', html: mt, iconSize: [wPx, hPx], iconAnchor: [wPx / 2, hPx / 2] }));
+                    });
+                } else if (currentMode === MODE_CACHE) {
+                    fetchTileCacheStatus(lat, normalizeLon(lon)).then(function (st) {
+                        labelMarker.setIcon(L.divIcon({ className: 'grid-label', html: st, iconSize: [wPx, hPx], iconAnchor: [wPx / 2, hPx / 2] }));
+                    });
+                }
             }
         }
         updateSelectionUIVisibility();

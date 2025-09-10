@@ -30,6 +30,7 @@ from utils.constants import system_type
 from utils.apple_token_service import apple_token_service
 from utils.utils import coord_from_sleepy_tilename
 from utils.tile_db_service import tile_db_service
+from utils.cache_db_service import cache_db_service
 
 
 MEMTRACE = False
@@ -487,7 +488,7 @@ class Tile(object):
     maxchunk_wait = float(CFG.autoortho.maxwait)
     imgs = None
 
-    def __init__(self, col, row, maptype, zoom, min_zoom=0, priority=0,
+    def __init__(self, col, row, maptype, zoom, lat, lon, min_zoom=0, priority=0,
             cache_dir=None, max_zoom=None):
         self.row = int(row)
         self.col = int(col)
@@ -499,6 +500,8 @@ class Tile(object):
         self._lock = threading.RLock()
         self.refs = 0
         self.imgs = {}
+        self.lat = lat
+        self.lon = lon
 
         self.bytes_read = 0
         self.lowest_offset = 99999999
@@ -1070,6 +1073,18 @@ class Tile(object):
         end_time = time.time()
         self.ready.set()
 
+        if mipmap == 0 and self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
+            cache_db_service.set_tile_cache_state(
+                self.row,
+                self.col,
+                self.zoom,
+                self.lat,
+                self.lon,
+                self.maptype,
+                True
+            )
+        log.debug(f"GET_MIPMAP: Set tile cache state for {self.row},{self.col},{self.zoom},{self.lat},{self.lon},{self.maptype} to True")
+
         zoom = self.max_zoom - mipmap
         tile_time = end_time - start_time
         mm_stats.set(mipmap, tile_time)
@@ -1284,12 +1299,14 @@ class TileCacher(object):
         log.debug(f"Get_tile: {idx}")
         with self.tc_lock:
             tile = self.tiles.get(idx)
+            lat, lon = coord_from_sleepy_tilename(row, col, zoom)
             if not tile:
                 self.misses += 1
                 inc_stat('tile_mem_miss')
                 # Use target zoom level directly - much cleaner than offset calculations
                 tile = Tile(
                     col, row, map_type, zoom, 
+                    lat, lon,
                     cache_dir=self.cache_dir,
                     min_zoom=self.min_zoom,
                     max_zoom=self._get_target_zoom_level(zoom),
@@ -1304,7 +1321,6 @@ class TileCacher(object):
                 inc_stat('tile_mem_hits')
 
             tile.refs += 1
-        lat, lon = coord_from_sleepy_tilename(row, col, zoom)
         if self.open_tiles_by_dsf.get((lat, lon)) is None:
             self.open_tiles_by_dsf[(lat, lon)] = 1
         else:

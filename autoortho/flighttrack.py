@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from xp_udp import DecodePacket, RequestDataRefs
 
 from aostats import STATS
+from getortho import tile_cacher
 #STATS = {'count': 71036, 'chunk_hit': 66094, 'mm_counts': {0: 19, 1: 39, 2: 97, 3: 294, 4: 2982}, 'mm_averages': {0: 0.56, 1: 0.14, 2: 0.04, 3: 0.01, 4: 0.0}, 'chunk_miss': 4942, 'bytes_dl': 65977757}
 from utils.constants import MAPTYPES
 from utils.tile_db_service import tile_db_service
@@ -206,6 +207,11 @@ async def available_maptypes():
 @app.get("/available_tiles", name='available_tiles')
 async def available_tiles():
     return JSONResponse({"tiles": scan_existing_tiles(CFG.paths.scenery_path)})
+
+
+@app.get("/open_tiles", name='open_tiles')
+async def open_tiles():
+    return JSONResponse({"tiles": tile_cacher.open_tiles_by_dsf})
 
 @app.post("/stage_maptype_overrides", name='stage_maptype_overrides')
 async def stage_maptype_overrides(payload: dict = Body(...)):
