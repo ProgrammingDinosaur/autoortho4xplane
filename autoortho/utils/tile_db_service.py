@@ -10,7 +10,7 @@ DB_NAME = "tile_db.sqlite"
 
 class TileDBService:
     def __init__(self):
-        self.default_maptype = "BI"
+        self.default_maptype = "DFLT"
         self._lock = threading.Lock()
 
         db_path = os.path.join(CFG.paths.tile_db_dir)

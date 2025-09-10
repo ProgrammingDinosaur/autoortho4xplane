@@ -22,6 +22,7 @@ from aostats import STATS
 #STATS = {'count': 71036, 'chunk_hit': 66094, 'mm_counts': {0: 19, 1: 39, 2: 97, 3: 294, 4: 2982}, 'mm_averages': {0: 0.56, 1: 0.14, 2: 0.04, 3: 0.01, 4: 0.0}, 'chunk_miss': 4942, 'bytes_dl': 65977757}
 from utils.constants import MAPTYPES
 from utils.tile_db_service import tile_db_service
+from utils.utils import scan_existing_tiles
 
 
 RUNNING=True
@@ -141,6 +142,9 @@ class FlightTracker(object):
         log.info("FlightTracker exiting.")
 
 ft = FlightTracker()
+_pending_lock = threading.Lock()
+# key: (lat, lon) -> maptype
+_PENDING_MAPTYPE_OVERRIDES = {}
 
 # Socket.IO events (async)
 @sio.event
@@ -179,7 +183,12 @@ async def get_latlon_route():
 @app.get("/tile_maptype", name='tile_maptype')
 async def tile_maptype(lat: int, lon: int):
     try:
-        maptype = tile_db_service.get_tile_maptype(lat, lon)
+        with _pending_lock:
+            mt = _PENDING_MAPTYPE_OVERRIDES.get((lat, lon))
+        if mt:
+            maptype = mt
+        else:
+            maptype = tile_db_service.get_tile_maptype(lat, lon)
         return JSONResponse({"lat": lat, "lon": lon, "maptype": maptype})
     except Exception as e:
         log.exception("tile_maptype error")
@@ -187,7 +196,54 @@ async def tile_maptype(lat: int, lon: int):
 
 @app.get("/available_maptypes", name='available_maptypes')
 async def available_maptypes():
-    return JSONResponse({"maptypes": MAPTYPES})
+    maptypes_parsed = MAPTYPES.copy()
+    maptypes_parsed.remove("Use tile settings")
+    maptypes_parsed.remove("Use tile default")
+    maptypes_parsed.append("DFLT")
+    return JSONResponse({"maptypes": maptypes_parsed})
+
+
+@app.get("/available_tiles", name='available_tiles')
+async def available_tiles():
+    return JSONResponse({"tiles": scan_existing_tiles(CFG.paths.scenery_path)})
+
+@app.post("/stage_maptype_overrides", name='stage_maptype_overrides')
+async def stage_maptype_overrides(payload: dict = Body(...)):
+    try:
+        maptype = payload.get("maptype")
+        tiles = payload.get("tiles") or []
+        if not maptype or not isinstance(tiles, list):
+            return JSONResponse({"error": "Invalid payload"}, status_code=400)
+        count = 0
+        with _pending_lock:
+            for item in tiles:
+                lat = item.get("lat")
+                lon = item.get("lon")
+                if isinstance(lat, int) and isinstance(lon, int):
+                    _PENDING_MAPTYPE_OVERRIDES[(lat, lon)] = maptype
+                    count += 1
+        return JSONResponse({"staged": count})
+    except Exception as e:
+        log.exception("stage_maptype_overrides error")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.post("/apply_maptype_overrides", name='apply_maptype_overrides')
+async def apply_maptype_overrides():
+    try:
+        with _pending_lock:
+            items = list(_PENDING_MAPTYPE_OVERRIDES.items())
+            _PENDING_MAPTYPE_OVERRIDES.clear()
+        applied = 0
+        for (lat, lon), mt in items:
+            try:
+                tile_db_service.change_maptype(lat, lon, mt)
+                applied += 1
+            except Exception:
+                log.exception("apply_maptype_overrides: failed for %s,%s", lat, lon)
+        return JSONResponse({"applied": applied})
+    except Exception as e:
+        log.exception("apply_maptype_overrides error")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/change_maptypes", name='change_maptypes')
 async def change_maptypes(payload: dict = Body(...)):

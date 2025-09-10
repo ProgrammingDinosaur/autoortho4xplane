@@ -460,8 +460,9 @@ class ConfigUI(QMainWindow):
         self.create_setup_tab()
         self.create_scenery_tab()
         self.create_settings_tab()
-        self.create_logs_tab()
         self.create_map_tab()
+        self.create_logs_tab()
+
 
         # Button layout
         button_layout = QHBoxLayout()
@@ -472,6 +473,8 @@ class ConfigUI(QMainWindow):
 
         self.save_button = StyledButton("Save Config")
         self.save_button.clicked.connect(self.on_save)
+        self.apply_overrides_button = StyledButton("Apply Maptype Overrides")
+        self.apply_overrides_button.clicked.connect(self.on_apply_overrides)
 
         self.quit_button = StyledButton("Quit")
         self.quit_button.clicked.connect(self.close)
@@ -479,6 +482,7 @@ class ConfigUI(QMainWindow):
         button_layout.addStretch()
         button_layout.addWidget(self.run_button)
         button_layout.addWidget(self.save_button)
+        button_layout.addWidget(self.apply_overrides_button)
         button_layout.addWidget(self.quit_button)
 
         main_layout.addLayout(button_layout)
@@ -487,6 +491,87 @@ class ConfigUI(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready")
+        # Initialize button visibility per active tab
+        try:
+            self.tabs.currentChanged.connect(self._update_action_buttons_visibility)
+        except Exception:
+            pass
+        self._update_action_buttons_visibility(self.tabs.currentIndex())
+
+    def _update_action_buttons_visibility(self, index):
+        try:
+            label = self.tabs.tabText(index)
+        except Exception:
+            label = ""
+        if label in ("Setup", "Advanced Settings"):
+            self.save_button.setVisible(True)
+            self.apply_overrides_button.setVisible(False)
+        elif label == "Tile Manager":
+            self.save_button.setVisible(False)
+            self.apply_overrides_button.setVisible(True)
+        else:
+            self.save_button.setVisible(True)
+            self.apply_overrides_button.setVisible(False)
+
+    def on_apply_overrides(self):
+        try:
+            # Pull pending overrides from the embedded map if available
+            try:
+                page = self.map_view.page()
+                # Execute JS in the web view to retrieve staged overrides
+                js = "(window.getPendingOverrides && JSON.stringify(window.getPendingOverrides())) || '[]'"
+                res = page.runJavaScript(js, self._apply_overrides_callback)
+                return
+            except Exception:
+                pass
+            # Fallback: call backend endpoint to apply staged overrides
+            import requests
+            port = int(self.cfg.flightdata.webui_port)
+            url = f"http://localhost:{port}/apply_maptype_overrides"
+            r = requests.post(url, timeout=10)
+            if r.status_code == 200:
+                self.update_status_bar("Applied maptype overrides")
+            else:
+                self.update_status_bar(f"Failed to apply overrides: {r.status_code}")
+        except Exception as err:
+            self.update_status_bar(f"Error applying overrides: {err}")
+
+    def _apply_overrides_callback(self, json_str):
+        try:
+            import json as _json
+            overrides = _json.loads(json_str or "[]")
+            if not overrides:
+                # Nothing staged; still call backend to clear or just return
+                self.update_status_bar("No maptype overrides to apply")
+                return
+            import requests
+            port = int(self.cfg.flightdata.webui_port)
+            url = f"http://localhost:{port}/change_maptypes"
+            # Batch by maptype
+            by_mt = {}
+            for item in overrides:
+                mt = item.get("maptype")
+                if not mt:
+                    continue
+                by_mt.setdefault(mt, []).append({"lat": item.get("lat"), "lon": item.get("lon")})
+            changed_total = 0
+            for mt, tiles in by_mt.items():
+                if not tiles:
+                    continue
+                r = requests.post(url, json={"maptype": mt, "tiles": tiles}, timeout=15)
+                if r.status_code == 200:
+                    try:
+                        changed_total += int((r.json() or {}).get("changed", 0))
+                    except Exception:
+                        pass
+            # Clear staged overrides in the web view
+            try:
+                self.map_view.page().runJavaScript("window.clearPendingOverrides && window.clearPendingOverrides();")
+            except Exception:
+                pass
+            self.update_status_bar(f"Applied overrides to {changed_total} tiles")
+        except Exception as err:
+            self.update_status_bar(f"Error applying overrides: {err}")
 
     def create_map_tab(self):
         """Create the flight map tab (served by FastAPI)"""

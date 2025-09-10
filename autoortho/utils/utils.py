@@ -1,5 +1,6 @@
 """ module to hold utility functions used throughout the project """
 import math
+import os
 import psutil
 from functools import lru_cache
 
@@ -21,3 +22,27 @@ def coord_from_sleepy_tilename(row, col, zoom):
     lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * col / n)))
     lat_deg = lat_rad * 180.0 / math.pi
     return math.floor(lat_deg), math.floor(lon_deg)
+
+
+def scan_existing_tiles(search_path: str) -> list[tuple[int, int]]:
+    """ scan existing tiles """
+    print("SCANNING EXISTING TILES")
+    base_ao_sceneries_path = os.path.join(search_path, "z_autoortho", "scenery")
+    existing_tiles = set()
+    if not os.path.exists(base_ao_sceneries_path):
+        return existing_tiles
+    for base_package_path in os.listdir(base_ao_sceneries_path):
+        package_path = os.path.join(base_ao_sceneries_path, base_package_path)
+        if not os.path.exists(package_path) or not os.path.isdir(package_path):
+            continue
+        base_dsf_paths = os.path.join(package_path, "Earth Nav Data")
+        if not os.path.exists(base_dsf_paths) or not os.path.isdir(base_dsf_paths):
+            continue
+        for base_dsf_dir_path in os.listdir(base_dsf_paths):
+            dsf_path = os.path.join(base_dsf_paths, base_dsf_dir_path)
+            if not os.path.exists(dsf_path) or not os.path.isdir(dsf_path):
+                continue
+            for dsf_file in os.listdir(dsf_path):
+                coord = dsf_file.split(".")[0]
+                existing_tiles.add(coord)
+    return list(existing_tiles)

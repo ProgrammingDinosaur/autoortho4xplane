@@ -1,5 +1,6 @@
 """Mappers used in autoortho code"""
 
+
 def map_kubilus_region_to_simheaven_region(region_id: str) -> str:
     """Map which SimHeaven region a Kubilus region belongs to"""
     region_map = {
