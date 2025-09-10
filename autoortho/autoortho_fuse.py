@@ -143,7 +143,7 @@ class AutoOrtho(Operations):
         self.root = os.path.abspath(root)
         self.cache_dir = cache_dir
 
-        self.tc = getortho.TileCacher(cache_dir)
+        self.tc = getortho.tile_cacher
     
         #self.path_condition = threading.Condition()
         #self.read_lock = threading.Lock()

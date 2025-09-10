@@ -1188,7 +1188,9 @@ class TileCacher(object):
             # Windows doesn't handle FS cache the same way so enable here.
             self.enable_cache = True
             self.cache_tile_lim = 50
-    
+
+        log.info("Initialized global TileCacher")
+
     def _get_target_zoom_level(self, default_zoom: int) -> int:
         if CFG.autoortho.using_custom_tiles:
             uncapped_target_zoom = self.target_zoom_level
@@ -1234,13 +1236,20 @@ class TileCacher(object):
                             continue
                         if t.refs <= 0:
                             t = self.tiles.pop(i)
-                            t.close()
-                            t = None
-                            lat, lon = coord_from_sleepy_tilename(t.row, t.col, t.tilename_zoom)
+                            try:
+                                lat, lon = coord_from_sleepy_tilename(t.row, t.col, t.tilename_zoom)
+                            except Exception:
+                                lat, lon = (None, None)
+                            try:
+                                t.close()
+                            finally:
+                                pass
+                            # Only update open_tiles_by_dsf if we could compute coords
+                            if lat is not None:
+                                self.open_tiles_by_dsf[(lat, lon)] -= 1
+                                if self.open_tiles_by_dsf[(lat, lon)] <= 0:
+                                    del self.open_tiles_by_dsf[(lat, lon)]
                             del t
-                            self.open_tiles_by_dsf[(lat, lon)] -= 1
-                            if self.open_tiles_by_dsf[(lat, lon)] <= 0:
-                                del self.open_tiles_by_dsf[(lat, lon)]
                 cur_mem = process.memory_info().rss
 
 
@@ -1334,6 +1343,9 @@ class TileCacher(object):
 # ============================================================
 # Module-level cleanup helpers
 # ============================================================
+
+"""Global TileCacher singleton used by all mounts"""
+tile_cacher = TileCacher()
 
 def shutdown():
     """Free network pools, worker threads and cached tiles to minimise RSS
