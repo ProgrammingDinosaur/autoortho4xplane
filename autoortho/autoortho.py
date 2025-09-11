@@ -275,11 +275,11 @@ class AOMount:
             self.unmount_sceneries()
 
 
-    def unmount_sceneries(self):
+    def unmount_sceneries(self, force=False):
         log.info("Unmounting ...")
         self.mounts_running = False
         for scenery in self.cfg.scenery_mounts:
-            self.unmount(scenery.get('mount'))
+            self.unmount(scenery.get('mount'), force)
 
         log.info("Wait on threads...")
         for t in self.mount_threads:
@@ -346,7 +346,7 @@ class AOMount:
             time.sleep(5)
             os._exit(2)
 
-    def unmount(self, mountpoint):
+    def unmount(self, mountpoint, force=False):
         log.info(f"Shutting down {mountpoint}")
         poison_path = os.path.join(mountpoint, ".poison")
 
@@ -357,11 +357,12 @@ class AOMount:
         except Exception as exc:
             log.debug(f"Poison trigger stat failed: {exc}")
 
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if not os.path.ismount(mountpoint):
-                break
-            time.sleep(0.5)
+        if not force:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if not os.path.ismount(mountpoint):
+                    break
+                time.sleep(0.5)
 
         if os.path.ismount(mountpoint):
             try:

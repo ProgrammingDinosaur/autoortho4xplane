@@ -1,10 +1,10 @@
 !define PRODUCT_NAME "AutoOrtho"
-;!define PRODUCT_VERSION "1.2.5"
+;!define PRODUCT_VERSION "1.2.6"
 ;!define PY_VERSION "3.12.9"
 ;!define PY_MAJOR_VERSION "3.12"
 ;!define BITNESS "32"
 !define ARCH_TAG ""
-;!define INSTALLER_NAME "AutoOrtho_1.2.5.exe"
+;!define INSTALLER_NAME "AutoOrtho_1.2.6.exe"
 !define INSTALLER_NAME "AutoOrtho.exe"
 !define PRODUCT_ICON "ao-icon.ico"
 
@@ -58,7 +58,7 @@ VIAddVersionKey "CompanyName" "AutoOrtho Project"
 VIAddVersionKey "LegalCopyright" "© AutoOrtho Project"
 VIAddVersionKey "FileDescription" "${PRODUCT_NAME} Installer"
 VIAddVersionKey "FileVersion" "0.1.0"
-VIAddVersionKey "ProductVersion" "1.2.5"
+VIAddVersionKey "ProductVersion" "1.2.6"
 
 ; Request admin rights explicitly in manifest
 RequestExecutionLevel admin

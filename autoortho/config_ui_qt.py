@@ -1913,7 +1913,7 @@ class ConfigUI(QMainWindow):
 
             # Attempt unmount via AOMount implementation if available
             try:
-                self.unmount_sceneries()
+                self.unmount_sceneries(force=True)
             except Exception:
                 pass
 
@@ -1928,7 +1928,8 @@ class ConfigUI(QMainWindow):
                 QMessageBox.warning(
                     self,
                     "Unmount Incomplete",
-                    "Some mounts could not be unmounted automatically."
+                    "Some mounts could not be unmounted automatically.\n"
+                    "Please remove the z_ao_<scenery_name> directories from your Custom Scenery directory manually and run AutoOrtho again."
                 )
             return True
         except Exception:
