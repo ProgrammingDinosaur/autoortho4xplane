@@ -11,12 +11,16 @@ from aoimage import AoImage as Image
 
 import threading
 
+# Global guard to prevent multiple parallel mip-0 compressions at once
+_parallel_guard_lock = threading.Lock()
+_parallel_active = 0
+
 #from functools import lru_cache, cache
 
 #from memory_profiler import profile
 from aoconfig import CFG
 from utils.constants import system_type
-from parallel_compress import compress_mipmap_to_bytes_parallel
+from parallel_compress import compress_mipmap_to_bytes_parallel, compress_mipmap_via_global_pool
 
 import logging
 log = logging.getLogger(__name__)
@@ -504,13 +508,15 @@ class DDS(Structure):
                 if use_parallel:
                     # Fetch raw RGBA bytes for the current image surface
                     rgba_buf = img.tobytes()
-                    dxtdata = compress_mipmap_to_bytes_parallel(
+                    # Use the persistent global pool with job limiting
+                    dxtdata = compress_mipmap_via_global_pool(
                         rgba_buf,
                         width,
                         height,
                         self.dxt_format,
                         workers=getattr(CFG.pydds, 'parallel_workers', 0),
                         stripe_height_px=getattr(CFG.pydds, 'parallel_stripe_height', 128),
+                        max_jobs=getattr(CFG.pydds, 'parallel_max_jobs', 1),
                     )
                 else:
                     dxtdata = self.compress(width, height, imgdata)

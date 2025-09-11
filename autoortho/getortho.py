@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from ast import Pass
 import os
 import sys
 import time
@@ -414,6 +415,11 @@ class Tile(object):
         return self.dds.mipmap_list[-1].idx
 
     def get_bytes(self, offset, length):
+        
+        # Guard against races where tile is being closed and DDS is cleared
+        if self.dds is None:
+            log.debug(f"GET_BYTES: DDS is None for {self}, likely closing; skipping")
+            return True
 
         mipmap = self.find_mipmap_pos(offset)
         log.debug(f"Get_bytes for mipmap {mipmap} ...")
@@ -475,6 +481,9 @@ class Tile(object):
             log.debug("No updates, so no image generated")
             return True
 
+        # If tile is being closed concurrently, avoid touching DDS
+        if self.dds is None:
+            return True
         self.ready.clear()
         #log.info(new_im.size)
         
@@ -495,9 +504,13 @@ class Tile(object):
             # usage.  Don't close here.
             #new_im.close()
 
-        # We haven't fully retrieved so unset flag
+        # We haven't fully retrieved so unset flag; guard against DDS being cleared
         log.debug(f"UNSETTING RETRIEVED! {self}")
-        self.dds.mipmap_list[mipmap].retrieved = False
+        try:
+            if self.dds is not None and self.dds.mipmap_list:
+                self.dds.mipmap_list[mipmap].retrieved = False
+        except Exception:
+            pass
         end_time = time.time()
         self.ready.set()
 
@@ -700,7 +713,7 @@ class Tile(object):
             cpu_workers = os.cpu_count() or 1
         except Exception:
             cpu_workers = 1
-        max_pool_workers = max(1, min(cpu_workers, 4))
+        max_pool_workers = max(1, min(cpu_workers, 16))
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_pool_workers, len(chunks))) as executor:
             # Submit all chunk processing tasks
             future_to_chunk = {executor.submit(process_chunk, chunk): chunk for chunk in chunks}
@@ -837,15 +850,9 @@ class Tile(object):
         self.ready.set()
 
         if mipmap == 0 and self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
-            cache_db_service.set_tile_cache_state(
-                tile_id=self.id,
-                lat=self.lat,
-                lon=self.lon,
-                maptype=self.maptype,
-                max_zoom=self.max_zoom,
-                is_cached=True,
-            )
-        log.debug(f"GET_MIPMAP: Set tile cache state for {self.row},{self.col},{self.zoom},{self.lat},{self.lon},{self.maptype} to True")
+            log.info(f"GET_MIPMAP: Setting tile cache state for {self.row},{self.col},{self.max_zoom},{self.lat},{self.lon},{self.maptype} to True")
+
+        log.debug(f"GET_MIPMAP: Set tile cache state for {self.row},{self.col},{self.max_zoom},{self.lat},{self.lon},{self.maptype} to True")
 
         zoom = self.max_zoom - mipmap
         tile_time = end_time - start_time
@@ -912,11 +919,13 @@ class Tile(object):
 
         # 2) Release DDS mip-map ByteIO buffers so the underlying bytes
         #    are no longer referenced from Python.
-        if self.dds is not None:
-            for mm in getattr(self.dds, "mipmap_list", []):
-                mm.databuffer = None
-            # Drop the DDS object reference itself
-            self.dds = None
+        #    Guard with lock so readers don't race with teardown.
+        with self._lock:
+            if self.dds is not None:
+                for mm in getattr(self.dds, "mipmap_list", []):
+                    mm.databuffer = None
+                # Drop the DDS object reference itself
+                self.dds = None
 
         for chunks in self.chunks.values():
             for chunk in chunks:
@@ -1052,7 +1061,7 @@ class Chunk(object):
 
     serverlist=['a','b','c','d']
 
-    def __init__(self, col: int, row: int, maptype: str, zoom: int, parent_tile: Tile, priority: int = 0, cache_dir: str = '.cache'):
+    def __init__(self, col: int, row: int, maptype: str, zoom: int, parent_tile: Tile = None, priority: int = 0, cache_dir: str = '.cache'):
         self.col = col
         self.row = row
         self.zoom = zoom
@@ -1149,15 +1158,9 @@ class Chunk(object):
                     log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
                     return
                 os.replace(temp_filename, self.cache_path)
-                cache_db_service.set_cache_file_cache_state(
-                    filename=self.cache_path,
-                    maptype=self.maptype,
-                    lat=self.parent_tile.lat,
-                    lon=self.parent_tile.lon,
-                    parent_max_zoom=self.parent_tile.max_zoom,
-                    parent_tile_id=self.parent_tile.row,
-                    size_in_bytes=len(self.data), 
-                    is_cached=True)
+                if self.parent_tile:
+                    # log.info(f"SAVE_CACHE: Setting tile cache state for {self.parent_tile.row},{self.parent_tile.col},{self.parent_tile.max_zoom},{self.parent_tile.lat},{self.parent_tile.lon},{self.parent_tile.maptype} to True")
+                    pass
                 return
             except FileExistsError:
                 try:

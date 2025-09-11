@@ -104,6 +104,12 @@ format = BC1
 parallel_compress = True
 # Direct assemble mipmap 0 directly in DXT space to reduce latency
 direct_assemble = True
+# Maximum number of parallel jobs for parallel compression
+parallel_max_jobs = 1
+# Stripe height for parallel compression
+parallel_stripe_height = 128
+# Number of workers for parallel compression
+parallel_workers = 2
 
 [scenery]
 # Don't cleanup downloads

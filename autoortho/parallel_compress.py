@@ -5,6 +5,7 @@ import math
 import ctypes
 import multiprocessing as mp
 from multiprocessing import shared_memory
+import atexit
 
 from utils.constants import system_type
 
@@ -39,6 +40,9 @@ def _load_ispc_lib():
 
 
 _ISPC = None
+_POOL = None
+_POOL_LOCK = mp.Lock() if hasattr(mp, 'Lock') else None
+_JOBS_SEM = None  # Initialized lazily based on max_jobs
 
 
 def _addr_of_buffer(buf) -> int:
@@ -167,5 +171,99 @@ def compress_mipmap_to_bytes_parallel(rgba_bytes: bytes, width: int, height: int
             out_shm.unlink()
         except Exception:
             pass
+
+
+def _ensure_pool(workers: int = 0, max_jobs: int = 1):
+    global _POOL, _JOBS_SEM
+    if workers is None or workers <= 0:
+        workers = max(1, (os.cpu_count() or 1) // 2)
+    if max_jobs is None or max_jobs <= 0:
+        max_jobs = 1
+
+    # Create semaphore once
+    if _JOBS_SEM is None:
+        # Use a threading-based semaphore since coordination is only in the parent process
+        # (process children pull tasks from the Pool work queue)
+        import threading as _th
+        _globals = globals()
+        _globals['_JOBS_SEM'] = _th.Semaphore(max_jobs)
+
+    if _POOL is None:
+        ctx = mp.get_context('spawn')
+        pool = ctx.Pool(processes=workers)
+        _globals = globals()
+        _globals['_POOL'] = pool
+
+        def _cleanup():
+            try:
+                pool.close()
+                pool.terminate()
+            except Exception:
+                pass
+        atexit.register(_cleanup)
+
+
+def compress_mipmap_via_global_pool(rgba_bytes: bytes, width: int, height: int, dxt_format: str, workers: int = 0, stripe_height_px: int = 128, max_jobs: int = 1) -> bytes:
+    """Compress using a persistent global process pool with a job semaphore.
+
+    Limits concurrent jobs to max_jobs and reuses the pool to reduce spawn overhead.
+    """
+    if width % 4 != 0 or height % 4 != 0:
+        raise ValueError("Dimensions must be multiples of 4 for BC compression")
+    if stripe_height_px < 4 or stripe_height_px % 4 != 0:
+        stripe_height_px = 128
+
+    _ensure_pool(workers=workers, max_jobs=max_jobs)
+
+    # Acquire a job slot (blocks if too many jobs)
+    _JOBS_SEM.acquire()
+    try:
+        # Shared memory setup
+        blocksize = 16 if dxt_format == 'BC3' else 8
+        blocks_per_row = width // 4
+        total_blocks = (width * height) // 16
+        out_size = total_blocks * blocksize
+
+        in_shm = shared_memory.SharedMemory(create=True, size=len(rgba_bytes))
+        out_shm = shared_memory.SharedMemory(create=True, size=out_size)
+        try:
+            in_shm.buf[:] = rgba_bytes
+
+            tasks = []
+            start = 0
+            while start < height:
+                hh = min(stripe_height_px, height - start)
+                hh = max(4, ((hh + 3) // 4) * 4)
+                dxt_offset = (start // 4) * blocks_per_row * blocksize
+                tasks.append((
+                    in_shm.name,
+                    out_shm.name,
+                    width,
+                    hh,
+                    width * 4,
+                    dxt_format,
+                    blocksize,
+                    start,
+                    dxt_offset,
+                ))
+                start += hh
+
+            # Map stripes across the persistent pool
+            results = _POOL.map(_compress_stripe_worker, tasks, chunksize=1)
+            if not all(results):
+                raise RuntimeError("Parallel compression failed in at least one worker")
+
+            return bytes(out_shm.buf)
+        finally:
+            try:
+                in_shm.close(); in_shm.unlink()
+            except Exception:
+                pass
+            try:
+                out_shm.close(); out_shm.unlink()
+            except Exception:
+                pass
+    finally:
+        _JOBS_SEM.release()
 
 

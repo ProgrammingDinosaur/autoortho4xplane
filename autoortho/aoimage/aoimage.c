@@ -10,11 +10,22 @@
 
 #ifdef AOIMAGE_WITH_PYTHON_GIL
 #include <Python.h>
+#define AOI_ALLOW_THREADS_BEGIN \
+    PyThreadState *_aoi_save = NULL; \
+    int _aoi_had_gil = 0; \
+    if (Py_IsInitialized()) { \
+        _aoi_had_gil = PyGILState_Check(); \
+        if (_aoi_had_gil) _aoi_save = PyEval_SaveThread(); \
+    }
+#define AOI_ALLOW_THREADS_END \
+    if (_aoi_had_gil) PyEval_RestoreThread(_aoi_save);
 #else
 #ifndef Py_BEGIN_ALLOW_THREADS
 #define Py_BEGIN_ALLOW_THREADS
 #define Py_END_ALLOW_THREADS
 #endif
+#define AOI_ALLOW_THREADS_BEGIN
+#define AOI_ALLOW_THREADS_END
 #endif
 
 #define TRUE 1
@@ -108,7 +119,7 @@ AOIAPI int32_t aoimage_2_rgba(const aoimage_t *s_img, aoimage_t *d_img) {
     const uint8_t *sptr = s_img->ptr;
     const uint8_t *send = sptr + slen;
     uint8_t *dptr = dest;
-    Py_BEGIN_ALLOW_THREADS
+    AOI_ALLOW_THREADS_BEGIN
     while (sptr < send) {
         *dptr++ = *sptr++;
         *dptr++ = *sptr++;
@@ -116,7 +127,7 @@ AOIAPI int32_t aoimage_2_rgba(const aoimage_t *s_img, aoimage_t *d_img) {
         *dptr++ = 0xff;
         //*dptr++ = 0x00;
     }
-    Py_END_ALLOW_THREADS
+    AOI_ALLOW_THREADS_END
 
    d_img->ptr = dest;
    d_img->width = s_img->width;
@@ -181,10 +192,10 @@ AOIAPI int32_t aoimage_write_jpg(const char *filename, aoimage_t *img, int32_t q
     }
 
     int rc;
-    Py_BEGIN_ALLOW_THREADS
+    AOI_ALLOW_THREADS_BEGIN
     rc = tjCompress2(tjh, img->ptr, img->width, 0, img->height, TJPF_RGBA,
                      &out_jpg_buf, &out_jpg_size, TJSAMP_444, quality, 0);
-    Py_END_ALLOW_THREADS
+    AOI_ALLOW_THREADS_END
     if (rc) {
         strncpy(img->errmsg, tjGetErrorStr2(tjh), sizeof(img->errmsg) - 1);
         goto err;
@@ -243,7 +254,7 @@ AOIAPI int32_t aoimage_reduce_2(const aoimage_t *s_img, aoimage_t *d_img) {
     int stride = s_img->width * 4;
 
     // fprintf(stderr, "%p %d %d %d\n", sptr, slen, dlen, stride); fflush(stderr);
-    Py_BEGIN_ALLOW_THREADS
+    AOI_ALLOW_THREADS_BEGIN
     while (srptr < send) {
         const uint8_t *sptr = srptr;
         while (sptr < srptr + stride) {
@@ -263,7 +274,7 @@ AOIAPI int32_t aoimage_reduce_2(const aoimage_t *s_img, aoimage_t *d_img) {
         }
         srptr += 2* stride;
     }
-    Py_END_ALLOW_THREADS
+    AOI_ALLOW_THREADS_END
     d_img->ptr = dest;
     d_img->width = s_img->width / 2;
     d_img->height = s_img->height / 2;
@@ -309,7 +320,7 @@ AOIAPI int32_t aoimage_scale(const aoimage_t *s_img, aoimage_t *d_img, uint32_t 
     }
 
     const uint32_t *src = (const uint32_t *)s_img->ptr;
-    Py_BEGIN_ALLOW_THREADS
+    AOI_ALLOW_THREADS_BEGIN
     for (uint32_t sy = 0; sy < src_h; ++sy) {
         for (uint32_t sx = 0; sx < src_w; ++sx) {
             uint32_t px = src[sy * src_w + sx];
@@ -324,7 +335,7 @@ AOIAPI int32_t aoimage_scale(const aoimage_t *s_img, aoimage_t *d_img, uint32_t 
             }
         }
     }
-    Py_END_ALLOW_THREADS
+    AOI_ALLOW_THREADS_END
 
     d_img->ptr = (uint8_t *)dest;
     d_img->width = dst_w;
@@ -374,9 +385,9 @@ AOIAPI int32_t aoimage_from_memory(aoimage_t *img, const uint8_t *data, uint32_t
     //printf("Pixel format: %d\n", TJPF_RGBA);
 
     int tjrc;
-    Py_BEGIN_ALLOW_THREADS
+    AOI_ALLOW_THREADS_BEGIN
     tjrc = tjDecompress2(tjh, data, len, img_buff, width, 0, height, TJPF_RGBA, TJFLAG_FASTDCT);
-    Py_END_ALLOW_THREADS
+    AOI_ALLOW_THREADS_END
     if (tjrc < 0) {
         strncpy(img->errmsg, tjGetErrorStr2(tjh), sizeof(img->errmsg) - 1);
         goto err;
@@ -413,13 +424,13 @@ AOIAPI int32_t aoimage_paste(aoimage_t *img, const aoimage_t *p_img, uint32_t x,
     uint8_t *ip = img->ptr + (y * img->width * 4) + x * 4;  // lower left corner of image
     uint8_t *pp = p_img->ptr;
 
-    Py_BEGIN_ALLOW_THREADS
+    AOI_ALLOW_THREADS_BEGIN
     for (int i = 0; i < p_img->height; i++) {
         memcpy(ip, pp, p_img->width * 4);
         ip += img->width * 4;
         pp += p_img->width * 4;
     }
-    Py_END_ALLOW_THREADS
+    AOI_ALLOW_THREADS_END
 
     return TRUE;
 }
@@ -432,13 +443,13 @@ AOIAPI int32_t aoimage_crop(aoimage_t *img, const aoimage_t *c_img, uint32_t x, 
     uint8_t *ip = img->ptr + (y * img->width * 4) + x * 4;  // lower left corner of image
     uint8_t *cp = c_img->ptr;
 
-    Py_BEGIN_ALLOW_THREADS
+    AOI_ALLOW_THREADS_BEGIN
     for (int i = 0; i < c_img->height; i++) {
         memcpy(cp, ip, c_img->width * 4);
         ip += img->width * 4;
         cp += c_img->width * 4;
     }
-    Py_END_ALLOW_THREADS
+    AOI_ALLOW_THREADS_END
 
     return TRUE;
 }

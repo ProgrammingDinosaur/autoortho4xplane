@@ -1,12 +1,16 @@
 import sqlite3
 import os
+import threading
 from aoconfig import CFG
 
 
 class CacheDBService:
     def __init__(self):
+        if not os.path.isdir(CFG.paths.cache_dir):
+            os.makedirs(CFG.paths.cache_dir)
         self.cache_dir = os.path.join(CFG.paths.cache_dir, 'cache.ao')
-        self.conn = sqlite3.connect(self.cache_dir)
+        self.conn = sqlite3.connect(self.cache_dir, check_same_thread=False)
+        self._lock = threading.Lock()
         self.conn.execute('''CREATE TABLE IF NOT EXISTS cache (
             tile_id TEXT NOT NULL,
             lat INTEGER NOT NULL,
@@ -33,7 +37,7 @@ class CacheDBService:
         self.conn.commit()
 
     def set_tile_cache_state(self, tile_id: str, lat: int, lon: int, maptype: str, max_zoom: int, is_cached: bool):
-        with self.conn:
+        with self._lock:
             self.conn.execute(
                 "INSERT OR REPLACE INTO cache (tile_id, lat, lon, maptype, max_zoom, is_cached) VALUES (?, ?, ?, ?, ?, ?)",
                 (tile_id, lat, lon, maptype, max_zoom, is_cached)
@@ -41,7 +45,7 @@ class CacheDBService:
             self.conn.commit()
 
     def get_tile_cache_state(self, tile_id: str, lat: int, lon: int, maptype: str, max_zoom: int) -> bool:
-        with self.conn:
+        with self._lock:
             cursor = self.conn.execute(
                 "SELECT is_cached FROM cache WHERE tile_id = ? AND lat = ? AND lon = ? AND maptype = ? AND max_zoom = ?",
                 (tile_id, lat, lon, maptype, max_zoom)
@@ -49,15 +53,15 @@ class CacheDBService:
             return cursor.fetchone()[0] if cursor.fetchone() else False
 
     def set_cache_file_cache_state(self, filename: str, maptype: str, lat: int, lon: int, parent_max_zoom: int, parent_tile_id: str, size_in_bytes: int, is_cached: bool):
-        with self.conn:
+        with self._lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO cache_files (filename, maptype, lat, lon, parent_max_zoom, parent_tile_id, is_cached) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO cache_files (filename, maptype, lat, lon, parent_max_zoom, parent_tile_id, size_in_bytes, is_cached) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (filename, maptype, lat, lon, parent_max_zoom, parent_tile_id, size_in_bytes, is_cached)
             )
             self.conn.commit()
     
     def get_cache_file_cache_state(self, filename: str, maptype: str, lat: int, lon: int, parent_max_zoom: int, parent_tile_id: str) -> bool:
-        with self.conn:
+        with self._lock:
             cursor = self.conn.execute(
                 "SELECT is_cached FROM cache_files WHERE filename = ? AND maptype = ? AND lat = ? AND lon = ? AND parent_max_zoom = ? AND parent_tile_id = ?",
                 (filename, maptype, lat, lon, parent_max_zoom, parent_tile_id)
@@ -65,7 +69,7 @@ class CacheDBService:
             return cursor.fetchone()[0] if cursor.fetchone() else False
     
     def delete_cache_file(self, filename: str):
-        with self.conn:
+        with self._lock:
             self.conn.execute(
                 "DELETE FROM cache_files WHERE filename = ?",
                 (filename,)

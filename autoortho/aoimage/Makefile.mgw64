@@ -13,9 +13,9 @@ CFLAGS+=-g -O2 -s -Wall -fdiagnostics-color -Wno-format-overflow  \
 	-DWIN32 \
 	-I$(JPGT)/include $(DEFINES)
 
-CFLAGS_DLL=$(CFLAGS) -DAOI_EXPORTS -mdll -I"C:/<pathtopython312>/include" -DAOIMAGE_WITH_PYTHON_GIL
+CFLAGS_DLL=$(CFLAGS) -DAOI_EXPORTS -mdll -I"C:/Users/Andres/anaconda3/envs/ao312/include" -DAOIMAGE_WITH_PYTHON_GIL
 LDFLAGS=-shared -static-libgcc -static
-LIBS=-L$(JPGT)/lib -lturbojpeg -L"C:/<pathtopython312>/libs" -lpython312
+LIBS=-L$(JPGT)/lib -lturbojpeg -L"C:/Users/Andres/anaconda3/envs/ao312/libs" -lpython312
 
 
 

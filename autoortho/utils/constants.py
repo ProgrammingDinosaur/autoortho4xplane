@@ -22,4 +22,3 @@ else:
     exit()
 
 DSFTOOL_PATH = os.path.abspath(DSFTOOL_PATH)
-print(f"DSFTOOL_PATH: {DSFTOOL_PATH}")
