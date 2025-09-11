@@ -16,6 +16,7 @@ import threading
 #from memory_profiler import profile
 from aoconfig import CFG
 from utils.constants import system_type
+from parallel_compress import compress_mipmap_to_bytes_parallel
 
 import logging
 log = logging.getLogger(__name__)
@@ -449,84 +450,95 @@ class DDS(Structure):
         #if not maxmipmaps:
         #    maxmipmaps = 8
 
-        with self.lock:
-            #print(f"gen_mipmaps: MIPMAP: {startmipmap} input SIZE: {img.size}")
+        # Print info outside lock; keep compression non-critical except for writes
+        width, height = img.size
+        mipmap = startmipmap
+        if maxmipmaps > self.smallest_mm:
+            log.debug(f"Setting maxmipmaps to {self.smallest_mm}")
+            maxmipmaps = self.smallest_mm
 
-            # Size of all mipmaps: sum([pow(2,x)*pow(2,x) for x in range(12,1,-1) ])
+        steps = 0
+        if mipmap > 0:
+            desired_width = self.width >> mipmap
+            while width > desired_width:
+                width >>= 1
+                compress_bytes >>= 2
+                steps += 1
 
-            #if not maxmipmaps:
-            #maxmipmaps = len(self.mipmap_list)
+        if steps > 0:
+            img = img.reduce_2(steps)
 
+        while True:
+            imgdata = img.data_ptr()
             width, height = img.size
-            mipmap = startmipmap
-            # I believe XP only references up to MM8, so might be able to trim
-            # this down more
-            # maxmipmaps == 0 indicates we want all mipmaps so set to len
-            # of our mipmap_list
-            if maxmipmaps > self.smallest_mm:
-                log.debug(f"Setting maxmipmaps to {self.smallest_mm}")
-                maxmipmaps = self.smallest_mm
+            log.debug(f"MIPMAP: {mipmap} SIZE: {img.size}")
 
-            log.debug(self.mipmap_list)
-            
-            # Initial reduction of image size before mipmap processing 
-            steps = 0
-            if mipmap > 0:
-                desired_width = self.width >> mipmap
-                while width > desired_width:
-                    width >>= 1
-                    compress_bytes >>= 2
-                    steps += 1
+            if compress_bytes:
+                # Get how many rows we need to process for requested number of bytes
+                height = math.ceil((compress_bytes * 16) / (width * self.blocksize))
+                # Make the rows a factor of 4
+                height = max(4, ((height + 3) // 4) * 4)
+                log.debug(f"Doing partial compress of {compress_bytes} bytes.  Height: {height}")
+                compress_bytes >>= 2
 
-            if steps > 0:        
-                #img = img.reduce(pow(2, steps))
-                img = img.reduce_2(steps)
+            try:
+                min_area = 2048 * 2048
+                # Only parallelize when:
+                # - feature enabled
+                # - ISPC available (thread-safe in separate processes)
+                # - full-surface compression (no partial reads)
+                # - mipmap 0 (largest, highest payoff)
+                # - surface is large enough to amortize overhead
+                use_parallel = (
+                    bool(getattr(CFG.pydds, 'parallel_compress', False))
+                    and bool(self.ispc)
+                    and (mipmap == 0)
+                    and (compress_bytes == 0)
+                    and ((width * height) >= min_area)
+                )
+            except Exception:
+                use_parallel = False
 
-            while True:
-                if True:
-                #if not self.mipmap_list[mipmap].retrieved:
-                    imgdata = img.data_ptr()
-                    width, height = img.size
-                    log.debug(f"MIPMAP: {mipmap} SIZE: {img.size}")
+            dxtdata = None
+            try:
+                if use_parallel:
+                    # Fetch raw RGBA bytes for the current image surface
+                    rgba_buf = img.tobytes()
+                    dxtdata = compress_mipmap_to_bytes_parallel(
+                        rgba_buf,
+                        width,
+                        height,
+                        self.dxt_format,
+                        workers=getattr(CFG.pydds, 'parallel_workers', 0),
+                        stripe_height_px=getattr(CFG.pydds, 'parallel_stripe_height', 128),
+                    )
+                else:
+                    dxtdata = self.compress(width, height, imgdata)
+            except Exception as e:
+                log.warning(f"dds compress failed: {e}")
+                dxtdata = None
 
-                    if compress_bytes:
-                        # Get how many rows we need to process for requested number of bytes
-                        height = math.ceil((compress_bytes * 16) / (width * self.blocksize))
-                        # Make the rows a factor of 4
-                        height = max(4, ((height + 3) // 4) * 4) 
-                        log.debug(f"Doing partial compress of {compress_bytes} bytes.  Height: {height}")
-                        compress_bytes >>= 2
+            if dxtdata is not None:
+                with self.lock:
+                    self.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=dxtdata)
+                    if not compress_bytes:
+                        self.mipmap_list[mipmap].retrieved = True
 
-                    try:
-                        dxtdata = self.compress(width, height, imgdata)
-                    except:
-                        log.warning("dds compress failed")
+                    if mipmap == self.smallest_mm:
+                        log.debug(f"At MM {mipmap}.  Set the remaining MMs..")
+                        for mm in self.mipmap_list[self.smallest_mm:]:
+                            mm.databuffer = BytesIO(initial_bytes=dxtdata)
+                            mm.retrieved = True
+                            mipmap += 1
+                dxtdata = None
 
-                    if dxtdata is not None:
-                        self.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=dxtdata)
-                        if not compress_bytes:
-                            self.mipmap_list[mipmap].retrieved = True
+            if mipmap >= maxmipmaps:
+                break
 
-                        # we are already at 4x4 so push result forward to
-                        # remaining MMs
-                        if mipmap == self.smallest_mm:
-                            log.debug(f"At MM {mipmap}.  Set the remaining MMs..")
-                            for mm in self.mipmap_list[self.smallest_mm:]:
-                                mm.databuffer = BytesIO(initial_bytes=dxtdata)
-                                mm.retrieved = True
-                                mipmap += 1
+            mipmap += 1
+            img = img.reduce_2()
 
-                    dxtdata = None
-
-            
-                if mipmap >= maxmipmaps: #(maxmipmaps + 1) or mipmap >= self.smallest_mm:
-                    # We've hit or max requested or possible mipmaps
-                    break
-
-                mipmap += 1
-                # Halve the image
-                img = img.reduce_2()
-
+        with self.lock:
             self.dump_header()
 
 

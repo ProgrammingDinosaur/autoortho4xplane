@@ -13,6 +13,15 @@ CFLAGS     += -O2 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
               -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
               -I$(TJ_INC)
 
+# Optional: enable GIL release macros if Python headers are available
+PY_INCLUDES ?= $(shell python3-config --includes 2>/dev/null)
+ifeq (,$(PY_INCLUDES))
+PY_INCLUDES := $(shell python3 -c "import sysconfig; v=sysconfig.get_config_var('INCLUDEPY'); print('-I'+v if v else '')" 2>/dev/null)
+endif
+ifneq (,$(strip $(PY_INCLUDES)))
+CFLAGS += $(PY_INCLUDES) -DAOIMAGE_WITH_PYTHON_GIL
+endif
+
 # aoimage.dylib remains relocatable; no rpath needed for turbojpeg since it's static
 LDFLAGS    := -dynamiclib -undefined dynamic_lookup \
               -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \

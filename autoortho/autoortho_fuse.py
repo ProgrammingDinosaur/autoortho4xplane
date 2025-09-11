@@ -513,6 +513,14 @@ class AutoOrtho(Operations):
             try:
                 t = self.tc._get_tile(row, col, maptype, zoom)
                 data = t.read_dds_bytes(offset, length)
+                # Opportunistic read-ahead: after the first reads of a tile, kick prefetch
+                try:
+                    if offset == 0 and length >= 128:
+                        # Prefetch the next chunk-row worth of bytes for the current mip (heuristic)
+                        # This is best-effort and non-blocking
+                        threading.Thread(target=t.get_bytes, args=(length, length), daemon=True).start()
+                except Exception:
+                    pass
                 if data is None:
                     self._failfast(f"Tile read returned None for {key}")
                 return data

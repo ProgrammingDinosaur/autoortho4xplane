@@ -193,7 +193,15 @@
             return container;
         }
     });
-    (new ModeControl({ position: 'topright' })).addTo(map);
+    (new ModeControl({ position: 'topleft' })).addTo(map);
+    // Ensure our control sits above the default zoom controls
+    try {
+        const corner = map.getContainer().querySelector('.leaflet-top.leaflet-left');
+        const zoomCtl = corner && corner.querySelector('.leaflet-control-zoom');
+        if (corner && zoomCtl && modeUI.container && modeUI.container.parentNode === corner) {
+            corner.insertBefore(modeUI.container, zoomCtl);
+        }
+    } catch (_e) { /* ignore */ }
 
     async function fetchTileMaptype(latDeg, lonDeg) {
         const key = cellKey(latDeg, lonDeg);

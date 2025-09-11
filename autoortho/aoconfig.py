@@ -100,6 +100,10 @@ using_custom_tiles = False
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
+# Use parallel compression
+parallel_compress = True
+# Direct assemble mipmap 0 directly in DXT space to reduce latency
+direct_assemble = True
 
 [scenery]
 # Don't cleanup downloads

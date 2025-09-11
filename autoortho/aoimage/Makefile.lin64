@@ -18,6 +18,16 @@ LDFLAGS=-shared -rdynamic -nodefaultlibs -undefined_warning -lpthread
 #LIBS=./linlibturbojpeg.a
 LIBS=-L$(JPGT)/lib -lturbojpeg
 
+# Optional: enable GIL release macros if Python headers are available
+PY_INCLUDES:=$(shell python3-config --includes 2>/dev/null)
+ifeq (,$(PY_INCLUDES))
+# try fallback
+PY_INCLUDES:=$(shell python3 -c "import sysconfig; v=sysconfig.get_config_var('INCLUDEPY'); print('-I'+v if v else '')" 2>/dev/null)
+endif
+ifneq (,$(strip $(PY_INCLUDES)))
+CFLAGS+= $(PY_INCLUDES) -DAOIMAGE_WITH_PYTHON_GIL
+endif
+
 all: $(TARGET)
 
 .c.o: $(HEADERS)
