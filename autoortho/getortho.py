@@ -43,6 +43,12 @@ log = logging.getLogger(__name__)
 
 import tracemalloc
 #from memory_profiler import profile
+# Bound global JPEG decode concurrency to reduce memory spikes and failures
+try:
+    _MAX_DECODE = int(getattr(CFG.pydds, 'max_decode_concurrency', 8))
+except Exception:
+    _MAX_DECODE = 8
+_decode_sem = threading.Semaphore(_MAX_DECODE)
 
 
 # Track average fetch times
@@ -156,12 +162,26 @@ class Getter(object):
 
 
             try:
+                # Mark object as in-flight to coalesce duplicate submissions
+                try:
+                    if hasattr(obj, 'in_queue'):
+                        obj.in_queue = False
+                    if hasattr(obj, 'in_flight'):
+                        obj.in_flight = True
+                except Exception:
+                    pass
                 if not self.get(obj, *args, **kwargs):
                     log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
                     self.submit(obj, *args, **kwargs)
             except Exception as err:
                 log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
                 self.submit(obj, *args, **kwargs)
+            finally:
+                try:
+                    if hasattr(obj, 'in_flight'):
+                        obj.in_flight = False
+                except Exception:
+                    pass
 
     def get(obj, *args, **kwargs):
         raise NotImplementedError
@@ -179,7 +199,7 @@ class Getter(object):
 class ChunkGetter(Getter):
     def get(self, obj, *args, **kwargs):
         if obj.ready.is_set():
-            log.info(f"{obj} already retrieved.  Exit")
+            log.debug(f"{obj} already retrieved.  Exit")
             return True
 
         kwargs['idx'] = self.localdata.idx
@@ -187,6 +207,21 @@ class ChunkGetter(Getter):
         kwargs['session'] = getattr(self.localdata, 'session', None)
         #log.debug(f"{obj}, {args}, {kwargs}")
         return obj.get(*args, **kwargs)
+
+    def submit(self, obj, *args, **kwargs):
+        # Coalesce duplicate chunk submissions
+        try:
+            if hasattr(obj, 'ready') and obj.ready.is_set():
+                return
+            if hasattr(obj, 'in_queue') and obj.in_queue:
+                return
+            if hasattr(obj, 'in_flight') and obj.in_flight:
+                return
+            if hasattr(obj, 'in_queue'):
+                obj.in_queue = True
+        except Exception:
+            pass
+        super().submit(obj, *args, **kwargs)
 
 chunk_getter = ChunkGetter(int(CFG.autoortho.fetch_threads))
 
@@ -682,7 +717,11 @@ class Tile(object):
             if chunk_ready and chunk.data:
                 # We returned and have data!
                 log.debug(f"GET_IMG: Ready and found chunk data.")
-                chunk_img = AoImage.load_from_memory(chunk.data)
+                try:
+                    with _decode_sem:
+                        chunk_img = AoImage.load_from_memory(chunk.data)
+                except Exception as _e:
+                    log.debug(f"GET_IMG: load_from_memory failed for {chunk}: {_e}")
             elif mipmap < self.max_mipmap and not chunk_ready:
                 # Ran out of time, requesting mm below max.  Search for backup...
                 log.debug(f"GET_IMG: Tile {self} not ready.  Try to find backup chunk.")
@@ -697,13 +736,22 @@ class Tile(object):
                 chunk_ready = chunk.ready.wait(maxwait)
                 if chunk_ready and chunk.data:
                     log.debug(f"GET_IMG: Final retry for {chunk}, SUCCESS!")
-                    chunk_img = AoImage.load_from_memory(chunk.data)
+                    try:
+                        with _decode_sem:
+                            chunk_img = AoImage.load_from_memory(chunk.data)
+                    except Exception as _e:
+                        log.debug(f"GET_IMG: load_from_memory failed on retry for {chunk}: {_e}")
 
             if not chunk_img and not chunk.data:
                 log.debug(f"GET_IMG: Empty chunk data.  Skip.")
                 STATS['chunk_missing_count'] = STATS.get('chunk_missing_count', 0) + 1
             elif not chunk_img and chunk.data:
-                log.warning(f"GET_IMG: FAILED! {chunk}:  LEN: {len(chunk.data)}  HEADER: {chunk.data[:8]}")
+                # Differentiate between decode failure and genuinely bad data
+                hdr = chunk.data[:8]
+                if not _is_jpeg(hdr[:3]):
+                    log.warning(f"GET_IMG: Non-JPEG data for {chunk}: HDR={hdr}")
+                else:
+                    log.debug(f"GET_IMG: Decode failed for {chunk} despite JPEG header; likely transient resource pressure")
                 
             return (chunk, chunk_img, start_x, start_y)
         
@@ -850,7 +898,14 @@ class Tile(object):
         self.ready.set()
 
         if mipmap == 0 and self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
-            log.info(f"GET_MIPMAP: Setting tile cache state for {self.row},{self.col},{self.max_zoom},{self.lat},{self.lon},{self.maptype} to True")
+            log.debug(f"GET_MIPMAP: Setting tile cache state for {self.row},{self.col},{self.max_zoom},{self.lat},{self.lon},{self.maptype} to True")
+            cache_db_service.set_tile_cache_state(
+                tile_id=self.id,
+                lat=self.lat,
+                lon=self.lon,
+                maptype=self.maptype,
+                max_zoom=self.max_zoom,
+                is_cached=True)
 
         log.debug(f"GET_MIPMAP: Set tile cache state for {self.row},{self.col},{self.max_zoom},{self.lat},{self.lon},{self.maptype} to True")
 
@@ -1068,6 +1123,9 @@ class Chunk(object):
         self.maptype = maptype
         self.cache_dir = cache_dir
         self.parent_tile = parent_tile
+        # Queue state flags to prevent duplicate submissions
+        self.in_queue = False
+        self.in_flight = False
         
         # Hack override maptype
         #self.maptype = "BI"
@@ -1159,8 +1217,16 @@ class Chunk(object):
                     return
                 os.replace(temp_filename, self.cache_path)
                 if self.parent_tile:
-                    # log.info(f"SAVE_CACHE: Setting tile cache state for {self.parent_tile.row},{self.parent_tile.col},{self.parent_tile.max_zoom},{self.parent_tile.lat},{self.parent_tile.lon},{self.parent_tile.maptype} to True")
-                    pass
+                    log.debug(f"SAVE_CACHE: Setting tile cache state for {self.parent_tile.row},{self.parent_tile.col},{self.parent_tile.max_zoom},{self.parent_tile.lat},{self.parent_tile.lon},{self.parent_tile.maptype} to True")
+                    cache_db_service.set_cache_file_cache_state(
+                        filename=self.cache_path,
+                        maptype=self.maptype,
+                        lat=self.parent_tile.lat,
+                        lon=self.parent_tile.lon,
+                        parent_max_zoom=self.parent_tile.max_zoom,
+                        parent_tile_id=self.parent_tile.row,
+                        size_in_bytes=len(self.data), 
+                        is_cached=True)
                 return
             except FileExistsError:
                 try:

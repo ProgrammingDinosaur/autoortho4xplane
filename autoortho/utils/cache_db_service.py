@@ -17,7 +17,6 @@ class CacheDBService:
             lon INTEGER NOT NULL,
             maptype TEXT NOT NULL,
             max_zoom INTEGER NOT NULL,
-            dds_filename TEXT NOT NULL,
             is_cached BOOLEAN NOT NULL,
             PRIMARY KEY (tile_id, lat, lon, maptype, max_zoom)
         )''')
@@ -75,5 +74,37 @@ class CacheDBService:
                 (filename,)
             )
             self.conn.commit()
+
+    def get_cache_size_mb_total(self):
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT SUM(size_in_bytes) FROM cache_files WHERE is_cached = 1"
+            )
+            return cursor.fetchone()[0] if cursor.fetchone() else 0
+    
+    def get_cache_size_mb_for_lat_lon(self, lat: int, lon: int):
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT SUM(size_in_bytes) FROM cache_files WHERE lat = ? AND lon = ? AND is_cached = 1",
+                (lat, lon)
+            )
+            return cursor.fetchone()[0] if cursor.fetchone() else 0
+
+    def get_files_for_lat_lon(self, lat: int, lon: int):
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT filename FROM cache_files WHERE lat = ? AND lon = ? AND is_cached = 1",
+                (lat, lon)
+            )
+            return cursor.fetchall()
+    
+    def get_files_for_lat_lon_maptype(self, lat: int, lon: int, maptype: str):
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT filename FROM cache_files WHERE lat = ? AND lon = ? AND maptype = ? AND is_cached = 1",
+                (lat, lon, maptype)
+            )
+            return cursor.fetchall()
+    
 
 cache_db_service = CacheDBService()

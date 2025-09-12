@@ -3,8 +3,10 @@
     const map = L.map('map', 
         {minZoom: 5, maxZoom: 18}
     ).setView([51.505, -0.09], 5);
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; OpenStreetMap contributors'
+    const BASE_TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+    const BASE_TILE_ATTR = '&copy; OpenStreetMap contributors';
+    let baseLayer = L.tileLayer(BASE_TILE_URL, {
+        attribution: BASE_TILE_ATTR
     }).addTo(map);
     const marker = L.marker([51.5, -0.09]).addTo(map);
     const line = L.polyline([]).addTo(map);
@@ -23,9 +25,13 @@
     const MODE_CACHE = 'cache';
     let currentMode = MODE_MAPTYPE;
     const modeUI = { container: null, maptypeBtn: null, cacheBtn: null };
+    let mainTileKey = null; // "lat,lon"
+    const infoBoxUI = { container: null, title: null, maptype: null, cache: null };
 
     let recenter_call = true;
     let availableTilesParsed = [];
+    const availableTilesMap = new Map(); // key: "lat,lon" -> {type, package}
+    let flushTimer = null;
 
 
     fetchAvailableMaptypes().then(function (maptypes) {
@@ -34,17 +40,35 @@
         });
         populateDropdownOptions();
     });
-    // Fetch available tiles once and rebuild when ready
-    (function () {
-        fetch('/available_tiles')
+    function loadAvailableTiles() {
+        return fetch('/available_tiles')
             .then(function (resp) { if (!resp.ok) throw new Error('HTTP ' + resp.status); return resp.json(); })
             .then(function (data) {
-                const tiles = (data && Array.isArray(data.tiles)) ? data.tiles : [];
-                availableTilesParsed = tiles.map(parseCoordTile).filter(Boolean);
+                const tilesObj = (data && data.tiles && typeof data.tiles === 'object') ? data.tiles : {};
+                availableTilesParsed = [];
+                availableTilesMap.clear();
+                try {
+                    for (const coord in tilesObj) {
+                        if (!Object.prototype.hasOwnProperty.call(tilesObj, coord)) continue;
+                        const parsed = parseCoordTile(coord);
+                        if (!parsed) continue;
+                        const lat = parsed[0];
+                        const lonRaw = parsed[1];
+                        const lon = normalizeLon(lonRaw);
+                        const k = cellKey(lat, lon);
+                        const info = tilesObj[coord] || {};
+                        availableTilesMap.set(k, info);
+                        availableTilesParsed.push({ lat: lat, lon: lon, key: k, info: info });
+                    }
+                } catch (_e) { /* ignore */ }
                 scheduleRebuild();
+                return true;
             })
-            .catch(function () { /* ignore */ });
-    })();
+            .catch(function () { /* ignore */ return false; });
+    }
+
+    // Fetch available tiles once and rebuild when ready
+    loadAvailableTiles();
 
     // Inject minimal styles for grid cell labels
     if (typeof document !== 'undefined' && document.head) {
@@ -56,7 +80,7 @@
         styleEl2.textContent = '.ao-help-btn{width:34px;height:34px;border-radius:50%;background:#1d71d1;color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,0.25);font:14px/1 Arial,Helvetica,sans-serif;font-weight:bold}.ao-help-btn:hover{background:#5183bd}.ao-help-panel{position:fixed;top:0;right:0;height:100%;width:360px;max-width:85vw;background:#ffffff;color:#111;transform:translateX(100%);transition:transform .25s ease-in-out, box-shadow .25s ease-in-out;z-index:4000;box-shadow:0 0 0 rgba(0,0,0,0)}.ao-help-panel.open{transform:translateX(0);box-shadow:-2px 0 12px rgba(0,0,0,0.25)}.ao-help-panel .ao-help-header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #e5e5e5;background:#f8f8f8}.ao-help-panel .ao-help-title{margin:0;font:600 16px/1.2 Arial,Helvetica,sans-serif;color:#1d71d1}.ao-help-panel .ao-help-close{border:none;background:transparent;font:700 18px/1 Arial,Helvetica,sans-serif;color:#666;cursor:pointer}.ao-help-panel .ao-help-close:hover{color:#000}.ao-help-panel .ao-help-content{padding:14px;overflow:auto;height:calc(100% - 50px)}.ao-help-panel .ao-help-content h2{font:600 18px/1.2 Arial,Helvetica,sans-serif;color:#333;margin:10px 0}.ao-help-panel .ao-help-content p{margin:8px 0 12px;color:#333}.ao-help-panel .ao-help-content ul{padding-left:18px;margin:8px 0 12px}.ao-help-panel .ao-help-content code{background:#f0f3f7;color:#0b3d91;padding:2px 4px;border-radius:3px;font-family:Menlo,Consolas,monospace;font-size:12px}.ao-help-panel .ao-help-content pre{background:#0b0f14;color:#e3e9f3;padding:10px;border-radius:6px;overflow:auto}';
         document.head.appendChild(styleEl2);
         const styleEl3 = document.createElement('style');
-        styleEl3.textContent = '.mode-switch{background:rgba(255,255,255,0.95);padding:4px;border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,0.2);display:inline-flex;gap:4px;align-items:center}.mode-btn{border:1px solid #d0d7de;border-radius:4px;background:#f6f8fa;color:#24292f;cursor:pointer;padding:4px 8px;font:12px Arial,Helvetica,sans-serif}.mode-btn.active{background:#1d71d1;color:#fff;border-color:#1d71d1}.mode-btn:focus{outline:none}.mode-legend{margin-left:8px;font:12px Arial,Helvetica,sans-serif;color:#333}';
+        styleEl3.textContent = '.mode-switch{background:rgba(255,255,255,0.95);padding:4px;border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,0.2);display:inline-flex;gap:4px;align-items:center}.mode-btn{border:1px solid #d0d7de;border-radius:4px;background:#f6f8fa;color:#24292f;cursor:pointer;padding:4px 8px;font:12px Arial,Helvetica,sans-serif}.mode-btn.active{background:#1d71d1;color:#fff;border-color:#1d71d1}.mode-btn:focus{outline:none}.mode-legend{margin-left:8px;font:12px Arial,Helvetica,sans-serif;color:#333}.main-info{position:absolute;top:6px;left:50%;transform:translateX(-50%);z-index:2000;background:rgba(255,255,255,0.95);border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.2);padding:8px 10px;display:none;max-width:80%;pointer-events:none}.main-info h4{margin:0 0 4px 0;font:600 13px Arial,Helvetica,sans-serif;color:#1d71d1}.main-info .row{font:12px Arial,Helvetica,sans-serif;color:#333;margin:2px 0}';
         document.head.appendChild(styleEl3);
     }
 
@@ -75,6 +99,22 @@
     });
     const selectionControl = new SelectionControl({ position: 'topright' });
     selectionControl.addTo(map);
+
+    // Create main info box container (absolute positioned within map)
+    if (typeof document !== 'undefined') {
+        const mapContainer = map.getContainer();
+        const info = document.createElement('div');
+        info.className = 'main-info';
+        info.innerHTML = ''+
+            '<h4 class="mi-title">Tile</h4>'+
+            '<div class="row mi-maptype">Maptype: <span class="v">\u2014</span></div>'+
+            '<div class="row mi-cache">Cache: <span class="v">\u2014</span></div>';
+        mapContainer.appendChild(info);
+        infoBoxUI.container = info;
+        infoBoxUI.title = info.querySelector('.mi-title');
+        infoBoxUI.maptype = info.querySelector('.mi-maptype .v');
+        infoBoxUI.cache = info.querySelector('.mi-cache .v');
+    }
 
     // Create Help panel (slides from right)
     let helpPanel = null;
@@ -144,6 +184,49 @@
         }
     }
 
+    function showMainInfo(key, lat, lon) {
+        if (!infoBoxUI.container) return;
+        infoBoxUI.title.textContent = 'Tile ' + lat + ',' + lon;
+        infoBoxUI.maptype.textContent = '\u2014';
+        infoBoxUI.cache.textContent = '\u2014';
+        infoBoxUI.container.style.display = 'block';
+        // Add static info from availableTilesMap if present
+        try {
+            const prev = infoBoxUI.container.querySelector('.mi-static');
+            if (prev) prev.remove();
+        } catch (_e) { /* ignore */ }
+        const staticDiv = document.createElement('div');
+        staticDiv.className = 'mi-static';
+        const info = availableTilesMap.get(cellKey(lat, lon)) || {};
+        const entries = [ ['type', info.type], ['package', info.package] ];
+        entries.forEach(function (pair) {
+            const label = pair[0];
+            const value = pair[1];
+            if (value === undefined || value === null) return;
+            const row = document.createElement('div');
+            row.className = 'row';
+            const labelCap = label.charAt(0).toUpperCase() + label.slice(1);
+            row.innerHTML = '<b>' + labelCap + ':</b> ' + String(value);
+            staticDiv.appendChild(row);
+        });
+        infoBoxUI.container.appendChild(staticDiv);
+        // Fill values depending on mode
+        if (currentMode === MODE_MAPTYPE) {
+            fetchTileMaptype(lat, lon).then(function (mt) {
+                if (mainTileKey === key) infoBoxUI.maptype.textContent = mt;
+            });
+        }
+        fetchTileCacheStatus(lat, lon).then(function (st) {
+            if (mainTileKey === key) infoBoxUI.cache.textContent = st;
+        });
+    }
+
+    function hideMainInfo() {
+        if (!infoBoxUI.container) return;
+        mainTileKey = null;
+        infoBoxUI.container.style.display = 'none';
+    }
+
     // Add circular "?" button as a Leaflet control (top-right)
     const HelpControl = L.Control.extend({
         onAdd: function () {
@@ -173,6 +256,9 @@
         }
         updateSelectionUIVisibility();
         scheduleRebuild();
+        if (mainTileKey) {
+            try { updateMainInfoFromKey(mainTileKey); } catch (_e) { /* ignore */ }
+        }
     }
 
     const ModeControl = L.Control.extend({
@@ -261,6 +347,10 @@
     // Disable default Shift+drag box-zoom so we can use Shift for unselect
     if (map.boxZoom && map.boxZoom.disable) {
         map.boxZoom.disable();
+    }
+    // Disable double-click zoom to reserve dblclick for main-tile selection
+    if (map.doubleClickZoom && map.doubleClickZoom.disable) {
+        map.doubleClickZoom.disable();
     }
     // Prevent browser context menu from interfering with right-drag panning
     if (map.getContainer()) {
@@ -372,6 +462,11 @@
         return { lat: parseInt(parts[0], 10), lon: parseInt(parts[1], 10) };
     }
 
+    function updateMainInfoFromKey(key) {
+        const p = parseKey(key);
+        showMainInfo(key, p.lat, p.lon);
+    }
+
     function applyLocalMaptypeToSelection(maptype) {
         if (!maptype) return;
         const tiles = Array.from(selectedCells).map(parseKey);
@@ -438,7 +533,16 @@
         return [lat, lon];
     }
 
-    function styleForCell(selected) {
+    function styleForCell(selected, isMain) {
+        if (isMain) {
+            return {
+                color: '#a65a14',
+                weight: 5,
+                opacity: 0.95,
+                fillOpacity: 0.35,
+                fillColor: '#a65a14'
+            };
+        }
         return {
             color: selected ? '#d69040' : '#6da4e3',
             weight: selected ? 3 : 1,
@@ -487,8 +591,8 @@
             const northCells = Math.min(north, 89); // cell upper bound limited to < 90
             const eastCells = eastForLines - 1; // [lon, lon+1]
             for (let i = 0; i < availableTilesParsed.length; i++) {
-                const lat = availableTilesParsed[i][0];
-                const lon = availableTilesParsed[i][1];
+                const lat = availableTilesParsed[i].lat;
+                const lon = availableTilesParsed[i].lon;
                 if (lat < south || lat > northCells) continue;
                 let lonCandidate = lon;
                 if (east < west && lon < west) lonCandidate = lon + 360; // anti-meridian
@@ -496,21 +600,44 @@
 
                 const ll = [lat, normalizeLon(lon)];
                 const ur = [lat + 1, normalizeLon(lon + 1)];
-                const key = cellKey(lat, normalizeLon(lon));
+                const key = availableTilesParsed[i].key || cellKey(lat, normalizeLon(lon));
                 const selected = selectedCells.has(key);
-                const rect = L.rectangle([ll, ur], styleForCell(selected));
+                const rect = L.rectangle([ll, ur], styleForCell(selected, mainTileKey === key));
                 rect.on('click', function () {
-                    const wasSelected = selectedCells.has(key);
-                    if (wasSelected) {
-                        selectedCells.delete(key);
+                    if (rect._clickTimeout) {
+                        clearTimeout(rect._clickTimeout);
+                    }
+                    rect._clickTimeout = setTimeout(function () {
+                        const wasSelected = selectedCells.has(key);
+                        if (wasSelected) {
+                            selectedCells.delete(key);
+                        } else {
+                            selectedCells.add(key);
+                        }
+                        rect.setStyle(styleForCell(!wasSelected, mainTileKey === key));
+                        if (typeof window !== 'undefined') {
+                            window.SelectedLatLonTiles = Array.from(selectedCells);
+                        }
+                        updateSelectionUIVisibility();
+                        rect._clickTimeout = null;
+                    }, 220);
+                });
+                rect.on('dblclick', function (ev) {
+                    if (rect._clickTimeout) {
+                        clearTimeout(rect._clickTimeout);
+                        rect._clickTimeout = null;
+                    }
+                    const thisKey = key;
+                    const thisLat = lat;
+                    const thisLon = normalizeLon(lon);
+                    if (mainTileKey === thisKey) {
+                        hideMainInfo();
                     } else {
-                        selectedCells.add(key);
+                        mainTileKey = thisKey;
+                        showMainInfo(thisKey, thisLat, thisLon);
                     }
-                    rect.setStyle(styleForCell(!wasSelected));
-                    if (typeof window !== 'undefined') {
-                        window.SelectedLatLonTiles = Array.from(selectedCells);
-                    }
-                    updateSelectionUIVisibility();
+                    if (ev && ev.originalEvent && ev.originalEvent.preventDefault) ev.originalEvent.preventDefault();
+                    if (ev && ev.originalEvent && ev.originalEvent.stopPropagation) ev.originalEvent.stopPropagation();
                 });
                 rect.addTo(gridCellsLayer);
 
@@ -535,9 +662,60 @@
                         labelMarker.setIcon(L.divIcon({ className: 'grid-label', html: st, iconSize: [wPx, hPx], iconAnchor: [wPx / 2, hPx / 2] }));
                     });
                 }
+                // Ensure main tile styling is updated after labels added
+                if (mainTileKey === key) {
+                    rect.setStyle(styleForCell(selected, true));
+                }
             }
         }
         updateSelectionUIVisibility();
+        // After rebuild, if a main tile is active and visible, restyle it
+        if (mainTileKey) {
+            try { updateMainInfoFromKey(mainTileKey); } catch (_e) { /* ignore */ }
+        }
+    }
+
+    function flushMapMemory() {
+        try {
+            gridLinesLayer.clearLayers();
+            gridCellsLayer.clearLayers();
+            gridLabelsLayer.clearLayers();
+        } catch (_e) {}
+        try {
+            if (baseLayer && baseLayer._tiles) {
+                // Leaflet tile layers keep tiles map; prune references
+                Object.keys(baseLayer._tiles).forEach(function (k) { delete baseLayer._tiles[k]; });
+            }
+        } catch (_e2) {}
+        try { tileMaptypeCache.clear(); } catch (_e3) {}
+        try { pendingOverrides.clear(); } catch (_e4) {}
+        // Keep availableTilesMap so we can quickly rebuild without refetch unless asked
+    }
+
+    function scheduleFlushIn(ms) {
+        if (flushTimer) {
+            clearTimeout(flushTimer);
+            flushTimer = null;
+        }
+        flushTimer = setTimeout(function () {
+            flushMapMemory();
+        }, Math.max(0, ms || 60000));
+    }
+
+    function cancelFlush() {
+        if (flushTimer) {
+            clearTimeout(flushTimer);
+            flushTimer = null;
+        }
+    }
+
+    // Expose a minimal API for host (Qt) to manage memory
+    if (typeof window !== 'undefined') {
+        window.AOMap = window.AOMap || {};
+        window.AOMap.flushNow = flushMapMemory;
+        window.AOMap.flushIn = scheduleFlushIn;
+        window.AOMap.cancelFlush = cancelFlush;
+        window.AOMap.reloadTiles = loadAvailableTiles;
     }
 
     // Debounce rebuilds

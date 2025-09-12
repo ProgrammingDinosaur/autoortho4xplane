@@ -24,11 +24,11 @@ def coord_from_sleepy_tilename(row, col, zoom):
     return math.floor(lat_deg), math.floor(lon_deg)
 
 
-def scan_existing_tiles(search_path: str) -> list[tuple[int, int]]:
+def scan_existing_tiles(search_path: str) -> dict[str, set[str]]:
     """ scan existing tiles """
     print("SCANNING EXISTING TILES")
     base_ao_sceneries_path = os.path.join(search_path, "z_autoortho", "scenery")
-    existing_tiles = set()
+    existing_tiles = {}
     if not os.path.exists(base_ao_sceneries_path):
         return existing_tiles
     for base_package_path in os.listdir(base_ao_sceneries_path):
@@ -43,6 +43,12 @@ def scan_existing_tiles(search_path: str) -> list[tuple[int, int]]:
             if not os.path.exists(dsf_path) or not os.path.isdir(dsf_path):
                 continue
             for dsf_file in os.listdir(dsf_path):
+                category = "Base AO Package" if base_package_path.startswith("z_ao_") else "Custom Tile"
                 coord = dsf_file.split(".")[0]
-                existing_tiles.add(coord)
-    return list(existing_tiles)
+                if coord not in existing_tiles or category == "Custom Tile":
+                    existing_tiles[coord] = {
+                        "type": category,
+                        "package": base_package_path,
+                    }
+
+    return existing_tiles

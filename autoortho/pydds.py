@@ -514,9 +514,9 @@ class DDS(Structure):
                         width,
                         height,
                         self.dxt_format,
-                        workers=getattr(CFG.pydds, 'parallel_workers', 0),
-                        stripe_height_px=getattr(CFG.pydds, 'parallel_stripe_height', 128),
-                        max_jobs=getattr(CFG.pydds, 'parallel_max_jobs', 1),
+                        workers=int(getattr(CFG.pydds, 'parallel_workers', 0)),
+                        stripe_height_px=int(getattr(CFG.pydds, 'parallel_stripe_height', 128)),
+                        max_jobs=int(getattr(CFG.pydds, 'parallel_max_jobs', 1)),
                     )
                 else:
                     dxtdata = self.compress(width, height, imgdata)

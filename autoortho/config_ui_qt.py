@@ -497,6 +497,11 @@ class ConfigUI(QMainWindow):
         except Exception:
             pass
         self._update_action_buttons_visibility(self.tabs.currentIndex())
+        # Hook tab changes to schedule/cancel map memory flush
+        try:
+            self.tabs.currentChanged.connect(self._on_tab_changed_for_map_flush)
+        except Exception:
+            pass
 
     def _update_action_buttons_visibility(self, index):
         try:
@@ -512,6 +517,23 @@ class ConfigUI(QMainWindow):
         else:
             self.save_button.setVisible(True)
             self.apply_overrides_button.setVisible(False)
+
+    def _on_tab_changed_for_map_flush(self, index):
+        try:
+            label = self.tabs.tabText(index)
+        except Exception:
+            label = ""
+        # If leaving Tile Manager, schedule flush in ~1 minute
+        if hasattr(self, 'map_view'):
+            try:
+                if label != "Tile Manager":
+                    # schedule flush
+                    self.map_view.page().runJavaScript("window.AOMap && AOMap.flushIn && AOMap.flushIn(60000);")
+                else:
+                    # cancel any pending flush and ensure tiles are loaded
+                    self.map_view.page().runJavaScript("window.AOMap && AOMap.cancelFlush && AOMap.cancelFlush(); AOMap && AOMap.reloadTiles && AOMap.reloadTiles();")
+            except Exception:
+                pass
 
     def on_apply_overrides(self):
         try:
