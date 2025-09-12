@@ -16,6 +16,7 @@ from packaging import version
 import utils.resources_rc
 from utils.constants import MAPTYPES, system_type
 from utils.mappers import map_kubilus_region_to_simheaven_region
+from utils.mount_utils import cleanup_mountpoint
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -1934,10 +1935,13 @@ class ConfigUI(QMainWindow):
                 return False
 
             # Attempt unmount via AOMount implementation if available
-            try:
-                self.unmount_sceneries(force=True)
-            except Exception:
-                pass
+            for scenery in self.cfg.scenery_mounts:
+                try:
+                    mount = scenery.get('mount')
+                    cleanup_mountpoint(mount)
+                    log.info(f"Cleaned up mountpoint: {mount}")
+                except Exception:
+                    log.error(f"Failed to cleanup mountpoint: {mount}")
 
             # Brief wait loop for unmount completion
             import time as _time
@@ -1953,6 +1957,8 @@ class ConfigUI(QMainWindow):
                     "Some mounts could not be unmounted automatically.\n"
                     "Please remove the z_ao_<scenery_name> directories from your Custom Scenery directory manually and run AutoOrtho again."
                 )
+            else:
+                log.info("All mounts cleaned up successfully")
             return True
         except Exception:
             return True

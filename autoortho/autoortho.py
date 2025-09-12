@@ -19,8 +19,9 @@ import aostats
 import winsetup
 import macsetup
 import flighttrack
-
+from utils.mount_utils import cleanup_mountpoint
 from utils.constants import MAPTYPES, system_type
+
 from version import __version__
 
 import logging
@@ -140,17 +141,13 @@ def setupmount(mountpoint, systemtype):
 
     try:
         yield mountpoint
+
     finally:
         # Do not remove if still mounted; just try to present placeholder content.
         try:
-            if os.path.ismount(mountpoint):
-                log.debug(f"Skipping cleanup: still mounted: {mountpoint}")
-            else:
-                for d in ('Earth nav data', 'terrain', 'textures'):
-                    os.makedirs(os.path.join(mountpoint, d), exist_ok=True)
-                Path(placeholder_path).touch()
+            cleanup_mountpoint(mountpoint)
         except Exception as e:
-            log.warning(f"Placeholder restore failed for {mountpoint}: {e}")
+            log.warning(f"Failed to cleanup mountpoint {mountpoint}: {e}")
 
 
 def diagnose(CFG):
