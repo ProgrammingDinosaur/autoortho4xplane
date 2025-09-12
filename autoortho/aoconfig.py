@@ -110,6 +110,8 @@ parallel_max_jobs = 1
 parallel_stripe_height = 128
 # Number of workers for parallel compression
 parallel_workers = 2
+# Maximum number of decode threads
+max_decode_concurrency = 8
 
 [scenery]
 # Don't cleanup downloads
