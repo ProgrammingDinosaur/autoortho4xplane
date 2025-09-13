@@ -34,6 +34,7 @@ from utils.apple_token_service import apple_token_service
 from utils.utils import coord_from_sleepy_tilename
 from utils.tile_db_service import tile_db_service
 from utils.cache_db_service import cache_db_service
+from parallel_compress import get_pool_status
 
 
 MEMTRACE = False
@@ -157,6 +158,11 @@ class Getter(object):
                 #log.info(f"Got {self.counter}")
                 continue
 
+            # Decrement pending counter when we pull a job off the queue
+            try:
+                STATS['chunk_pending'] = max(0, STATS.get('chunk_pending', 0) - 1)
+            except Exception:
+                pass
             #STATS.setdefault('count', 0) + 1
             STATS['count'] = STATS.get('count', 0) + 1
 
@@ -191,8 +197,14 @@ class Getter(object):
 
     def show_stats(self):
         while self.WORKING:
-            log.info(f"{self.__class__.__name__} got: {self.count}")
-            time.sleep(10)
+            try:
+                in_queue = self.queue.qsize()
+            except Exception:
+                in_queue = -1
+            set_stat('chunk_queue_len', in_queue)
+            set_stat('chunk_inflight', STATS.get('chunk_inflight', 0))
+            log.debug(f"{self.__class__.__name__}: queue={in_queue} inflight={STATS.get('chunk_inflight', 0)} total={self.count}")
+            time.sleep(5)
         log.info(f"Exiting {self.__class__.__name__} stat thread.  Got: {self.count} total")
 
 
@@ -219,6 +231,7 @@ class ChunkGetter(Getter):
                 return
             if hasattr(obj, 'in_queue'):
                 obj.in_queue = True
+            STATS['chunk_pending'] = STATS.get('chunk_pending', 0) + 1
         except Exception:
             pass
         super().submit(obj, *args, **kwargs)
@@ -532,9 +545,11 @@ class Tile(object):
             compress_len = 0
 
         try:
+            # Track DDS partial compression as pending
+            STATS['dds_pending'] = STATS.get('dds_pending', 0) + 1
             self.dds.gen_mipmaps(new_im, mipmap, mipmap, compress_len)
         finally:
-            pass
+            STATS['dds_pending'] = max(0, STATS.get('dds_pending', 0) - 1)
             # We may have retrieved a full image that could be saved for later
             # usage.  Don't close here.
             #new_im.close()
@@ -761,7 +776,9 @@ class Tile(object):
             cpu_workers = os.cpu_count() or 1
         except Exception:
             cpu_workers = 1
-        max_pool_workers = max(1, min(cpu_workers, 16))
+        max_pool_workers = min(cpu_workers, len(chunks), _MAX_DECODE)
+        total_chunks = len(chunks)
+        completed = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_pool_workers, len(chunks))) as executor:
             # Submit all chunk processing tasks
             future_to_chunk = {executor.submit(process_chunk, chunk): chunk for chunk in chunks}
@@ -770,6 +787,7 @@ class Tile(object):
             for future in concurrent.futures.as_completed(future_to_chunk):
                 try:
                     chunk, chunk_img, start_x, start_y = future.result()
+                    completed += 1
                     if chunk_img:
                         # For adaptive system, chunks are already downloaded at the optimal zoom level
                         # or retrieved from backup at appropriate resolution. Paste directly.
@@ -781,6 +799,9 @@ class Tile(object):
                             pass
                 except Exception as exc:
                     log.error(f"Chunk processing failed: {exc}")
+                # periodic progress log (debug to avoid noise)
+                if total_chunks and (completed % max(1, total_chunks // 4) == 0):
+                    log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
 
         if complete_img and mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")
@@ -864,6 +885,12 @@ class Tile(object):
         if mipmap > self.max_mipmap:
             mipmap = self.max_mipmap
 
+        # Assess mip dimensions for potential mosaic-at-mip-size build
+        base_width_px = max(4, int(self.dds.width) >> mipmap)
+        base_height_px = max(4, int(self.dds.height) >> mipmap)
+        # Build mosaic directly at mip size for larger mips (>= 2048)
+        do_mosaic_at_mip = (mipmap > 0 and base_width_px >= 2048 and base_height_px >= 2048)
+
         # If enabled, assemble mipmap 0 directly in DXT space to reduce latency
         use_direct_assemble = getattr(CFG.pydds, 'direct_assemble', False) and mipmap == 0
 
@@ -875,7 +902,24 @@ class Tile(object):
                 log.debug("GET_MIPMAP: Direct assemble failed or skipped, falling back to image path")
                 use_direct_assemble = False
         
-        if not use_direct_assemble:
+        if do_mosaic_at_mip:
+            # Build a small RGBA mosaic at the mip's resolution to preserve filtering across chunk edges
+            log.debug(f"GET_MIPMAP: Mosaic-at-mip-size for mip {mipmap} at {base_width_px}x{base_height_px}")
+            new_im = self.get_img(mipmap, maxwait=self.maxchunk_wait)
+            if not new_im:
+                log.debug("GET_MIPMAP: No updates, so no image generated (mip mosaic)")
+                return True
+            self.ready.clear()
+            start_time = time.time()
+            try:
+                STATS['dds_pending'] = STATS.get('dds_pending', 0) + 1
+                # Compress only this mip; deeper mips can be built later from reads if needed
+                self.dds.gen_mipmaps(new_im, mipmap, mipmap)
+            finally:
+                STATS['dds_pending'] = max(0, STATS.get('dds_pending', 0) - 1)
+            end_time = time.time()
+
+        elif not use_direct_assemble:
             # We can have multiple threads wait on get_img ...
             log.debug(f"GET_MIPMAP: Next call is get_img which may block!.............")
             new_im = self.get_img(mipmap, maxwait=self.maxchunk_wait)
@@ -886,14 +930,26 @@ class Tile(object):
             self.ready.clear()
             start_time = time.time()
             try:
+                STATS['dds_pending'] = STATS.get('dds_pending', 0) + 1
                 if mipmap == 0:
                     self.dds.gen_mipmaps(new_im, mipmap, 0)
                 else:
                     self.dds.gen_mipmaps(new_im, mipmap)
             finally:
+                STATS['dds_pending'] = max(0, STATS.get('dds_pending', 0) - 1)
                 pass
                 #new_im.close()
             end_time = time.time()
+        else:
+            # direct assemble path already set end_time
+            pass
+        # expose compression pool status
+        try:
+            pool_status = get_pool_status()
+            set_stat('compress_pool_workers', pool_status.get('workers', 0))
+            set_stat('compress_pool_active', pool_status.get('active_jobs', 0))
+        except Exception:
+            pass
 
         self.ready.set()
 
@@ -1261,132 +1317,137 @@ class Chunk(object):
             self.ready.set()
             return True
 
-        if not self.starttime:
-            self.startime = time.time()
-
-        server_num = idx%(len(self.serverlist))
-        server = self.serverlist[server_num]
-        quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
-
-        # Hack override maptype
-        #maptype = "ARC"
-
-        MAPID = "s2cloudless-2023_3857"
-        MATRIXSET = "g"
-        MAPTYPES = {
-            "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
-            "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
-            "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
-            "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
-            "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
-        }
-
-        # Build URL per request. For APPLE, always inject the latest token without mutating shared state
-        if self.maptype.upper() == "APPLE":
-            self.url = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
-        else:
-            self.url = MAPTYPES[self.maptype.upper()]
-        #log.debug(f"{self} getting {url}")
-        header = {
-                "user-agent": "curl/7.68.0"
-        }
-        if self.maptype.upper() == "EOX":
-            log.info("EOX DETECTED")
-            header.update({'referer': 'https://s2maps.eu/'})
-       
-        # Exponential backoff with jitter for retry pacing
-        self.attempt += 1
+        # mark inflight for stats
+        STATS['chunk_inflight'] = STATS.get('chunk_inflight', 0) + 1
         try:
-            base = 0.1
-            backoff = base * (2 ** max(0, self.attempt - 1))
-            backoff = min(1.5, backoff)
-            jitter = random.uniform(0.0, backoff * 0.25)
-            time.sleep(backoff + jitter)
-        except Exception:
-            time.sleep(0.1)
+            if not self.starttime:
+                self.startime = time.time()
 
-        log.debug(f"Requesting {self.url} ..")
+            server_num = idx%(len(self.serverlist))
+            server = self.serverlist[server_num]
+            quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
 
-        use_requests = True
-        
-        resp = 0
-        try:
-            if use_requests:
-                # Ensure we have a real Session; fall back to module if needed
-                sess = session if hasattr(session, 'get') else requests
-                resp = sess.get(self.url, headers=header, timeout=(2, 8))
-                status_code = resp.status_code
+            # Hack override maptype
+            #maptype = "ARC"
 
-                if self.maptype.upper() == "APPLE" and status_code == 403:
-                    log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.  Retrying with new Apple Maps token.")
-                    apple_token_service.reset_apple_maps_token()
-                    self.url = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
-                    resp = sess.get(self.url, headers=header, timeout=(2, 8))
-                    status_code = resp.status_code
+            MAPID = "s2cloudless-2023_3857"
+            MATRIXSET = "g"
+            MAPTYPES = {
+                "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
+                "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
+                "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
+                "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+                "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+                "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+                "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+                "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
+                "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
+            }
 
+            # Build URL per request. For APPLE, always inject the latest token without mutating shared state
+            if self.maptype.upper() == "APPLE":
+                self.url = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
             else:
-                req = Request(self.url, headers=header)
-                resp = urlopen(req, timeout=8)
-                status_code = resp.status
+                self.url = MAPTYPES[self.maptype.upper()]
+            #log.debug(f"{self} getting {url}")
+            header = {
+                    "user-agent": "curl/7.68.0"
+            }
+            if self.maptype.upper() == "EOX":
+                log.info("EOX DETECTED")
+                header.update({'referer': 'https://s2maps.eu/'})
+           
+            # Exponential backoff with jitter for retry pacing
+            self.attempt += 1
+            try:
+                base = 0.1
+                backoff = base * (2 ** max(0, self.attempt - 1))
+                backoff = min(1.5, backoff)
+                jitter = random.uniform(0.0, backoff * 0.25)
+                time.sleep(backoff + jitter)
+            except Exception:
+                time.sleep(0.1)
 
-                if self.maptype.upper() == "APPLE" and status_code == 403:
-                    log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.  Retrying with new Apple Maps token.")
-                    apple_token_service.reset_apple_maps_token()
-                    self.url = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
-                    # Use requests for the retry to honor timeouts consistently
+            log.debug(f"Requesting {self.url} ..")
+
+            use_requests = True
+            
+            resp = 0
+            try:
+                if use_requests:
+                    # Ensure we have a real Session; fall back to module if needed
                     sess = session if hasattr(session, 'get') else requests
                     resp = sess.get(self.url, headers=header, timeout=(2, 8))
                     status_code = resp.status_code
 
-            if status_code != 200:
-                log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.")
-                inc_stat(f"http_{status_code}")
-                inc_stat("req_err")
+                    if self.maptype.upper() == "APPLE" and status_code == 403:
+                        log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.  Retrying with new Apple Maps token.")
+                        apple_token_service.reset_apple_maps_token()
+                        self.url = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
+                        resp = sess.get(self.url, headers=header, timeout=(2, 8))
+                        status_code = resp.status_code
 
-                err = get_stat("req_err")
-                if err > 50:
-                    ok = get_stat("req_ok")
-                    error_rate = err / ( err + ok )
-                    if error_rate >= 0.10:
-                        log.error(f"Very high network error rate detected : {error_rate * 100 : .2f}%")
-                        log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
+                else:
+                    req = Request(self.url, headers=header)
+                    resp = urlopen(req, timeout=8)
+                    status_code = resp.status
+
+                    if self.maptype.upper() == "APPLE" and status_code == 403:
+                        log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.  Retrying with new Apple Maps token.")
+                        apple_token_service.reset_apple_maps_token()
+                        self.url = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
+                        # Use requests for the retry to honor timeouts consistently
+                        sess = session if hasattr(session, 'get') else requests
+                        resp = sess.get(self.url, headers=header, timeout=(2, 8))
+                        status_code = resp.status_code
+
+                if status_code != 200:
+                    log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.")
+                    inc_stat(f"http_{status_code}")
+                    inc_stat("req_err")
+
+                    err = get_stat("req_err")
+                    if err > 50:
+                        ok = get_stat("req_ok")
+                        error_rate = err / ( err + ok )
+                        if error_rate >= 0.10:
+                            log.error(f"Very high network error rate detected : {error_rate * 100 : .2f}%")
+                            log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
+                    return False
+
+                inc_stat("req_ok")
+
+                if use_requests:
+                    data = resp.content
+                    #data = resp.raw.read()
+                else:
+                    data = resp.read()
+
+                if _is_jpeg(data[:3]):
+                    log.debug(f"Data for {self} is JPEG")
+                    self.data = data
+                else:
+                    # FFD8FF identifies image as a JPEG
+                    log.debug(f"Loading file {self} not a JPEG! {data[:3]} URL: {self.url}")
+                #    return False
+                    self.data = b''
+
+                inc_stat('bytes_dl', len(self.data))
+                    
+            except Exception as err:
+                log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
                 return False
+            finally:
+                if resp:
+                    resp.close()
 
-            inc_stat("req_ok")
+            self.fetchtime = time.time() - self.starttime
 
-            if use_requests:
-                data = resp.content
-                #data = resp.raw.read()
-            else:
-                data = resp.read()
-
-            if _is_jpeg(data[:3]):
-                log.debug(f"Data for {self} is JPEG")
-                self.data = data
-            else:
-                # FFD8FF identifies image as a JPEG
-                log.debug(f"Loading file {self} not a JPEG! {data[:3]} URL: {self.url}")
-            #    return False
-                self.data = b''
-
-            inc_stat('bytes_dl', len(self.data))
-                
-        except Exception as err:
-            log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
-            return False
+            self.save_cache()
+            self.ready.set()
+            return True
         finally:
-            if resp:
-                resp.close()
-
-        self.fetchtime = time.time() - self.starttime
-
-        self.save_cache()
-        self.ready.set()
-        return True
+            STATS['chunk_inflight'] = max(0, STATS.get('chunk_inflight', 0) - 1)
 
     def close(self):
         """Release all references held by this Chunk so its memory can be reclaimed."""

@@ -101,7 +101,7 @@ compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
 # Use parallel compression
-parallel_compress = True
+parallel_compress = False
 # Direct assemble mipmap 0 directly in DXT space to reduce latency
 direct_assemble = True
 # Maximum number of parallel jobs for parallel compression
@@ -111,7 +111,7 @@ parallel_stripe_height = 128
 # Number of workers for parallel compression
 parallel_workers = 2
 # Maximum number of decode threads
-max_decode_concurrency = 8
+max_decode_concurrency = 6
 
 [scenery]
 # Don't cleanup downloads

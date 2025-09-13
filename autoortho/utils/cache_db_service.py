@@ -49,7 +49,8 @@ class CacheDBService:
                 "SELECT is_cached FROM cache WHERE tile_id = ? AND lat = ? AND lon = ? AND maptype = ? AND max_zoom = ?",
                 (tile_id, lat, lon, maptype, max_zoom)
             )
-            return cursor.fetchone()[0] if cursor.fetchone() else False
+            row = cursor.fetchone()
+            return bool(row[0]) if row is not None else False
 
     def set_cache_file_cache_state(self, filename: str, maptype: str, lat: int, lon: int, parent_max_zoom: int, parent_tile_id: str, size_in_bytes: int, is_cached: bool):
         with self._lock:
@@ -65,7 +66,8 @@ class CacheDBService:
                 "SELECT is_cached FROM cache_files WHERE filename = ? AND maptype = ? AND lat = ? AND lon = ? AND parent_max_zoom = ? AND parent_tile_id = ?",
                 (filename, maptype, lat, lon, parent_max_zoom, parent_tile_id)
             )
-            return cursor.fetchone()[0] if cursor.fetchone() else False
+            row = cursor.fetchone()
+            return bool(row[0]) if row is not None else False
     
     def delete_cache_file(self, filename: str):
         with self._lock:
@@ -78,9 +80,11 @@ class CacheDBService:
     def get_cache_size_mb_total(self):
         with self._lock:
             cursor = self.conn.execute(
-                "SELECT SUM(size_in_bytes) FROM cache_files WHERE is_cached = 1"
+                "SELECT SUM(size_in_bytes) FROM cache_files WHERE is_cached = TRUE"
             )
-            return cursor.fetchone()[0] if cursor.fetchone() else 0
+            row = cursor.fetchone()
+            byte_size = row[0] if (row is not None and row[0] is not None) else 0
+            return byte_size / 1024 / 1024
     
     def get_cache_size_mb_for_lat_lon(self, lat: int, lon: int):
         with self._lock:
@@ -88,7 +92,8 @@ class CacheDBService:
                 "SELECT SUM(size_in_bytes) FROM cache_files WHERE lat = ? AND lon = ? AND is_cached = 1",
                 (lat, lon)
             )
-            return cursor.fetchone()[0] if cursor.fetchone() else 0
+            row = cursor.fetchone()
+            return row[0] if (row is not None and row[0] is not None) else 0
 
     def get_files_for_lat_lon(self, lat: int, lon: int):
         with self._lock:

@@ -43,6 +43,7 @@ _ISPC = None
 _POOL = None
 _POOL_LOCK = mp.Lock() if hasattr(mp, 'Lock') else None
 _JOBS_SEM = None  # Initialized lazily based on max_jobs
+_ACTIVE_JOBS = 0
 
 
 def _addr_of_buffer(buf) -> int:
@@ -208,6 +209,7 @@ def compress_mipmap_via_global_pool(rgba_bytes: bytes, width: int, height: int, 
 
     Limits concurrent jobs to max_jobs and reuses the pool to reduce spawn overhead.
     """
+    global _ACTIVE_JOBS
     if width % 4 != 0 or height % 4 != 0:
         raise ValueError("Dimensions must be multiples of 4 for BC compression")
     if stripe_height_px < 4 or stripe_height_px % 4 != 0:
@@ -218,6 +220,7 @@ def compress_mipmap_via_global_pool(rgba_bytes: bytes, width: int, height: int, 
     # Acquire a job slot (blocks if too many jobs)
     _JOBS_SEM.acquire()
     try:
+        _ACTIVE_JOBS += 1
         # Shared memory setup
         blocksize = 16 if dxt_format == 'BC3' else 8
         blocks_per_row = width // 4
@@ -264,6 +267,23 @@ def compress_mipmap_via_global_pool(rgba_bytes: bytes, width: int, height: int, 
             except Exception:
                 pass
     finally:
+        try:
+            _ACTIVE_JOBS = max(0, _ACTIVE_JOBS - 1)
+        except Exception:
+            pass
         _JOBS_SEM.release()
+
+
+def get_pool_status():
+    """Return a lightweight status snapshot of the compression pool."""
+    try:
+        workers = getattr(_POOL, '_processes', 0) if _POOL is not None else 0
+    except Exception:
+        workers = 0
+    return {
+        'pool_created': bool(_POOL is not None),
+        'workers': workers,
+        'active_jobs': int(_ACTIVE_JOBS),
+    }
 
 

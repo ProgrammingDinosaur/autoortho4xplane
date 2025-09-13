@@ -1197,6 +1197,131 @@ class ConfigUI(QMainWindow):
         format_layout.addStretch()
         dds_layout.addLayout(format_layout)
 
+        # Direct assemble mip 0
+        self.direct_assemble_check = QCheckBox("Direct assemble mip 0 (fastest)")
+        self.direct_assemble_check.setChecked(bool(self.cfg.pydds.direct_assemble))
+        self.direct_assemble_check.setObjectName('direct_assemble')
+        self.direct_assemble_check.setToolTip(
+            "Build mip 0 directly in DXT space from chunk blocks (no full RGBA mosaic).\n"
+            "Pros: Faster, lower memory.\n"
+            "Quality: Same as standard at mip 0 (no resampling)."
+        )
+        dds_layout.addWidget(self.direct_assemble_check)
+
+        # Parallel compress master toggle
+        self.parallel_compress_check = QCheckBox("Enable parallel compression (advanced)")
+        self.parallel_compress_check.setChecked(bool(self.cfg.pydds.parallel_compress))
+        self.parallel_compress_check.setObjectName('parallel_compress')
+        self.parallel_compress_check.setToolTip(
+            "Use a persistent process pool to compress mip 0 in parallel.\n"
+            "Warning: Can significantly increase CPU and RAM usage.\n"
+            "Use only if compression (not network) is your bottleneck."
+        )
+        dds_layout.addWidget(self.parallel_compress_check)
+
+        # Parallel workers
+        workers_layout = QHBoxLayout()
+        workers_label = QLabel("Parallel workers:")
+        workers_label.setToolTip(
+            "Number of worker processes in the compression pool.\n"
+            "Higher = more CPU and process memory usage.\n"
+            "Recommended: 2."
+        )
+        workers_layout.addWidget(workers_label)
+        self.parallel_workers_spin = ModernSpinBox()
+        try:
+            max_procs = os.cpu_count() or 1
+        except Exception:
+            max_procs = 1
+        self.parallel_workers_spin.setRange(1, max_procs)
+        self.parallel_workers_spin.setValue(int(self.cfg.pydds.parallel_workers))
+        self.parallel_workers_spin.setObjectName('parallel_workers')
+        self.parallel_workers_spin.setToolTip(
+            "Worker processes in the pool (1..CPU cores). More workers = more CPU & RAM."
+        )
+        workers_layout.addWidget(self.parallel_workers_spin)
+        workers_layout.addStretch()
+        dds_layout.addLayout(workers_layout)
+
+        # Parallel max jobs
+        jobs_layout = QHBoxLayout()
+        jobs_label = QLabel("Parallel max jobs:")
+        jobs_label.setToolTip(
+            "Maximum number of compression jobs running concurrently.\n"
+            "Each job allocates large shared memory buffers (~64MB + output).\n"
+            "Strongly recommended: keep at 1 to avoid RAM spikes."
+        )
+        jobs_layout.addWidget(jobs_label)
+        self.parallel_max_jobs_spin = ModernSpinBox()
+        self.parallel_max_jobs_spin.setRange(1, 4)
+        self.parallel_max_jobs_spin.setValue(int(self.cfg.pydds.parallel_max_jobs))
+        self.parallel_max_jobs_spin.setObjectName('parallel_max_jobs')
+        self.parallel_max_jobs_spin.setToolTip(
+            "Max concurrent compression jobs (1..4). Higher values increase RAM substantially."
+        )
+        jobs_layout.addWidget(self.parallel_max_jobs_spin)
+        jobs_layout.addStretch()
+        dds_layout.addLayout(jobs_layout)
+
+        # Parallel stripe height
+        stripe_layout = QHBoxLayout()
+        stripe_label = QLabel("Parallel stripe height (px):")
+        stripe_label.setToolTip(
+            "Vertical stripe size per task (must be a multiple of 4).\n"
+            "Smaller = better load balance, higher overhead.\n"
+            "Recommended: 128 or 256."
+        )
+        stripe_layout.addWidget(stripe_label)
+        self.parallel_stripe_spin = ModernSpinBox()
+        self.parallel_stripe_spin.setRange(4, 1024)
+        self.parallel_stripe_spin.setSingleStep(4)
+        self.parallel_stripe_spin.setValue(int(self.cfg.pydds.parallel_stripe_height))
+        self.parallel_stripe_spin.setObjectName('parallel_stripe_height')
+        self.parallel_stripe_spin.setToolTip(
+            "Stripe height in pixels (multiple of 4)."
+        )
+        stripe_layout.addWidget(self.parallel_stripe_spin)
+        stripe_layout.addStretch()
+        dds_layout.addLayout(stripe_layout)
+
+        # Max decode concurrency
+        decode_layout = QHBoxLayout()
+        decode_label = QLabel("Max decode concurrency:")
+        decode_label.setToolTip(
+            "Maximum concurrent JPEG→RGBA decodes.\n"
+            "Higher = more CPU and RAM (each decode ~256KB+).\n"
+            "Recommended: 6–8."
+        )
+        decode_layout.addWidget(decode_label)
+        self.max_decode_spin = ModernSpinBox()
+        self.max_decode_spin.setRange(1, max_procs)
+        self.max_decode_spin.setValue(int(self.cfg.pydds.max_decode_concurrency))
+        self.max_decode_spin.setObjectName('max_decode_concurrency')
+        self.max_decode_spin.setToolTip(
+            "Cap for concurrent decodes (1..CPU cores)."
+        )
+        decode_layout.addWidget(self.max_decode_spin)
+        decode_layout.addStretch()
+        dds_layout.addLayout(decode_layout)
+
+        # Enable/disable dependent controls based on parallel_compress
+        def _toggle_parallel_controls(checked):
+            for w in (
+                self.parallel_workers_spin,
+                self.parallel_max_jobs_spin,
+                self.parallel_stripe_spin,
+            ):
+                try:
+                    w.setEnabled(bool(checked))
+                except Exception:
+                    pass
+
+        try:
+            self.parallel_compress_check.toggled.connect(_toggle_parallel_controls)
+        except Exception:
+            pass
+        _toggle_parallel_controls(self.parallel_compress_check.isChecked())
+
         self.settings_layout.addWidget(dds_group)
 
         # General Settings group
@@ -1876,6 +2001,29 @@ class ConfigUI(QMainWindow):
             if not self.system == "darwin":
                 self.cfg.pydds.compressor = self.compressor_combo.currentText()
             self.cfg.pydds.format = self.format_combo.currentText()
+            # New DDS advanced settings
+            try:
+                self.cfg.pydds.direct_assemble = bool(self.direct_assemble_check.isChecked())
+            except Exception:
+                pass
+            try:
+                self.cfg.pydds.parallel_compress = bool(self.parallel_compress_check.isChecked())
+            except Exception:
+                pass
+            try:
+                # enforce constraints
+                pw = max(1, int(self.parallel_workers_spin.value()))
+                mj = max(1, int(self.parallel_max_jobs_spin.value()))
+                sh = max(4, int(self.parallel_stripe_spin.value()))
+                # ensure multiple of 4
+                sh = (sh // 4) * 4
+                md = max(1, int(self.max_decode_spin.value()))
+                self.cfg.pydds.parallel_workers = str(pw)
+                self.cfg.pydds.parallel_max_jobs = str(mj)
+                self.cfg.pydds.parallel_stripe_height = str(sh)
+                self.cfg.pydds.max_decode_concurrency = str(md)
+            except Exception:
+                pass
 
             # General settings
             self.cfg.general.gui = self.gui_check.isChecked()
