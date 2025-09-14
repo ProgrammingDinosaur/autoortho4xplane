@@ -24,6 +24,9 @@ from getortho import tile_cacher
 from utils.constants import MAPTYPES
 from utils.tile_db_service import tile_db_service
 from utils.utils import scan_existing_tiles
+from utils.cache_db_service import cache_db_service
+from utils.dsf_utils import get_maptype_from_dsf
+from utils.cache_db_service import cache_db_service
 
 
 RUNNING=True
@@ -146,6 +149,73 @@ ft = FlightTracker()
 _pending_lock = threading.Lock()
 # key: (lat, lon) -> maptype
 _PENDING_MAPTYPE_OVERRIDES = {}
+_DSF_MAPTYPE_CACHE = {}
+_DSF_PATH_CACHE = {}
+_DSF_CACHE_LOCK = threading.Lock()
+_AVAILABLE_TILES_CACHE = None  # coord('+23-053') -> {"type":..., "package":...}
+
+def _format_coord(lat: int, lon: int) -> str:
+    lat_prefix = '+' if lat >= 0 else '-'
+    lon_prefix = '+' if lon >= 0 else '-'
+    return f"{lat_prefix}{abs(lat):02d}{lon_prefix}{abs(lon):03d}"
+
+def _ensure_available_tiles_cache():
+    global _AVAILABLE_TILES_CACHE
+    if _AVAILABLE_TILES_CACHE is None:
+        _AVAILABLE_TILES_CACHE = scan_existing_tiles(CFG.paths.scenery_path)
+
+def _find_dsf_path_for_latlon(coord: str) -> str | None:
+    with _DSF_CACHE_LOCK:
+        p = _DSF_PATH_CACHE.get(coord)
+    if p:
+        return p
+    _ensure_available_tiles_cache()
+    info = (_AVAILABLE_TILES_CACHE or {}).get(coord) or {}
+    package = info.get('package')
+    if not package:
+        return None
+    base = os.path.join(CFG.paths.scenery_path, 'z_autoortho', 'scenery', package, 'Earth Nav Data')
+    try:
+        if not os.path.isdir(base):
+            return None
+        target_name = coord + '.dsf'
+        for sub in os.listdir(base):
+            subdir = os.path.join(base, sub)
+            if not os.path.isdir(subdir):
+                continue
+            cand = os.path.join(subdir, target_name)
+            if os.path.exists(cand):
+                with _DSF_CACHE_LOCK:
+                    _DSF_PATH_CACHE[coord] = cand
+                return cand
+        return None
+    except Exception:
+        return None
+
+def _resolve_effective_maptype(lat: int, lon: int, maptype: str) -> str:
+    if maptype and maptype != 'DFLT':
+        return maptype
+    coord = _format_coord(lat, lon)
+    with _DSF_CACHE_LOCK:
+        cached = _DSF_MAPTYPE_CACHE.get(coord)
+    if cached:
+        return cached
+    package_info = (_AVAILABLE_TILES_CACHE or {}).get(coord) or {}
+    package_type = package_info.get('type')
+    if package_type == "Base AO Package":
+        return "BI"
+    dsf_path = _find_dsf_path_for_latlon(coord)
+    if not dsf_path:
+        return 'DFLT'
+    try:
+        mt = get_maptype_from_dsf(dsf_path)
+        if mt:
+            with _DSF_CACHE_LOCK:
+                _DSF_MAPTYPE_CACHE[coord] = mt
+            return mt
+    except Exception:
+        pass
+    return 'DFLT'
 
 # Socket.IO events (async)
 @sio.event
@@ -182,7 +252,7 @@ async def get_latlon_route():
     return JSONResponse({"lat": lat, "lon": lon})
 
 @app.get("/tile_maptype", name='tile_maptype')
-async def tile_maptype(lat: int, lon: int):
+async def tile_maptype(lat: int, lon: int, resolve_dflt: bool = False):
     try:
         with _pending_lock:
             mt = _PENDING_MAPTYPE_OVERRIDES.get((lat, lon))
@@ -190,7 +260,11 @@ async def tile_maptype(lat: int, lon: int):
             maptype = mt
         else:
             maptype = tile_db_service.get_tile_maptype(lat, lon)
-        return JSONResponse({"lat": lat, "lon": lon, "maptype": maptype})
+        resp = {"lat": lat, "lon": lon, "maptype": maptype}
+        if resolve_dflt and maptype == 'DFLT':
+            effective = _resolve_effective_maptype(lat, lon, maptype)
+            resp["effective_maptype"] = effective
+        return JSONResponse(resp)
     except Exception as e:
         log.exception("tile_maptype error")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -206,8 +280,61 @@ async def available_maptypes():
 
 @app.get("/available_tiles", name='available_tiles')
 async def available_tiles():
-    return JSONResponse({"tiles": scan_existing_tiles(CFG.paths.scenery_path)})
+    global _AVAILABLE_TILES_CACHE
+    _AVAILABLE_TILES_CACHE = scan_existing_tiles(CFG.paths.scenery_path)
+    return JSONResponse({"tiles": _AVAILABLE_TILES_CACHE})
 
+@app.get("/cache_status", name='cache_status')
+async def cache_status(lat: int, lon: int, maptype: str | None = None):
+    try:
+        # Determine raw maptype if not provided (respect staged overrides)
+        if not maptype:
+            with _pending_lock:
+                mt = _PENDING_MAPTYPE_OVERRIDES.get((lat, lon))
+            if mt:
+                maptype = mt
+            else:
+                maptype = tile_db_service.get_tile_maptype(lat, lon)
+        # Resolve DFLT to DSF-derived maptype only for cache queries
+        effective = _resolve_effective_maptype(lat, lon, maptype)
+        agg = cache_db_service.get_latlon_maptype_cache_aggregate(lat, lon, effective)
+        return JSONResponse({"lat": lat, "lon": lon, "maptype": maptype, "effective_maptype": effective, **agg})
+    except Exception as e:
+        log.exception("cache_status error")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/cache_subgrid", name='cache_subgrid')
+async def cache_subgrid(lat: int, lon: int, maptype: str | None = None, zoom: int = 16):
+    try:
+        # Determine raw maptype if not provided (respect staged overrides)
+        if not maptype:
+            with _pending_lock:
+                mt = _PENDING_MAPTYPE_OVERRIDES.get((lat, lon))
+            if mt:
+                maptype = mt
+            else:
+                maptype = tile_db_service.get_tile_maptype(lat, lon)
+        # Resolve DFLT only for cache queries
+        effective = _resolve_effective_maptype(lat, lon, maptype)
+        agg = cache_db_service.get_latlon_maptype_cache_aggregate(lat, lon, effective)
+        total = int(agg.get('total', -1))
+        cached = int(agg.get('cached', -1))
+        if total <= 0:
+            return JSONResponse({"lat": lat, "lon": lon, "maptype": maptype, "effective_maptype": effective, "zoom": zoom, "rows": 0, "cols": 0, "tiles": []})
+        # For now, return a coarse uniform grid (16x16) colored by aggregate state
+        rows = 16
+        cols = 16
+        if cached == total and total > 0:
+            status = 'green'
+        elif cached > 0 and cached < total:
+            status = 'yellow'
+        else:
+            status = 'red'
+        tiles = [{"row": r, "col": c, "status": status} for r in range(rows) for c in range(cols)]
+        return JSONResponse({"lat": lat, "lon": lon, "maptype": maptype, "effective_maptype": effective, "zoom": zoom, "rows": rows, "cols": cols, "tiles": tiles})
+    except Exception as e:
+        log.exception("cache_subgrid error")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/open_tiles", name='open_tiles')
 async def open_tiles():
@@ -277,6 +404,10 @@ async def index(request: Request):
 @app.get("/map", response_class=HTMLResponse, name='map')
 async def map_view(request: Request):
     return templates.TemplateResponse("map.html", {"request": request, "mapkey": ""})
+
+@app.get("/cache", response_class=HTMLResponse, name='cache')
+async def cache_view(request: Request):
+    return templates.TemplateResponse("cache.html", {"request": request, "mapkey": ""})
 
 @app.get("/stats", response_class=HTMLResponse, name='stats')
 async def stats_view(request: Request):

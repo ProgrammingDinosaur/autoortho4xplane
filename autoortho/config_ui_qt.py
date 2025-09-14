@@ -462,6 +462,7 @@ class ConfigUI(QMainWindow):
         self.create_scenery_tab()
         self.create_settings_tab()
         self.create_map_tab()
+        self.create_cache_tab()
         self.create_logs_tab()
 
 
@@ -533,6 +534,15 @@ class ConfigUI(QMainWindow):
                 else:
                     # cancel any pending flush and ensure tiles are loaded
                     self.map_view.page().runJavaScript("window.AOMap && AOMap.cancelFlush && AOMap.cancelFlush(); AOMap && AOMap.reloadTiles && AOMap.reloadTiles();")
+            except Exception:
+                pass
+        # Apply same behavior to Cache Manager
+        if hasattr(self, 'cache_view'):
+            try:
+                if label != "Cache Manager":
+                    self.cache_view.page().runJavaScript("window.AOMap && AOMap.flushIn && AOMap.flushIn(60000);")
+                else:
+                    self.cache_view.page().runJavaScript("window.AOMap && AOMap.cancelFlush && AOMap.cancelFlush(); AOMap && AOMap.reloadTiles && AOMap.reloadTiles();")
             except Exception:
                 pass
 
@@ -616,6 +626,27 @@ class ConfigUI(QMainWindow):
             self.tabs.addTab(map_widget, "Tile Manager")
         except Exception as e:
             log.warning(f"Failed to initialize Map tab: {e}")
+
+    def create_cache_tab(self):
+        """Create the cache manager tab (served by FastAPI)"""
+        try:
+            cache_widget = QWidget()
+            layout = QVBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            cache_widget.setLayout(layout)
+
+            self.cache_view = QWebEngineView()
+            try:
+                port = int(self.cfg.flightdata.webui_port)
+            except Exception:
+                port = 8080
+            url = QUrl(f"http://localhost:{port}/cache")
+            self.cache_view.load(url)
+
+            layout.addWidget(self.cache_view)
+            self.tabs.addTab(cache_widget, "Cache Manager")
+        except Exception as e:
+            log.warning(f"Failed to initialize Cache tab: {e}")
 
     def create_setup_tab(self):
         """Create the setup configuration tab"""

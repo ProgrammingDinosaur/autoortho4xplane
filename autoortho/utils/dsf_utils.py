@@ -3,7 +3,7 @@ import os
 import subprocess
 import re
 
-from constants import DSFTOOL_PATH
+from utils.constants import DSFTOOL_PATH
 
 log = logging.getLogger(__name__)
 
@@ -58,3 +58,32 @@ def get_ter_tiles_from_dsf(dsf_path: str):
                 pass
 
     return list(final_ter_tiles)
+
+def get_maptype_from_dsf(dsf_path: str):
+    """ get the maptype from the dsf """
+    if not os.path.exists(DSFTOOL_PATH):
+        log.error("DSFTOOL_PATH does not exist")
+        return []
+    # command looks like: .\DSFTool --dsf2text <name>.dsf -
+    # Stream stdout line-by-line to avoid loading the entire output into memory.
+    command = [DSFTOOL_PATH, "--dsf2text", dsf_path, "-"]
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if "TERRAIN_DEF terrain/" in line:
+                parsed_line = line.replace("TERRAIN_DEF terrain/", "").replace(".ter", "").strip()
+                groups = parsed_line.split("_")
+                maptype_substring = groups[2]
+                # remove the trailing numbers
+                maptype_substring = re.sub(r'\d+$', '', maptype_substring)
+                return maptype_substring
+    finally:
+        proc.terminate()
+    return None

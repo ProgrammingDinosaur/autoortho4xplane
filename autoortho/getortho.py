@@ -356,6 +356,13 @@ class Tile(object):
                 dxt_format=CFG.pydds.format)
 
         self.id = f"{row}_{col}_{maptype}_{self.tilename_zoom}"
+        cache_db_service.create_tile_cache_state(
+            tile_id=self.id,
+            lat=lat,
+            lon=lon,
+            maptype=maptype,
+            max_zoom=self.max_zoom,
+            is_cached=False)
 
 
     def __lt__(self, other):
@@ -955,7 +962,7 @@ class Tile(object):
 
         if mipmap == 0 and self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
             log.debug(f"GET_MIPMAP: Setting tile cache state for {self.row},{self.col},{self.max_zoom},{self.lat},{self.lon},{self.maptype} to True")
-            cache_db_service.set_tile_cache_state(
+            cache_db_service.update_tile_cache_state(
                 tile_id=self.id,
                 lat=self.lat,
                 lon=self.lon,
@@ -1555,7 +1562,7 @@ class TileCacher(object):
                         if t.refs <= 0:
                             t = self.tiles.pop(i)
                             try:
-                                lat, lon = coord_from_sleepy_tilename(t.row, t.col, t.tilename_zoom)
+                                lat, lon = coord_from_sleepy_tilename(t.col, t.row, t.tilename_zoom)
                             except Exception:
                                 lat, lon = (None, None)
                             try:
@@ -1593,7 +1600,7 @@ class TileCacher(object):
     def _open_tile(self, row, col, map_type, zoom):
         if self.maptype_override and self.maptype_override != "Use tile default":
             if self.maptype_override == "Use tile settings":
-                lat, lon = coord_from_sleepy_tilename(row, col, zoom)
+                lat, lon = coord_from_sleepy_tilename(col, row, zoom)
                 map_type = tile_db_service.get_tile_maptype(lat, lon)
             else:
                 map_type = self.maptype_override
@@ -1602,7 +1609,7 @@ class TileCacher(object):
         log.debug(f"Get_tile: {idx}")
         with self.tc_lock:
             tile = self.tiles.get(idx)
-            lat, lon = coord_from_sleepy_tilename(row, col, zoom)
+            lat, lon = coord_from_sleepy_tilename(col, row, zoom)
             if not tile:
                 self.misses += 1
                 inc_stat('tile_mem_miss')
@@ -1650,7 +1657,7 @@ class TileCacher(object):
                 t.close()
                 t = None
                 del t
-                lat, lon = coord_from_sleepy_tilename(row, col, zoom)
+                lat, lon = coord_from_sleepy_tilename(col, row, zoom)
                 self.open_tiles_by_dsf[(lat, lon)] -= 1
                 if self.open_tiles_by_dsf[(lat, lon)] <= 0:
                     del self.open_tiles_by_dsf[(lat, lon)]
