@@ -25,6 +25,7 @@ class DsfUtils:
         self.xplane_path = CFG.paths.xplane_path
         self.ao_path = CFG.paths.scenery_path
         self.global_scenery_path = os.path.join(self.xplane_path, "Global Scenery", "X-Plane 12 Global Scenery", "Earth Nav Data")
+        self.demo_scenery_path = os.path.join(self.xplane_path, "Global Scenery", "X-Plane 12 Demo Areas", "Earth Nav Data")
         self.overlay_scenery_path = os.path.join(self.ao_path, "yAutoOrtho_Overlays", "Earth Nav Data")
         self.dsf_dir = CFG.paths.dsf_dir
 
@@ -53,21 +54,33 @@ class DsfUtils:
         lat = float(lat)
         lon = float(lon)
 
-        folder_lat = int(lat // self.GRID) * self.GRID
-        folder_lon = int(lon // self.GRID) * self.GRID
+        folder_lat = str(int(lat // self.GRID) * self.GRID)
+        folder_lon = str(int(lon // self.GRID) * self.GRID)
 
         if positive_lat:
-            folder_lat = "+" + str(folder_lat)
+            folder_lat = "+" + folder_lat
         if positive_lon:
-            folder_lon = "+" + str(folder_lon)
+            folder_lon = "+" + folder_lon
 
         if len(folder_lon) == 3:
             folder_lon = folder_lon[:1] + "0" + folder_lon[1:]
         
         if is_overlay:
-            return os.path.join(self.overlay_scenery_path, f"{folder_lat}{folder_lon}")
+            tentative_path = os.path.join(self.overlay_scenery_path, f"{folder_lat}{folder_lon}")
+            if os.path.exists(tentative_path):
+                return tentative_path
+            else:
+                raise Exception(f"Overlay DSF file does not exist in {self.overlay_scenery_path}")
         else:
-            return os.path.join(self.global_scenery_path, f"{folder_lat}{folder_lon}")
+            tentative_path = os.path.join(self.global_scenery_path, f"{folder_lat}{folder_lon}")
+            if os.path.exists(tentative_path):
+                return tentative_path
+            else:
+                fallback_path = os.path.join(self.demo_scenery_path, f"{folder_lat}{folder_lon}")
+                if os.path.exists(fallback_path):
+                    return fallback_path
+                else:
+                    raise Exception(f"Global DSF file does not exist in {tentative_path} or {fallback_path}")
     
     def convert_dsf_to_txt(self, dsf_file_path, txt_file_path):
         command = [
