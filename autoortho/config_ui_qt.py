@@ -1393,7 +1393,7 @@ class ConfigUI(QMainWindow):
                         self.on_install_scenery(rid)
                     )
                 )
-                item_layout.addWidget(delete_btn)
+                item_layout.addWidget(install_btn)
 
             else:
                 status_label = QLabel("✓ Up to date")
@@ -1432,9 +1432,10 @@ class ConfigUI(QMainWindow):
                     line-height: 30px;
                     """
                 )
-                add_seasons_btn.setObjectName(f"add-seasons-{r.region_id}")
+                package_name = os.path.basename(latest.subfolder_dir)
+                add_seasons_btn.setObjectName(f"add-seasons-{package_name}")
                 add_seasons_btn.clicked.connect(
-                    lambda checked, rid=os.path.basename(latest.subfolder_dir): (
+                    lambda checked, rid=package_name: (
                         self.on_add_seasons(rid)
                     )
                 )
