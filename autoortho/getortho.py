@@ -59,6 +59,13 @@ def bump_many(d: dict):
         inc_many(d)
 
 
+seasons_enabled = CFG.seasons.enabled
+
+if seasons_enabled:
+    from aoseasons import AoSeasonCache
+    ao_seasons = AoSeasonCache(CFG.paths.cache_dir)
+
+
 def _is_jpeg(dataheader):
     # FFD8FF identifies image as a JPEG
     if dataheader[:3] == b'\xFF\xD8\xFF':
@@ -974,6 +981,11 @@ class Tile(object):
             self.imgs[mipmap] = new_im
 
         log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
+
+        if self.seasons_enabled:
+            saturation = 0.01 * ao_seasons.saturation(self.row, self.col, self.zoom)
+            if saturation < 1.0:    # desaturation is expensive
+                im = im.copy().desaturate(saturation)
         # Return image along with mipmap and zoom level this was created at
         return new_im
 
