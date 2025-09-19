@@ -16,6 +16,7 @@ from packaging import version
 import utils.resources_rc
 from utils.constants import MAPTYPES, system_type
 from utils.mappers import map_kubilus_region_to_simheaven_region
+from utils.dsf_utils import dsf_utils
 from utils.mount_utils import cleanup_mountpoint
 
 from PySide6.QtWidgets import (
@@ -112,6 +113,35 @@ class UpdateCheckWorker(QThread):
             self.result.emit((tag, html_url))
         except Exception as err:
             self.error.emit(str(err))
+
+class AddSeasonsWorker(QThread):
+    """Worker thread for adding seasons"""
+    finished = Signal(str, bool)  # region_id, success
+    error = Signal(str, str)  # region_id, error_message
+    progress = Signal(str, dict)  # region_id, progress_data
+
+    def __init__(self, scenery_name: str, scenery_path: str):
+        super().__init__()
+        self.scenery_name = scenery_name
+        self.scenery_path = os.path.join(scenery_path, "z_autoortho", "scenery", self.scenery_name)
+
+    def run(self):
+        """Run the worker thread"""
+        try:
+            log.info(f"Adding seasons to {self.scenery_name}")
+            def progress_callback(progress_data):
+                self.progress.emit(self.scenery_name, progress_data)
+
+            success = dsf_utils.add_seasons_to_package(self.scenery_name, progress_callback=progress_callback)
+
+            log.info(f"Finished adding seasons to {self.scenery_name}")
+            self.progress.emit(self.scenery_name, {"stage": "finished"})
+            self.finished.emit(self.scenery_name, success)
+        except Exception as err:
+            tb = traceback.format_exc()
+            log.error(tb)
+            self.error.emit(self.scenery_name, str(err))
+
 
 class StyledButton(QPushButton):
     """Custom styled button with hover effects"""
@@ -271,6 +301,7 @@ class ConfigUI(QMainWindow):
         self.download_workers = {}
         self.download_progress = {}
         self.uninstall_workers = {}
+        self.add_seasons_workers = {}
         self.simheaven_config_changed_session = False
         self.installed_packages = []
         self.cache_thread = None
@@ -1362,7 +1393,8 @@ class ConfigUI(QMainWindow):
                         self.on_install_scenery(rid)
                     )
                 )
-                item_layout.addWidget(install_btn)
+                item_layout.addWidget(delete_btn)
+
             else:
                 status_label = QLabel("✓ Up to date")
                 status_label.setStyleSheet("color: #4CAF50;")
@@ -1389,7 +1421,36 @@ class ConfigUI(QMainWindow):
                         self.on_delete_scenery(rid)
                     )
                 )
-                item_layout.addWidget(delete_btn)
+                add_seasons_btn = StyledButton("Add Native Seasons", primary=False)
+                add_seasons_btn.setFixedSize(150,35)
+                add_seasons_btn.setStyleSheet(
+                    """
+                    background-color: #2d78ba;
+                    font-size: 16px;
+                    font-weight: bold;
+                    text-align: center;
+                    line-height: 30px;
+                    """
+                )
+                add_seasons_btn.setObjectName(f"add-seasons-{r.region_id}")
+                add_seasons_btn.clicked.connect(
+                    lambda checked, rid=os.path.basename(latest.subfolder_dir): (
+                        self.on_add_seasons(rid)
+                    )
+                )
+                # add a horizontal layout
+                h_layout = QHBoxLayout()
+                h_layout.addWidget(add_seasons_btn)
+                h_layout.addWidget(delete_btn)
+
+                dsf_progress_bar = QProgressBar()
+                dsf_progress_bar.setVisible(False)
+                dsf_progress_bar.setObjectName(f"dsf-progress-bar-{r.region_id}")
+                dsf_progress_bar.setToolTip("Progress of adding seasons to DSFs")
+
+                item_layout.addLayout(h_layout)
+                item_layout.addWidget(dsf_progress_bar)
+
 
             self.scenery_layout.addWidget(item_frame)
 
@@ -1637,6 +1698,69 @@ class ConfigUI(QMainWindow):
         self.download_workers[region_id] = worker
         worker.start()
 
+    def on_add_seasons(self, region_id):
+        """Handle adding seasons"""
+        button = self.findChild(QPushButton, f"add-seasons-{region_id}")
+        if button:
+            button.setEnabled(False)
+            button.setText("Adding seasons...")
+        
+        dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if dsf_progress_bar:
+            dsf_progress_bar.setVisible(True)
+
+        # Create worker thread
+        worker = AddSeasonsWorker(region_id, self.cfg.paths.scenery_path)
+        worker.progress.connect(self.on_add_seasons_progress)
+        worker.finished.connect(self.on_add_seasons_finished)
+        worker.error.connect(self.on_add_seasons_error)
+        # Keep a strong reference so the thread isn't GC'd while running
+        self.add_seasons_workers[region_id] = worker
+        worker.setParent(self)
+        worker.start()
+
+    def on_add_seasons_error(self, region_id, error_msg):
+        """Handle add seasons error"""
+        self.show_error.emit(f"Failed to add seasons to {region_id}:\n{error_msg}")
+        self.on_add_seasons_finished(region_id, False)
+
+    def on_add_seasons_finished(self, region_id, success):
+        """Handle add seasons completion"""
+        button = self.findChild(QPushButton, f"add-seasons-{region_id}")
+        if button:
+            button.setEnabled(True)
+            button.setText("Add Native Seasons")
+
+        if success:
+            self.update_status_bar(f"Successfully added seasons to {region_id}")
+            button.setText("Native Seasons Added")
+        else:
+            self.update_status_bar(f"Failed to add seasons to {region_id}")
+            button.setText("Add Native Seasons")
+
+        dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if dsf_progress_bar:
+            dsf_progress_bar.setVisible(False)
+
+        # Clean up worker
+        if region_id in self.add_seasons_workers:
+            try:
+                self.add_seasons_workers[region_id].wait()
+            except Exception:
+                pass
+            del self.add_seasons_workers[region_id]
+
+    def on_add_seasons_progress(self, region_id, progress_data):
+        """Handle add seasons progress"""
+
+        dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if dsf_progress_bar:
+            dsf_progress_bar.setVisible(True)
+            dsf_progress_bar.setValue(int(progress_data['pcnt_done']))
+            dsf_progress_bar.setMaximum(int(progress_data['files_total']))
+            dsf_progress_bar.setFormat(f"{progress_data['files_done']}/{progress_data['files_total']}")
+
+
     def on_uninstall_error(self, region_id, error_msg):
         """Handle uninstall error"""
         self.show_error.emit(f"Failed to uninstall {region_id}:\n{error_msg}")
@@ -1666,7 +1790,13 @@ class ConfigUI(QMainWindow):
             del self.uninstall_workers[region_id]
         if region_id in self.download_workers:
             del self.download_workers[region_id]
-
+        if region_id in self.add_seasons_workers:
+            try:
+                self.add_seasons_workers[region_id].wait()
+                self.add_seasons_workers[region_id].deleteLater()
+            except Exception:
+                pass
+            del self.add_seasons_workers[region_id]
 
     def on_download_progress(self, region_id, progress_data):
         """Update download progress"""

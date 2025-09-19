@@ -72,6 +72,8 @@ cache_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "cache")}
 download_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "downloads")}
 # Changing log_file dir is currently not supported
 log_file = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "autoortho.log")}
+# Directory where dsf files are cached
+dsf_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "dsf")}
 
 [autoortho]
 # Override map type with a different source
