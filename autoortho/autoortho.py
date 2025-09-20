@@ -85,6 +85,16 @@ class LogServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
 
 
+_SERVER_STATS_STORE = None
+
+def _get_or_create_stats_store():
+    """Factory used by the StatsManager server process to expose a singleton store."""
+    global _SERVER_STATS_STORE
+    if _SERVER_STATS_STORE is None:
+        _SERVER_STATS_STORE = aostats.StatsStore()
+    return _SERVER_STATS_STORE
+
+
 @contextmanager
 def setupmount(mountpoint, systemtype):
     mountpoint = os.path.expanduser(mountpoint)
@@ -289,7 +299,7 @@ class AOMount:
         self.mount_threads = []
         self.mac_os_procs = []
 
-        StatsManager.register('get_store')
+        # Start shared stats manager and reporter/log servers
         self.start_stats_manager()
 
         self._reporter_stop = threading.Event()
@@ -306,6 +316,7 @@ class AOMount:
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
         self.log_server = server
+        self.log_thread = t
         self.log_host = host
         self.log_port = port
         self.log_addr = f"{self.log_host}:{self.log_port}"
@@ -313,23 +324,41 @@ class AOMount:
 
     def stop_log_server(self, join_timeout: float = 2.0):
         server = getattr(self, "log_server", None)
-        if server:
-            server.shutdown()
-        if server and server.is_alive():
-            server.join(timeout=join_timeout)
+        t = getattr(self, "log_thread", None)
+        try:
+            if server:
+                server.shutdown()
+        except Exception:
+            pass
+        if t and t.is_alive():
+            try:
+                t.join(timeout=join_timeout)
+            except Exception:
+                pass
         self.log_server = None
+        self.log_thread = None
         self.log_host = None
         self.log_port = None
         self.log_addr = None
         return
 
     def start_stats_manager(self, authkey: bytes = b'AO4XPSTATS'):
-        self._shared_store = aostats.StatsStore()
+        # Register the store exposure BEFORE starting the manager so the server
+        # process exports a singleton StatsStore with the required API.
+        StatsManager.register(
+            'get_store',
+            callable=_get_or_create_stats_store,
+            exposed=['inc', 'inc_many', 'set', 'get', 'delete', 'keys', 'snapshot']
+        )
 
         mgr = StatsManager(address=('127.0.0.1', 0), authkey=authkey)
         mgr.start()
-        StatsManager.register('get_store', callable=lambda: self._shared_store)
-        aostats.bind_local_store(self._shared_store)
+
+        # Obtain a proxy to the server-owned store and bind helpers to it so
+        # that all stats updates/readouts go through the shared store.
+        store_proxy = mgr.get_store()
+        aostats.bind_local_store(store_proxy)
+        self._shared_store = store_proxy
         host, port = mgr.address
         log.info(f"StatsManager listening on {host}:{port}")
         self.stats_manager = mgr

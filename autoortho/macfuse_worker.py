@@ -1,5 +1,6 @@
 import argparse
 import logging
+import logging.handlers
 import os
 from mfusepy import FUSE
 import sys
@@ -63,9 +64,11 @@ def main():
     log.info(f"MOUNT: {args.mountpoint}")
     additional_args = fuse_option_profiles_by_os(args.nothreads, args.volname)
 
-    log.info(f"Starting FUSE mount")
-    log.debug(f"Loading FUSE with options: "
-            f"{', '.join(sorted(map(str, additional_args.keys())))}")
+    log.info("Starting FUSE mount")
+    log.debug(
+            "Loading FUSE with options: %s",
+            ", ".join(sorted(map(str, additional_args.keys())))
+    )
 
     try:
         FUSE(AutoOrtho(args.root, use_ns=True), os.path.abspath(args.mountpoint), **additional_args)

@@ -28,7 +28,10 @@ def _connect_manager_from_env():
 
     class _StatsManager(BaseManager):
         pass
-    _StatsManager.register('get_store')
+    _StatsManager.register(
+        'get_store',
+        exposed=['inc', 'inc_many', 'set', 'get', 'delete', 'keys', 'snapshot']
+    )
     m = _StatsManager(address=(host, int(port)), authkey=auth.encode('utf-8'))
     m.connect()
     return m, m.get_store()
