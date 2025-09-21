@@ -20,7 +20,7 @@ import psutil
 from aoimage import AoImage
 
 from aoconfig import CFG
-from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat
+from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
 from utils.constants import system_type
 from utils.apple_token_service import apple_token_service
 
@@ -40,12 +40,21 @@ mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
 
 stats_batcher = None
-if os.getenv("AO_STATS_ADDR"):  # means we're in a worker
-    stats_batcher = StatsBatcher(flush_interval=0.05, max_items=200)
-    atexit.register(stats_batcher.stop)
+
+def _ensure_stats_batcher():
+    global stats_batcher
+    if stats_batcher is None:
+        try:
+            # Create when a remote store is bound (either via env or parent bind)
+            if getattr(STATS, "_remote", None) is not None or os.getenv("AO_STATS_ADDR"):
+                stats_batcher = StatsBatcher(flush_interval=0.05, max_items=200)
+                atexit.register(stats_batcher.stop)
+        except Exception:
+            stats_batcher = None
 
 
 def bump(key, n=1):
+    _ensure_stats_batcher()
     if stats_batcher:
         stats_batcher.add(key, n)
     else:
@@ -53,6 +62,7 @@ def bump(key, n=1):
 
 
 def bump_many(d: dict):
+    _ensure_stats_batcher()
     if stats_batcher:
         stats_batcher.add_many(d)
     else:
@@ -760,11 +770,16 @@ class Tile(object):
         self.ready.set()
 
         if compress_len:
-            #STATS['partial_mm'] = STATS.get('partial_mm', 0) + 1
             tile_time = end_time - start_time
             partial_stats.set(mipmap, tile_time)
-            STATS['partial_mm_averages'] = partial_stats.averages
-            STATS['partial_mm_counts'] = partial_stats.counts
+            # Record partial mm stats via counters for aggregation
+            try:
+                bump_many({
+                    f"partial_mm_count:{mipmap}": 1,
+                    f"partial_mm_time_total_ms:{mipmap}": int(tile_time * 1000)
+                })
+            except Exception:
+                pass
 
         return True
 
@@ -1088,11 +1103,14 @@ class Tile(object):
         tile_time = end_time - start_time
         mm_stats.set(mipmap, tile_time)
 
-        #log.info(f"Compress MM {mipmap} for ZL {zoom} in {tile_time} seconds")
-        #log.info(f"Average compress times: {mm_averages}")
-        #log.info(f"MM counts: {mm_counts}")
-        STATS['mm_counts'] = mm_stats.counts
-        STATS['mm_averages'] = mm_stats.averages
+        # Record mm stats via counters for aggregation
+        try:
+            bump_many({
+                f"mm_count:{mipmap}": 1,
+                f"mm_time_total_ms:{mipmap}": int(tile_time * 1000)
+            })
+        except Exception:
+            pass
 
         # Don't close all chunks since we don't gen all mipmaps 
         if mipmap == 0:
@@ -1218,7 +1236,8 @@ class TileCacher(object):
     def show_stats(self):
         process = psutil.Process(os.getpid())
         cur_mem = process.memory_info().rss
-        set_stat('cur_mem_mb', cur_mem//1048576)
+        # Report per-process memory to shared store; parent will aggregate
+        update_process_memory_stat()
         #set_stat('tile_mem_open', len(self.tiles))
         if self.enable_cache:
             #set_stat('tile_mem_miss', self.misses)
@@ -1364,6 +1383,11 @@ def shutdown():
     try:
         if stats_batcher:
             stats_batcher.stop()
+    except Exception:
+        pass
+
+    try:
+        clear_process_memory_stat()
     except Exception:
         pass
 

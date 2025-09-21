@@ -126,6 +126,7 @@ cache_mem_limit = 4
 auto_clean_cache = False
 
 [seasons]
+seasons_convert_workers = 4
 enabled = False
 spr_saturation = 70.0
 sum_saturation = 100.0

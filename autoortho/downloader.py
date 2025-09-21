@@ -18,6 +18,7 @@ from urllib.error import URLError, HTTPError
 from datetime import datetime, timezone, timedelta
 from packaging import version
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import Enum
 
 
 from aoconfig import CFG
@@ -37,6 +38,11 @@ def do_url(url, headers={}, ):
 
 
 cur_activity = {}
+
+class SeasonsApplyStatus(Enum):
+    NOT_APPLIED = "not_applied"
+    PARTIALLY_APPLIED = "partially_applied"
+    APPLIED = "applied"
 
 
 class Zip(object):
@@ -400,7 +406,7 @@ class Release(object):
     totalsize = 0
     ver = "0.0.0"
     url = ""
-    
+    seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
     install_name = ""
 
     installed = False
@@ -431,6 +437,9 @@ class Release(object):
         self.subfolder_dir = os.path.join(self.install_dir, "z_autoortho", "scenery", f"z_ao_{self.name}")
         self.ortho_dirs = []
         self.info_ver = "v2"
+        self.dsf_folders_files = {}
+        self.processed_dsf_seasons = {}
+        self.total_dsfs = 0
 
         #if os.path.exists(self.info_path):
         #    self.load(self.info_path)
@@ -453,6 +462,15 @@ class Release(object):
         self.installed = True
         self.downloaded = True
         self.cleaned = True
+
+        if not self.dsf_folders_files and not self.processed_dsf_seasons:
+            self.seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
+        elif self.dsf_folders_files == self.processed_dsf_seasons:
+            self.seasons_apply_status = SeasonsApplyStatus.APPLIED
+        elif self.dsf_folders_files != self.processed_dsf_seasons:
+            self.seasons_apply_status = SeasonsApplyStatus.PARTIALLY_APPLIED
+        else:
+            self.seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
 
         detected_info_ver = info.get('info_ver')
         if self.ortho_dirs and detected_info_ver is None:

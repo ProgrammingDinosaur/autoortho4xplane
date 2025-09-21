@@ -451,8 +451,137 @@ class AOMount:
         def _reporter_loop():
             while not self._reporter_stop.wait(interval_sec):
                 try:
+                    # Update this process's own memory heartbeat so it's counted
+                    try:
+                        aostats.update_process_memory_stat()
+                    except Exception:
+                        pass
+
+                    # Aggregate RSS across all live processes reporting into the shared store
+                    total_rss = 0
+                    proc_count = 0
+                    now_ts = int(time.time())
+                    try:
+                        keys = self._shared_store.keys()
+                        for k in keys:
+                            if isinstance(k, str) and k.startswith('proc_mem_rss_bytes:'):
+                                pid = k.split(':', 1)[1]
+                                # Liveness check: heartbeat within last 45 seconds
+                                alive_ts = self._shared_store.get(f'proc_alive_ts:{pid}', 0)
+                                if isinstance(alive_ts, (int, float)):
+                                    alive_ok = (now_ts - int(alive_ts)) <= 45
+                                else:
+                                    alive_ok = False
+                                if not alive_ok:
+                                    # Clean stale entries
+                                    try:
+                                        self._shared_store.delete(k)
+                                        self._shared_store.delete(f'proc_alive_ts:{pid}')
+                                    except Exception:
+                                        pass
+                                    continue
+                                try:
+                                    val = int(self._shared_store.get(k, 0) or 0)
+                                except Exception:
+                                    val = 0
+                                if val > 0:
+                                    total_rss += val
+                                    proc_count += 1
+                        try:
+                            # 'proc_count' is not required externally; only publish cur_mem_mb
+                            self._shared_store.set('cur_mem_mb', total_rss // 1048576)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                    # Aggregate mm and partial-mm counters into averages and counts
+                    try:
+                        keys = self._shared_store.keys()
+                        mm_counts = {}
+                        mm_averages = {}
+                        p_counts = {}
+                        p_averages = {}
+                        for k in keys:
+                            if not isinstance(k, str):
+                                continue
+                            if k.startswith('mm_count:'):
+                                try:
+                                    mm = int(k.split(':', 1)[1])
+                                except Exception:
+                                    continue
+                                cnt = int(self._shared_store.get(k, 0) or 0)
+                                tot = int(self._shared_store.get(f'mm_time_total_ms:{mm}', 0) or 0)
+                                if cnt > 0:
+                                    mm_counts[mm] = cnt
+                                    mm_averages[mm] = round(tot / cnt / 1000.0, 3)
+                            elif k.startswith('partial_mm_count:'):
+                                try:
+                                    mm = int(k.split(':', 1)[1])
+                                except Exception:
+                                    continue
+                                cnt = int(self._shared_store.get(k, 0) or 0)
+                                tot = int(self._shared_store.get(f'partial_mm_time_total_ms:{mm}', 0) or 0)
+                                if cnt > 0:
+                                    p_counts[mm] = cnt
+                                    p_averages[mm] = round(tot / cnt / 1000.0, 3)
+                        # Publish aggregated views only when non-empty; otherwise remove
+                        try:
+                            if mm_counts:
+                                self._shared_store.set('mm_counts', mm_counts)
+                                self._shared_store.set('mm_averages', mm_averages)
+                            else:
+                                try:
+                                    self._shared_store.delete('mm_counts')
+                                    self._shared_store.delete('mm_averages')
+                                except Exception:
+                                    pass
+
+                            if p_counts:
+                                self._shared_store.set('partial_mm_counts', p_counts)
+                                self._shared_store.set('partial_mm_averages', p_averages)
+                            else:
+                                try:
+                                    self._shared_store.delete('partial_mm_counts')
+                                    self._shared_store.delete('partial_mm_averages')
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
                     snap = self._shared_store.snapshot()
-                    log.info("STATS: %s", snap)
+                    # Hide internal per-process and batching keys from logs
+                    try:
+                        def _is_internal(k):
+                            return (
+                                (isinstance(k, str) and (
+                                    k.startswith('proc_mem_rss_bytes') or
+                                    k.startswith('proc_alive_ts') or
+                                    k.startswith('mm_count:') or
+                                    k.startswith('mm_time_total_ms:') or
+                                    k.startswith('partial_mm_count:') or
+                                    k.startswith('partial_mm_time_total_ms:')
+                                )) or k in ('proc_count',)
+                            )
+                        filtered = {k: v for k, v in snap.items() if not _is_internal(k)}
+                    except Exception:
+                        filtered = snap
+
+                    # Ensure nested dicts are logged with numerically sorted keys
+                    try:
+                        for _name in ('mm_counts', 'mm_averages', 'partial_mm_counts', 'partial_mm_averages'):
+                            _val = filtered.get(_name)
+                            if isinstance(_val, dict) and _val:
+                                try:
+                                    sorted_items = sorted(_val.items(), key=lambda kv: int(kv[0]))
+                                except Exception:
+                                    sorted_items = sorted(_val.items(), key=lambda kv: kv[0])
+                                filtered[_name] = {k: v for k, v in sorted_items}
+                    except Exception:
+                        pass
+                    log.info("STATS: %s", filtered)
                 except Exception as e:
                     log.debug("reporter(): %s", e)
 

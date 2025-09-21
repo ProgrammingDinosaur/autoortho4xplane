@@ -6,6 +6,7 @@ from mfusepy import FUSE
 import sys
 
 from autoortho_fuse import AutoOrtho, fuse_option_profiles_by_os
+from aostats import update_process_memory_stat, clear_process_memory_stat
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,11 @@ def main():
     )
 
     try:
+        # Initial heartbeat before mounting
+        try:
+            update_process_memory_stat()
+        except Exception:
+            pass
         FUSE(AutoOrtho(args.root, use_ns=True), os.path.abspath(args.mountpoint), **additional_args)
         log.info(f"FUSE: Exiting mount {args.mountpoint}")
     except Exception as e:
@@ -84,6 +90,10 @@ def main():
             shutdown()
         except Exception as e:
             log.error(f"Error stopping stats batcher: {e}")
+            pass
+        try:
+            clear_process_memory_stat()
+        except Exception:
             pass
 
 

@@ -5,12 +5,12 @@ import shutil
 import subprocess
 import uuid
 from logging import getLogger
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 from aoconfig import CFG
 from utils.constants import system_type
 
-logger = getLogger(__name__)
+log = getLogger(__name__)
 
 
 class DsfUtils:
@@ -26,8 +26,10 @@ class DsfUtils:
         self.ao_path = CFG.paths.scenery_path
         self.global_scenery_path = os.path.join(self.xplane_path, "Global Scenery", "X-Plane 12 Global Scenery", "Earth Nav Data")
         self.demo_scenery_path = os.path.join(self.xplane_path, "Global Scenery", "X-Plane 12 Demo Areas", "Earth Nav Data")
-        self.overlay_scenery_path = os.path.join(self.ao_path, "yAutoOrtho_Overlays", "Earth Nav Data")
         self.dsf_dir = CFG.paths.dsf_dir
+
+    def get_scenery_dsf_backup_dir(self, scenery_name):
+        return os.path.join(self.ao_path, "z_autoortho", "scenery", scenery_name, "dsf_backups")
 
     def get_dsf_tool_location(self):
         if system_type == "windows":
@@ -42,45 +44,18 @@ class DsfUtils:
         binary_name = "DSFTool.exe" if system_type == "windows" else "DSFTool"
         return os.path.join(base_dir, "lib", lib_subfolder, binary_name)
 
-    def get_dsf_folder_location(self, dsf_name, is_overlay=False):
+    def get_dsf_folder_location(self, dsf_folder, dsf_filename):
         # remove .dsf from the end of the dsf name
-        dsf_name = dsf_name.rstrip(".dsf")
-        lat = str(dsf_name[:3])
-        lon = str(dsf_name[3:])
-        positive_lat = lat.startswith("+")
-        positive_lon = lon.startswith("+")
-        lat = lat.replace("+", "")
-        lon = lon.replace("+", "")
-        lat = float(lat)
-        lon = float(lon)
-
-        folder_lat = str(int(lat // self.GRID) * self.GRID)
-        folder_lon = str(int(lon // self.GRID) * self.GRID)
-
-        if positive_lat:
-            folder_lat = "+" + folder_lat
-        if positive_lon:
-            folder_lon = "+" + folder_lon
-
-        if len(folder_lon) == 3:
-            folder_lon = folder_lon[:1] + "0" + folder_lon[1:]
         
-        if is_overlay:
-            tentative_path = os.path.join(self.overlay_scenery_path, f"{folder_lat}{folder_lon}")
-            if os.path.exists(tentative_path):
-                return tentative_path
-            else:
-                raise Exception(f"Overlay DSF file does not exist in {self.overlay_scenery_path}")
+        tentative_path = os.path.join(self.global_scenery_path, dsf_folder, dsf_filename)
+        if os.path.exists(tentative_path):
+            return tentative_path
         else:
-            tentative_path = os.path.join(self.global_scenery_path, f"{folder_lat}{folder_lon}")
-            if os.path.exists(tentative_path):
-                return tentative_path
+            fallback_path = os.path.join(self.demo_scenery_path, dsf_folder, dsf_filename)
+            if os.path.exists(fallback_path):
+                return fallback_path
             else:
-                fallback_path = os.path.join(self.demo_scenery_path, f"{folder_lat}{folder_lon}")
-                if os.path.exists(fallback_path):
-                    return fallback_path
-                else:
-                    raise Exception(f"Global DSF file does not exist in {tentative_path} or {fallback_path}")
+                raise Exception(f"Global DSF file does not exist in {tentative_path} or {fallback_path}")
     
     def convert_dsf_to_txt(self, dsf_file_path, txt_file_path):
         command = [
@@ -93,19 +68,19 @@ class DsfUtils:
             result = subprocess.run(
                 command,
                 check=True,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
             return result.returncode == 0
         except subprocess.CalledProcessError as e:
-            logger.error(
+            log.error(
                 "DSFTool dsf2text failed for %s: %s",
                 dsf_file_path,
                 e.stderr.decode(errors="ignore"),
             )
             return False
         except OSError as e:
-            logger.error("Failed to execute DSFTool at %s: %s", self.dsf_tool_location, e)
+            log.error("Failed to execute DSFTool at %s: %s", self.dsf_tool_location, e)
             return False
 
     def convert_txt_to_dsf(self, txt_file_path, dsf_file_path):
@@ -119,61 +94,56 @@ class DsfUtils:
             result = subprocess.run(
                 command,
                 check=True,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
             return result.returncode == 0
         except subprocess.CalledProcessError as e:
-            logger.error(
+            log.error(
                 "DSFTool text2dsf failed for %s: %s",
                 txt_file_path,
                 e.stderr.decode(errors="ignore"),
             )
             return False
         except OSError as e:
-            logger.error("Failed to execute DSFTool at %s: %s", self.dsf_tool_location, e)
+            log.error("Failed to execute DSFTool at %s: %s", self.dsf_tool_location, e)
             return False
 
-    def add_season_to_dsf_txt(self, dsf_to_parse_location, cache_dir):
-        # get the name of the dsf to parse
-        os.makedirs(cache_dir, exist_ok=True)
-        process_dsf_name = os.path.basename(dsf_to_parse_location)
-        global_dsf_folder_location = self.get_dsf_folder_location(process_dsf_name)
-        ao_overlay_dsf_folder_location = self.get_dsf_folder_location(process_dsf_name, is_overlay=True)
-        global_dsf_file_path = os.path.join(global_dsf_folder_location, process_dsf_name)
-        ao_overlay_dsf_file_path = os.path.join(ao_overlay_dsf_folder_location, process_dsf_name)
-
-        ao_mesh_dsf_txt_file_path = f"{os.path.join(cache_dir, f"ao_{process_dsf_name}.txt")}"
-        global_dsf_txt_file_path = f"{os.path.join(cache_dir, f"global_{process_dsf_name}.txt")}"
-        ao_overlay_dsf_txt_file_path = f"{os.path.join(cache_dir, f"ao_overlay_{process_dsf_name}.txt")}"
+    def add_season_to_dsf_txt(self, package_name, dsf_folder, dsf_filename, cache_dir, processed_dsf_seasons):
 
         skip_main_dsf = False
+        if dsf_folder in processed_dsf_seasons:
+            if dsf_filename in processed_dsf_seasons[dsf_folder]:
+                log.info(f"DSF {dsf_folder}/{dsf_filename} already processed")
+                return True
+
+        # get the name of the dsf to parse
+        os.makedirs(cache_dir, exist_ok=True)
+        dsf_to_parse_location = os.path.join(self.ao_path, "z_autoortho", "scenery", package_name, "Earth Nav Data", dsf_folder, dsf_filename)
+        global_dsf_file_path = self.get_dsf_folder_location(dsf_folder, dsf_filename)
+
+        ao_mesh_dsf_txt_file_path = f"{os.path.join(cache_dir, f"ao_{dsf_filename}.txt")}"
+        global_dsf_txt_file_path = f"{os.path.join(cache_dir, f"global_{dsf_filename}.txt")}"
+
         if self.convert_dsf_to_txt(dsf_to_parse_location, ao_mesh_dsf_txt_file_path):
             with open(ao_mesh_dsf_txt_file_path, "r") as file:
                 for line in file:
                     if line.startswith("RASTER_"):
-                        logger.info(f"Found RASTER line, skipping file")
+                        log.debug(f"Found RASTER line, skipping file")
                         skip_main_dsf = True
                         break
         else:
-            raise Exception(f"Failed to convert {dsf_to_parse_location} to txt")
+            log.error(f"Failed to convert {dsf_to_parse_location} to txt")
+            shutil.rmtree(cache_dir)
+            log.debug(f"Removed cache directory {cache_dir}")
+            return False
 
-        skip_overlay_dsf = False
-        if os.path.exists(ao_overlay_dsf_file_path) and self.convert_dsf_to_txt(ao_overlay_dsf_file_path, ao_overlay_dsf_txt_file_path):
-            with open(ao_overlay_dsf_txt_file_path, "r") as file:
-                for line in file:
-                    if line.startswith("RASTER_"):
-                        logger.info(f"Found RASTER line, skipping file")
-                        skip_overlay_dsf = True      
-                        break
-        else:
-            # If overlay DSF doesn't exist, skip overlay processing
-            skip_overlay_dsf = True
-            logger.info("Overlay DSF not found or failed to convert; skipping overlay for this tile")
 
-        if skip_main_dsf and skip_overlay_dsf:
-            logger.info(f"Skipping {dsf_to_parse_location} because it is already processed")
-            return
+        if skip_main_dsf:
+            log.info(f"Skipping {dsf_to_parse_location} because it is already processed")
+            shutil.rmtree(cache_dir)
+            log.debug(f"Removed cache directory {cache_dir}")
+            return True
 
         raster_refs = []
         on_raster_refs = False
@@ -188,134 +158,226 @@ class DsfUtils:
                     else:
                         continue
         else:
-            raise Exception(f"Failed to convert {global_dsf_file_path} to txt")
+            log.error(f"Failed to convert {global_dsf_file_path} to txt")
+            shutil.rmtree(cache_dir)
+            log.debug(f"Removed cache directory {cache_dir}")
+            return False
 
         if not raster_refs:
-            logger.error(f"Global DSF file {global_dsf_file_path} does not contain any raster refs")
-            return
+            log.error(f"Global DSF file {global_dsf_file_path} does not contain any raster refs")
+            shutil.rmtree(cache_dir)
+            log.debug(f"Removed cache directory {cache_dir}")
+            return False
+
 
         if not skip_main_dsf:
             with open(ao_mesh_dsf_txt_file_path, "a") as file:
-                for raster_ref in raster_refs:
-                    file.write(raster_ref)
+                for ref in raster_refs:
+                    file.write(ref)
 
-        if not skip_overlay_dsf:
-            with open(ao_overlay_dsf_txt_file_path, "a") as file:
-                for raster_ref in raster_refs:
-                    file.write(raster_ref)
 
-        temp_mesh_dsf_file_path = f"{os.path.join(cache_dir, f"temp_mesh_{process_dsf_name}")}" 
-        temp_overlay_dsf_file_path = f"{os.path.join(cache_dir, f"temp_overlay_{process_dsf_name}")}" 
+        temp_mesh_dsf_file_path = f"{os.path.join(cache_dir, f"temp_mesh_{dsf_filename}")}" 
 
         if not skip_main_dsf:
             if self.convert_txt_to_dsf(ao_mesh_dsf_txt_file_path, temp_mesh_dsf_file_path):
-                logger.info(f"Built temp mesh DSF for {dsf_to_parse_location}")
+                log.debug(f"Built temp mesh DSF for {dsf_to_parse_location}")
             else:
-                raise Exception(f"Failed to build temp mesh DSF for {dsf_to_parse_location}")
-
-        if not skip_overlay_dsf:
-            if self.convert_txt_to_dsf(ao_overlay_dsf_txt_file_path, temp_overlay_dsf_file_path):
-                logger.info(f"Built temp overlay DSF for {ao_overlay_dsf_file_path}")
-            else:
-                raise Exception(f"Failed to build temp overlay DSF for {ao_overlay_dsf_file_path}")
-
-        if not skip_overlay_dsf:
-            shutil.copy(ao_overlay_dsf_file_path, ao_overlay_dsf_file_path + ".bak")
-            logger.info(f"Backed up old {ao_overlay_dsf_file_path}")
-            shutil.move(temp_overlay_dsf_file_path, ao_overlay_dsf_file_path)
-            logger.info(f"Moved new {temp_overlay_dsf_file_path} to {ao_overlay_dsf_file_path}")
+                log.error(f"Failed to build temp mesh DSF for {dsf_to_parse_location}")
+                shutil.rmtree(cache_dir)
+                log.debug(f"Removed cache directory {cache_dir}")
+                return False
 
         if not skip_main_dsf:
-            shutil.copy(dsf_to_parse_location, dsf_to_parse_location + ".bak")
-            logger.info(f"Backed up old {dsf_to_parse_location}")
+            main_backup_dir = os.path.join(self.get_scenery_dsf_backup_dir(package_name), dsf_folder)
+            os.makedirs(main_backup_dir, exist_ok=True)
+            backup_path = os.path.join(main_backup_dir, dsf_filename + ".bak")
+            if not os.path.exists(backup_path):
+                shutil.copy(dsf_to_parse_location, backup_path)
+                log.debug(f"Backed up old {dsf_to_parse_location}")
+            else:
+                log.debug(f"Backup exists for {backup_path}")
+
             shutil.move(temp_mesh_dsf_file_path, dsf_to_parse_location)
-            logger.info(f"Moved new {temp_mesh_dsf_file_path} to {dsf_to_parse_location}")
+            log.debug(f"Moved new {temp_mesh_dsf_file_path} to {dsf_to_parse_location}")
 
         shutil.rmtree(cache_dir)
-        logger.info(f"Removed cache directory {cache_dir}")
+        log.debug(f"Removed cache directory {cache_dir}")
 
-        return
+        return True
 
     def scan_for_dsfs(self, scenery_package_path):
-        dsf_files_list = []
+        total_dsfs = 0
+        dsf_folder_files = {}
         dsf_folders = os.path.join(self.ao_path, "z_autoortho", "scenery", scenery_package_path, "Earth Nav Data")
-        logger.info(f"Scanning for dsfs in {dsf_folders}")
+        log.debug(f"Scanning for dsfs in {dsf_folders}")
         if not os.path.isdir(dsf_folders):
-            return []
+            return {}, 0
         for folder in os.listdir(dsf_folders):
             if os.path.isdir(os.path.join(dsf_folders, folder)):
                 for file in os.listdir(os.path.join(dsf_folders, folder)):
                     if file.endswith(".dsf"):
-                        dsf_files_list.append(os.path.join(dsf_folders, folder, file))
-        return dsf_files_list
+                        if folder not in dsf_folder_files:
+                            dsf_folder_files[folder] = []
+                        dsf_folder_files[folder].append(os.path.join(file))
+                        total_dsfs += 1
+        log.debug(f"Found {total_dsfs} dsfs in {scenery_package_path}")
+        return dsf_folder_files, total_dsfs
 
-    def add_seasons_to_package(self, scenery_name:str, progress_callback=None, concurent_processes=None):
+    def add_seasons_to_package(self, scenery_name:str, progress_callback=None):
         # try to load a json file that contains the list of dsfs that have already been processed
-        logger.info(f"Adding seasons to {scenery_name}")
+        log.debug(f"Adding seasons to {scenery_name}")
         scenery_info_json = os.path.join(self.ao_path, "z_autoortho", scenery_name.replace("z_ao_", "") + "_info.json")
         if os.path.exists(scenery_info_json):
             with open(scenery_info_json, "r") as file:
                 scenery_info = json.load(file)
-                dsf_files_list = scenery_info.get("dsf_files_list", [])
-                pending_dsf_seasons = scenery_info.get("pending_dsf_seasons", [])
+                dsf_folder_files = scenery_info.get("dsf_folder_files", {})
+                processed_dsf_seasons = scenery_info.get("processed_dsf_seasons", {})
+                total_dsfs = scenery_info.get("total_dsfs", 0)
         else:
             scenery_info = {}
-            dsf_files_list = []
-            pending_dsf_seasons = []
+            dsf_folder_files = {}
+            total_dsfs = 0
+            processed_dsf_seasons = {}
 
-        if not dsf_files_list and not pending_dsf_seasons:
-            dsf_files_list = self.scan_for_dsfs(scenery_name)
-            pending_dsf_seasons = dsf_files_list.copy()
-            logger.info(f"Found {len(dsf_files_list)} dsfs and {len(pending_dsf_seasons)} pending dsf seasons in {scenery_name}")
+        if not dsf_folder_files and not processed_dsf_seasons:
+            dsf_folder_files, total_dsfs = self.scan_for_dsfs(scenery_name)
+            log.debug(f"Found {total_dsfs} dsf seasons in {scenery_name}")
 
-        if concurent_processes is None:
-            concurent_processes = min(os.cpu_count(), 8)
+        
 
         files_done = 0
         failures = 0
-        files_total = len(pending_dsf_seasons)
+        workers = int(CFG.seasons.seasons_convert_workers)
 
         if progress_callback:
-            progress_callback({"pcnt_done": 0, "status": "Processing...", "files_done": files_done, "files_total": files_total})
+            progress_callback({"pcnt_done": 0, "status": "Processing...", "files_done": files_done, "files_total": total_dsfs})
 
-        with ThreadPoolExecutor(max_workers=concurent_processes) as executor:
-            future_to_dsf = {
-                executor.submit(
-                    self.add_season_to_dsf_txt,
-                    dsf_file,
-                    os.path.join(self.dsf_dir, str(uuid.uuid4())),
-                ): dsf_file
-                for dsf_file in list(pending_dsf_seasons)
-                if dsf_file in dsf_files_list
-            }
+        # Stream tasks into the executor instead of queueing all at once
+        def _iter_tasks():
+            for dsf_folder, dsf_files in dsf_folder_files.items():
+                for dsf_file in dsf_files:
+                    yield dsf_folder, dsf_file
 
-            for future in as_completed(future_to_dsf):
-                dsf_file = future_to_dsf[future]
-                try:
-                    future.result()
-                    if dsf_file in pending_dsf_seasons:
-                        pending_dsf_seasons.remove(dsf_file)
-                    files_done += 1
-                except Exception as e:
-                    logger.error(f"Error adding season to {dsf_file}: {e}")
-                    failures += 1
-                finally:
-                    if progress_callback:
-                        pcnt = int((files_done / files_total) * 100) if files_total else 100
-                        progress_callback({"pcnt_done": pcnt, "files_done": files_done, "files_total": files_total, "failures": failures})
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            tasks = _iter_tasks()
+            in_flight = {}
+
+            # Prime up to max workers
+            try:
+                for _ in range(max(1, workers)):
+                    dsf_folder, dsf_file = next(tasks)
+                    fut = executor.submit(
+                        self.add_season_to_dsf_txt,
+                        scenery_name,
+                        dsf_folder,
+                        dsf_file,
+                        os.path.join(self.dsf_dir, str(uuid.uuid4())),
+                        processed_dsf_seasons,
+                    )
+                    in_flight[fut] = (dsf_folder, dsf_file)
+            except StopIteration:
+                pass
+
+            while in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    dsf_folder, dsf_file = in_flight.pop(future)
+                    try:
+                        success = future.result()
+                        if success:
+                            if dsf_folder not in processed_dsf_seasons:
+                                processed_dsf_seasons[dsf_folder] = [dsf_file]
+                            elif dsf_file not in processed_dsf_seasons[dsf_folder]:
+                                processed_dsf_seasons[dsf_folder].append(dsf_file)
+                        else:
+                            log.error(f"Failed to add season to {dsf_folder}/{dsf_file}")
+                            failures += 1
+                        files_done += 1
+                    except Exception as e:
+                        log.error(f"Error adding season to {dsf_folder}/{dsf_file}: {e}")
+                        failures += 1
+                        files_done += 1
+                    finally:
+                        if progress_callback:
+                            pcnt = int((files_done / total_dsfs) * 100) if total_dsfs else 100
+                            progress_callback({"pcnt_done": pcnt, "files_done": files_done, "files_total": total_dsfs, "failures": failures})
+
+                    # Keep the pipeline full
+                    try:
+                        dsf_folder, dsf_file = next(tasks)
+                        fut = executor.submit(
+                            self.add_season_to_dsf_txt,
+                            scenery_name,
+                            dsf_folder,
+                            dsf_file,
+                            os.path.join(self.dsf_dir, str(uuid.uuid4())),
+                            processed_dsf_seasons,
+                        )
+                        in_flight[fut] = (dsf_folder, dsf_file)
+                    except StopIteration:
+                        pass
         
         # only change the keys we need to change
         scenery_info.update({
-            "dsf_files_list": dsf_files_list,
-            "pending_dsf_seasons": pending_dsf_seasons
+            "dsf_folder_files": dsf_folder_files,
+            "processed_dsf_seasons": processed_dsf_seasons,
+            "total_dsfs": total_dsfs
         })
         tmp_path = scenery_info_json + ".tmp"
         with open(tmp_path, "w") as file:
             json.dump(scenery_info, file, indent=4)
         os.replace(tmp_path, scenery_info_json)
 
-        return pending_dsf_seasons == []
+        return processed_dsf_seasons == dsf_folder_files
+
+
+    def restore_default_dsfs(self, scenery_name:str, progress_callback=None):
+        log.debug(f"Restoring default DSFs for {scenery_name}")
+        scenery_info_json = os.path.join(self.ao_path, "z_autoortho", scenery_name.replace("z_ao_", "") + "_info.json")
+        if os.path.exists(scenery_info_json):
+            with open(scenery_info_json, "r") as file:
+                scenery_info = json.load(file)
+                dsf_folder_files = scenery_info.get("dsf_folder_files", {})
+        else:
+            log.error(f"Scenery info json does not exist for {scenery_name}")
+            return False
+        
+        files_done = 0
+        total_dsfs = scenery_info.get("total_dsfs", 0)
+        if progress_callback:
+            progress_callback({"pcnt_done": 0, "status": "Restoring default DSFs...", "files_done": files_done, "files_total": total_dsfs})
+
+        for dsf_folder, dsf_files in dsf_folder_files.items():
+            for dsf_file in dsf_files:
+                folder_backup_path = os.path.join(self.get_scenery_dsf_backup_dir(scenery_name), dsf_folder)
+
+                dsf_file_path = os.path.join(self.ao_path, "z_autoortho", "scenery", scenery_name, "Earth Nav Data", dsf_folder, dsf_file)
+                backup_path = os.path.join(self.get_scenery_dsf_backup_dir(scenery_name), dsf_folder, dsf_file + ".bak")
+                if os.path.exists(backup_path):
+                    os.remove(dsf_file_path)
+                    shutil.move(backup_path, dsf_file_path)
+                    log.debug(f"Moved new {backup_path} to {dsf_file_path}")
+                else:
+                    log.debug(f"Backup does not exist for {dsf_file_path}")
+
+                files_done += 1
+                if progress_callback:
+                    pcnt = int((files_done / total_dsfs) * 100) if total_dsfs else 100
+                    progress_callback({"pcnt_done": pcnt, "files_done": files_done, "files_total": total_dsfs})
+            shutil.rmtree(folder_backup_path)
+            log.debug(f"Removed backup directory {folder_backup_path}")
+        
+        # reset fields in scenery info json
+        scenery_info.update({
+            "processed_dsf_seasons": {},
+        })
+        tmp_path = scenery_info_json + ".tmp"
+        with open(tmp_path, "w") as file:
+            json.dump(scenery_info, file, indent=4)
+        os.replace(tmp_path, scenery_info_json)
                     
+        return True
+        
 
 dsf_utils = DsfUtils()
 

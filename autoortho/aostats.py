@@ -4,6 +4,7 @@ import threading
 import collections
 from collections.abc import MutableMapping
 from multiprocessing.managers import BaseManager
+import psutil
 
 
 from aoconfig import CFG
@@ -144,6 +145,43 @@ def inc_many(items: dict):
         with _local_lock:
             for k, v in items.items():
                 _local_stats[k] = _local_stats.get(k, 0) + int(v)
+
+
+def delete_stat(stat: str):
+    """Delete a stat from the shared store or local fallback."""
+    if _store:
+        try:
+            _store.delete(stat)
+        except Exception:
+            pass
+    else:
+        with _local_lock:
+            _local_stats.pop(stat, None)
+
+
+def update_process_memory_stat():
+    """Update this process's RSS and heartbeat in the shared stats store.
+
+    Writes two keys:
+      - proc_mem_rss_bytes:<pid> = RSS in bytes
+      - proc_alive_ts:<pid> = unix timestamp of last heartbeat
+    """
+    try:
+        pid = os.getpid()
+        rss = psutil.Process(pid).memory_info().rss
+        now_ts = int(time.time())
+        set_stat(f"proc_mem_rss_bytes:{pid}", int(rss))
+        set_stat(f"proc_alive_ts:{pid}", now_ts)
+    except Exception as _err:
+        # Best-effort; ignore failures
+        log.debug(f"update_process_memory_stat: {_err}")
+
+
+def clear_process_memory_stat():
+    """Remove this process's memory/heartbeat keys from the stats store."""
+    pid = os.getpid()
+    delete_stat(f"proc_mem_rss_bytes:{pid}")
+    delete_stat(f"proc_alive_ts:{pid}")
 
 
 class AOStats(object):
