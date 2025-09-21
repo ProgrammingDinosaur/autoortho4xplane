@@ -854,7 +854,7 @@ class Tile(object):
 
         # Get effective zoom  
         zoom = min((self.max_zoom - mipmap), self.max_zoom)
-        log.debug(f"GET_IMG: Default tile zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
+        log.debug(f"GET_IMG: Default tile zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(zoom, min_zoom)
         log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")        
         
@@ -998,7 +998,7 @@ class Tile(object):
         log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
 
         if seasons_enabled:
-            saturation = 0.01 * ao_seasons.saturation(self.row, self.col, self.zoom)
+            saturation = 0.01 * ao_seasons.saturation(self.row, self.col, self.tilename_zoom)
             if saturation < 1.0:    # desaturation is expensive
                 new_im = new_im.copy().desaturate(saturation)
         # Return image along with mipmap and zoom level this was created at

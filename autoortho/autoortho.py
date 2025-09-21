@@ -680,7 +680,8 @@ class AOMount:
             t.join(5)
             log.info(f"Thread {t.ident} exited.")
 
-        self.stop_macfuse_workers()
+        if system_type == "darwin":
+            self.stop_macfuse_workers()
 
         self.stop_stats_manager()
 

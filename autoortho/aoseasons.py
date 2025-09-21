@@ -1,5 +1,6 @@
 import struct, re, os, math, time, datetime, atexit
 import py7zr
+import py7zr.io
 
 from aoconfig import CFG
 from aostats import STATS, StatTracker, inc_stat
@@ -46,21 +47,66 @@ class AoDsfSeason():
             if not os.path.isfile(dsf_name_full):
                 return
 
-            self.f = py7zr.SevenZipFile(dsf_name_full).readall()[dsf_name]
+            # Use new py7zr factory API to extract DSF into memory (only the target file)
+            with py7zr.SevenZipFile(dsf_name_full, mode='r') as archive:
+                # Find archive member that matches our DSF (exact or suffix)
+                arc_names = archive.getnames()
+                target_name = None
+                for n in arc_names:
+                    if n == dsf_name or n.endswith("/" + dsf_name) or n.endswith("\\" + dsf_name) or n.endswith(dsf_name):
+                        target_name = n
+                        break
 
-            self.f.seek(0, os.SEEK_END)
-            file_len = self.f.tell()
-            #print(file_len)
-            self.f.seek(0, os.SEEK_SET)
-            file_len -= 16  # footer
+                if not target_name:
+                    return
 
-            buf = self.f.read(12)
-            cockie, version = struct.unpack("<8sI", buf)
-            #print(cockie, version)
+                # Determine a safe in-memory buffer limit based on file metadata
+                try:
+                    info = archive.getinfo(target_name)
+                except Exception:
+                    info = None
 
-            self._decode_atom(file_len - 12, 0)
+                uncompressed = None
+                if info is not None:
+                    # Try multiple attribute names to be compatible across versions
+                    for attr in ("uncompressed", "uncompressed_size", "size"):
+                        val = getattr(info, attr, None)
+                        if isinstance(val, int) and val > 0:
+                            uncompressed = val
+                            break
 
-        self.f.close()
+                if not uncompressed:
+                    uncompressed = 128 * 1024 * 1024  # 128 MiB conservative default
+
+                limit = int(uncompressed) + (1 * 1024 * 1024)  # +1 MiB headroom
+
+                factory = py7zr.io.BytesIOFactory(limit=limit)
+                archive.extract(targets=[target_name], factory=factory)
+
+                fobj = factory.products.get(target_name)
+                if fobj is None:
+                    return
+
+                self.f = fobj
+
+                # Compute file length using size() when tell() is not available
+                try:
+                    file_len = self.f.size()
+                except Exception:
+                    self.f.seek(0, os.SEEK_END)
+                    file_len = self.f.tell()
+                    self.f.seek(0, os.SEEK_SET)
+                file_len -= 16  # footer
+
+                buf = self.f.read(12)
+                cockie, version = struct.unpack("<8sI", buf)
+
+                self._decode_atom(file_len - 12, 0)
+
+        try:
+            self.f.close()
+        except Exception:
+            pass
         self.f = None   # reduce memory footprint
 
         i = 0

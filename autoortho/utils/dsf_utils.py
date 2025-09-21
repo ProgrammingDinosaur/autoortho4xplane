@@ -15,9 +15,13 @@ log = getLogger(__name__)
 
 class DsfUtils:
 
-    GRID = 10
-    SEASONS_LINES = [
-
+    SAFE_RASTERS = [
+        "spr",
+        "win",
+        "fal",
+        "sum",
+        "soundscape",
+        "elevation",
     ]
 
     def __init__(self):
@@ -27,6 +31,32 @@ class DsfUtils:
         self.global_scenery_path = os.path.join(self.xplane_path, "Global Scenery", "X-Plane 12 Global Scenery", "Earth Nav Data")
         self.demo_scenery_path = os.path.join(self.xplane_path, "Global Scenery", "X-Plane 12 Demo Areas", "Earth Nav Data")
         self.dsf_dir = CFG.paths.dsf_dir
+        self.seven_zip_dir = self.get_7zip_location()    # compressing dsf files
+
+    def compress_dsf_file(self, dsf_to_compress_path, compressed_dsf_path) -> bool:
+        command = [
+            self.seven_zip_dir,
+            "a",
+            "-t7z",
+            "-m0=lzma",
+            compressed_dsf_path,
+            dsf_to_compress_path,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            return result.returncode == 0
+        except subprocess.CalledProcessError as e:
+            log.error(f"Failed to compress {dsf_to_compress_path} to {compressed_dsf_path}: {e}")
+            return False
+        except OSError as e:
+            log.error(f"Failed to execute 7-zip at {self.seven_zip_dir}: {e}")
+            return False
+
 
     def get_scenery_dsf_backup_dir(self, scenery_name):
         return os.path.join(self.ao_path, "z_autoortho", "scenery", scenery_name, "dsf_backups")
@@ -43,6 +73,18 @@ class DsfUtils:
         base_dir = os.path.dirname(os.path.dirname(__file__))
         binary_name = "DSFTool.exe" if system_type == "windows" else "DSFTool"
         return os.path.join(base_dir, "lib", lib_subfolder, binary_name)
+
+    def get_7zip_location(self):
+        if system_type == "windows":
+            lib_dir = "windows/7zip/7za.exe"
+        elif system_type == "linux":
+            lib_dir = "linux/7zip/7zz"
+        elif system_type == "darwin":
+            lib_dir = "macos/7zip/7zz"
+        else:
+            raise ValueError(f"Unsupported system type: {system_type}")
+        base_dir = os.path.dirname(os.path.dirname(__file__))
+        return os.path.join(base_dir, "lib", lib_dir)
 
     def get_dsf_folder_location(self, dsf_folder, dsf_filename):
         # remove .dsf from the end of the dsf name
@@ -111,6 +153,8 @@ class DsfUtils:
 
     def add_season_to_dsf_txt(self, package_name, dsf_folder, dsf_filename, cache_dir, processed_dsf_seasons):
 
+        # BASED on script by hotbso https://github.com/hotbso/o4xp_2_xp12/blob/main/o4xp_2_xp12.py. Credit to him.
+
         skip_main_dsf = False
         if dsf_folder in processed_dsf_seasons:
             if dsf_filename in processed_dsf_seasons[dsf_folder]:
@@ -150,7 +194,7 @@ class DsfUtils:
         if self.convert_dsf_to_txt(global_dsf_file_path, global_dsf_txt_file_path):
             with open(global_dsf_txt_file_path, "r") as file:
                 for line in file:
-                    if line.startswith("RASTER_"):
+                    if line.startswith("RASTER_") and any(raster in line for raster in self.SAFE_RASTERS):
                         on_raster_refs = True
                         raster_refs.append(line)
                     elif on_raster_refs:
@@ -177,6 +221,7 @@ class DsfUtils:
 
 
         temp_mesh_dsf_file_path = f"{os.path.join(cache_dir, f"temp_mesh_{dsf_filename}")}" 
+        compressed_temp_mesh_dsf_file_path = f"{os.path.join(cache_dir, f"temp_mesh_7z_{dsf_filename}")}"
 
         if not skip_main_dsf:
             if self.convert_txt_to_dsf(ao_mesh_dsf_txt_file_path, temp_mesh_dsf_file_path):
@@ -187,7 +232,14 @@ class DsfUtils:
                 log.debug(f"Removed cache directory {cache_dir}")
                 return False
 
-        if not skip_main_dsf:
+            if CFG.seasons.compress_dsf:
+                if self.compress_dsf_file(temp_mesh_dsf_file_path, compressed_temp_mesh_dsf_file_path):
+                    log.debug(f"Compressed temp mesh DSF for {dsf_to_parse_location}")
+                else:
+                    shutil.rmtree(cache_dir)
+                    log.debug(f"Removed cache directory {cache_dir}")
+                    return False
+
             main_backup_dir = os.path.join(self.get_scenery_dsf_backup_dir(package_name), dsf_folder)
             os.makedirs(main_backup_dir, exist_ok=True)
             backup_path = os.path.join(main_backup_dir, dsf_filename + ".bak")
@@ -197,8 +249,9 @@ class DsfUtils:
             else:
                 log.debug(f"Backup exists for {backup_path}")
 
-            shutil.move(temp_mesh_dsf_file_path, dsf_to_parse_location)
-            log.debug(f"Moved new {temp_mesh_dsf_file_path} to {dsf_to_parse_location}")
+            baked_dsf_file_path = compressed_temp_mesh_dsf_file_path if CFG.seasons.compress_dsf else temp_mesh_dsf_file_path
+            shutil.move(baked_dsf_file_path, dsf_to_parse_location)
+            log.debug(f"Moved new {baked_dsf_file_path} to {dsf_to_parse_location}")
 
         shutil.rmtree(cache_dir)
         log.debug(f"Removed cache directory {cache_dir}")

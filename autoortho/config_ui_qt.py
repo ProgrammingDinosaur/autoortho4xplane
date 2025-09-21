@@ -1208,6 +1208,16 @@ class ConfigUI(QMainWindow):
         seasons_convert_workers_row.addWidget(self.seasons_convert_workers_value_label)
         seasons_layout.addLayout(seasons_convert_workers_row)
 
+        # Compress DSF
+
+        compress_dsf_row = QHBoxLayout()
+        self.compress_dsf_check = QCheckBox("Compress DSF after conversion")
+        self.compress_dsf_check.setChecked(self.cfg.seasons.compress_dsf)
+        self.compress_dsf_check.setObjectName('compress_dsf')
+        self.compress_dsf_check.setToolTip("Compress DSF to 7z format after conversion to XP12 format")
+        compress_dsf_row.addWidget(self.compress_dsf_check)
+        seasons_layout.addLayout(compress_dsf_row)
+
         # Initialize enabled state of sliders
         self._set_seasons_controls_enabled(seasons_enabled)
 
@@ -1465,6 +1475,8 @@ class ConfigUI(QMainWindow):
             ):
                 if slider is not None:
                     slider.setEnabled(enabled)
+            if self.compress_dsf_check is not None:
+                self.compress_dsf_check.setEnabled(enabled)
         except Exception:
             pass
 
@@ -2383,20 +2395,13 @@ class ConfigUI(QMainWindow):
             )
 
             # Seasons settings
-            try:
-                seasons_enabled = getattr(self.seasons_enabled_radio, 'isChecked', lambda: False)()
-                self.cfg.seasons.seasons_convert_workers = str(self.seasons_convert_workers_slider.value())
-                self.cfg.seasons.enabled = seasons_enabled
-                if hasattr(self, 'spr_sat_slider'):
-                    self.cfg.seasons.spr_saturation = str(self.spr_sat_slider.value())
-                if hasattr(self, 'sum_sat_slider'):
-                    self.cfg.seasons.sum_saturation = str(self.sum_sat_slider.value())
-                if hasattr(self, 'fal_sat_slider'):
-                    self.cfg.seasons.fal_saturation = str(self.fal_sat_slider.value())
-                if hasattr(self, 'win_sat_slider'):
-                    self.cfg.seasons.win_saturation = str(self.win_sat_slider.value())
-            except Exception:
-                pass
+            self.cfg.seasons.enabled = self.seasons_enabled_radio.isChecked()
+            self.cfg.seasons.compress_dsf = self.compress_dsf_check.isChecked()
+            self.cfg.seasons.seasons_convert_workers = str(self.seasons_convert_workers_slider.value())
+            self.cfg.seasons.spr_saturation = str(self.spr_sat_slider.value())
+            self.cfg.seasons.sum_saturation = str(self.sum_sat_slider.value())
+            self.cfg.seasons.fal_saturation = str(self.fal_sat_slider.value())
+            self.cfg.seasons.win_saturation = str(self.win_sat_slider.value())
 
         self.cfg.save()
         self.ready.set()

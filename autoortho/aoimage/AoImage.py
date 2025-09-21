@@ -109,6 +109,25 @@ class AoImage(Structure):
         _aoi.aoimage_crop(self, c_img, pos[0], pos[1])
         return True
 
+    def copy(self, height_only = 0):
+        new = AoImage()
+        if not _aoi.aoimage_copy(self, new, height_only):
+            log.error(f"AoImage.copy error: {self._errmsg.decode()}")
+            return None
+
+        return new
+
+    
+    def desaturate(self, saturation = 1.0):
+        assert 0.0 <= saturation and saturation <= 1.0
+        if saturation == 1.0 or saturation is None:
+            return self
+
+        if not _aoi.aoimage_desaturate(self, saturation):
+            log.error(f"AoImage.desaturate error: {self._errmsg.decode()}")
+            return None
+        return self
+
 
     @property
     def size(self):
@@ -167,6 +186,8 @@ _aoi.aoimage_tobytes.argtypes = (POINTER(AoImage), c_char_p)
 _aoi.aoimage_from_memory.argtypes = (POINTER(AoImage), c_char_p, c_uint32)
 _aoi.aoimage_paste.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32, c_uint32)
 _aoi.aoimage_crop.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32, c_uint32)
+_aoi.aoimage_copy.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32)
+_aoi.aoimage_desaturate.argtypes = (POINTER(AoImage), c_float)
 
 def main():
     logging.basicConfig(level = logging.DEBUG)

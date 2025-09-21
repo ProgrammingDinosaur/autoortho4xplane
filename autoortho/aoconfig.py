@@ -132,6 +132,7 @@ spr_saturation = 70.0
 sum_saturation = 100.0
 fal_saturation = 80.0
 win_saturation = 55.0
+compress_dsf = True
 
 [windows]
 prefer_winfsp = True
