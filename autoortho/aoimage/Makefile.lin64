@@ -16,7 +16,8 @@ CFLAGS+=-O2 -Wall -fPIC -fdiagnostics-color -fvisibility=hidden \
 LDFLAGS=-shared -rdynamic -nodefaultlibs -undefined_warning -lpthread
 #LIBS=-lturbojpeg
 #LIBS=./linlibturbojpeg.a
-LIBS=-L$(JPGT)/lib -lturbojpeg
+#LIBS=-L$(JPGT)/lib -lturbojpeg
+LIBS=$(JPGT)/lib/linlibturbojpeg.a -lm
 
 all: $(TARGET)
 
