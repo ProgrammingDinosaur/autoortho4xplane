@@ -18,6 +18,7 @@ from urllib.error import URLError, HTTPError
 from datetime import datetime, timezone, timedelta
 from packaging import version
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import Enum
 
 
 from aoconfig import CFG
@@ -37,6 +38,11 @@ def do_url(url, headers={}, ):
 
 
 cur_activity = {}
+
+class SeasonsApplyStatus(Enum):
+    NOT_APPLIED = "not_applied"
+    PARTIALLY_APPLIED = "partially_applied"
+    APPLIED = "applied"
 
 
 class Zip(object):
@@ -400,7 +406,7 @@ class Release(object):
     totalsize = 0
     ver = "0.0.0"
     url = ""
-    
+    seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
     install_name = ""
 
     installed = False
@@ -431,6 +437,10 @@ class Release(object):
         self.subfolder_dir = os.path.join(self.install_dir, "z_autoortho", "scenery", f"z_ao_{self.name}")
         self.ortho_dirs = []
         self.info_ver = "v2"
+        self.dsf_folders_files = {}
+        self.processed_dsf_seasons = {}
+        self.total_dsfs = 0
+        self.missing_xp_tiles = {}
 
         #if os.path.exists(self.info_path):
         #    self.load(self.info_path)
@@ -453,6 +463,35 @@ class Release(object):
         self.installed = True
         self.downloaded = True
         self.cleaned = True
+
+        # Determine seasons status by comparing (processed ∪ missing) to
+        # the expected DSF list, using order-insensitive set logic
+        def _to_dict_of_sets(folder_to_files):
+            normalized = {}
+            for folder, files in (folder_to_files or {}).items():
+                normalized[folder] = set(files)
+            return normalized
+
+        expected = getattr(self, 'dsf_folder_files', None)
+        if expected is None:
+            expected = getattr(self, 'dsf_folders_files', {})
+
+        expected_sets = _to_dict_of_sets(expected)
+
+        merged_sets = _to_dict_of_sets(self.processed_dsf_seasons)
+        for folder, files in (self.missing_xp_tiles or {}).items():
+            if folder not in merged_sets:
+                merged_sets[folder] = set(files)
+            else:
+                merged_sets[folder].update(files)
+
+        if (not expected_sets and not self.processed_dsf_seasons
+                and not self.missing_xp_tiles):
+            self.seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
+        elif merged_sets == expected_sets:
+            self.seasons_apply_status = SeasonsApplyStatus.APPLIED
+        else:
+            self.seasons_apply_status = SeasonsApplyStatus.PARTIALLY_APPLIED
 
         detected_info_ver = info.get('info_ver')
         if self.ortho_dirs and detected_info_ver is None:
@@ -584,7 +623,7 @@ class Release(object):
         self.downloaded = True
         return True
 
-    def install(self, progress_callback=None):
+    def install(self, progress_callback=None, noclean=False):
         if self.installed:
             log.info(f"Already installed {self.name}")
             return True
@@ -603,7 +642,8 @@ class Release(object):
             return False
         self.save()
         self.installed = True
-        self.cleanup()
+        if not noclean:
+            self.cleanup()
         return True
 
     def verify_and_install_all(self, progress_callback=None):
@@ -761,7 +801,7 @@ class Region(object):
         log.debug(f"SORTED: {releases}")
         return releases[0]
 
-    def install_release(self, ver=None, progress_callback=None):
+    def install_release(self, ver=None, progress_callback=None, noclean=False):
 
         if ver is None:
             rel = self.get_latest_release()
@@ -781,7 +821,7 @@ class Region(object):
             log.error(f"Failed to download release {rel}")
             return False
 
-        if not rel.install(progress_callback=progress_callback):
+        if not rel.install(progress_callback=progress_callback, noclean=noclean):
             log.error(f"Failed to install release {rel}")
             return False
 

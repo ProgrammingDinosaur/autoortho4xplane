@@ -240,7 +240,9 @@ class DDS(Structure):
                 log.debug(f"Writing {mipmap.startpos}")
                 h.seek(mipmap.startpos)
                 if mipmap.databuffer is not None:
-                    h.write(mipmap.databuffer.getbuffer())
+                    buf = mipmap.databuffer.getbuffer()
+                    # Write no more than the declared mipmap length to avoid misalignment
+                    h.write(buf[:mipmap.length])
                 log.debug(f"Wrote {h.tell()-mipmap.startpos} bytes")
 
             # Make sure we complete the full file size
@@ -413,13 +415,12 @@ class DDS(Structure):
             )
             result = True
         else:
-            is_rgba = True
-            #print("Will use stb")
-            blocksize = 16
+            # Use STB compressor; honor BC1 (DXT1, 8 bytes/block) vs BC3 (DXT5, 16 bytes/block)
+            use_alpha = (self.dxt_format == "BC3")
+            blocksize = self.blocksize
             dxt_size = ((width+3) >> 2) * ((height+3) >> 2) * blocksize
             outdata = create_string_buffer(dxt_size)
 
-            #print(f"LEN: {len(outdata)}")
             _stb.compress_pixels.argtypes = (
                     c_char_p,
                     c_char_p, 
@@ -432,7 +433,7 @@ class DDS(Structure):
                     c_char_p(data),
                     c_uint64(width), 
                     c_uint64(height), 
-                    c_bool(is_rgba))
+                    c_bool(use_alpha))
 
 
         if not result:

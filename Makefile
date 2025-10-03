@@ -24,6 +24,11 @@ autoortho/.version:
 	echo "$(VERSION)" > $@
 
 bin: autoortho/.version
+	# Ensure required Linux libraries and helper binaries are executable before packaging
+	chmod +x autoortho/lib/linux/7zip/7zz || true
+	chmod +x autoortho/lib/linux/DSFTool || true
+	chmod +x autoortho/lib/linux/*.so || true
+	chmod +x autoortho/aoimage/aoimage.so || true
 	python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--linux-icon=autoortho/imgs/ao-icon.ico \
 		--enable-plugin=pyside6 \
@@ -34,6 +39,11 @@ bin: autoortho/.version
 		./autoortho/__main__.py -o autoortho_lin.bin
 
 __main__.app: autoortho/.version
+	# Ensure required macOS libraries and helper binaries are executable before packaging
+	chmod +x autoortho/lib/macos/7zip/7zz || true
+	chmod +x autoortho/lib/macos/DSFTool || true
+	chmod +x autoortho/lib/macos/*.dylib || true
+	chmod +x autoortho/aoimage/aoimage.dylib || true
 	sudo python3 -m nuitka --verbose --verbose-output=nuitka.log \
 		--assume-yes-for-downloads \
 		--standalone \
@@ -41,6 +51,8 @@ __main__.app: autoortho/.version
 		--macos-target-arch=arm64 \
 		--macos-app-name=AutoOrtho \
 		--macos-app-icon=autoortho/imgs/ao-icon.icns \
+		--include-module=autoortho.macfuse_worker \
+		--include-module=mfusepy \
 		--enable-plugin=pyside6 \
 		--include-data-file=autoortho/.version=autoortho/.version \
 		--include-data-file=./autoortho/templates/*.html=templates/ \

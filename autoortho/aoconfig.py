@@ -74,6 +74,8 @@ download_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "downlo
 log_file = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "autoortho.log")}
 # Directory where the DB that stores tile configuration is stored
 tile_db_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "tile_settings")}
+# Directory where dsf files are cached
+dsf_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "dsf")}
 
 [autoortho]
 # Override map type with a different source
@@ -94,6 +96,8 @@ fetch_threads = 32
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.
 using_custom_tiles = False
+# Color used for missing textures.
+missing_color = [66, 77, 55]
 
 [pydds]
 # ISPC or STB for dds file compression
@@ -119,7 +123,7 @@ noclean = False
 
 [fuse]
 # Enable or disable multi-threading when using FUSE
-threading = True
+threading = {False if system_type == "darwin" else True}
 
 [flightdata]
 # Local port for map and stats
@@ -134,6 +138,15 @@ file_cache_size = 30
 cache_mem_limit = 4
 # Auto clean cache on AutoOrtho exit
 auto_clean_cache = False
+
+[seasons]
+seasons_convert_workers = 4
+enabled = False
+spr_saturation = 70.0
+sum_saturation = 100.0
+fal_saturation = 80.0
+win_saturation = 55.0
+compress_dsf = True
 
 [windows]
 prefer_winfsp = True

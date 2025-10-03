@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 
 from ast import Pass
+import atexit
 import os
-import sys
 import time
-import math
-import tempfile
 import threading
 import concurrent.futures
 import random
@@ -13,6 +11,8 @@ import random
 import subprocess
 import collections
 import uuid
+import math
+from typing import Optional
 
 from io import BytesIO
 from urllib.request import urlopen, Request
@@ -28,7 +28,7 @@ import psutil
 from aoimage import AoImage
 
 from aoconfig import CFG
-from aostats import STATS, StatTracker, set_stat, inc_stat, get_stat
+from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
 from utils.constants import system_type
 from utils.apple_token_service import apple_token_service
 from utils.utils import coord_from_sleepy_tilename
@@ -56,6 +56,69 @@ _decode_sem = threading.Semaphore(_MAX_DECODE)
 tile_stats = StatTracker(20, 12)
 mm_stats = StatTracker(0, 5)
 partial_stats = StatTracker()
+
+stats_batcher = None
+
+def _ensure_stats_batcher():
+    global stats_batcher
+    if stats_batcher is None:
+        try:
+            # Create when a remote store is bound (either via env or parent bind)
+            if getattr(STATS, "_remote", None) is not None or os.getenv("AO_STATS_ADDR"):
+                stats_batcher = StatsBatcher(flush_interval=0.05, max_items=200)
+                atexit.register(stats_batcher.stop)
+        except Exception:
+            stats_batcher = None
+
+
+def bump(key, n=1):
+    _ensure_stats_batcher()
+    if stats_batcher:
+        stats_batcher.add(key, n)
+    else:
+        inc_stat(key, n)
+
+
+def bump_many(d: dict):
+    _ensure_stats_batcher()
+    if stats_batcher:
+        stats_batcher.add_many(d)
+    else:
+        inc_many(d)
+
+
+seasons_enabled = CFG.seasons.enabled
+
+if seasons_enabled:
+    from aoseasons import AoSeasonCache
+    ao_seasons = AoSeasonCache(CFG.paths.cache_dir)
+
+    # Per-DSF tile locks to serialize .si generation across threads
+    _season_lock_map = {}
+    _season_lock_map_lock = threading.Lock()
+
+    def _season_tile_key_from_rc(row: int, col: int, zoom: int) -> str:
+        # Compute DSF base name used by AoDsfSeason (e.g., +37-122)
+        lon = col / pow(2, zoom) * 360 - 180
+        n = math.pi - 2 * math.pi * row / pow(2, zoom)
+        lat = 180 / math.pi * math.atan(0.5 * (math.exp(n) - math.exp(-n)))
+        lat_i = math.floor(lat)
+        lon_i = math.floor(lon)
+        return f"{lat_i:+03d}{lon_i:+04d}"
+
+    def _get_season_lock(key: str) -> threading.Lock:
+        with _season_lock_map_lock:
+            lock = _season_lock_map.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                _season_lock_map[key] = lock
+            return lock
+
+    def season_saturation_locked(row: int, col: int, zoom: int, day: Optional[int] = None) -> float:
+        key = _season_tile_key_from_rc(row, col, zoom)
+        lock = _get_season_lock(key)
+        with lock:
+            return ao_seasons.saturation(row, col, zoom, day)
 
 
 def _is_jpeg(dataheader):
@@ -93,7 +156,7 @@ def locked(fn):
 class Getter(object):
     queue = None 
     workers = None
-    WORKING = False
+    WORKING = None
     session = None
 
     def __init__(self, num_workers):
@@ -101,7 +164,8 @@ class Getter(object):
         self.count = 0
         self.queue = PriorityQueue()
         self.workers = []
-        self.WORKING = True
+        self.WORKING = threading.Event()
+        self.WORKING.set()
         self.localdata = threading.local()
         # Use per-thread Sessions created in worker() to avoid shared-state contention
         
@@ -116,7 +180,7 @@ class Getter(object):
 
 
     def stop(self):
-        self.WORKING = False
+        self.WORKING.clear()
         for t in self.workers:
             t.join()
         # If a stats thread was started, join it as well
@@ -164,8 +228,7 @@ class Getter(object):
             except Exception:
                 pass
             #STATS.setdefault('count', 0) + 1
-            STATS['count'] = STATS.get('count', 0) + 1
-
+            bump('count', 1)
 
             try:
                 # Mark object as in-flight to coalesce duplicate submissions
@@ -196,7 +259,7 @@ class Getter(object):
         self.queue.put((obj, args, kwargs))
 
     def show_stats(self):
-        while self.WORKING:
+        while self.WORKING.is_set():
             try:
                 in_queue = self.queue.qsize()
             except Exception:
@@ -247,6 +310,271 @@ chunk_getter = ChunkGetter(int(CFG.autoortho.fetch_threads))
 
 log.info(f"chunk_getter: {chunk_getter}")
 #log.info(f"tile_getter: {tile_getter}")
+
+
+class Chunk(object):
+    col = -1
+    row = -1
+    source = None
+    chunk_id = ""
+    priority = 0
+    width = 256
+    height = 256
+    cache_dir = 'cache'
+    
+    attempt = 0
+
+    starttime = 0
+    fetchtime = 0
+
+    ready = None
+    data = None
+    img = None
+    url = None
+
+    serverlist=['a','b','c','d']
+
+    def __init__(self, col, row, maptype, zoom, priority=0, cache_dir='.cache'):
+        self.col = col
+        self.row = row
+        self.zoom = zoom
+        self.maptype = maptype
+        self.cache_dir = cache_dir
+        
+        # Hack override maptype
+        #self.maptype = "BI"
+
+        if not priority:
+            self.priority = zoom
+        self.chunk_id = f"{col}_{row}_{zoom}_{maptype}"
+        self.ready = threading.Event()
+        self.ready.clear()
+        if maptype == "Null":
+            self.maptype = "EOX"
+
+        self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
+        
+        # FIXED: Check cache during initialization and set ready if found
+        if self.get_cache():
+            self.ready.set()
+            log.debug(f"Chunk {self} initialized with cached data")
+
+    def __lt__(self, other):
+        return self.priority < other.priority
+
+    def __repr__(self):
+        return f"Chunk({self.col},{self.row},{self.maptype},{self.zoom},{self.priority})"
+
+    def get_cache(self):
+        if os.path.isfile(self.cache_path):
+            bump('chunk_hit')
+            cache_file = Path(self.cache_path)
+            # Get data
+            data = cache_file.read_bytes()
+
+            cache_file.touch()
+            # Update modified data
+            try:
+                os.utime(self.cache_path, None)
+            except (FileNotFoundError, PermissionError):
+                pass 
+
+            if _is_jpeg(data[:3]):
+                #print(f"Found cache that is JPEG for {self}")
+                self.data = data
+                return True
+            else:
+                log.info(f"Loading file {self} not a JPEG! {data[:3]} path: {self.cache_path}")
+                self.data = b''
+                return False  # FIXED: Explicitly return False for corrupted cache
+        else:
+            bump('chunk_miss')
+            return False
+
+    def save_cache(self):
+        # Snapshot data to avoid races with close() mutating self.data
+        data = self.data
+        if not data:
+            return
+
+        # Ensure cache directory exists
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        # Unique temp filename per writer to avoid collisions between threads/tiles
+        temp_filename = os.path.join(self.cache_dir, f"{self.chunk_id}_{uuid.uuid4().hex}.tmp")
+
+        # Write data to the unique temp file first
+        try:
+            with open(temp_filename, 'wb') as h:
+                h.write(data)
+        except Exception as e:
+            # Could not write temp file
+            try:
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+            except Exception:
+                pass
+            log.warning(f"Failed to save cache for {self}: {e}")
+            return
+
+        # Try to move into place atomically with a few retries for WinError 32
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if os.path.exists(self.cache_path):
+                    # Another writer got there first; clean up our temp
+                    os.remove(temp_filename)
+                    log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
+                    return
+                os.replace(temp_filename, self.cache_path)
+                return
+            except FileExistsError:
+                try:
+                    os.remove(temp_filename)
+                except Exception:
+                    pass
+                log.debug(f"Another thread saved cache for {self}, removed temp file")
+                return
+            except OSError as e:
+                if getattr(e, 'winerror', None) in (5, 32, 33) and attempt < max_attempts:
+                    time.sleep(0.05 * attempt)
+                    if os.path.exists(self.cache_path):
+                        try:
+                            if os.path.exists(temp_filename):
+                                os.remove(temp_filename)
+                        except Exception:
+                            pass
+                        return
+                    continue
+                try:
+                    if os.path.exists(temp_filename):
+                        os.remove(temp_filename)
+                except Exception:
+                    pass
+                log.warning(f"Failed to save cache for {self}: {e}")
+                return
+
+    def get(self, idx=0, session=requests):
+        log.debug(f"Getting {self}") 
+
+        if self.get_cache():
+            self.ready.set()
+            return True
+
+        if not self.starttime:
+            self.starttime = time.time()
+
+        server_num = idx % (len(self.serverlist))
+        server = self.serverlist[server_num]
+        quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
+
+        # Hack override maptype
+        #maptype = "ARC"
+
+        MAPID = "s2cloudless-2023_3857"
+        MATRIXSET = "g"
+        MAPTYPES = {
+            "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
+            "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
+            "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
+            "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
+            "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
+        }
+
+        MAPTYPES_WITH_SERVER = ["YNDX", "EOX", "GO2"]
+
+        self.url = MAPTYPES[self.maptype.upper()]
+        #log.debug(f"{self} getting {url}")
+        header = {
+                "user-agent": "curl/7.68.0"
+        }
+        if self.maptype.upper() == "EOX":
+            log.debug("EOX DETECTED")
+            header.update({'referer': 'https://s2maps.eu/'})
+       
+        time.sleep((self.attempt/10))
+        self.attempt += 1
+
+        log.debug(f"Requesting {self.url} ..")
+        
+        resp = None
+        try:
+
+            resp = session.get(self.url, headers=header, timeout=(5, 20))
+            status_code = resp.status_code
+
+            if self.maptype.upper() == "APPLE" and status_code in (403, 410):
+                log.warning("APPLE tile got %s; rotating token and retrying", status_code)
+                apple_token_service.reset_apple_maps_token()
+                MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
+                self.url = MAPTYPES[self.maptype.upper()]
+                if resp is not None:
+                    resp.close()
+                resp = session.get(self.url, headers=header, timeout=(5, 20))
+                status_code = resp.status_code
+
+            if status_code != 200:
+                log.warning(f"Failed with status {status_code} to get chunk {self}" + (" on server " + server if self.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
+                bump_many({f"http_{status_code}": 1, "req_err": 1})
+
+                err = get_stat("req_err")
+                if err > 50:
+                    ok = get_stat("req_ok")
+                    error_rate = err / ( err + ok )
+                    if error_rate >= 0.10:
+                        log.error(f"Very high network error rate detected : {error_rate * 100 : .2f}%")
+                        log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
+                return False
+
+            bump("req_ok")
+
+            data = resp.content
+
+            if _is_jpeg(data[:3]):
+                log.debug(f"Data for {self} is JPEG")
+                self.data = data
+            else:
+                # FFD8FF identifies image as a JPEG
+                log.debug(f"Loading file {self} not a JPEG! {data[:3]} URL: {self.url}")
+            #    return False
+                self.data = b''
+
+            bump('bytes_dl', len(self.data))
+                
+        except Exception as err:
+            log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
+            return False
+        finally:
+            if resp:
+                resp.close()
+
+        self.fetchtime = time.monotonic() - self.starttime
+
+        self.save_cache()
+        self.ready.set()
+        return True
+
+    def close(self):
+        """Release all references held by this Chunk so its memory can be reclaimed."""
+
+        # Release image buffer if we created one
+        if hasattr(self, 'img') and self.img is not None:
+            try:
+                # AoImage instances have a close() that frees underlying C memory
+                if hasattr(self.img, "close"):
+                    self.img.close()
+            finally:
+                self.img = None
+
+        # Remove raw JPEG bytes
+        self.data = None
 
 
 class Tile(object):
@@ -572,11 +900,16 @@ class Tile(object):
         self.ready.set()
 
         if compress_len:
-            #STATS['partial_mm'] = STATS.get('partial_mm', 0) + 1
             tile_time = end_time - start_time
             partial_stats.set(mipmap, tile_time)
-            STATS['partial_mm_averages'] = partial_stats.averages
-            STATS['partial_mm_counts'] = partial_stats.counts
+            # Record partial mm stats via counters for aggregation
+            try:
+                bump_many({
+                    f"partial_mm_count:{mipmap}": 1,
+                    f"partial_mm_time_total_ms:{mipmap}": int(tile_time * 1000)
+                })
+            except Exception:
+                pass
 
         return True
 
@@ -651,7 +984,7 @@ class Tile(object):
 
         # Get effective zoom  
         zoom = min((self.max_zoom - mipmap), self.max_zoom)
-        log.debug(f"GET_IMG: Default tile zoom: {self.zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
+        log.debug(f"GET_IMG: Default tile zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(zoom, min_zoom)
         log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")        
         
@@ -716,7 +1049,15 @@ class Tile(object):
         
         log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
         
-        new_im = AoImage.new('RGBA', (img_width, img_height), (66,77,55))
+        new_im = AoImage.new(
+            "RGBA",
+            (img_width, img_height),
+            (
+                CFG.autoortho.missing_color[0],
+                CFG.autoortho.missing_color[1],
+                CFG.autoortho.missing_color[2],
+            ),
+        )
 
         log.debug(f"GET_IMG: Will use image {new_im}")
 
@@ -749,12 +1090,12 @@ class Tile(object):
                 log.debug(f"GET_IMG: Tile {self} not ready.  Try to find backup chunk.")
                 chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
                 if chunk_img:
-                    inc_stat('backup_chunk_count')
+                    bump('backup_chunk_count')
 
             if not chunk_ready and not chunk_img:
                 # Ran out of time, lower mipmap.  Retry...
                 log.debug(f"GET_IMG: Final retry for {chunk}")
-                inc_stat('retry_chunk_count')
+                bump('retry_chunk_count')
                 chunk_ready = chunk.ready.wait(maxwait)
                 if chunk_ready and chunk.data:
                     log.debug(f"GET_IMG: Final retry for {chunk}, SUCCESS!")
@@ -766,7 +1107,7 @@ class Tile(object):
 
             if not chunk_img and not chunk.data:
                 log.debug(f"GET_IMG: Empty chunk data.  Skip.")
-                STATS['chunk_missing_count'] = STATS.get('chunk_missing_count', 0) + 1
+                bump('chunk_missing_count')
             elif not chunk_img and chunk.data:
                 # Differentiate between decode failure and genuinely bad data
                 hdr = chunk.data[:8]
@@ -815,6 +1156,11 @@ class Tile(object):
             self.imgs[mipmap] = new_im
 
         log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
+
+        if seasons_enabled:
+            saturation = 0.01 * season_saturation_locked(self.row, self.col, self.tilename_zoom)
+            if saturation < 1.0:    # desaturation is expensive
+                new_im = new_im.copy().desaturate(saturation)
         # Return image along with mipmap and zoom level this was created at
         return new_im
 
@@ -976,11 +1322,14 @@ class Tile(object):
         tile_time = end_time - start_time
         mm_stats.set(mipmap, tile_time)
 
-        #log.info(f"Compress MM {mipmap} for ZL {zoom} in {tile_time} seconds")
-        #log.info(f"Average compress times: {mm_averages}")
-        #log.info(f"MM counts: {mm_counts}")
-        STATS['mm_counts'] = mm_stats.counts
-        STATS['mm_averages'] = mm_stats.averages
+        # Record mm stats via counters for aggregation
+        try:
+            bump_many({
+                f"mm_count:{mipmap}": 1,
+                f"mm_time_total_ms:{mipmap}": int(tile_time * 1000)
+            })
+        except Exception:
+            pass
 
         # Don't close all chunks since we don't gen all mipmaps 
         if mipmap == 0:
@@ -1157,321 +1506,6 @@ class Tile(object):
             return False
 
 
-class Chunk(object):
-    col = -1
-    row = -1
-    source = None
-    chunk_id = ""
-    priority = 0
-    width = 256
-    height = 256
-    cache_dir = 'cache'
-    
-    attempt = 0
-
-    starttime = 0
-    fetchtime = 0
-
-    ready = None
-    data = None
-    img = None
-    url = None
-
-    serverlist=['a','b','c','d']
-
-    def __init__(self, col: int, row: int, maptype: str, zoom: int, parent_tile: Tile = None, priority: int = 0, cache_dir: str = '.cache'):
-        self.col = col
-        self.row = row
-        self.zoom = zoom
-        self.maptype = maptype
-        self.cache_dir = cache_dir
-        self.parent_tile = parent_tile
-        # Queue state flags to prevent duplicate submissions
-        self.in_queue = False
-        self.in_flight = False
-        
-        # Hack override maptype
-        #self.maptype = "BI"
-
-        if not priority:
-            self.priority = zoom
-        self.chunk_id = f"{col}_{row}_{zoom}_{maptype}"
-        self.ready = threading.Event()
-        self.ready.clear()
-        if maptype == "Null":
-            self.maptype = "EOX"
-
-        self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
-        
-        # FIXED: Check cache during initialization and set ready if found
-        if self.get_cache():
-            self.ready.set()
-            log.debug(f"Chunk {self} initialized with cached data")
-
-    def __lt__(self, other):
-        return self.priority < other.priority
-
-    def __repr__(self):
-        return f"Chunk({self.col},{self.row},{self.maptype},{self.zoom},{self.priority})"
-
-    def get_cache(self):
-        if os.path.isfile(self.cache_path):
-            inc_stat('chunk_hit')
-            cache_file = Path(self.cache_path)
-            # Get data
-            data = cache_file.read_bytes()
-
-            cache_file.touch()
-            # Update modified data
-            try:
-                os.utime(self.cache_path, None)
-            except (FileNotFoundError, PermissionError):
-                pass 
-
-            if _is_jpeg(data[:3]):
-                #print(f"Found cache that is JPEG for {self}")
-                self.data = data
-                return True
-            else:
-                log.info(f"Loading file {self} not a JPEG! {data[:3]} path: {self.cache_path}")
-                self.data = b''
-                return False  # FIXED: Explicitly return False for corrupted cache
-        else:
-            inc_stat('chunk_miss')
-            return False
-
-    def save_cache(self):
-        # Snapshot data to avoid races with close() mutating self.data
-        data = self.data
-        if not data:
-            return
-
-        # Ensure cache directory exists
-        try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-        except Exception:
-            pass
-
-        # Unique temp filename per writer to avoid collisions between threads/tiles
-        temp_filename = os.path.join(self.cache_dir, f"XX_{self.chunk_id}_{uuid.uuid4().hex}.tmp")
-
-        # Write data to the unique temp file first
-        try:
-            with open(temp_filename, 'wb') as h:
-                h.write(data)
-        except Exception as e:
-            # Could not write temp file
-            try:
-                if os.path.exists(temp_filename):
-                    os.remove(temp_filename)
-            except Exception:
-                pass
-            log.warning(f"Failed to save cache for {self}: {e}")
-            return
-
-        # Try to move into place atomically with a few retries for WinError 32
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                if os.path.exists(self.cache_path):
-                    # Another writer got there first; clean up our temp
-                    os.remove(temp_filename)
-                    log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
-                    return
-                os.replace(temp_filename, self.cache_path)
-                if self.parent_tile:
-                    log.debug(f"SAVE_CACHE: Setting tile cache state for {self.parent_tile.row},{self.parent_tile.col},{self.parent_tile.max_zoom},{self.parent_tile.lat},{self.parent_tile.lon},{self.parent_tile.maptype} to True")
-                    cache_db_service.set_cache_file_cache_state(
-                        filename=self.cache_path,
-                        maptype=self.maptype,
-                        lat=self.parent_tile.lat,
-                        lon=self.parent_tile.lon,
-                        parent_max_zoom=self.parent_tile.max_zoom,
-                        parent_tile_id=self.parent_tile.row,
-                        size_in_bytes=len(self.data), 
-                        is_cached=True)
-                return
-            except FileExistsError:
-                try:
-                    os.remove(temp_filename)
-                except Exception:
-                    pass
-                log.debug(f"Another thread saved cache for {self}, removed temp file")
-                return
-            except OSError as e:
-                if getattr(e, 'winerror', None) in (5, 32, 33) and attempt < max_attempts:
-                    time.sleep(0.05 * attempt)
-                    if os.path.exists(self.cache_path):
-                        try:
-                            if os.path.exists(temp_filename):
-                                os.remove(temp_filename)
-                        except Exception:
-                            pass
-                        return
-                    continue
-                try:
-                    if os.path.exists(temp_filename):
-                        os.remove(temp_filename)
-                except Exception:
-                    pass
-                log.warning(f"Failed to save cache for {self}: {e}")
-                return
-
-    def get(self, idx=0, session=requests):
-        log.debug(f"Getting {self}") 
-
-        if self.get_cache():
-            self.ready.set()
-            return True
-
-        # mark inflight for stats
-        STATS['chunk_inflight'] = STATS.get('chunk_inflight', 0) + 1
-        try:
-            if not self.starttime:
-                self.startime = time.time()
-
-            server_num = idx%(len(self.serverlist))
-            server = self.serverlist[server_num]
-            quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
-
-            # Hack override maptype
-            #maptype = "ARC"
-
-            MAPID = "s2cloudless-2023_3857"
-            MATRIXSET = "g"
-            MAPTYPES = {
-                "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
-                "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
-                "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
-                "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-                "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-                "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-                "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-                "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
-                "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
-            }
-
-            # Build URL per request. For APPLE, always inject the latest token without mutating shared state
-            if self.maptype.upper() == "APPLE":
-                self.url = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
-            else:
-                self.url = MAPTYPES[self.maptype.upper()]
-            #log.debug(f"{self} getting {url}")
-            header = {
-                    "user-agent": "curl/7.68.0"
-            }
-            if self.maptype.upper() == "EOX":
-                log.info("EOX DETECTED")
-                header.update({'referer': 'https://s2maps.eu/'})
-           
-            # Exponential backoff with jitter for retry pacing
-            self.attempt += 1
-            try:
-                base = 0.1
-                backoff = base * (2 ** max(0, self.attempt - 1))
-                backoff = min(1.5, backoff)
-                jitter = random.uniform(0.0, backoff * 0.25)
-                time.sleep(backoff + jitter)
-            except Exception:
-                time.sleep(0.1)
-
-            log.debug(f"Requesting {self.url} ..")
-
-            use_requests = True
-            
-            resp = 0
-            try:
-                if use_requests:
-                    # Ensure we have a real Session; fall back to module if needed
-                    sess = session if hasattr(session, 'get') else requests
-                    resp = sess.get(self.url, headers=header, timeout=(2, 8))
-                    status_code = resp.status_code
-
-                    if self.maptype.upper() == "APPLE" and status_code == 403:
-                        log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.  Retrying with new Apple Maps token.")
-                        apple_token_service.reset_apple_maps_token()
-                        self.url = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
-                        resp = sess.get(self.url, headers=header, timeout=(2, 8))
-                        status_code = resp.status_code
-
-                else:
-                    req = Request(self.url, headers=header)
-                    resp = urlopen(req, timeout=8)
-                    status_code = resp.status
-
-                    if self.maptype.upper() == "APPLE" and status_code == 403:
-                        log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.  Retrying with new Apple Maps token.")
-                        apple_token_service.reset_apple_maps_token()
-                        self.url = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v=10181&accessKey={apple_token_service.apple_token}"
-                        # Use requests for the retry to honor timeouts consistently
-                        sess = session if hasattr(session, 'get') else requests
-                        resp = sess.get(self.url, headers=header, timeout=(2, 8))
-                        status_code = resp.status_code
-
-                if status_code != 200:
-                    log.warning(f"Failed with status {status_code} to get chunk {self} on server {server}.")
-                    inc_stat(f"http_{status_code}")
-                    inc_stat("req_err")
-
-                    err = get_stat("req_err")
-                    if err > 50:
-                        ok = get_stat("req_ok")
-                        error_rate = err / ( err + ok )
-                        if error_rate >= 0.10:
-                            log.error(f"Very high network error rate detected : {error_rate * 100 : .2f}%")
-                            log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
-                    return False
-
-                inc_stat("req_ok")
-
-                if use_requests:
-                    data = resp.content
-                    #data = resp.raw.read()
-                else:
-                    data = resp.read()
-
-                if _is_jpeg(data[:3]):
-                    log.debug(f"Data for {self} is JPEG")
-                    self.data = data
-                else:
-                    # FFD8FF identifies image as a JPEG
-                    log.debug(f"Loading file {self} not a JPEG! {data[:3]} URL: {self.url}")
-                #    return False
-                    self.data = b''
-
-                inc_stat('bytes_dl', len(self.data))
-                    
-            except Exception as err:
-                log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
-                return False
-            finally:
-                if resp:
-                    resp.close()
-
-            self.fetchtime = time.time() - self.starttime
-
-            self.save_cache()
-            self.ready.set()
-            return True
-        finally:
-            STATS['chunk_inflight'] = max(0, STATS.get('chunk_inflight', 0) - 1)
-
-    def close(self):
-        """Release all references held by this Chunk so its memory can be reclaimed."""
-
-        # Release image buffer if we created one
-        if hasattr(self, 'img') and self.img is not None:
-            try:
-                # AoImage instances have a close() that frees underlying C memory
-                if hasattr(self.img, "close"):
-                    self.img.close()
-            finally:
-                self.img = None
-
-        # Remove raw JPEG bytes
-        self.data = None
-
-
 class TileCacher(object):
     hits = 0
     misses = 0
@@ -1532,7 +1566,8 @@ class TileCacher(object):
     def show_stats(self):
         process = psutil.Process(os.getpid())
         cur_mem = process.memory_info().rss
-        set_stat('cur_mem_mb', cur_mem//1048576)
+        # Report per-process memory to shared store; parent will aggregate
+        update_process_memory_stat()
         #set_stat('tile_mem_open', len(self.tiles))
         if self.enable_cache:
             #set_stat('tile_mem_miss', self.misses)
@@ -1612,7 +1647,7 @@ class TileCacher(object):
             lat, lon = coord_from_sleepy_tilename(col, row, zoom)
             if not tile:
                 self.misses += 1
-                inc_stat('tile_mem_miss')
+                bump('tile_mem_miss')
                 # Use target zoom level directly - much cleaner than offset calculations
                 tile = Tile(
                     col, row, map_type, zoom, 
@@ -1628,7 +1663,7 @@ class TileCacher(object):
             elif tile.refs <= 0:
                 # Only in this case would this cache have made a difference
                 self.hits += 1
-                inc_stat('tile_mem_hits')
+                bump('tile_mem_hits')
 
             tile.refs += 1
         if self.open_tiles_by_dsf.get((lat, lon)) is None:
@@ -1701,5 +1736,16 @@ def shutdown():
         except Exception:
             # Ignore any edge-case failures during shutdown
             pass
+
+    try:
+        if stats_batcher:
+            stats_batcher.stop()
+    except Exception:
+        pass
+
+    try:
+        clear_process_memory_stat()
+    except Exception:
+        pass
 
     log.info("autoortho.getortho shutdown complete")

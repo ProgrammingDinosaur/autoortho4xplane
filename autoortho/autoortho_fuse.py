@@ -8,8 +8,6 @@ import math
 import errno
 import ctypes
 import threading
-import shutil
-import stat
 
 import flighttrack
 
@@ -67,12 +65,8 @@ def fuse_config_by_os() -> dict:
             set_gid=1,
         ))
     elif system_type == 'darwin':
-        overrides["config"].update(dict(
-            negative_timeout=0,
-            attr_timeout=30,
-            entry_timeout=30,
-            kernel_cache=True,
-        ))
+        # Leave defaults
+        pass
     elif system_type == 'windows':
         overrides["config"].update(dict(
             uid=-1,
@@ -101,8 +95,6 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
             foreground=True,
             allow_other=True,
             volname=mount_name,
-            local=True,
-            rdonly=True,
         ))
 
     elif system_type == 'windows':
@@ -134,7 +126,7 @@ class AutoOrtho(Operations):
 
     startup = True
 
-    def __init__(self, root, cache_dir='.cache'):
+    def __init__(self, root, cache_dir='.cache', *args, **kwargs):
         log.info(f"ROOT: {root}")
         self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\S*)(\d{2}).dds")
         self.ktx2_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\D*)(\d+).ktx2")
@@ -158,6 +150,8 @@ class AutoOrtho(Operations):
         self._size_cache = {}
         self._ft_started = False
         self._ft_start_lock = threading.Lock()
+
+        self.use_ns = kwargs.get("use_ns", False)
 
     # Helpers
     # =======
@@ -560,6 +554,10 @@ class AutoOrtho(Operations):
     def releasedir(self, path, fh):
         log.debug(f"RELEASEDIR: {path}")
         return 0
+    
+    def opendir(self, path):
+        log.debug(f"OPENDIR: {path}")
+        return 0 
 
     #@locked
     def release(self, path, fh):
@@ -600,7 +598,7 @@ def run(ao, mountpoint, name="", nothreads=False):
     options = fuse_option_profiles_by_os(nothreads, name)
 
     log.info(f"Starting FUSE mount")
-    log.debug(f"Loading FUSE with options: "
+    log.info(f"Loading FUSE with options: "
             f"{', '.join(sorted(map(str, options.keys())))}")
 
     try:

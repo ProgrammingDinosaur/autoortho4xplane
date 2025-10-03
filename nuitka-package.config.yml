@@ -32,3 +32,37 @@
         prefixes: ['aoimage']
         suffixes: ['dll']
         when: 'win32'
+    - from_filenames:
+        relative_path: 'lib/windows/7zip'
+        prefixes: ['7za', '7zxa']
+        suffixes: ['dll']
+        when: 'win32'
+    - from_filenames:
+        relative_path: 'lib/windows'
+        prefixes: ['DSFTool']
+        suffixes: ['exe']
+        executable: yes
+        when: 'win32'
+    - from_filenames:
+        relative_path: 'lib/windows/7zip'
+        prefixes: ['7za']
+        suffixes: ['exe']
+        executable: yes
+        when: 'win32'
+
+  data-files:
+    - dirs:
+        - 'lib/macos/7zip'
+        - 'lib/macos'
+      patterns:
+        - '7zz'
+        - 'DSFTool'
+      when: 'macos'
+
+    - dirs:
+        - 'lib/linux/7zip'
+        - 'lib/linux'
+      patterns:
+        - '7zz'
+        - 'DSFTool'
+      when: 'linux'

@@ -1,10 +1,10 @@
 !define PRODUCT_NAME "AutoOrtho"
-;!define PRODUCT_VERSION "1.2.6"
+;!define PRODUCT_VERSION "1.3.2"
 ;!define PY_VERSION "3.12.9"
 ;!define PY_MAJOR_VERSION "3.12"
 ;!define BITNESS "32"
 !define ARCH_TAG ""
-;!define INSTALLER_NAME "AutoOrtho_1.2.6.exe"
+;!define INSTALLER_NAME "AutoOrtho_1.3.2.exe"
 !define INSTALLER_NAME "AutoOrtho.exe"
 !define PRODUCT_ICON "ao-icon.ico"
 
@@ -52,13 +52,13 @@ OutFile "${INSTALLER_NAME}"
 ShowInstDetails show
 
 ; Add version info and manifest to reduce AV false positives
-VIProductVersion "0.0.8.1"
+VIProductVersion "0.1.3.2"
 VIAddVersionKey "ProductName" "${PRODUCT_NAME}"
 VIAddVersionKey "CompanyName" "AutoOrtho Project"
 VIAddVersionKey "LegalCopyright" "© AutoOrtho Project"
 VIAddVersionKey "FileDescription" "${PRODUCT_NAME} Installer"
 VIAddVersionKey "FileVersion" "0.1.0"
-VIAddVersionKey "ProductVersion" "1.2.6"
+VIAddVersionKey "ProductVersion" "1.3.2"
 
 ; Request admin rights explicitly in manifest
 RequestExecutionLevel admin

@@ -9,10 +9,23 @@ class AppleTokenService:
         self.duckduckgo_token_url = "https://duckduckgo.com/local.js?get_mk_token=1"
         self.apple_token_url = "https://cdn.apple-mapkit.com/ma/bootstrap?apiVersion=2&mkjsVersion=5.79.95&poi=1"
         self.apple_token = None
+        self.version = 0
 
-    def process_apple_token(self, apple_token: str) -> str:
+    def get_url_metadata_from_response(self, response: dict) -> dict[str, str]:
         """Process the Apple Maps access token"""
-        return str(apple_token).replace("/", "%2F").replace("=", "%3D").replace("+", "%2B")
+        try:
+            tile_sources = response["tileSources"]
+            for tile_source in tile_sources:
+                if tile_source["tileSource"] == "satellite":
+                    path = tile_source["path"]
+                    version = path.split("v=")[1].split("&")[0]
+                    access_key = path.split("accessKey=")[1].split("&")[0]
+                    return {
+                        "version": version,
+                        "access_key": access_key
+                    }
+        except Exception as e:
+            raise RuntimeError(f"Failed to get URL metadata from response: {e}")
 
     def reset_apple_maps_token(self) -> str:
         """
@@ -34,9 +47,10 @@ class AppleTokenService:
             )
             apple_token_response.raise_for_status()
             apple_token_body = apple_token_response.json()
-            apple_token = self.process_apple_token(apple_token_body["accessKey"])
+            url_metadata = self.get_url_metadata_from_response(apple_token_body)
 
-            self.apple_token = apple_token
+            self.apple_token = url_metadata["access_key"]
+            self.version = url_metadata["version"]
 
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to retrieve Apple Maps token: {e}")
