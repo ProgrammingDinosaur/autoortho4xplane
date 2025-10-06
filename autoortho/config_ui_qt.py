@@ -875,42 +875,6 @@ class ConfigUI(QMainWindow):
         maptype_layout.addStretch()
         options_layout.addLayout(maptype_layout)
 
-                # File cache size
-        file_cache_layout = QHBoxLayout()
-        file_cache_label = QLabel("File cache size (GB):")
-        file_cache_label.setToolTip(
-            "Maximum disk space used for caching imagery files.\n"
-            "Larger cache = fewer downloads but more disk usage.\n"
-            "Optimal: 50-200GB for regular use, 200-500GB for extensive "
-            "flying.\n"
-            "Minimum recommended: 20GB"
-        )
-        file_cache_layout.addWidget(file_cache_label)
-        self.file_cache_slider = ModernSlider()
-        self.file_cache_slider.setRange(10, 500)
-        self.file_cache_slider.setSingleStep(5)
-        self.file_cache_slider.setValue(
-            int(float(self.cfg.cache.file_cache_size))
-        )
-        self.file_cache_slider.setObjectName('file_cache_size')
-        self.file_cache_slider.setToolTip(
-            "Drag to adjust maximum cache size in gigabytes"
-        )
-        self.file_cache_label = QLabel(f"{self.cfg.cache.file_cache_size} GB")
-        self.file_cache_slider.valueChanged.connect(
-            lambda v: self.file_cache_label.setText(f"{v} GB")
-        )
-        file_cache_layout.addWidget(self.file_cache_slider)
-        file_cache_layout.addWidget(self.file_cache_label)
-        self.clean_cache_btn = StyledButton("Clean Cache")
-        self.clean_cache_btn.clicked.connect(self.on_clean_cache)
-        self.clean_cache_btn.setToolTip(
-            "Remove old cached files to free up disk space.\n"
-            "This will delete the oldest cached images first."
-        )
-        file_cache_layout.addWidget(self.clean_cache_btn)
-        options_layout.addLayout(file_cache_layout)
-
         self.simheaven_compat_check = QCheckBox("SimHeaven compatibility mode")
         self.simheaven_compat_check.setChecked(self.cfg.autoortho.simheaven_compat)
         self.simheaven_compat_check.setObjectName('simheaven_compat')
@@ -1060,16 +1024,60 @@ class ConfigUI(QMainWindow):
         mem_cache_layout.addWidget(self.mem_cache_label)
         cache_layout.addLayout(mem_cache_layout)
 
-        auto_clean_cache_layout = QHBoxLayout()
-        self.auto_clean_cache_check = QCheckBox("Auto clean cache on AutoOrtho exit")
+        # File cache size
+        file_cache_layout = QHBoxLayout()
+        file_cache_label = QLabel("File cache clean limit (GB):")
+        file_cache_label.setToolTip(
+            "This is the total size of the imagery files that the cache\n"
+            "clean operation leaves in the file cache after cleaning.\n"
+            "Note that this cache grows without bounds while AutoOrtho is running.\n"
+            "Use the Clean Cache button to reduce the cache to this size.\n"
+            "Larger cache = fewer downloads but more disk usage.\n"
+            "Optimal: 50-200GB for regular use, 200-500GB for extensive "
+            "flying.\n"
+            "Minimum recommended: 20GB"
+        )
+        file_cache_layout.addWidget(file_cache_label)
+        self.file_cache_slider = ModernSlider()
+        self.file_cache_slider.setRange(10, 500)
+        self.file_cache_slider.setSingleStep(5)
+        self.file_cache_slider.setValue(
+            int(float(self.cfg.cache.file_cache_size))
+        )
+        self.file_cache_slider.setObjectName('file_cache_size')
+        self.file_cache_slider.setToolTip(
+            "Drag to adjust the cache clean limit in gigabytes"
+        )
+        self.file_cache_label = QLabel(f"{self.cfg.cache.file_cache_size} GB")
+        self.file_cache_slider.valueChanged.connect(
+            lambda v: self.file_cache_label.setText(f"{v} GB")
+        )
+        file_cache_layout.addWidget(self.file_cache_slider)
+        file_cache_layout.addWidget(self.file_cache_label)
+        cache_layout.addLayout(file_cache_layout)
+
+        clean_cache_controls_layout = QHBoxLayout()
+        clean_cache_controls_layout.setSpacing(10)
+        self.clean_cache_btn = StyledButton("Clean Cache")
+        self.clean_cache_btn.clicked.connect(self.on_clean_cache)
+        self.clean_cache_btn.setToolTip(
+            "Delete cache files until the file cache clean limit is reached.\n"
+            "This will delete the oldest cached images first.\n"
+            "If the cache is smaller than the clean limit, no files are deleted.\n"
+            "Note that this can take a long time."
+        )
+        clean_cache_controls_layout.addWidget(self.clean_cache_btn)
+        self.auto_clean_cache_check = QCheckBox("Auto clean file cache on AutoOrtho exit")
         self.auto_clean_cache_check.setChecked(self.cfg.cache.auto_clean_cache)
         self.auto_clean_cache_check.setObjectName('auto_clean_cache')
         self.auto_clean_cache_check.setToolTip(
-            "Automatically clean cache when AutoOrtho exits."
+            "Automatically clean cache when AutoOrtho exits.\n"
+            "Note that this can take a long time."
         )
 
-        auto_clean_cache_layout.addWidget(self.auto_clean_cache_check)
-        cache_layout.addLayout(auto_clean_cache_layout)
+        clean_cache_controls_layout.addWidget(self.auto_clean_cache_check)
+        clean_cache_controls_layout.addStretch()
+        cache_layout.addLayout(clean_cache_controls_layout)
 
         self.settings_layout.addWidget(cache_group)
 

@@ -220,11 +220,9 @@ class AutoOrtho(Operations):
         log.error(msg)
         if exc:
             log.exception("cause:", exc_info=exc)
-        try:
-            fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
-            _libfuse.fuse_exit(fuse_ptr)
-        except Exception as e:
-            log.error(f"fuse_exit failed: {e}")
+        # In previous versions we called fuse_exit here, which kills the mount and
+        # the simulator session on transient per-tile errors (e.g. cache sharing violations).
+        # Instead, surface an I/O error back to the caller and keep the FS alive.
         raise FuseOSError(errno.EIO)
 
     # Filesystem methods
@@ -516,10 +514,17 @@ class AutoOrtho(Operations):
                 except Exception:
                     pass
                 if data is None:
-                    self._failfast(f"Tile read returned None for {key}")
+                    log.error(f"Tile read returned None for {key}")
+                    raise FuseOSError(errno.EIO)
                 return data
+            except FuseOSError:
+                # Propagate specific FS error without killing the mount
+                raise
             except Exception as e:
-                self._failfast(f"Tile read/build failed for {key}", e)
+                # Log and map to EIO, but do not exit the whole FUSE session
+                log.error(f"Tile read/build failed for {key}")
+                log.exception("cause:", exc_info=e)
+                raise FuseOSError(errno.EIO)
             finally:
                 lock.release()
 

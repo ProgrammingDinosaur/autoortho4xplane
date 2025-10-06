@@ -726,15 +726,17 @@ class Release(object):
         #self.cleanup()
 
         try:
-            log.info(f"Removing {self.subfolder_dir}")
+            scenery_dir = os.path.join(CFG.paths.scenery_path, "z_autoortho", "scenery", f"z_ao_{self.name}")
+            log.info(f"Removing {scenery_dir}")
 
-            if os.path.exists(self.subfolder_dir):
-                log.info(f"Removing {self.subfolder_dir}")
-                shutil.rmtree(self.subfolder_dir)
+            if os.path.exists(scenery_dir):
+                log.info(f"Removing {scenery_dir}")
+                shutil.rmtree(scenery_dir)
 
-            if os.path.exists(self.info_path):
-                log.info(f"Removing {self.info_path}")
-                os.remove(self.info_path)
+            json_path = os.path.join(CFG.paths.scenery_path, "z_autoortho", f"{self.name}_info.json")
+            if os.path.exists(json_path):
+                log.info(f"Removing {json_path}")
+                os.remove(json_path)
 
             log.info(f"Release {self.name} uninstalled.")
             self.installed = False

@@ -254,7 +254,11 @@ prefer_winfsp = True
                         needs_default = True
 
                 if needs_default:
-                    self.config.set(sect, key, str(def_val))
+                    if key.startswith('#'):
+                        # Avoid trailing '=' in comment lines
+                        self.config.set(sect, key, None)
+                    else:
+                        self.config.set(sect, key, str(def_val))
                     patched = True
 
         # Flag for persistence after object dict is constructed

@@ -17,6 +17,11 @@ autoortho_lin_$(SAFE_VERSION).bin: autoortho/*.py
 	docker run --rm -v `pwd`:/code ubuntu:noble /bin/bash -c "cd /code; ./buildreqs.sh; . .venv/bin/activate; time make bin VERSION=$(VERSION)"
 	mv autoortho_lin.bin $@
 
+lin_tar: autoortho_linux_$(SAFE_VERSION).tar.gz
+autoortho_linux_$(SAFE_VERSION).tar.gz: autoortho_lin_$(SAFE_VERSION).bin
+	chmod a+x $<
+	tar -czf $@ $<
+
 enter:
 	docker run --rm -it -v `pwd`:/code ubuntu:focal /bin/bash
 
@@ -119,5 +124,5 @@ serve_docs:
 	docker run -p 8000:8000 -v `pwd`:/docs squidfunk/mkdocs-material
 
 clean:
-	rm -rf __main__.app AutoOrtho.app *.zip *.build *.dist build dist
+	rm -rf __main__.app AutoOrtho.app *.zip *.tar.gz *.build *.dist build dist
 	

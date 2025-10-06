@@ -51,19 +51,19 @@ jobs:
 
     - name: Build
       run: |
-        make lin_bin VERSION=${{ env.VERNAME }}
+        make lin_tar VERSION=${{ env.VERNAME }}
 
     - name: Save artifact
       uses: actions/upload-artifact@v4
       with:
         name: linbin
-        path: autoortho_lin_*.bin
+        path: autoortho_linux_*.tar.gz
 
     - name: Release
       if: ${{ inputs.relname != '' }}
       uses: softprops/action-gh-release@v1
       with:
-        files: autoortho_lin_*.bin
+        files: autoortho_linux_*.tar.gz
         tag_name: ${{ inputs.relname }}
         prerelease: ${{ inputs.prerelease }}
         make_latest: ${{ inputs.make_latest }}

@@ -19,6 +19,7 @@ from urllib.request import urlopen, Request
 from queue import Queue, PriorityQueue, Empty
 from functools import wraps, lru_cache
 from pathlib import Path
+from collections import OrderedDict
 
 import pydds
 
@@ -370,7 +371,30 @@ class Chunk(object):
             bump('chunk_hit')
             cache_file = Path(self.cache_path)
             # Get data
-            data = cache_file.read_bytes()
+            data = None
+            # On Windows, the cache file can be briefly locked by AV or a concurrent writer.
+            # Add a short retry/backoff loop to avoid spurious PermissionError / sharing violations.
+            max_attempts = 5
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    data = cache_file.read_bytes()
+                    break
+                except PermissionError as e:
+                    if attempt < max_attempts:
+                        time.sleep(0.02 * attempt)
+                        continue
+                    log.warning(f"Permission denied reading cache {self}: {e}")
+                    return False
+                except FileNotFoundError:
+                    # Raced with a concurrent replace/remove; treat as miss
+                    return False
+                except OSError as e:
+                    winerr = getattr(e, 'winerror', None)
+                    if winerr in (5, 32, 33) and attempt < max_attempts:
+                        time.sleep(0.02 * attempt)
+                        continue
+                    log.debug(f"OSError reading cache {self}: {e}")
+                    return False
 
             cache_file.touch()
             # Update modified data
@@ -1518,7 +1542,7 @@ class TileCacher(object):
         if MEMTRACE:
             tracemalloc.start()
 
-        self.tiles = {}
+        self.tiles = OrderedDict()
         self.open_count = {}
         self.open_tiles_by_dsf = {}
 
@@ -1531,6 +1555,11 @@ class TileCacher(object):
             log.info(f"Maptype override not set, will use default.")
         log.info(f"Will use Compressor: {CFG.pydds.compressor}")
         self.tc_lock = threading.RLock()
+        self._pid = os.getpid()
+        # Eviction behavior controls
+        self.evict_hysteresis_frac = 0.10  # keep ~10% headroom below limit
+        self.evict_headroom_min_bytes = 256 * 1048576  # at least 256MB headroom
+        self.evict_leader_ttl_sec = 5  # seconds
         
         self.cache_dir = CFG.paths.cache_dir
         log.info(f"Cache dir: {self.cache_dir}")
@@ -1575,43 +1604,157 @@ class TileCacher(object):
             log.debug(f"TILE CACHE:  MISS: {self.misses}  HIT: {self.hits}")
         log.debug(f"NUM OPEN TILES: {len(self.tiles)}.  TOTAL MEM: {cur_mem//1048576} MB")
 
+    # -----------------------------
+    # LRU helpers and leader logic
+    # -----------------------------
+    def _touch_tile(self, idx, tile):
+        try:
+            # Move to MRU position
+            self.tiles.move_to_end(idx, last=True)
+        except Exception:
+            pass
+
+    def _lru_candidates(self):
+        try:
+            # Keys iterate from LRU -> MRU after move_to_end
+            return list(self.tiles.keys())
+        except Exception:
+            return list(self.tiles.keys())
+
+    def _has_shared_store(self) -> bool:
+        return bool(getattr(STATS, "_remote", None) or os.getenv("AO_STATS_ADDR"))
+
+    def _try_acquire_evict_leader(self) -> bool:
+        if not self._has_shared_store():
+            return True
+        now = int(time.time())
+        try:
+            leader_until = get_stat('evict_leader_until') or 0
+            leader_pid = get_stat('evict_leader_pid') or 0
+        except Exception:
+            leader_until = 0
+            leader_pid = 0
+
+        if int(leader_until) < now:
+            # Try to become leader
+            try:
+                set_stat('evict_leader_pid', self._pid)
+                set_stat('evict_leader_until', now + self.evict_leader_ttl_sec)
+                return True
+            except Exception:
+                return False
+
+        # Renew if we are already leader
+        if int(leader_pid) == self._pid:
+            try:
+                set_stat('evict_leader_until', now + self.evict_leader_ttl_sec)
+                return True
+            except Exception:
+                return False
+
+        return False
+
+    def _renew_evict_leader(self) -> None:
+        if not self._has_shared_store():
+            return
+        try:
+            now = int(time.time())
+            if int(get_stat('evict_leader_pid') or 0) == self._pid:
+                set_stat('evict_leader_until', now + self.evict_leader_ttl_sec)
+        except Exception:
+            pass
+
+    def _evict_batch(self, max_to_evict: int) -> int:
+        evicted = 0
+        # Prefer strict LRU order: left to right
+        for idx in list(self._lru_candidates()):
+            if evicted >= max_to_evict:
+                break
+            t = self.tiles.get(idx)
+            if not t:
+                continue
+            if t.refs > 0:
+                continue
+            # Evict this tile
+            try:
+                t = self.tiles.pop(idx)
+            except KeyError:
+                continue
+            try:
+                t.close()
+            except Exception:
+                pass
+            finally:
+                t = None
+                evicted += 1
+        return evicted
+
     def clean(self):
         log.info(f"Started tile clean thread.  Mem limit {self.cache_mem_lim}")
+        # Faster cadence when a shared stats store is present (macOS parent)
+        fast_mode = self._has_shared_store()
+        poll_interval = 3 if fast_mode else 15
+
         while True:
             process = psutil.Process(os.getpid())
             cur_mem = process.memory_info().rss
 
+            # Publish this process heartbeat + RSS so the parent can aggregate
+            try:
+                update_process_memory_stat()
+            except Exception:
+                pass
+
             self.show_stats()
-            time.sleep(15)
-            
+
             if not self.enable_cache:
+                time.sleep(poll_interval)
                 continue
 
-            while len(self.tiles) >= self.cache_tile_lim and cur_mem > self.cache_mem_lim:
-                log.debug("Hit cache limit.  Remove oldest 20")
-                with self.tc_lock:
-                    for i in list(self.tiles.keys())[:20]:
-                        t = self.tiles.get(i)
-                        if not t:
-                            continue
-                        if t.refs <= 0:
-                            t = self.tiles.pop(i)
-                            try:
-                                lat, lon = coord_from_sleepy_tilename(t.col, t.row, t.tilename_zoom)
-                            except Exception:
-                                lat, lon = (None, None)
-                            try:
-                                t.close()
-                            finally:
-                                pass
-                            # Only update open_tiles_by_dsf if we could compute coords
-                            if lat is not None:
-                                self.open_tiles_by_dsf[(lat, lon)] -= 1
-                                if self.open_tiles_by_dsf[(lat, lon)] <= 0:
-                                    del self.open_tiles_by_dsf[(lat, lon)]
-                            del t
-                cur_mem = process.memory_info().rss
+            # Use aggregated memory across all workers when available; otherwise local RSS
+            try:
+                global_mem_mb = get_stat('cur_mem_mb')
+                global_mem_bytes = int(global_mem_mb) * 1048576 if isinstance(global_mem_mb, (int, float)) else 0
+            except Exception:
+                global_mem_bytes = 0
 
+            effective_mem = global_mem_bytes or cur_mem
+
+            # Hysteresis target: evict down to limit - headroom
+            headroom = max(int(self.cache_mem_lim * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
+            target_bytes = max(0, int(self.cache_mem_lim) - headroom)
+
+            # Leader election: only one worker performs eviction when shared store is present
+            if effective_mem > self.cache_mem_lim:
+                if not self._try_acquire_evict_leader():
+                    time.sleep(poll_interval)
+                    continue
+
+            # Evict while above target using adaptive batch sizing
+            while self.tiles and effective_mem > target_bytes:
+                over_bytes = max(0, effective_mem - target_bytes)
+                ratio = min(1.0, over_bytes / max(1, self.cache_mem_lim))
+                adaptive = max(20, int(len(self.tiles) * min(0.10, ratio)))
+                with self.tc_lock:
+                    evicted = self._evict_batch(adaptive)
+                if evicted == 0:
+                    break
+
+                # Recompute local RSS and, if available, the aggregated RSS
+                cur_mem = process.memory_info().rss
+                try:
+                    global_mem_mb = get_stat('cur_mem_mb')
+                    global_mem_bytes = int(global_mem_mb) * 1048576 if isinstance(global_mem_mb, (int, float)) else 0
+                except Exception:
+                    global_mem_bytes = 0
+                effective_mem = global_mem_bytes or cur_mem
+
+                # Renew leadership and publish heartbeat after an eviction batch
+                try:
+                    self._renew_evict_leader()
+                    update_process_memory_stat()
+                except Exception:
+                    pass
 
             if MEMTRACE:
                 snapshot = tracemalloc.take_snapshot()
@@ -1621,7 +1764,7 @@ class TileCacher(object):
                 for stat in top_stats[:10]:
                         log.info(stat)
 
-            time.sleep(15)
+            time.sleep(poll_interval)
 
     def _get_tile(self, row, col, map_type, zoom):
         
@@ -1630,6 +1773,9 @@ class TileCacher(object):
             tile = self.tiles.get(idx)
             if not tile:
                 tile = self._open_tile(row, col, map_type, zoom)
+            else:
+                # Touch LRU on hit
+                self._touch_tile(idx, tile)
         return tile
 
     def _open_tile(self, row, col, map_type, zoom):
@@ -1657,6 +1803,8 @@ class TileCacher(object):
                     max_zoom=self._get_target_zoom_level(zoom),
                 )
                 self.tiles[idx] = tile
+                # New tile becomes MRU
+                self._touch_tile(idx, tile)
                 self.open_count[idx] = self.open_count.get(idx, 0) + 1
                 if self.open_count[idx] > 1:
                     log.debug(f"Tile: {idx} opened for the {self.open_count[idx]} time.")
