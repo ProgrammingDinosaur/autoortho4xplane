@@ -536,6 +536,7 @@ class AutoOrtho(Operations):
             except OSError as e:
                 raise FuseOSError(e.errno)
 
+    # X-Plane never writes to files in the FUSE mount
     def _write(self, path, buf, offset, fh):
         os.lseek(fh, offset, os.SEEK_SET)
         return os.write(fh, buf)
@@ -546,7 +547,8 @@ class AutoOrtho(Operations):
         with open(full_path, 'r+') as f:
             f.truncate(length)
 
-    def flush(self, path, fh):
+    # X-Plane never writes to files in the FUSE mount
+    def _flush(self, path, fh):
         # No-op for virtual DDS files; fsync real files.
         if self.dds_re.match(path):
             return 0
@@ -580,7 +582,8 @@ class AutoOrtho(Operations):
         finally:
             self.fh_locks.pop(fh, None)
 
-    def fsync(self, path, fdatasync, fh):
+    # X-Plane never writes to files in the FUSE mount
+    def _fsync(self, path, fdatasync, fh):
         log.debug(f"FSYNC: {path}")
         return self.flush(path, fh)
 

@@ -721,22 +721,17 @@ class Release(object):
             v.cleanup()
         self.cleaned = True
 
-
     def uninstall(self) -> bool:
-        #self.cleanup()
-
+        # self.cleanup()
         try:
-            scenery_dir = os.path.join(CFG.paths.scenery_path, "z_autoortho", "scenery", f"z_ao_{self.name}")
-            log.info(f"Removing {scenery_dir}")
 
-            if os.path.exists(scenery_dir):
-                log.info(f"Removing {scenery_dir}")
-                shutil.rmtree(scenery_dir)
+            if os.path.exists(self.install_dir):
+                log.info(f"Removing {self.install_dir}")
+                shutil.rmtree(self.install_dir)
 
-            json_path = os.path.join(CFG.paths.scenery_path, "z_autoortho", f"{self.name}_info.json")
-            if os.path.exists(json_path):
-                log.info(f"Removing {json_path}")
-                os.remove(json_path)
+            if os.path.exists(self.info_path):
+                log.info(f"Removing {self.info_path}")
+                os.remove(self.info_path)
 
             log.info(f"Release {self.name} uninstalled.")
             self.installed = False
