@@ -870,14 +870,10 @@ class ConfigUI(QMainWindow):
             "clean operation leaves in the file cache after cleaning.\n"
             "Note that this cache grows without bounds while AutoOrtho is running.\n"
             "Use the Clean Cache button to reduce the cache to this size.\n"
-            "Larger cache = fewer downloads but more disk usage.\n"
-            "Optimal: 50-200GB for regular use, 200-500GB for extensive "
-            "flying.\n"
-            "Minimum recommended: 20GB"
         )
         file_cache_layout.addWidget(file_cache_label)
         self.file_cache_slider = ModernSlider()
-        self.file_cache_slider.setRange(10, 500)
+        self.file_cache_slider.setRange(0, 500)
         self.file_cache_slider.setSingleStep(5)
         self.file_cache_slider.setValue(
             int(float(self.cfg.cache.file_cache_size))
@@ -2863,50 +2859,54 @@ class ConfigUI(QMainWindow):
             f"Cleaning up cache_dir {cache_dir}. Please wait..."
         )
 
-        target_gb = max(size_gb, 10)
-        target_bytes = pow(2, 30) * target_gb
+        target_bytes = pow(2, 30) * size_gb
 
         try:
-            cfiles = sorted(
-                pathlib.Path(cache_dir).glob('**/*'), key=os.path.getmtime
-            )
-            if not cfiles:
-                self.status_update.emit("Cache is empty.")
-                return
+            if size_gb == 0:
+                for entry in os.scandir(cache_dir):
+                    if entry.is_file():
+                        os.remove(entry.path)
+            else:
+                cfiles = sorted(
+                    pathlib.Path(cache_dir).glob('**/*'), key=os.path.getmtime
+                )
+                if not cfiles:
+                    self.status_update.emit("Cache is empty.")
+                    return
 
-            cache_bytes = sum(
-                file.stat().st_size for file in cfiles if file.is_file()
-            )
-            cachecount = len(cfiles)
-            avgcachesize = cache_bytes / cachecount if cachecount > 0 else 0
+                cache_bytes = sum(
+                    file.stat().st_size for file in cfiles if file.is_file()
+                )
+                cachecount = len(cfiles)
+                avgcachesize = cache_bytes / cachecount if cachecount > 0 else 0
 
-            self.status_update.emit(
-                f"Cache has {cachecount} files. "
-                f"Total size approx {cache_bytes//1048576} MB."
-            )
+                self.status_update.emit(
+                    f"Cache has {cachecount} files. "
+                    f"Total size approx {cache_bytes//1048576} MB."
+                )
 
-            empty_files = [
-                x for x in cfiles if x.is_file() and x.stat().st_size == 0
-            ]
-            self.status_update.emit(
-                f"Found {len(empty_files)} empty files to cleanup."
-            )
-            for file in empty_files:
-                if os.path.exists(file):
-                    os.remove(file)
+                empty_files = [
+                    x for x in cfiles if x.is_file() and x.stat().st_size == 0
+                ]
+                self.status_update.emit(
+                    f"Found {len(empty_files)} empty files to cleanup."
+                )
+                for file in empty_files:
+                    if os.path.exists(file):
+                        os.remove(file)
 
-            if target_bytes > cache_bytes:
-                self.status_update.emit("Cache within size limits.")
-                return
+                if target_bytes > cache_bytes:
+                    self.status_update.emit("Cache within size limits.")
+                    return
 
-            to_delete = int((cache_bytes - target_bytes) // avgcachesize)
+                to_delete = int((cache_bytes - target_bytes) // avgcachesize)
 
-            self.status_update.emit(
-                f"Over cache size limit, will remove {to_delete} files."
-            )
-            for file in cfiles[:to_delete]:
-                if file.is_file():
-                    os.remove(file)
+                self.status_update.emit(
+                    f"Over cache size limit, will remove {to_delete} files."
+                )
+                for file in cfiles[:to_delete]:
+                    if file.is_file():
+                        os.remove(file)
 
             self.status_update.emit("Cache cleanup done.")
         except Exception as e:
