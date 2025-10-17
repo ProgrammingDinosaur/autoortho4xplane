@@ -20,6 +20,7 @@ PySide6 = "^6.9.1"
 fastapi = "^0.116.1"
 uvicorn = "^0.35.0"
 py7zr = "^1.0.0"
+sqlalchemy = "^2.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "8.*"

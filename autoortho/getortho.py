@@ -30,11 +30,11 @@ from aoimage import AoImage
 
 from aoconfig import CFG
 from aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
+from services.cache_service import cache_manager
 from utils.constants import system_type
 from utils.apple_token_service import apple_token_service
 from utils.utils import coord_from_sleepy_tilename
 from utils.tile_db_service import tile_db_service
-from utils.cache_db_service import cache_db_service
 from parallel_compress import get_pool_status
 
 
@@ -335,15 +335,14 @@ class Chunk(object):
 
     serverlist=['a','b','c','d']
 
-    def __init__(self, col, row, maptype, zoom, priority=0, cache_dir='.cache'):
+    def __init__(self, col: int, row: int, maptype: str, zoom: int, parent_tile: 'Tile', priority: int = 0):
         self.col = col
         self.row = row
         self.zoom = zoom
-        self.maptype = maptype
-        self.cache_dir = cache_dir
-        
+        self.maptype = maptype        
         # Hack override maptype
         #self.maptype = "BI"
+        self.parent_tile = parent_tile
 
         if not priority:
             self.priority = zoom
@@ -352,6 +351,8 @@ class Chunk(object):
         self.ready.clear()
         if maptype == "Null":
             self.maptype = "EOX"
+
+        self.cache_dir = cache_manager.get_cache_folder_for_tile(self.row, self.col, self.zoom, self.maptype)
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
         
@@ -582,6 +583,8 @@ class Chunk(object):
         self.fetchtime = time.monotonic() - self.starttime
 
         self.save_cache()
+        cached_data_size = len(self.data)
+        cache_manager.cache_db_service.increment_cache_size_in_bytes(self.parent_tile.row, self.parent_tile.col, self.parent_tile.lat, self.parent_tile.lon, self.parent_tile.maptype, self.parent_tile.max_zoom, cached_data_size)
         self.ready.set()
         return True
 
@@ -708,13 +711,13 @@ class Tile(object):
                 dxt_format=CFG.pydds.format)
 
         self.id = f"{row}_{col}_{maptype}_{self.tilename_zoom}"
-        cache_db_service.create_tile_cache_state(
-            tile_id=self.id,
-            lat=lat,
-            lon=lon,
-            maptype=maptype,
-            max_zoom=self.max_zoom,
-            is_cached=False)
+        cache_manager.cache_db_service.create_tile_cache_state(
+            row=self.row,
+            col=self.col,
+            lat_tile=self.lat,
+            lon_tile=self.lon,
+            maptype=self.maptype,
+            cached_max_zoom=self.max_zoom)
 
 
     def __lt__(self, other):
@@ -1332,12 +1335,13 @@ class Tile(object):
 
         if mipmap == 0 and self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
             log.debug(f"GET_MIPMAP: Setting tile cache state for {self.row},{self.col},{self.max_zoom},{self.lat},{self.lon},{self.maptype} to True")
-            cache_db_service.update_tile_cache_state(
-                tile_id=self.id,
-                lat=self.lat,
-                lon=self.lon,
+            cache_manager.cache_db_service.update_tile_cache_state(
+                row=self.row,
+                col=self.col,
+                lat_tile=self.lat,
+                lon_tile=self.lon,
                 maptype=self.maptype,
-                max_zoom=self.max_zoom,
+                cached_max_zoom=self.max_zoom,
                 is_cached=True)
 
         log.debug(f"GET_MIPMAP: Set tile cache state for {self.row},{self.col},{self.max_zoom},{self.lat},{self.lon},{self.maptype} to True")

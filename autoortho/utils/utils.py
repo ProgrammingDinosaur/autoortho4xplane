@@ -52,3 +52,17 @@ def scan_existing_tiles(search_path: str) -> dict[str, set[str]]:
                     }
 
     return existing_tiles
+
+
+def get_main_dsf_folder_from_coord(latitude: int, longitude: int) -> str:
+    """ get the main dsf folder from a coordinate """
+    latitude_10 = math.ceil(latitude / 10) * 10
+    longitude_10 = math.ceil(longitude / 10) * 10
+    return f"{latitude_10:+03d}{longitude_10:+04d}"
+
+
+def get_dsf_name_from_coord(latitude: int, longitude: int) -> str:
+    """ get the dsf name from a coordinate """
+    latitude_10 = math.floor(latitude)
+    longitude_10 = math.floor(longitude)
+    return f"{latitude_10:+03d}{longitude_10:+04d}.dsf"

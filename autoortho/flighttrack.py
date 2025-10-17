@@ -24,9 +24,8 @@ from getortho import tile_cacher
 from utils.constants import MAPTYPES
 from utils.tile_db_service import tile_db_service
 from utils.utils import scan_existing_tiles
-from utils.cache_db_service import cache_db_service
+from services.cache_service import cache_manager
 from utils.dsf_utils import get_maptype_from_dsf
-from utils.cache_db_service import cache_db_service
 
 
 RUNNING=True
@@ -297,7 +296,7 @@ async def cache_status(lat: int, lon: int, maptype: str | None = None):
                 maptype = tile_db_service.get_tile_maptype(lat, lon)
         # Resolve DFLT to DSF-derived maptype only for cache queries
         effective = _resolve_effective_maptype(lat, lon, maptype)
-        agg = cache_db_service.get_latlon_maptype_cache_aggregate(lat, lon, effective)
+        agg = cache_manager.cache_db_service.get_rowcol_maptype_cache_aggregate(lat, lon, effective)
         return JSONResponse({"lat": lat, "lon": lon, "maptype": maptype, "effective_maptype": effective, **agg})
     except Exception as e:
         log.exception("cache_status error")
@@ -316,7 +315,7 @@ async def cache_subgrid(lat: int, lon: int, maptype: str | None = None, zoom: in
                 maptype = tile_db_service.get_tile_maptype(lat, lon)
         # Resolve DFLT only for cache queries
         effective = _resolve_effective_maptype(lat, lon, maptype)
-        agg = cache_db_service.get_latlon_maptype_cache_aggregate(lat, lon, effective)
+        agg = cache_manager.cache_db_service.get_rowcol_maptype_cache_aggregate(lat, lon, effective)
         total = int(agg.get('total', -1))
         cached = int(agg.get('cached', -1))
         if total <= 0:

@@ -5,18 +5,19 @@ import threading
 from aoconfig import CFG
 
 
-DB_NAME = "tiles.ao"
-
-
 class TileDBService:
+
+    db_folder = "tile_data"
+    db_name = "tiles.ao"
+
     def __init__(self):
         self.default_maptype = "DFLT"
         self._lock = threading.Lock()
 
-        db_path = os.path.join(CFG.paths.tile_db_dir)
+        db_path = os.path.join(CFG.paths.cache_dir, self.db_folder, self.db_name)
         if not os.path.exists(db_path):
             os.makedirs(db_path)
-        db_path_full = os.path.join(db_path, DB_NAME)
+        db_path_full = os.path.join(db_path, self.db_folder, self.db_name)
         # Open DB connection and ensure schema exists
         self.conn = sqlite3.connect(db_path_full, check_same_thread=False)
         self.conn.execute(
