@@ -1280,7 +1280,7 @@ class Tile(object):
             placeholder_img = AoImage.new('RGBA', (img_width, img_height), (128, 128, 128))
             return placeholder_img
             
-        def process_chunk(chunk):
+        def process_chunk(chunk, skip_download_wait=False):
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
             # Calculate position using native chunk size (no scaling)
             start_x = int(chunk.width * (chunk.col - col))
@@ -1293,7 +1293,11 @@ class Tile(object):
                 bump(f'chunk_permanent_fail_{chunk.failure_reason}')
             
             # Smart timeout: only wait for download, not decode
-            if chunk.ready.is_set():
+            # If skip_download_wait is True, go straight to fallbacks (for chunks that never started)
+            if skip_download_wait:
+                chunk_ready = False
+                log.debug(f"Chunk {chunk} never started downloading, skipping wait and going to fallbacks")
+            elif chunk.ready.is_set():
                 # Download already complete, just needs decode
                 chunk_ready = True
                 log.debug(f"Chunk {chunk} already downloaded, proceeding to decode")
@@ -1456,23 +1460,28 @@ class Tile(object):
             # These would otherwise be left as missing color patches
             unprocessed_chunks = [c for c in chunks if id(c) not in processed_chunks and not c.permanent_failure]
             if unprocessed_chunks:
-                log.debug(f"Processing {len(unprocessed_chunks)} chunks that never started downloading (fallback only)")
+                log.info(f"Processing {len(unprocessed_chunks)} chunks that never started downloading (fallback only)")
+                
+                # Submit ALL unprocessed chunks in parallel (not serial!)
+                unprocessed_futures = {}
                 for chunk in unprocessed_chunks:
+                    # Use skip_download_wait=True to go straight to fallbacks
+                    future = executor.submit(process_chunk, chunk, skip_download_wait=True)
+                    unprocessed_futures[future] = chunk
+                    processed_chunks.add(id(chunk))
+                
+                # Process results as they complete (parallel, not serial)
+                for future in concurrent.futures.as_completed(unprocessed_futures.keys(), timeout=10):
                     try:
-                        # Don't wait for download, go straight to fallback
-                        future = executor.submit(process_chunk, chunk)
-                        result = future.result(timeout=5)  # Short timeout for fallback
-                        if result:
-                            chunk, chunk_img, start_x, start_y = result
-                            if chunk_img:
-                                new_im.paste(chunk_img, (start_x, start_y))
-                            else:
-                                bump('chunk_missing_count')
-                        processed_chunks.add(id(chunk))
+                        chunk, chunk_img, start_x, start_y = future.result()
+                        if chunk_img:
+                            new_im.paste(chunk_img, (start_x, start_y))
+                        else:
+                            bump('chunk_missing_count')
                     except Exception as exc:
+                        chunk = unprocessed_futures.get(future, "unknown")
                         log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
                         bump('chunk_missing_count')
-                        processed_chunks.add(id(chunk))
                     
         finally:
             executor.shutdown(wait=True)
@@ -1761,7 +1770,7 @@ class Tile(object):
             return chunk_img
 
         log.debug(f"No best chunk found for {col}x{row}x{zoom}!")
-        return False
+        return None
 
     def get_maxwait(self):
         effective_maxwait = self.maxchunk_wait

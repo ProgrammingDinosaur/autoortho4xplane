@@ -2259,7 +2259,8 @@ class ConfigUI(QMainWindow):
         except Exception:
             pass
         self.save_config()
-        self.cfg.load()
+        # Note: cfg.load() removed - save_config() already saves to disk and updates cfg object
+        # The redundant load() was creating a race condition window where defaults could be exposed
         # Preflight check: prompt to unmount previous mounts if detected
         try:
             if not self.preflight_mount_check_and_prompt():
@@ -2310,7 +2311,8 @@ class ConfigUI(QMainWindow):
                 return
         
         self.save_config()
-        self.cfg.load()
+        # Note: cfg.load() removed - save_config() already saves to disk and updates cfg object
+        # The redundant load() was creating a race condition window where defaults could be exposed
         self.refresh_scenery_list()
 
         

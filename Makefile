@@ -86,7 +86,7 @@ _autoortho_win.exe: autoortho/.version
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--user-package-configuration-file=nuitka-package.config.yml \
 		--onefile \
-		--disable-console \
+		--windows-console-mode=disable \
 		./autoortho/__main__.py -o autoortho_win.exe
 
 __main__.dist: autoortho/.version
@@ -100,7 +100,7 @@ __main__.dist: autoortho/.version
 		--include-data-file=./autoortho/templates/*.html=templates/ \
 		--user-package-configuration-file=nuitka-package.config.yml \
 		--standalone \
-		--disable-console \
+		--windows-console-mode=disable \
 		./autoortho/__main__.py -o autoortho_win.exe
 
 win_exe: AutoOrtho_win_$(SAFE_VERSION).exe

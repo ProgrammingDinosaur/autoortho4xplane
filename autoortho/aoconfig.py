@@ -334,8 +334,9 @@ prefer_winfsp = True
 
 CFG = AOConfig()
 
-if __name__ == "__main__":
-    aoc = AOConfig()
-    cfgui = ConfigUI(aoc)
-    cfgui.setup()
-    cfgui.verify()
+# Note: The test code below is obsolete and has been commented out
+# if __name__ == "__main__":
+#     aoc = AOConfig()
+#     cfgui = ConfigUI(aoc)  # ConfigUI is not imported in this module
+#     cfgui.setup()
+#     cfgui.verify()
