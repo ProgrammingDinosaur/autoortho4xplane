@@ -12,8 +12,13 @@
 #define FALSE 0
 
 AOIAPI void aoimage_delete(aoimage_t *img) {
-    if (img->ptr)
-        free(img->ptr);
+    // Prevent double-free by atomically clearing pointer first
+    uint8_t *ptr_to_free = img->ptr;
+    img->ptr = NULL;  // Clear pointer BEFORE freeing (atomic on x86/x64)
+    
+    if (ptr_to_free) {
+        free(ptr_to_free);
+    }
     memset(img, 0, sizeof(aoimage_t));
 }
 
@@ -345,7 +350,18 @@ AOIAPI int32_t aoimage_copy(const aoimage_t *s_img, aoimage_t *d_img, uint32_t s
 AOIAPI int32_t aoimage_from_memory(aoimage_t *img, const uint8_t *data, uint32_t len) {
     memset(img, 0, sizeof(aoimage_t));
 
-    // strange enough tj does not check the signture */
+    // Validate input parameters to prevent access violations
+    if (data == NULL) {
+        strcpy(img->errmsg, "data pointer is NULL");
+        return FALSE;
+    }
+    
+    if (len < 4) {
+        strcpy(img->errmsg, "data too short (< 4 bytes)");
+        return FALSE;
+    }
+
+    // Check JPEG signature (FFD8FF)
     uint32_t signature = *(uint32_t *)data & 0x00ffffff;
 
     if (signature != 0x00ffd8ff) {
@@ -365,7 +381,19 @@ AOIAPI int32_t aoimage_from_memory(aoimage_t *img, const uint8_t *data, uint32_t
     int subsamp, width, height, color_space;
 
     if (tjDecompressHeader3(tjh, data, len, &width, &height, &subsamp, &color_space) < 0) {
-        strncpy(img->errmsg, tjGetErrorStr2(tjh), sizeof(img->errmsg) - 1);
+        const char *err_str = tjGetErrorStr2(tjh);
+        if (err_str != NULL) {
+            strncpy(img->errmsg, err_str, sizeof(img->errmsg) - 1);
+            img->errmsg[sizeof(img->errmsg) - 1] = '\0';  // Ensure null termination
+        } else {
+            strcpy(img->errmsg, "tjDecompressHeader3 failed (no error string)");
+        }
+        goto err;
+    }
+    
+    // Validate dimensions to prevent allocation issues
+    if (width <= 0 || height <= 0 || width > 65536 || height > 65536) {
+        sprintf(img->errmsg, "invalid dimensions: %dx%d", width, height);
         goto err;
     }
 
@@ -382,7 +410,13 @@ AOIAPI int32_t aoimage_from_memory(aoimage_t *img, const uint8_t *data, uint32_t
     //printf("Pixel format: %d\n", TJPF_RGBA);
 
     if (tjDecompress2(tjh, data, len, img_buff, width, 0, height, TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
-        strncpy(img->errmsg, tjGetErrorStr2(tjh), sizeof(img->errmsg) - 1);
+        const char *err_str = tjGetErrorStr2(tjh);
+        if (err_str != NULL) {
+            strncpy(img->errmsg, err_str, sizeof(img->errmsg) - 1);
+            img->errmsg[sizeof(img->errmsg) - 1] = '\0';  // Ensure null termination
+        } else {
+            strcpy(img->errmsg, "tjDecompress2 failed (no error string)");
+        }
         goto err;
     }
 

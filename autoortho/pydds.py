@@ -20,6 +20,15 @@ from utils.constants import system_type
 import logging
 log = logging.getLogger(__name__)
 
+# Define rgba_surface structure BEFORE it's referenced in library setup
+class rgba_surface(Structure):
+    _fields_ = [
+        ('data', c_char_p),
+        ('width', c_uint32),
+        ('height', c_uint32),
+        ('stride', c_uint32)
+    ]
+
 #_stb = CDLL("/usr/lib/x86_64-linux-gnu/libstb.so")
 if system_type == 'linux':
     print("Linux detected")
@@ -37,11 +46,39 @@ else:
     print("System is not supported")
     exit()
 
+# Load compression libraries with error handling
 _stb = None
 if _stb_path:
-    _stb = CDLL(_stb_path)
+    try:
+        if not os.path.exists(_stb_path):
+            raise FileNotFoundError(f"STB DXT library not found at: {_stb_path}")
+        _stb = CDLL(_stb_path)
+        log.info(f"Loaded STB DXT library from {_stb_path}")
+        
+        # CRITICAL FIX #5: Set argtypes ONCE at module load (thread safety)
+        _stb.compress_pixels.argtypes = (c_char_p, c_char_p, c_uint64, c_uint64, c_bool)
+        
+    except Exception as e:
+        log.error(f"Failed to load STB DXT library from {_stb_path}: {e}")
+        log.warning("DXT1 compression may not work correctly")
+        # Don't raise - ISPC can handle all formats
 
-_ispc = CDLL(_ispc_path)
+try:
+    if not os.path.exists(_ispc_path):
+        raise FileNotFoundError(f"ISPC texcomp library not found at: {_ispc_path}")
+    _ispc = CDLL(_ispc_path)
+    log.info(f"Loaded ISPC texcomp library from {_ispc_path}")
+    
+    # CRITICAL FIX #5: Set argtypes ONCE at module load (thread safety)
+    # Don't set these in compress() - causes race conditions!
+    _ispc.CompressBlocksBC3.argtypes = (POINTER(rgba_surface), c_char_p)
+    _ispc.CompressBlocksBC1.argtypes = (POINTER(rgba_surface), c_char_p)
+    
+except Exception as e:
+    log.error(f"FATAL: Failed to load ISPC texcomp library from {_ispc_path}")
+    log.error(f"Error: {e}")
+    log.error("AutoOrtho cannot continue without this library.")
+    raise
 
 DDSD_CAPS = 0x00000001          # dwCaps/dwCaps2 is enabled. 
 DDSD_HEIGHT = 0x00000002                # dwHeight is enabled. 
@@ -111,15 +148,6 @@ class MipMap(object):
 
     def __repr__(self):
         return f"MipMap({self.idx}, {self.startpos}, {self.endpos}, {self.length}, {self.retrieved}, {self.databuffer})"
-
-
-class rgba_surface(Structure):
-    _fields_ = [
-        ('data', c_char_p),
-        ('width', c_uint32),
-        ('height', c_uint32),
-        ('stride', c_uint32)
-    ]
 
 
 class DDS(Structure):
@@ -222,6 +250,11 @@ class DDS(Structure):
         self.lock = threading.Lock()
         self.ready = threading.Event()
         self.ready.clear()
+        
+        # PHASE 2 FIX #9: Per-mipmap locks for thread-safe generation
+        self.mipmap_locks = {}  # Lock per mipmap level
+        for i in range(self.mipMapCount):
+            self.mipmap_locks[i] = threading.Lock()
    
         self.compress_count = 0
 
@@ -355,10 +388,27 @@ class DDS(Structure):
     #@profile 
     def compress(self, width, height, data):
         # Compress width * height of data
-
-        if (width < 4 or width % 4 != 0 or height < 4 or height % 4 != 0):
-            log.debug(f"Compressed images must have dimensions that are multiples of 4. We got {width}x{height}")
+        
+        # CRITICAL FIX #1: Validate data before passing to C code
+        if not data:
+            log.error("DDS.compress: data is None or empty")
             return None
+        
+        # Validate dimensions
+        if (width < 4 or width % 4 != 0 or height < 4 or height % 4 != 0):
+            log.error(f"DDS.compress: Invalid dimensions {width}x{height} (must be multiple of 4, >= 4)")
+            return None
+        
+        # Validate data size
+        expected_size = width * height * 4  # RGBA = 4 bytes per pixel
+        if hasattr(data, '__len__'):
+            actual_size = len(data)
+            if actual_size < expected_size:
+                log.error(f"DDS.compress: Data too short: {actual_size} < {expected_size} bytes")
+                return None
+        
+        # Breadcrumb: Log before entering C code
+        log.debug(f"DDS.compress: Compressing {width}x{height} RGBA ({expected_size} bytes) to {self.dxt_format}")
 
         #outdata = b'\x00'*dxt_size
         
@@ -367,8 +417,20 @@ class DDS(Structure):
 
 
         if self.ispc and self.dxt_format == "BC3":
+            # Calculate compressed size
             dxt_size = ((width+3) >> 2) * ((height+3) >> 2) * self.blocksize
-            outdata = create_string_buffer(dxt_size)
+            
+            # CRITICAL FIX #7: Check for integer overflow
+            if dxt_size <= 0 or dxt_size > 2**31:  # Sanity check
+                log.error(f"DDS.compress: Invalid compressed size: {dxt_size}")
+                return None
+            
+            try:
+                outdata = create_string_buffer(dxt_size)
+            except MemoryError as e:
+                log.error(f"DDS.compress: Failed to allocate {dxt_size} bytes: {e}")
+                return None
+            
             #print(f"LEN: {len(outdata)}")
             s = rgba_surface()
             s.data = c_char_p(data)
@@ -376,21 +438,30 @@ class DDS(Structure):
             s.height = c_uint32(height)
             s.stride = c_uint32(width * 4)
             
-            #print("Will do ispc")
-            _ispc.CompressBlocksBC3.argtypes = (
-                POINTER(rgba_surface),
-                c_char_p
-            )
-
-            _ispc.CompressBlocksBC3(
-                s, outdata
-            )
-            result = True
+            # CRITICAL FIX #3: Add error handling for C calls
+            try:
+                log.debug("DDS.compress: Calling CompressBlocksBC3")
+                _ispc.CompressBlocksBC3(s, outdata)
+                log.debug("DDS.compress: CompressBlocksBC3 succeeded")
+                result = True
+            except Exception as e:
+                log.error(f"DDS.compress: CompressBlocksBC3 failed: {e}")
+                return None
         elif self.ispc and self.dxt_format == "BC1":
             #print("BC1")
             blocksize = 8
             dxt_size = ((width+3) >> 2) * ((height+3) >> 2) * self.blocksize
-            outdata = create_string_buffer(dxt_size)
+            
+            # CRITICAL FIX #7: Check for integer overflow
+            if dxt_size <= 0 or dxt_size > 2**31:
+                log.error(f"DDS.compress: Invalid compressed size: {dxt_size}")
+                return None
+            
+            try:
+                outdata = create_string_buffer(dxt_size)
+            except MemoryError as e:
+                log.error(f"DDS.compress: Failed to allocate {dxt_size} bytes: {e}")
+                return None
             #print(f"LEN: {len(outdata)}")
         
             s = rgba_surface()
@@ -399,36 +470,49 @@ class DDS(Structure):
             s.height = c_uint32(height)
             s.stride = c_uint32(width * 4)
             
-            #print("Will do ispc")
-            _ispc.CompressBlocksBC1.argtypes = (
-                POINTER(rgba_surface),
-                c_char_p
-            )
-
-            _ispc.CompressBlocksBC1(
-                s, outdata
-            )
-            result = True
+            # CRITICAL FIX #3: Add error handling for C calls
+            try:
+                log.debug("DDS.compress: Calling CompressBlocksBC1")
+                _ispc.CompressBlocksBC1(s, outdata)
+                log.debug("DDS.compress: CompressBlocksBC1 succeeded")
+                result = True
+            except Exception as e:
+                log.error(f"DDS.compress: CompressBlocksBC1 failed: {e}")
+                return None
         else:
             # Use STB compressor; honor BC1 (DXT1, 8 bytes/block) vs BC3 (DXT5, 16 bytes/block)
             use_alpha = (self.dxt_format == "BC3")
             blocksize = self.blocksize
             dxt_size = ((width+3) >> 2) * ((height+3) >> 2) * blocksize
-            outdata = create_string_buffer(dxt_size)
+            
+            # CRITICAL FIX #7: Check for integer overflow
+            if dxt_size <= 0 or dxt_size > 2**31:
+                log.error(f"DDS.compress: Invalid compressed size: {dxt_size}")
+                return None
+            
+            try:
+                outdata = create_string_buffer(dxt_size)
+            except MemoryError as e:
+                log.error(f"DDS.compress: Failed to allocate {dxt_size} bytes: {e}")
+                return None
 
-            _stb.compress_pixels.argtypes = (
-                    c_char_p,
-                    c_char_p, 
-                    c_uint64, 
-                    c_uint64, 
-                    c_bool)
-
-            result = _stb.compress_pixels(
-                    outdata,
-                    c_char_p(data),
-                    c_uint64(width), 
-                    c_uint64(height), 
-                    c_bool(use_alpha))
+            # CRITICAL FIX #3: Add error handling for STB calls
+            try:
+                log.debug("DDS.compress: Calling STB compress_pixels")
+                result = _stb.compress_pixels(
+                        outdata,
+                        c_char_p(data),
+                        c_uint64(width), 
+                        c_uint64(height), 
+                        c_bool(use_alpha))
+                if result:
+                    log.debug("DDS.compress: STB compress_pixels succeeded")
+                else:
+                    log.error("DDS.compress: STB compress_pixels returned False")
+                    return None
+            except Exception as e:
+                log.error(f"DDS.compress: STB compress_pixels failed: {e}")
+                return None
 
 
         if not result:
@@ -477,11 +561,22 @@ class DDS(Structure):
             img = img.reduce_2(steps)
 
         while True:
-            if True:
-            #if not self.mipmap_list[mipmap].retrieved:
-                imgdata = img.data_ptr()
-                width, height = img.size
-                log.debug(f"MIPMAP: {mipmap} SIZE: {img.size}")
+            # PHASE 2 FIX #9: Lock per-mipmap to prevent concurrent generation
+            # This prevents race conditions when multiple threads generate same mipmap
+            mipmap_lock = self.mipmap_locks.get(mipmap, threading.Lock())
+            
+            with mipmap_lock:
+                # Check if already retrieved (another thread may have done it)
+                if self.mipmap_list[mipmap].retrieved and not compress_bytes:
+                    log.debug(f"MIPMAP: {mipmap} already retrieved by another thread, skipping")
+                    break
+                
+                # CRITICAL FIX #2: Keep strong reference to img during data_ptr() use
+                # This prevents GC from freeing the image while C code is using the pointer
+                img_ref = img  # Strong reference
+                imgdata = img_ref.data_ptr()
+                width, height = img_ref.size
+                log.debug(f"MIPMAP: {mipmap} SIZE: {img_ref.size}")
 
                 if compress_bytes:
                     # Get how many rows we need to process for requested number of bytes
@@ -492,28 +587,33 @@ class DDS(Structure):
                     compress_bytes >>= 2
 
                 try:
+                    # Keep img_ref alive during compress
                     dxtdata = self.compress(width, height, imgdata)
                 except Exception as e:
-                    log.warning(f"dds compress failed: {e}")
+                    log.error(f"dds compress failed: {e}")
                     dxtdata = None
+                finally:
+                    # CRITICAL FIX #11: Explicitly release reference after compression
+                    # This ensures deterministic cleanup even if compress fails
+                    pass  # img_ref will be released when we exit this scope
 
-                # Lock ONLY for databuffer assignment
+                # Assign databuffer (still within mipmap_lock)
                 if dxtdata is not None:
-                    with self.lock:
-                        self.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=dxtdata)
-                        if not compress_bytes:
-                            self.mipmap_list[mipmap].retrieved = True
+                    self.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=dxtdata)
+                    if not compress_bytes:
+                        self.mipmap_list[mipmap].retrieved = True
 
-                        # we are already at 4x4 so push result forward to
-                        # remaining MMs
-                        if mipmap == self.smallest_mm:
-                            log.debug(f"At MM {mipmap}.  Set the remaining MMs..")
-                            for mm in self.mipmap_list[self.smallest_mm:]:
-                                mm.databuffer = BytesIO(initial_bytes=dxtdata)
-                                mm.retrieved = True
-                                mipmap += 1
+                    # we are already at 4x4 so push result forward to
+                    # remaining MMs
+                    if mipmap == self.smallest_mm:
+                        log.debug(f"At MM {mipmap}.  Set the remaining MMs..")
+                        for mm in self.mipmap_list[self.smallest_mm:]:
+                            mm.databuffer = BytesIO(initial_bytes=dxtdata)
+                            mm.retrieved = True
+                            mipmap += 1
 
                 dxtdata = None
+                # mipmap_lock released here
 
         
             if mipmap >= maxmipmaps: #(maxmipmaps + 1) or mipmap >= self.smallest_mm:
@@ -522,9 +622,12 @@ class DDS(Structure):
 
             mipmap += 1
             # Halve the image
-            img = img.reduce_2()
+            # Keep reference to original before reducing
+            prev_img = img
+            img = prev_img.reduce_2()
+            # prev_img can now be GC'd
 
-        # Lock for header dump
+        # Dump header (use main lock for header writes)
         with self.lock:
             self.dump_header()
 

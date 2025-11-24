@@ -14,3 +14,5 @@ PRIORITY_DISTANCE_WEIGHT = 1.0
 PRIORITY_DIRECTION_WEIGHT = 0.5
 PRIORITY_MIPMAP_WEIGHT = 2.0
 LOOKAHEAD_TIME_SEC = 30
+
+LOGS_DIR = os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs")

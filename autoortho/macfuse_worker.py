@@ -10,6 +10,16 @@ from aostats import update_process_memory_stat, clear_process_memory_stat
 
 log = logging.getLogger(__name__)
 
+# Install crash handler for macOS worker subprocess
+# CRITICAL: macOS uses subprocesses, each needs its own crash handler!
+try:
+    from crash_handler import install_crash_handler
+    install_crash_handler()
+    log.debug("Crash handler installed in macOS worker subprocess")
+except Exception as e:
+    # Don't fail if crash handler can't be installed
+    print(f"Warning: macOS worker could not install crash handler: {e}", file=sys.stderr)
+
 
 def configure_worker_logging(mount_name, loglevel: str):
     addr = os.getenv("AO_LOG_ADDR")

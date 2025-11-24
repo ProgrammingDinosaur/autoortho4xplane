@@ -1280,11 +1280,24 @@ class Tile(object):
             placeholder_img = AoImage.new('RGBA', (img_width, img_height), (128, 128, 128))
             return placeholder_img
             
-        def process_chunk(chunk):
+        def process_chunk(chunk, skip_download_wait=False):
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
             # Calculate position using native chunk size (no scaling)
             start_x = int(chunk.width * (chunk.col - col))
             start_y = int(chunk.height * (chunk.row - row))
+            
+            # PHASE 2 FIX #6 & #8: Validate coordinates before use
+            # Negative coordinates indicate logic error or data corruption
+            if start_x < 0 or start_y < 0:
+                log.error(f"GET_IMG: Invalid negative coordinates: start_x={start_x}, start_y={start_y}, chunk.col={chunk.col}, chunk.row={chunk.row}, base col={col}, base row={row}")
+                # Return placeholder to prevent crash
+                return (chunk, None, 0, 0)
+            
+            # Check if coordinates would extend beyond image bounds
+            if start_x + chunk.width > img_width or start_y + chunk.height > img_height:
+                log.error(f"GET_IMG: Coordinates extend beyond image: pos=({start_x},{start_y}), size=({chunk.width}x{chunk.height}), image=({img_width}x{img_height})")
+                # Return placeholder to prevent crash
+                return (chunk, None, 0, 0)
             
             # Track if this chunk permanently failed
             is_permanent_failure = chunk.permanent_failure
@@ -1293,7 +1306,11 @@ class Tile(object):
                 bump(f'chunk_permanent_fail_{chunk.failure_reason}')
             
             # Smart timeout: only wait for download, not decode
-            if chunk.ready.is_set():
+            # If skip_download_wait is True, go straight to fallbacks (for chunks that never started)
+            if skip_download_wait:
+                chunk_ready = False
+                log.debug(f"Chunk {chunk} never started downloading, skipping wait and going to fallbacks")
+            elif chunk.ready.is_set():
                 # Download already complete, just needs decode
                 chunk_ready = True
                 log.debug(f"Chunk {chunk} already downloaded, proceeding to decode")
@@ -1310,8 +1327,11 @@ class Tile(object):
                 try:
                     with _decode_sem:
                         chunk_img = AoImage.load_from_memory(chunk.data)
+                        if chunk_img is None:
+                            log.warning(f"GET_IMG: load_from_memory returned None for {chunk}")
                 except Exception as _e:
-                    log.debug(f"GET_IMG: load_from_memory failed for {chunk}: {_e}")
+                    log.error(f"GET_IMG: load_from_memory exception for {chunk}: {_e}")
+                    chunk_img = None
             
             # FALLBACK CHAIN (in order of preference):
             # Each fallback only runs if previous ones failed
@@ -1350,8 +1370,11 @@ class Tile(object):
                     try:
                         with _decode_sem:
                             chunk_img = AoImage.load_from_memory(chunk.data)
+                            if chunk_img is None:
+                                log.warning(f"GET_IMG: load_from_memory returned None on retry for {chunk}")
                     except Exception as _e:
-                        log.debug(f"GET_IMG: load_from_memory failed on retry for {chunk}: {_e}")
+                        log.error(f"GET_IMG: load_from_memory exception on retry for {chunk}: {_e}")
+                        chunk_img = None
 
             if not chunk_img:
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Empty chunk data.  Skip.")
@@ -1426,7 +1449,12 @@ class Tile(object):
                             chunk, chunk_img, start_x, start_y = future.result()
                             completed += 1
                             if chunk_img:
-                                new_im.paste(chunk_img, (start_x, start_y))
+                                # PHASE 2 FIX #6: Validate coordinates before paste
+                                if start_x >= 0 and start_y >= 0:
+                                    if not new_im.paste(chunk_img, (start_x, start_y)):
+                                        log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                                else:
+                                    log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
                                 # Free native buffer immediately after paste
                                 try:
                                     chunk_img.close()
@@ -1448,7 +1476,12 @@ class Tile(object):
                 try:
                     chunk, chunk_img, start_x, start_y = future.result()
                     if chunk_img:
-                        new_im.paste(chunk_img, (start_x, start_y))
+                        # PHASE 2 FIX #6: Validate coordinates before paste
+                        if start_x >= 0 and start_y >= 0:
+                            if not new_im.paste(chunk_img, (start_x, start_y)):
+                                log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                        else:
+                            log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
                 except Exception as exc:
                     log.error(f"Chunk processing failed: {exc}")
             
@@ -1456,23 +1489,33 @@ class Tile(object):
             # These would otherwise be left as missing color patches
             unprocessed_chunks = [c for c in chunks if id(c) not in processed_chunks and not c.permanent_failure]
             if unprocessed_chunks:
-                log.debug(f"Processing {len(unprocessed_chunks)} chunks that never started downloading (fallback only)")
+                log.info(f"Processing {len(unprocessed_chunks)} chunks that never started downloading (fallback only)")
+                
+                # Submit ALL unprocessed chunks in parallel (not serial!)
+                unprocessed_futures = {}
                 for chunk in unprocessed_chunks:
+                    # Use skip_download_wait=True to go straight to fallbacks
+                    future = executor.submit(process_chunk, chunk, skip_download_wait=True)
+                    unprocessed_futures[future] = chunk
+                    processed_chunks.add(id(chunk))
+                
+                # Process results as they complete (parallel, not serial)
+                for future in concurrent.futures.as_completed(unprocessed_futures.keys(), timeout=10):
                     try:
-                        # Don't wait for download, go straight to fallback
-                        future = executor.submit(process_chunk, chunk)
-                        result = future.result(timeout=5)  # Short timeout for fallback
-                        if result:
-                            chunk, chunk_img, start_x, start_y = result
-                            if chunk_img:
-                                new_im.paste(chunk_img, (start_x, start_y))
+                        chunk, chunk_img, start_x, start_y = future.result()
+                        if chunk_img:
+                            # PHASE 2 FIX #6: Validate coordinates before paste
+                            if start_x >= 0 and start_y >= 0:
+                                if not new_im.paste(chunk_img, (start_x, start_y)):
+                                    log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
                             else:
-                                bump('chunk_missing_count')
-                        processed_chunks.add(id(chunk))
+                                log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
+                        else:
+                            bump('chunk_missing_count')
                     except Exception as exc:
+                        chunk = unprocessed_futures.get(future, "unknown")
                         log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
                         bump('chunk_missing_count')
-                        processed_chunks.add(id(chunk))
                     
         finally:
             executor.shutdown(wait=True)
@@ -1536,6 +1579,9 @@ class Tile(object):
                 try:
                     with _decode_sem:
                         fallback_img = AoImage.load_from_memory(fallback_chunk.data)
+                        if fallback_img is None:
+                            log.warning(f"GET_IMG: Fallback load_from_memory returned None for {fallback_chunk}")
+                            continue
                     
                     # Calculate which portion to extract and upscale
                     scale_factor = 1 << mipmap_diff
@@ -1610,7 +1656,21 @@ class Tile(object):
                 # Crop scale_factor*256 region, then downscale to 256
                 crop_size = 256 * scale_factor
                 cropped = AoImage.new('RGBA', (crop_size, crop_size), (0,0,0,0))
-                higher_img.crop(cropped, (chunk_offset_x, chunk_offset_y))
+                
+                # PHASE 2 FIX #6 & #8: Validate crop coordinates
+                if chunk_offset_x < 0 or chunk_offset_y < 0:
+                    log.warning(f"GET_IMG: Negative crop offset: ({chunk_offset_x},{chunk_offset_y}), skipping fallback")
+                    continue
+                
+                # Check bounds
+                higher_width, higher_height = higher_img.size
+                if chunk_offset_x + crop_size > higher_width or chunk_offset_y + crop_size > higher_height:
+                    log.warning(f"GET_IMG: Crop extends beyond image: pos=({chunk_offset_x},{chunk_offset_y}), size={crop_size}, image=({higher_width}x{higher_height})")
+                    continue
+                
+                if not higher_img.crop(cropped, (chunk_offset_x, chunk_offset_y)):
+                    log.warning(f"GET_IMG: crop() failed for fallback at ({chunk_offset_x},{chunk_offset_y})")
+                    continue
                 
                 downscale_steps = int(math.log2(scale_factor))
                 downscaled = cropped.reduce_2(downscale_steps)
@@ -1742,9 +1802,15 @@ class Tile(object):
             log.debug(f"Pixel Size: {w_p}x{h_p}")
 
             # Load image to crop
-            img_p = AoImage.load_from_memory(c.data)
+            try:
+                img_p = AoImage.load_from_memory(c.data)
+            except Exception as e:
+                log.error(f"Exception loading chunk {c} into memory: {e}")
+                c.close()
+                continue
+            
             if not img_p:
-                log.warning(f"Failed to load chunk {c} into memory.")
+                log.warning(f"Failed to load chunk {c} into memory (returned None).")
                 c.close()
                 continue
 
@@ -1761,7 +1827,7 @@ class Tile(object):
             return chunk_img
 
         log.debug(f"No best chunk found for {col}x{row}x{zoom}!")
-        return False
+        return None
 
     def get_maxwait(self):
         effective_maxwait = self.maxchunk_wait

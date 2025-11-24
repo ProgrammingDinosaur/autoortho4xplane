@@ -30,15 +30,29 @@ class AoImage(Structure):
         self._stride = 0
         self._channels = 0
         self._errmsg = b'';
+        self._freed = False  # Prevent double-free crashes
 
     def __del__(self):
-        _aoi.aoimage_delete(self)
+        # Only delete if not already freed (prevents double-free crash)
+        if not self._freed:
+            try:
+                _aoi.aoimage_delete(self)
+                self._freed = True
+            except Exception as e:
+                # Log but don't raise in __del__ (causes issues)
+                log.debug(f"Error in AoImage.__del__: {e}")
 
     def __repr__(self):
         return f"ptr:  width: {self._width} height: {self._height} stride: {self._stride} channels: {self._channels}"
 
     def close(self):
-        _aoi.aoimage_delete(self)
+        # Only delete if not already freed (prevents double-free crash)
+        if not self._freed:
+            try:
+                _aoi.aoimage_delete(self)
+                self._freed = True
+            except Exception as e:
+                log.error(f"Error in AoImage.close: {e}")
         
     def convert(self, mode):
         """
@@ -72,13 +86,28 @@ class AoImage(Structure):
         return half
 
     def scale(self, factor=2):
-        scaled = AoImage()
-        orig = self
-        if not _aoi.aoimage_scale(orig, scaled, factor):
-            log.debug(f"AoImage.scale error: {new._errmsg.decode()}")
+        # CRITICAL FIX #10: Validate scale factor
+        if not isinstance(factor, (int, float)) or factor <= 0:
+            log.error(f"scale: Invalid factor {factor} - must be positive number")
             return None
         
-        return scaled
+        if factor > 1000:  # Sanity check
+            log.error(f"scale: Factor {factor} too large (max 1000)")
+            return None
+        
+        scaled = AoImage()
+        orig = self
+        
+        try:
+            log.debug(f"AoImage.scale: Scaling {self._width}x{self._height} by {factor}")
+            if not _aoi.aoimage_scale(orig, scaled, factor):
+                log.error(f"AoImage.scale error: {scaled._errmsg.decode()}")
+                return None
+            log.debug(f"AoImage.scale: Success, created {scaled._width}x{scaled._height}")
+            return scaled
+        except Exception as e:
+            log.error(f"scale: Exception: {e}")
+            return None
 
     def write_jpg(self, filename, quality = 90):
         """
@@ -102,12 +131,50 @@ class AoImage(Structure):
         return self._data
 
     def paste(self, p_img, pos):
-        _aoi.aoimage_paste(self, p_img, pos[0], pos[1])
-        return True
+        # CRITICAL FIX #4: Validate parameters before C call
+        if not p_img or not hasattr(p_img, '_width'):
+            log.error("paste: Invalid image object")
+            return False
+        
+        x, y = pos
+        if x < 0 or y < 0:
+            log.error(f"paste: Invalid position ({x}, {y}) - cannot be negative")
+            return False
+        
+        if x + p_img._width > self._width or y + p_img._height > self._height:
+            log.error(f"paste: Image extends beyond bounds: pos=({x},{y}), size=({p_img._width}x{p_img._height}), dest=({self._width}x{self._height})")
+            return False
+        
+        try:
+            log.debug(f"AoImage.paste: Pasting {p_img._width}x{p_img._height} at ({x},{y})")
+            _aoi.aoimage_paste(self, p_img, pos[0], pos[1])
+            return True
+        except Exception as e:
+            log.error(f"paste: C call failed: {e}")
+            return False
 
     def crop(self, c_img, pos):
-        _aoi.aoimage_crop(self, c_img, pos[0], pos[1])
-        return True
+        # CRITICAL FIX #4: Validate parameters before C call
+        if not c_img or not hasattr(c_img, '_width'):
+            log.error("crop: Invalid destination image object")
+            return False
+        
+        x, y = pos
+        if x < 0 or y < 0:
+            log.error(f"crop: Invalid position ({x}, {y}) - cannot be negative")
+            return False
+        
+        if x + c_img._width > self._width or y + c_img._height > self._height:
+            log.error(f"crop: Crop region extends beyond bounds: pos=({x},{y}), size=({c_img._width}x{c_img._height}), source=({self._width}x{self._height})")
+            return False
+        
+        try:
+            log.debug(f"AoImage.crop: Cropping {c_img._width}x{c_img._height} from ({x},{y})")
+            _aoi.aoimage_crop(self, c_img, pos[0], pos[1])
+            return True
+        except Exception as e:
+            log.error(f"crop: C call failed: {e}")
+            return False
 
     def copy(self, height_only = 0):
         new = AoImage()
@@ -163,11 +230,33 @@ def new(mode, wh, color):
 
 
 def load_from_memory(mem, datalen=None):
+    # Validate input before passing to C code
+    if not mem:
+        log.error("AoImage.load_from_memory: mem is None or empty")
+        return None
+    
     if not datalen:
         datalen = len(mem)
+    
+    if datalen < 4:
+        log.error(f"AoImage.load_from_memory: data too short ({datalen} bytes)")
+        return None
+    
     new = AoImage()
-    if not _aoi.aoimage_from_memory(new, mem, datalen):
-        log.error(f"AoImage.load_from_memory error: {new._errmsg.decode()}")
+    try:
+        # Breadcrumb: Log BEFORE entering C code (helps debug crashes)
+        log.debug(f"AoImage: Calling C aoimage_from_memory with {datalen} bytes")
+        
+        # Keep strong reference to mem to prevent GC during C call
+        mem_ref = mem
+        if not _aoi.aoimage_from_memory(new, mem_ref, datalen):
+            log.error(f"AoImage.load_from_memory error: {new._errmsg.decode()}")
+            return None
+        
+        # Breadcrumb: Made it through C code successfully
+        log.debug(f"AoImage: C call succeeded, created {new._width}x{new._height} image")
+    except Exception as e:
+        log.error(f"AoImage.load_from_memory exception: {e}")
         return None
 
     return new
@@ -191,7 +280,17 @@ else:
     log.error("System is not supported")
     exit()
 
-_aoi = CDLL(_aoi_path)
+# Load C library with error handling to prevent silent crashes
+try:
+    if not os.path.exists(_aoi_path):
+        raise FileNotFoundError(f"aoimage library not found at: {_aoi_path}")
+    _aoi = CDLL(_aoi_path)
+except Exception as e:
+    log.error(f"FATAL: Failed to load aoimage library from {_aoi_path}")
+    log.error(f"Error: {e}")
+    log.error("AutoOrtho cannot continue without this library.")
+    log.error("Please verify installation and that all DLL dependencies are present.")
+    raise
 _aoi.aoimage_read_jpg.argtypes = (c_char_p, POINTER(AoImage))
 _aoi.aoimage_write_jpg.argtypes = (c_char_p, POINTER(AoImage), c_int32)
 _aoi.aoimage_2_rgba.argtypes = (POINTER(AoImage), POINTER(AoImage))

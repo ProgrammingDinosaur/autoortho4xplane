@@ -58,4 +58,4 @@ def _find_version_file():
     return "unknown"
 
 # TODO: Remove this once the version file is working
-__version__ = "1.4.1" # _find_version_file()
+__version__ = "1.4.2" # _find_version_file()

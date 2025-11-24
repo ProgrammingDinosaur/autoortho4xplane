@@ -16,6 +16,15 @@ from aoconfig import CFG
 from pathlib import Path
 from utils.constants import system_type
 
+# Install crash handler EARLY, before any C extensions load
+# This allows us to log C-level crashes (segfaults, access violations)
+try:
+    from crash_handler import install_crash_handler
+    install_crash_handler()
+except Exception as e:
+    # Don't fail if crash handler can't be installed
+    print(f"Warning: Could not install crash handler: {e}", file=sys.stderr)
+
 # ---------------------------------------------------------------------------
 # Global cleanup hook – ensures we release worker threads, caches & C buffers
 # ---------------------------------------------------------------------------
