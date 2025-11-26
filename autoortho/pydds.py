@@ -385,30 +385,69 @@ class DDS(Structure):
         self.header.seek(0)
         self.header.write(self)
 
-    #@profile 
-    def compress(self, width, height, data):
+    #@profile
+    def compress(self, width, height, data, img_keepalive=None):
         # Compress width * height of data
-        
+        # img_keepalive: Optional reference to keep alive during C call
+
+        # SAFE MODE: If enabled, use subprocess isolation
+        # This prevents crashes from bringing down the main process
+        # Do NOT fall back to direct calls - that defeats the purpose!
+        safe_mode = getattr(CFG.pydds, 'safe_mode', 'off')
+        if safe_mode == 'full':
+            # Use shared memory worker (optimized full protection)
+            try:
+                from shared_memory_worker import shm_compress_dds
+                result = shm_compress_dds(width, height, data,
+                                          dxt_format=self.dxt_format,
+                                          ispc=self.ispc)
+                if result:
+                    return result
+                log.warning("Shared memory compression failed, returning placeholder")
+                from safe_compress import get_placeholder_dds
+                return get_placeholder_dds(width, height, self.dxt_format)
+            except Exception as e:
+                log.error(f"Shared memory compression exception: {e}")
+                from safe_compress import get_placeholder_dds
+                return get_placeholder_dds(width, height, self.dxt_format)
+        elif safe_mode == 'compression_only':
+            # Use queue-based worker (compression only)
+            try:
+                from safe_compress import safe_compress as _safe_compress
+                result = _safe_compress(width, height, data, 
+                                        dxt_format=self.dxt_format, 
+                                        ispc=self.ispc)
+                if result:
+                    return result
+                # Safe compression failed - return placeholder, don't fall back!
+                log.warning("Safe compression failed, returning placeholder")
+                from safe_compress import get_placeholder_dds
+                return get_placeholder_dds(width, height, self.dxt_format)
+            except Exception as e:
+                log.error(f"Safe compression exception: {e}")
+                from safe_compress import get_placeholder_dds
+                return get_placeholder_dds(width, height, self.dxt_format)
+
         # CRITICAL FIX #1: Validate data before passing to C code
         if not data:
             log.error("DDS.compress: data is None or empty")
             return None
-        
+
         # Validate dimensions
         if (width < 4 or width % 4 != 0 or height < 4 or height % 4 != 0):
-            log.error(f"DDS.compress: Invalid dimensions {width}x{height} (must be multiple of 4, >= 4)")
+            log.error(f"DDS.compress: dims {width}x{height} invalid")
             return None
-        
+
         # Validate data size
         expected_size = width * height * 4  # RGBA = 4 bytes per pixel
         if hasattr(data, '__len__'):
             actual_size = len(data)
             if actual_size < expected_size:
-                log.error(f"DDS.compress: Data too short: {actual_size} < {expected_size} bytes")
+                log.error(f"DDS.compress: Data {actual_size} < {expected_size}")
                 return None
-        
-        # Breadcrumb: Log before entering C code
-        log.debug(f"DDS.compress: Compressing {width}x{height} RGBA ({expected_size} bytes) to {self.dxt_format}")
+
+        # Breadcrumb: Log before C code
+        log.debug(f"compress: {width}x{height} -> {self.dxt_format}")
 
         #outdata = b'\x00'*dxt_size
         
@@ -440,12 +479,16 @@ class DDS(Structure):
             
             # CRITICAL FIX #3: Add error handling for C calls
             try:
-                log.debug("DDS.compress: Calling CompressBlocksBC3")
+                # Breadcrumb before C call for crash debugging
+                try:
+                    from crash_handler import breadcrumb
+                    breadcrumb(f"BC3 compress {width}x{height}")
+                except Exception:
+                    pass
                 _ispc.CompressBlocksBC3(s, outdata)
-                log.debug("DDS.compress: CompressBlocksBC3 succeeded")
                 result = True
             except Exception as e:
-                log.error(f"DDS.compress: CompressBlocksBC3 failed: {e}")
+                log.error(f"BC3 failed: {e}")
                 return None
         elif self.ispc and self.dxt_format == "BC1":
             #print("BC1")
@@ -472,12 +515,15 @@ class DDS(Structure):
             
             # CRITICAL FIX #3: Add error handling for C calls
             try:
-                log.debug("DDS.compress: Calling CompressBlocksBC1")
+                try:
+                    from crash_handler import breadcrumb
+                    breadcrumb(f"BC1 compress {width}x{height}")
+                except Exception:
+                    pass
                 _ispc.CompressBlocksBC1(s, outdata)
-                log.debug("DDS.compress: CompressBlocksBC1 succeeded")
                 result = True
             except Exception as e:
-                log.error(f"DDS.compress: CompressBlocksBC1 failed: {e}")
+                log.error(f"BC1 failed: {e}")
                 return None
         else:
             # Use STB compressor; honor BC1 (DXT1, 8 bytes/block) vs BC3 (DXT5, 16 bytes/block)
@@ -498,20 +544,22 @@ class DDS(Structure):
 
             # CRITICAL FIX #3: Add error handling for STB calls
             try:
-                log.debug("DDS.compress: Calling STB compress_pixels")
+                try:
+                    from crash_handler import breadcrumb
+                    breadcrumb(f"STB compress {width}x{height}")
+                except Exception:
+                    pass
                 result = _stb.compress_pixels(
                         outdata,
                         c_char_p(data),
-                        c_uint64(width), 
-                        c_uint64(height), 
+                        c_uint64(width),
+                        c_uint64(height),
                         c_bool(use_alpha))
-                if result:
-                    log.debug("DDS.compress: STB compress_pixels succeeded")
-                else:
-                    log.error("DDS.compress: STB compress_pixels returned False")
+                if not result:
+                    log.error("STB compression returned False")
                     return None
             except Exception as e:
-                log.error(f"DDS.compress: STB compress_pixels failed: {e}")
+                log.error(f"STB failed: {e}")
                 return None
 
 
@@ -519,6 +567,12 @@ class DDS(Structure):
             log.debug("Failed to compress")
 
         self.compress_count += 1
+
+        # CRITICAL: Use img_keepalive to prevent Nuitka from optimizing away
+        # the reference before C code completes
+        if img_keepalive is not None:
+            _ = img_keepalive._width  # Force reference access
+
         return outdata
 
     #@profile
@@ -568,34 +622,32 @@ class DDS(Structure):
             with mipmap_lock:
                 # Check if already retrieved (another thread may have done it)
                 if self.mipmap_list[mipmap].retrieved and not compress_bytes:
-                    log.debug(f"MIPMAP: {mipmap} already retrieved by another thread, skipping")
+                    log.debug(f"MM {mipmap} already done, skipping")
                     break
-                
-                # CRITICAL FIX #2: Keep strong reference to img during data_ptr() use
-                # This prevents GC from freeing the image while C code is using the pointer
-                img_ref = img  # Strong reference
+
+                # CRITICAL: Keep strong reference to img during C call
+                # Nuitka may optimize away unused refs - explicitly use after
+                img_ref = img  # Strong reference - DO NOT REMOVE
                 imgdata = img_ref.data_ptr()
                 width, height = img_ref.size
-                log.debug(f"MIPMAP: {mipmap} SIZE: {img_ref.size}")
 
                 if compress_bytes:
-                    # Get how many rows we need to process for requested number of bytes
                     height = math.ceil((compress_bytes * 16) / (width * self.blocksize))
-                    # Make the rows a factor of 4
-                    height = max(4, ((height + 3) // 4) * 4) 
-                    log.debug(f"Doing partial compress of {compress_bytes} bytes.  Height: {height}")
+                    height = max(4, ((height + 3) // 4) * 4)
                     compress_bytes >>= 2
 
+                dxtdata = None
                 try:
-                    # Keep img_ref alive during compress
-                    dxtdata = self.compress(width, height, imgdata)
+                    # Pass img_ref to compress to keep reference alive
+                    dxtdata = self.compress(width, height, imgdata, img_ref)
                 except Exception as e:
                     log.error(f"dds compress failed: {e}")
                     dxtdata = None
                 finally:
-                    # CRITICAL FIX #11: Explicitly release reference after compression
-                    # This ensures deterministic cleanup even if compress fails
-                    pass  # img_ref will be released when we exit this scope
+                    # CRITICAL: Use img_ref AFTER C call to prevent Nuitka
+                    # from optimizing away the reference
+                    if img_ref is not None:
+                        _ = img_ref._width  # Force reference to stay alive
 
                 # Assign databuffer (still within mipmap_lock)
                 if dxtdata is not None:

@@ -26,7 +26,15 @@ AOIAPI void aoimage_delete(aoimage_t *img) {
 AOIAPI int32_t aoimage_create(aoimage_t *img, uint32_t width, uint32_t height, uint32_t r, uint32_t g, uint32_t b) {
     memset(img, 0, sizeof(aoimage_t));
 
-    assert(height >=4 && (height & 3) == 0);    // multiple of 4
+    // Runtime validation
+    if (height < 4 || (height & 3) != 0) {
+        sprintf(img->errmsg, "height %d must be >= 4 and multiple of 4", height);
+        return FALSE;
+    }
+    if (width < 4 || (width & 3) != 0) {
+        sprintf(img->errmsg, "width %d must be >= 4 and multiple of 4", width);
+        return FALSE;
+    }
     int len = width * height * 4;
     img->ptr = malloc(len);
     if (NULL == img->ptr) {
@@ -62,7 +70,13 @@ AOIAPI int32_t aoimage_create(aoimage_t *img, uint32_t width, uint32_t height, u
             uptr += 4 * img->stride;
         }
 
-        assert(uptr == img->ptr + len);
+        // Verify fill completed correctly (defensive check, not assert)
+        if (uptr != img->ptr + len) {
+            strcpy(img->errmsg, "internal error: fill length mismatch");
+            free(img->ptr);
+            img->ptr = NULL;
+            return FALSE;
+        }
     }
 
     return TRUE;
@@ -77,6 +91,14 @@ AOIAPI void aoimage_dump(const char *title, const aoimage_t *img) {
 
 // no longer really needed as jpeg-turbo already returns RGBA
 AOIAPI int32_t aoimage_2_rgba(const aoimage_t *s_img, aoimage_t *d_img) {
+    memset(d_img, 0, sizeof(aoimage_t));
+    
+    // Runtime validation
+    if (s_img == NULL || s_img->ptr == NULL) {
+        strcpy(d_img->errmsg, "source image is NULL");
+        return FALSE;
+    }
+    
     // already 4 channels means copy
     if (4 == s_img->channels) {
         memcpy(d_img, s_img, sizeof(aoimage_t));
@@ -90,7 +112,10 @@ AOIAPI int32_t aoimage_2_rgba(const aoimage_t *s_img, aoimage_t *d_img) {
         return TRUE;
     }
 
-    assert(s_img->channels == 3);
+    if (s_img->channels != 3) {
+        sprintf(d_img->errmsg, "channels must be 3 or 4, got %d", s_img->channels);
+        return FALSE;
+    }
 
     int slen = s_img->width * s_img->height * 3;
     int dlen = s_img->width * s_img->height * 4;
@@ -203,17 +228,21 @@ AOIAPI int32_t aoimage_write_jpg(const char *filename, aoimage_t *img, int32_t q
 }
 
 AOIAPI int32_t aoimage_reduce_2(const aoimage_t *s_img, aoimage_t *d_img) {
+    memset(d_img, 0, sizeof(aoimage_t));
+    
+    // Runtime validation
+    if (s_img == NULL || s_img->ptr == NULL) {
+        strcpy(d_img->errmsg, "source image is NULL");
+        return FALSE;
+    }
+    
     if (s_img->channels != 4) {
-		sprintf(d_img->errmsg, "channel error %d != 4", s_img->channels);
-        d_img->ptr = NULL;
+        sprintf(d_img->errmsg, "channel error %d != 4", s_img->channels);
         return FALSE;
     }
 
-    if ( (s_img->width < 4)
-           || (s_img->width != s_img->height)
-           || (0 != (s_img->width & 0x03)) ) {
-		sprintf(d_img->errmsg, "width error: %d", s_img->width);
-        d_img->ptr = NULL;
+    if (s_img->width < 4 || (s_img->width & 0x03) != 0) {
+        sprintf(d_img->errmsg, "width error: %d", s_img->width);
         return FALSE;
     }
 
@@ -249,7 +278,13 @@ AOIAPI int32_t aoimage_reduce_2(const aoimage_t *s_img, aoimage_t *d_img) {
             *dptr++ = b;
             *dptr++ = 0xff;
             //*dptr++ = 0x00;
-            assert(dptr <= dest + dlen);
+            // Bounds check (defensive, replaces assert)
+            if (dptr > dest + dlen) {
+                strcpy(d_img->errmsg, "reduce_2 buffer overflow");
+                free(dest);
+                d_img->ptr = NULL;
+                return FALSE;
+            }
         }
         srptr += 2* stride;
     }
@@ -259,21 +294,37 @@ AOIAPI int32_t aoimage_reduce_2(const aoimage_t *s_img, aoimage_t *d_img) {
     d_img->stride = 4 * d_img->width;
     d_img->channels = 4;
 
-    assert(dptr == dest + dlen);
-    assert(dlen == d_img->width * d_img->height * 4);
+    // Final verification (defensive, replaces assert)
+    if (dptr != dest + dlen || dlen != d_img->width * d_img->height * 4) {
+        strcpy(d_img->errmsg, "reduce_2 size mismatch");
+        free(dest);
+        d_img->ptr = NULL;
+        return FALSE;
+    }
     return TRUE;
 }
 
 AOIAPI int32_t aoimage_scale(const aoimage_t *s_img, aoimage_t *d_img, uint32_t factor) {
-    assert(s_img->channels == 4);
+    memset(d_img, 0, sizeof(aoimage_t));
+    
+    // Runtime validation (replaces asserts that are disabled in release builds)
+    if (s_img == NULL || s_img->ptr == NULL) {
+        strcpy(d_img->errmsg, "source image is NULL");
+        return FALSE;
+    }
+    
+    if (s_img->channels != 4) {
+        sprintf(d_img->errmsg, "invalid channels: %d != 4", s_img->channels);
+        return FALSE;
+    }
 
-    assert((s_img->width >= 4)
-           && (s_img->width == s_img->height)
-           && (0 == (s_img->width & 0x03)));
+    if (s_img->width < 4 || (s_img->width & 0x03) != 0) {
+        sprintf(d_img->errmsg, "invalid width: %d", s_img->width);
+        return FALSE;
+    }
 
     if (factor == 0) {
         strcpy(d_img->errmsg, "invalid scale factor");
-        d_img->ptr = NULL;
         return FALSE;
     }
 
@@ -322,8 +373,18 @@ AOIAPI int32_t aoimage_scale(const aoimage_t *s_img, aoimage_t *d_img, uint32_t 
 }
 
 AOIAPI int32_t aoimage_copy(const aoimage_t *s_img, aoimage_t *d_img, uint32_t s_height_only) {
-    assert(NULL != s_img->ptr);
-    assert(s_height_only <= s_img->height);
+    memset(d_img, 0, sizeof(aoimage_t));
+    
+    // Runtime validation (replaces asserts)
+    if (s_img == NULL || s_img->ptr == NULL) {
+        strcpy(d_img->errmsg, "source image is NULL");
+        return FALSE;
+    }
+    
+    if (s_height_only > s_img->height) {
+        sprintf(d_img->errmsg, "height_only %d > height %d", s_height_only, s_img->height);
+        return FALSE;
+    }
 
     if (0 == s_height_only)
         s_height_only = s_img->height;
@@ -440,9 +501,24 @@ AOIAPI void aoimage_tobytes(aoimage_t *img, uint8_t *data) {
 }
 
 AOIAPI int32_t aoimage_paste(aoimage_t *img, const aoimage_t *p_img, uint32_t x, uint32_t y) {
-    assert(x + p_img->width <= img->width);
-    assert(y + p_img->height <= img->height);
-    assert((img->channels == 4) && (p_img->channels == 4));
+    // Runtime validation (replaces asserts)
+    if (img == NULL || img->ptr == NULL) {
+        if (img) strcpy(img->errmsg, "destination image is NULL");
+        return FALSE;
+    }
+    if (p_img == NULL || p_img->ptr == NULL) {
+        strcpy(img->errmsg, "source image is NULL");
+        return FALSE;
+    }
+    if (x + p_img->width > img->width || y + p_img->height > img->height) {
+        sprintf(img->errmsg, "paste out of bounds: (%d,%d)+(%dx%d) > %dx%d",
+                x, y, p_img->width, p_img->height, img->width, img->height);
+        return FALSE;
+    }
+    if (img->channels != 4 || p_img->channels != 4) {
+        strcpy(img->errmsg, "both images must have 4 channels");
+        return FALSE;
+    }
 
     //aoimage_dump("paste img", img);
     //aoimage_dump("paste P", p_img);
@@ -461,9 +537,24 @@ AOIAPI int32_t aoimage_paste(aoimage_t *img, const aoimage_t *p_img, uint32_t x,
 }
 
 AOIAPI int32_t aoimage_crop(aoimage_t *img, const aoimage_t *c_img, uint32_t x, uint32_t y) {
-    assert(x + c_img->width <= img->width);
-    assert(y + c_img->height <= img->height);
-    assert((img->channels == 4) && (c_img->channels == 4));
+    // Runtime validation (replaces asserts)
+    if (img == NULL || img->ptr == NULL) {
+        if (c_img) strcpy(c_img->errmsg, "source image is NULL");
+        return FALSE;
+    }
+    if (c_img == NULL || c_img->ptr == NULL) {
+        strcpy(img->errmsg, "destination image is NULL");
+        return FALSE;
+    }
+    if (x + c_img->width > img->width || y + c_img->height > img->height) {
+        sprintf(img->errmsg, "crop out of bounds: (%d,%d)+(%dx%d) > %dx%d",
+                x, y, c_img->width, c_img->height, img->width, img->height);
+        return FALSE;
+    }
+    if (img->channels != 4 || c_img->channels != 4) {
+        strcpy(img->errmsg, "both images must have 4 channels");
+        return FALSE;
+    }
 
     uint8_t *ip = img->ptr + (y * img->width * 4) + x * 4;  // lower left corner of image
     uint8_t *cp = c_img->ptr;
@@ -478,7 +569,19 @@ AOIAPI int32_t aoimage_crop(aoimage_t *img, const aoimage_t *c_img, uint32_t x, 
 }
 
 AOIAPI int32_t aoimage_desaturate(aoimage_t *img, float saturation) {
-    assert(img->channels == 4);
+    // Runtime validation
+    if (img == NULL || img->ptr == NULL) {
+        if (img) strcpy(img->errmsg, "image is NULL");
+        return FALSE;
+    }
+    if (img->channels != 4) {
+        sprintf(img->errmsg, "channels must be 4, got %d", img->channels);
+        return FALSE;
+    }
+    if (saturation < 0.0f || saturation > 1.0f) {
+        strcpy(img->errmsg, "saturation must be 0.0-1.0");
+        return FALSE;
+    }
 
     int len = img->width * img->height * 4;
     for (uint8_t *ptr = img->ptr; ptr < img->ptr + len; ptr += 4) {
@@ -498,8 +601,16 @@ AOIAPI int32_t aoimage_crop_and_upscale(aoimage_t *src_img, aoimage_t *dst_img,
                                         uint32_t scale_factor) {
     memset(dst_img, 0, sizeof(aoimage_t));
     
-    // Validate inputs
-    assert(src_img->channels == 4);
+    // Validate inputs (runtime checks, not asserts)
+    if (src_img == NULL || src_img->ptr == NULL) {
+        strcpy(dst_img->errmsg, "source image is NULL");
+        return FALSE;
+    }
+    
+    if (src_img->channels != 4) {
+        sprintf(dst_img->errmsg, "channels must be 4, got %d", src_img->channels);
+        return FALSE;
+    }
     
     if (scale_factor == 0 || (scale_factor & (scale_factor - 1)) != 0) {
         strcpy(dst_img->errmsg, "scale_factor must be power of 2");
@@ -570,6 +681,12 @@ AOIAPI int32_t aoimage_crop_and_upscale(aoimage_t *src_img, aoimage_t *dst_img,
     dst_img->stride = dst_width * 4;
     dst_img->channels = 4;
     
-    assert(dst_ptr == dest + num_bytes);
+    // Verify write completed correctly (defensive check, replaces assert)
+    if (dst_ptr != dest + num_bytes) {
+        strcpy(dst_img->errmsg, "crop_and_upscale size mismatch");
+        free(dest);
+        dst_img->ptr = NULL;
+        return FALSE;
+    }
     return TRUE;
 }

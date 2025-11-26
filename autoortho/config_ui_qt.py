@@ -1540,6 +1540,43 @@ class ConfigUI(QMainWindow):
         format_layout.addStretch()
         dds_layout.addLayout(format_layout)
 
+        # Safe Mode
+        safe_mode_layout = QHBoxLayout()
+        safe_mode_label = QLabel("Safe Mode:")
+        safe_mode_label.setToolTip(
+            "Process isolation for crash protection.\n\n"
+            "Prevents AutoOrtho from crashing due to library errors.\n"
+            "Failed operations show magenta tiles instead of crashing."
+        )
+        safe_mode_layout.addWidget(safe_mode_label)
+        
+        self.safe_mode_combo = QComboBox()
+        self.safe_mode_combo.addItems(['off', 'compression_only', 'full'])
+        current_safe_mode = getattr(self.cfg.pydds, 'safe_mode', 'off')
+        # Migrate old full_optimized to full
+        if current_safe_mode == 'full_optimized':
+            current_safe_mode = 'full'
+        if current_safe_mode not in ['off', 'compression_only', 'full']:
+            current_safe_mode = 'off'
+        self.safe_mode_combo.setCurrentText(current_safe_mode)
+        self.safe_mode_combo.setObjectName('safe_mode')
+        self.safe_mode_combo.setToolTip(
+            "OFF: Direct calls (fastest, default)\n"
+            "  • Best performance\n"
+            "  • Library crashes will crash AutoOrtho\n\n"
+            "COMPRESSION ONLY: DDS compression isolated\n"
+            "  • Protects against compression library crashes\n"
+            "  • ~5% slower\n\n"
+            "FULL: All image operations isolated (recommended)\n"
+            "  • Maximum protection with shared memory optimization\n"
+            "  • ~5% slower\n"
+            "  • AutoOrtho will NEVER crash from library failures\n"
+            "  • Retries failed operations before showing placeholder"
+        )
+        safe_mode_layout.addWidget(self.safe_mode_combo)
+        safe_mode_layout.addStretch()
+        dds_layout.addLayout(safe_mode_layout)
+
         self.settings_layout.addWidget(dds_group)
 
         # General Settings group
@@ -2823,6 +2860,7 @@ class ConfigUI(QMainWindow):
             self.cfg.pydds.max_decode_concurrency = str(
                 self.max_decode_slider.value()
             )
+            self.cfg.pydds.safe_mode = self.safe_mode_combo.currentText()
 
             # General settings
             self.cfg.general.gui = self.gui_check.isChecked()

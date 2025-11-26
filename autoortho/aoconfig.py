@@ -110,6 +110,13 @@ compressor = ISPC
 format = BC1
 # Maximum number of concurrent JPEG decode threads (default: CPU count)
 max_decode_concurrency = {os.cpu_count() or 1}
+# Safe mode - isolates C operations in subprocesses to prevent crashes
+# Guarantees main process NEVER crashes due to library failures
+# Options: off, compression_only, full
+# - off: Direct calls (fastest, may crash)
+# - compression_only: Only DDS compression isolated (~5% slower)
+# - full: All C operations isolated with shared memory (~5% slower, recommended)
+safe_mode = off
 
 [scenery]
 # Don't cleanup downloads

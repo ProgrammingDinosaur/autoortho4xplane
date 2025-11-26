@@ -1,6 +1,18 @@
 import os
 import sys
 
+# =============================================================================
+# CRASH HANDLERS - Multiple layers for reliability
+# =============================================================================
+# Layer 1: faulthandler (Python's built-in, works with Nuitka)
+try:
+    import faulthandler
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+except Exception:
+    pass
+
+# =============================================================================
+
 if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
     # Absolute import is robust under Nuitka for the entry module
     from macfuse_worker import main as _ao_worker_main
@@ -10,20 +22,71 @@ if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
 
 import logging
 import logging.handlers
-import atexit, signal, threading
+import atexit
+import signal
+import threading
 import platform
 from aoconfig import CFG
 from pathlib import Path
 from utils.constants import system_type
 
-# Install crash handler EARLY, before any C extensions load
-# This allows us to log C-level crashes (segfaults, access violations)
+# Install FULL crash handler now (with file logging)
 try:
     from crash_handler import install_crash_handler
     install_crash_handler()
 except Exception as e:
-    # Don't fail if crash handler can't be installed
     print(f"Warning: Could not install crash handler: {e}", file=sys.stderr)
+
+# ---------------------------------------------------------------------------
+# Run state tracking - detects crashes even when no handler runs
+# ---------------------------------------------------------------------------
+_RUN_STATE_FILE = Path.home() / ".autoortho-data" / "logs" / "run_state.txt"
+
+
+def _write_run_state(state, extra=""):
+    """Write current run state to file for crash detection."""
+    try:
+        _RUN_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime
+        with open(_RUN_STATE_FILE, 'w') as f:
+            f.write(f"state={state}\n")
+            f.write(f"time={datetime.now().isoformat()}\n")
+            f.write(f"pid={os.getpid()}\n")
+            if extra:
+                f.write(f"info={extra}\n")
+    except Exception:
+        pass
+
+
+def _check_previous_crash():
+    """Check if previous run crashed (state file shows 'running')."""
+    try:
+        if _RUN_STATE_FILE.exists():
+            content = _RUN_STATE_FILE.read_text()
+            if "state=running" in content:
+                return True, content
+    except Exception:
+        pass
+    return False, ""
+
+
+# Check for previous crash on startup
+_had_crash, _prev_state = _check_previous_crash()
+if _had_crash:
+    try:
+        log_dir = _RUN_STATE_FILE.parent
+        from datetime import datetime
+        crash_notice = log_dir / f"prev_crash_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        with open(crash_notice, 'w') as f:
+            f.write("AutoOrtho detected a previous crash.\n")
+            f.write("The application did not exit cleanly last time.\n\n")
+            f.write("Previous state:\n")
+            f.write(_prev_state)
+    except Exception:
+        pass
+
+# Mark as running
+_write_run_state("running")
 
 # ---------------------------------------------------------------------------
 # Global cleanup hook – ensures we release worker threads, caches & C buffers
@@ -34,6 +97,9 @@ def _global_shutdown(signum=None, frame=None):
     if getattr(_global_shutdown, "_done", False):
         return
     _global_shutdown._done = True
+
+    # Mark clean exit (if we get here, it wasn't a crash)
+    _write_run_state("exited_clean", f"signal={signum}")
 
     log = logging.getLogger(__name__)
     try:
@@ -55,6 +121,27 @@ def _global_shutdown(signum=None, frame=None):
     try:
         from autoortho.getortho import shutdown as _go_shutdown
         _go_shutdown()
+    except Exception:
+        pass
+
+    # Shutdown safe compressor if it was used
+    try:
+        from safe_compress import shutdown_safe_compressor
+        shutdown_safe_compressor()
+    except Exception:
+        pass
+
+    # Shutdown tile worker pool if it was used
+    try:
+        from safe_tile_worker import shutdown_worker_pool
+        shutdown_worker_pool()
+    except Exception:
+        pass
+
+    # Shutdown shared memory worker pool if it was used
+    try:
+        from shared_memory_worker import shutdown_shm_worker_pool
+        shutdown_shm_worker_pool()
     except Exception:
         pass
 

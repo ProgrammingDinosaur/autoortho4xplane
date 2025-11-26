@@ -1,275 +1,474 @@
 #!/usr/bin/env python
+"""
+AoImage - Python wrapper for aoimage C library.
+
+This module provides a safe Python interface to the aoimage C library,
+with comprehensive error handling to prevent crashes.
+"""
 
 import os
 import sys
-from ctypes import *
+from ctypes import (
+    Structure, CDLL, POINTER,
+    c_uint64, c_uint32, c_int32, c_float, c_char, c_char_p,
+    create_string_buffer
+)
 
 from utils.constants import system_type
 import logging
 log = logging.getLogger(__name__)
 
+
+# Optional breadcrumb support for crash debugging
+def _breadcrumb(msg):
+    """Write breadcrumb for crash debugging (if available)."""
+    try:
+        from crash_handler import breadcrumb
+        breadcrumb(msg)
+    except Exception:
+        pass
+
+
 class AOImageException(Exception):
+    """Exception for AoImage errors."""
     pass
 
+
 class AoImage(Structure):
+    """
+    Python wrapper for aoimage_t C structure.
+    
+    Provides safe access to C image processing functions with:
+    - Automatic memory management (prevent double-free)
+    - Input validation before C calls
+    - Exception handling for C call failures
+    """
     _fields_ = [
-        ('_data', c_uint64),    # ctypes pointers are tricky when changed under the hud so we treat it as number
-        #('_data', POINTER(c_uint64)),    # ctypes pointers are tricky when changed under the hud so we treat it as number
+        ('_data', c_uint64),
         ('_width', c_uint32),
         ('_height', c_uint32),
         ('_stride', c_uint32),
         ('_channels', c_uint32),
-        ('_errmsg', c_char*80)  #possible error message to be filled by the C routines
+        ('_errmsg', c_char * 80)
     ]
 
     def __init__(self):
         self._data = 0
-        #self._data = cast('\x00', POINTER(c_uint64))
         self._width = 0
         self._height = 0
         self._stride = 0
         self._channels = 0
-        self._errmsg = b'';
+        self._errmsg = b''
         self._freed = False  # Prevent double-free crashes
 
     def __del__(self):
-        # Only delete if not already freed (prevents double-free crash)
-        if not self._freed:
+        """Clean up C memory. Protected against double-free."""
+        if not self._freed and self._data != 0:
             try:
                 _aoi.aoimage_delete(self)
                 self._freed = True
             except Exception as e:
-                # Log but don't raise in __del__ (causes issues)
                 log.debug(f"Error in AoImage.__del__: {e}")
 
     def __repr__(self):
-        return f"ptr:  width: {self._width} height: {self._height} stride: {self._stride} channels: {self._channels}"
+        return (f"AoImage(width={self._width}, height={self._height}, "
+                f"stride={self._stride}, channels={self._channels})")
 
     def close(self):
-        # Only delete if not already freed (prevents double-free crash)
-        if not self._freed:
+        """Explicitly free C memory. Safe to call multiple times."""
+        if not self._freed and self._data != 0:
             try:
                 _aoi.aoimage_delete(self)
                 self._freed = True
             except Exception as e:
                 log.error(f"Error in AoImage.close: {e}")
-        
+
     def convert(self, mode):
-        """
-        Not really needed as AoImage always loads as RGBA
-        """
-        assert mode == "RGBA", "Sorry, only conversion to RGBA supported"
-        new = AoImage()
-        if not _aoi.aoimage_2_rgba(self, new):
-            log.debug(f"AoImage.reduce_2 error: {new._errmsg.decode()}")
+        """Convert image to specified mode (only RGBA supported)."""
+        if mode != "RGBA":
+            log.error(f"convert: Only RGBA mode supported, got {mode}")
+            return None
+        
+        if self._data == 0:
+            log.error("convert: Source image has no data")
+            return None
+        
+        new_img = AoImage()
+        try:
+            _breadcrumb(f"convert {self._width}x{self._height}")
+            if not _aoi.aoimage_2_rgba(self, new_img):
+                log.error(f"convert error: {new_img._errmsg.decode()}")
+                return None
+            return new_img
+        except Exception as e:
+            log.error(f"convert exception: {e}")
             return None
 
-        return new
-
-    def reduce_2(self, steps = 1):
-        """
-        Reduce image by factor 2.
-        """
-        assert steps >= 1, "useless reduce_2" # otherwise we must do a useless copy
+    def reduce_2(self, steps=1):
+        """Reduce image by factor of 2, repeated 'steps' times."""
+        if steps < 1:
+            log.error(f"reduce_2: Invalid steps {steps}")
+            return None
+        
+        if self._data == 0:
+            log.error("reduce_2: Source image has no data")
+            return None
 
         half = self
-        while steps >= 1:
+        for i in range(steps):
             orig = half
             half = AoImage()
-            if not _aoi.aoimage_reduce_2(orig, half):
-                log.debug(f"AoImage.reduce_2 error: {half._errmsg.decode()}")
-                raise AOImageException(f"AoImage.reduce_2 error: {half._errmsg.decode()}")
-                #return None
-
-            steps -= 1
+            try:
+                _breadcrumb(f"reduce_2 step {i+1}/{steps}")
+                if not _aoi.aoimage_reduce_2(orig, half):
+                    err = half._errmsg.decode()
+                    log.error(f"reduce_2 error at step {i+1}: {err}")
+                    raise AOImageException(f"reduce_2 error: {err}")
+            except AOImageException:
+                raise
+            except Exception as e:
+                log.error(f"reduce_2 exception at step {i+1}: {e}")
+                raise AOImageException(f"reduce_2 exception: {e}")
 
         return half
 
     def scale(self, factor=2):
-        # CRITICAL FIX #10: Validate scale factor
+        """Scale image by given factor."""
+        # Validate factor
         if not isinstance(factor, (int, float)) or factor <= 0:
-            log.error(f"scale: Invalid factor {factor} - must be positive number")
+            log.error(f"scale: Invalid factor {factor}")
             return None
         
-        if factor > 1000:  # Sanity check
+        if factor > 1000:
             log.error(f"scale: Factor {factor} too large (max 1000)")
             return None
         
-        scaled = AoImage()
-        orig = self
+        if self._data == 0:
+            log.error("scale: Source image has no data")
+            return None
         
+        scaled = AoImage()
         try:
-            log.debug(f"AoImage.scale: Scaling {self._width}x{self._height} by {factor}")
-            if not _aoi.aoimage_scale(orig, scaled, factor):
-                log.error(f"AoImage.scale error: {scaled._errmsg.decode()}")
+            _breadcrumb(f"scale {self._width}x{self._height} by {factor}")
+            if not _aoi.aoimage_scale(self, scaled, int(factor)):
+                log.error(f"scale error: {scaled._errmsg.decode()}")
                 return None
-            log.debug(f"AoImage.scale: Success, created {scaled._width}x{scaled._height}")
             return scaled
         except Exception as e:
-            log.error(f"scale: Exception: {e}")
+            log.error(f"scale exception: {e}")
             return None
 
-    def write_jpg(self, filename, quality = 90):
-        """
-        Convenience function to write jpeg.
-        """   
-        if not _aoi.aoimage_write_jpg(filename.encode(), self, quality):
-            log.debug(f"AoImage.new error: {new._errmsg.decode()}")
-    
+    def write_jpg(self, filename, quality=90):
+        """Write image to JPEG file."""
+        if self._data == 0:
+            log.error("write_jpg: Image has no data")
+            return False
+        
+        try:
+            _breadcrumb(f"write_jpg {filename}")
+            if not _aoi.aoimage_write_jpg(filename.encode(), self, quality):
+                log.error(f"write_jpg error: {self._errmsg.decode()}")
+                return False
+            return True
+        except Exception as e:
+            log.error(f"write_jpg exception: {e}")
+            return False
+
     def tobytes(self):
-        """
-        Not really needed, high overhead. Use data_ptr instead.
-        """      
-        buf = create_string_buffer(self._width * self._height * self._channels)
-        _aoi.aoimage_tobytes(self, buf)
-        return buf.raw
+        """Return image data as bytes. High overhead - use data_ptr() instead."""
+        if self._data == 0:
+            log.error("tobytes: Image has no data")
+            return None
+        
+        try:
+            size = self._width * self._height * self._channels
+            buf = create_string_buffer(size)
+            _aoi.aoimage_tobytes(self, buf)
+            return buf.raw
+        except Exception as e:
+            log.error(f"tobytes exception: {e}")
+            return None
 
     def data_ptr(self):
-        """
-        Return ptr to image data. Valid only as long as the object lives.
-        """
+        """Return pointer to image data. Valid only while object is alive."""
         return self._data
 
+    def _set_data(self, rgba_bytes):
+        """
+        Set image data from raw RGBA bytes.
+        
+        Used for reconstructing image from subprocess results.
+        WARNING: Internal use only. Caller must ensure correct size.
+        """
+        if self._data == 0:
+            log.error("_set_data: Image has no buffer")
+            return False
+        
+        expected_size = self._width * self._height * 4
+        if len(rgba_bytes) != expected_size:
+            log.error(f"_set_data: Size mismatch {len(rgba_bytes)} != {expected_size}")
+            return False
+        
+        try:
+            # Copy bytes into existing buffer
+            ctypes.memmove(self._data, rgba_bytes, expected_size)
+            return True
+        except Exception as e:
+            log.error(f"_set_data exception: {e}")
+            return False
+
     def paste(self, p_img, pos):
-        # CRITICAL FIX #4: Validate parameters before C call
+        """Paste another image onto this image at position (x, y)."""
+        # Validate parameters
         if not p_img or not hasattr(p_img, '_width'):
-            log.error("paste: Invalid image object")
+            log.error("paste: Invalid source image")
+            return False
+        
+        if self._data == 0:
+            log.error("paste: Destination image has no data")
+            return False
+        
+        if p_img._data == 0:
+            log.error("paste: Source image has no data")
             return False
         
         x, y = pos
         if x < 0 or y < 0:
-            log.error(f"paste: Invalid position ({x}, {y}) - cannot be negative")
+            log.error(f"paste: Negative position ({x}, {y})")
             return False
         
         if x + p_img._width > self._width or y + p_img._height > self._height:
-            log.error(f"paste: Image extends beyond bounds: pos=({x},{y}), size=({p_img._width}x{p_img._height}), dest=({self._width}x{self._height})")
+            log.error(f"paste: Out of bounds: ({x},{y}) + "
+                      f"({p_img._width}x{p_img._height}) > "
+                      f"({self._width}x{self._height})")
             return False
         
         try:
-            log.debug(f"AoImage.paste: Pasting {p_img._width}x{p_img._height} at ({x},{y})")
-            _aoi.aoimage_paste(self, p_img, pos[0], pos[1])
+            _breadcrumb(f"paste {p_img._width}x{p_img._height} at ({x},{y})")
+            _aoi.aoimage_paste(self, p_img, x, y)
             return True
         except Exception as e:
-            log.error(f"paste: C call failed: {e}")
+            log.error(f"paste exception: {e}")
             return False
 
     def crop(self, c_img, pos):
-        # CRITICAL FIX #4: Validate parameters before C call
+        """Crop region from this image into c_img at position (x, y)."""
+        # Validate parameters
         if not c_img or not hasattr(c_img, '_width'):
-            log.error("crop: Invalid destination image object")
+            log.error("crop: Invalid destination image")
+            return False
+        
+        if self._data == 0:
+            log.error("crop: Source image has no data")
             return False
         
         x, y = pos
         if x < 0 or y < 0:
-            log.error(f"crop: Invalid position ({x}, {y}) - cannot be negative")
+            log.error(f"crop: Negative position ({x}, {y})")
             return False
         
         if x + c_img._width > self._width or y + c_img._height > self._height:
-            log.error(f"crop: Crop region extends beyond bounds: pos=({x},{y}), size=({c_img._width}x{c_img._height}), source=({self._width}x{self._height})")
+            log.error(f"crop: Out of bounds: ({x},{y}) + "
+                      f"({c_img._width}x{c_img._height}) > "
+                      f"({self._width}x{self._height})")
             return False
         
         try:
-            log.debug(f"AoImage.crop: Cropping {c_img._width}x{c_img._height} from ({x},{y})")
-            _aoi.aoimage_crop(self, c_img, pos[0], pos[1])
+            _breadcrumb(f"crop {c_img._width}x{c_img._height} from ({x},{y})")
+            _aoi.aoimage_crop(self, c_img, x, y)
             return True
         except Exception as e:
-            log.error(f"crop: C call failed: {e}")
+            log.error(f"crop exception: {e}")
             return False
 
-    def copy(self, height_only = 0):
-        new = AoImage()
-        if not _aoi.aoimage_copy(self, new, height_only):
-            log.error(f"AoImage.copy error: {self._errmsg.decode()}")
+    def copy(self, height_only=0):
+        """Create a copy of this image (optionally only first height_only rows)."""
+        if self._data == 0:
+            log.error("copy: Source image has no data")
+            return None
+        
+        new_img = AoImage()
+        try:
+            _breadcrumb(f"copy {self._width}x{self._height}")
+            if not _aoi.aoimage_copy(self, new_img, height_only):
+                log.error(f"copy error: {new_img._errmsg.decode()}")
+                return None
+            return new_img
+        except Exception as e:
+            log.error(f"copy exception: {e}")
             return None
 
-        return new
-
-    
-    def desaturate(self, saturation = 1.0):
-        assert 0.0 <= saturation and saturation <= 1.0
-        if saturation == 1.0 or saturation is None:
+    def desaturate(self, saturation=1.0):
+        """Desaturate image (0.0 = grayscale, 1.0 = full color)."""
+        if saturation < 0.0 or saturation > 1.0:
+            log.error(f"desaturate: Invalid saturation {saturation}")
+            return None
+        
+        if saturation == 1.0:
             return self
-
-        if not _aoi.aoimage_desaturate(self, saturation):
-            log.error(f"AoImage.desaturate error: {self._errmsg.decode()}")
+        
+        if self._data == 0:
+            log.error("desaturate: Image has no data")
             return None
-        return self
+        
+        try:
+            _breadcrumb(f"desaturate {saturation}")
+            if not _aoi.aoimage_desaturate(self, saturation):
+                log.error(f"desaturate error: {self._errmsg.decode()}")
+                return None
+            return self
+        except Exception as e:
+            log.error(f"desaturate exception: {e}")
+            return None
 
     def crop_and_upscale(self, x, y, width, height, scale_factor):
-        """
-        Crop a region and upscale it atomically in C (high performance).
-        This is optimized for fallback imagery - single allocation, no intermediate buffers.
+        """Crop region and upscale atomically (high performance)."""
+        if self._data == 0:
+            raise AOImageException("crop_and_upscale: Source has no data")
         
-        Args:
-            x, y: Crop region start position
-            width, height: Crop region dimensions
-            scale_factor: Upscale factor (must be power of 2: 2, 4, 8, 16)
+        # Validate bounds
+        if x < 0 or y < 0 or width <= 0 or height <= 0:
+            raise AOImageException(f"crop_and_upscale: Invalid params "
+                                   f"x={x} y={y} w={width} h={height}")
         
-        Returns:
-            New AoImage with dimensions (width * scale_factor, height * scale_factor)
-        """
+        if x + width > self._width or y + height > self._height:
+            raise AOImageException(f"crop_and_upscale: Out of bounds")
+        
+        if scale_factor <= 0 or scale_factor > 64:
+            raise AOImageException(f"crop_and_upscale: Invalid scale {scale_factor}")
+        
         result = AoImage()
-        if not _aoi.aoimage_crop_and_upscale(self, result, x, y, width, height, scale_factor):
-            raise AOImageException(f"crop_and_upscale failed: {result._errmsg.decode()}")
-        return result
+        try:
+            _breadcrumb(f"crop_upscale ({x},{y}) {width}x{height} *{scale_factor}")
+            if not _aoi.aoimage_crop_and_upscale(
+                    self, result, x, y, width, height, scale_factor):
+                raise AOImageException(f"crop_and_upscale: {result._errmsg.decode()}")
+            return result
+        except AOImageException:
+            raise
+        except Exception as e:
+            raise AOImageException(f"crop_and_upscale exception: {e}")
 
     @property
     def size(self):
+        """Return (width, height) tuple."""
         return self._width, self._height
 
-## factories
+
+# Factory functions
 def new(mode, wh, color):
-    #print(f"{mode}, {wh}, {color}")
-    assert(mode == "RGBA")
-    new = AoImage()
-    if not _aoi.aoimage_create(new, wh[0], wh[1], color[0], color[1], color[2]):
-        log.debug(f"AoImage.new error: {new._errmsg.decode()}")
-        return None
-
-    return new
-
-
-def load_from_memory(mem, datalen=None):
-    # Validate input before passing to C code
-    if not mem:
-        log.error("AoImage.load_from_memory: mem is None or empty")
+    """Create new image with given dimensions and fill color."""
+    if mode != "RGBA":
+        log.error(f"new: Only RGBA mode supported, got {mode}")
         return None
     
-    if not datalen:
+    width, height = wh
+    if width <= 0 or height <= 0:
+        log.error(f"new: Invalid dimensions {width}x{height}")
+        return None
+    
+    if width > 65536 or height > 65536:
+        log.error(f"new: Dimensions too large {width}x{height}")
+        return None
+    
+    img = AoImage()
+    try:
+        _breadcrumb(f"new {width}x{height}")
+        if not _aoi.aoimage_create(img, width, height, color[0], color[1], color[2]):
+            log.error(f"new error: {img._errmsg.decode()}")
+            return None
+        return img
+    except Exception as e:
+        log.error(f"new exception: {e}")
+        return None
+
+
+def load_from_memory(mem, datalen=None, use_safe_mode=None):
+    """
+    Load image from memory buffer (JPEG data).
+    
+    Args:
+        mem: JPEG data bytes
+        datalen: Optional length (defaults to len(mem))
+        use_safe_mode: None=use config, True=force safe, False=force direct
+    """
+    if not mem:
+        log.error("load_from_memory: Empty buffer")
+        return None
+    
+    if datalen is None:
         datalen = len(mem)
     
     if datalen < 4:
-        log.error(f"AoImage.load_from_memory: data too short ({datalen} bytes)")
+        log.error(f"load_from_memory: Data too short ({datalen} bytes)")
         return None
     
-    new = AoImage()
+    # Check if we should use safe mode (subprocess isolation)
+    if use_safe_mode is None:
+        try:
+            from aoconfig import CFG
+            safe_mode = getattr(CFG.pydds, 'safe_mode', 'off')
+            use_safe_mode = (safe_mode == 'full')
+        except Exception:
+            use_safe_mode = False
+    
+    if use_safe_mode:
+        # SAFE MODE: All C operations in subprocess with shared memory
+        # Do NOT fall back to direct calls - that defeats the purpose!
+        try:
+            # Use shared memory worker (optimized)
+            from shared_memory_worker import shm_load_jpeg
+            width, height, rgba_data = shm_load_jpeg(mem)
+            
+            # Create AoImage from raw RGBA data
+            img = new('RGBA', (width, height), (0, 0, 0))
+            if img and rgba_data:
+                # Copy RGBA data into image
+                img._set_data(rgba_data)
+                return img
+            else:
+                log.warning("Safe mode: Failed to create image from worker result")
+                return None
+        except Exception as e:
+            log.error(f"Safe mode load exception: {e}")
+            return None  # Return None, do NOT fall back to direct!
+    
+    # Direct load (only used when safe_mode is OFF)
+    img = AoImage()
     try:
-        # Breadcrumb: Log BEFORE entering C code (helps debug crashes)
-        log.debug(f"AoImage: Calling C aoimage_from_memory with {datalen} bytes")
-        
-        # Keep strong reference to mem to prevent GC during C call
+        # Keep strong reference to prevent GC during C call
         mem_ref = mem
-        if not _aoi.aoimage_from_memory(new, mem_ref, datalen):
-            log.error(f"AoImage.load_from_memory error: {new._errmsg.decode()}")
+        _breadcrumb(f"load_from_memory {datalen} bytes")
+        if not _aoi.aoimage_from_memory(img, mem_ref, datalen):
+            log.error(f"load_from_memory error: {img._errmsg.decode()}")
             return None
-        
-        # Breadcrumb: Made it through C code successfully
-        log.debug(f"AoImage: C call succeeded, created {new._width}x{new._height} image")
+        # Use mem_ref after C call to prevent early GC
+        _ = len(mem_ref)
+        return img
     except Exception as e:
-        log.error(f"AoImage.load_from_memory exception: {e}")
+        log.error(f"load_from_memory exception: {e}")
         return None
 
-    return new
 
 def open(filename):
-    new = AoImage()
-    if not _aoi.aoimage_read_jpg(filename.encode(), new):
-        log.debug(f"AoImage.open error for {filename}: {new._errmsg.decode()}")
+    """Open JPEG file and return AoImage."""
+    if not filename:
+        log.error("open: No filename provided")
+        return None
+    
+    img = AoImage()
+    try:
+        _breadcrumb(f"open {filename}")
+        if not _aoi.aoimage_read_jpg(filename.encode(), img):
+            log.debug(f"open error for {filename}: {img._errmsg.decode()}")
+            return None
+        return img
+    except Exception as e:
+        log.error(f"open exception for {filename}: {e}")
         return None
 
-    return new
 
-# init code
+# Library initialization
 if system_type == 'linux':
     _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.so')
 elif system_type == 'windows':
@@ -277,87 +476,114 @@ elif system_type == 'windows':
 elif system_type == 'darwin':
     _aoi_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'aoimage.dylib')
 else:
-    log.error("System is not supported")
-    exit()
+    log.error(f"Unsupported system: {system_type}")
+    raise RuntimeError(f"Unsupported system: {system_type}")
 
-# Load C library with error handling to prevent silent crashes
 try:
     if not os.path.exists(_aoi_path):
         raise FileNotFoundError(f"aoimage library not found at: {_aoi_path}")
     _aoi = CDLL(_aoi_path)
+    log.debug(f"Loaded aoimage library from {_aoi_path}")
 except Exception as e:
-    log.error(f"FATAL: Failed to load aoimage library from {_aoi_path}")
-    log.error(f"Error: {e}")
-    log.error("AutoOrtho cannot continue without this library.")
-    log.error("Please verify installation and that all DLL dependencies are present.")
+    log.error(f"FATAL: Failed to load aoimage library: {e}")
     raise
+
+# Set argtypes for type safety
 _aoi.aoimage_read_jpg.argtypes = (c_char_p, POINTER(AoImage))
 _aoi.aoimage_write_jpg.argtypes = (c_char_p, POINTER(AoImage), c_int32)
 _aoi.aoimage_2_rgba.argtypes = (POINTER(AoImage), POINTER(AoImage))
 _aoi.aoimage_reduce_2.argtypes = (POINTER(AoImage), POINTER(AoImage))
 _aoi.aoimage_scale.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32)
 _aoi.aoimage_delete.argtypes = (POINTER(AoImage),)
-_aoi.aoimage_create.argtypes = (POINTER(AoImage), c_uint32, c_uint32, c_uint32, c_uint32, c_uint32)
+_aoi.aoimage_create.argtypes = (
+    POINTER(AoImage), c_uint32, c_uint32, c_uint32, c_uint32, c_uint32
+)
 _aoi.aoimage_tobytes.argtypes = (POINTER(AoImage), c_char_p)
 _aoi.aoimage_from_memory.argtypes = (POINTER(AoImage), c_char_p, c_uint32)
-_aoi.aoimage_paste.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32, c_uint32)
-_aoi.aoimage_crop.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32, c_uint32)
+_aoi.aoimage_paste.argtypes = (
+    POINTER(AoImage), POINTER(AoImage), c_uint32, c_uint32
+)
+_aoi.aoimage_crop.argtypes = (
+    POINTER(AoImage), POINTER(AoImage), c_uint32, c_uint32
+)
 _aoi.aoimage_copy.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32)
 _aoi.aoimage_desaturate.argtypes = (POINTER(AoImage), c_float)
-_aoi.aoimage_crop_and_upscale.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32, c_uint32, c_uint32, c_uint32, c_uint32)
-
-def main():
-    logging.basicConfig(level = logging.DEBUG)
-    width = 16
-    height = 16
-    black = new('RGBA', (256*width,256*height), (0,0,0))
-    log.info(f"{black}")
-    log.info(f"black._data: {black._data}")
-    log.info(f"black.data_ptr(): {black.data_ptr()}")
-    black.write_jpg("black.jpg")
-    w, h = black.size
-    black = None
-    log.info(f"black done, {w} {h}")
-
-    green = new('RGBA', (256*width,256*height), (0,230,0))
-    log.info(f"green {green}")
-    green.write_jpg("green.jpg")
-
-    log.info("Trying nonexistent jpg")
-    img = open("../testfiles/non_exitent.jpg")
-
-    log.info("Trying non jpg")
-    img = open("main.c")
-
-    img = open("../testfiles/test_tile2.jpg")
-    log.info(f"AoImage.open {img}")
-
-    img2 = img.reduce_2()
-    log.info(f"img2: {img2}")
-
-    img2.write_jpg("test_tile_2.jpg")
-
-    img3 = open("../testfiles/test_tile_small.jpg")
-    big = img3.scale(16)
-    big.write_jpg('test_tile_big.jpg')
-
-    cropimg = new('RGBA', (256,256), (0,0,0))
-    img.crop(cropimg, (256,256))
-    cropimg.write_jpg("crop.jpg")
-
-    green.paste(img2, (1024, 1024))
-    green.write_jpg("test_tile_p.jpg")
-
-    img4 = img.reduce_2(2)
-    log.info(f"img4 {img4}")
+_aoi.aoimage_crop_and_upscale.argtypes = (
+    POINTER(AoImage), POINTER(AoImage),
+    c_uint32, c_uint32, c_uint32, c_uint32, c_uint32
+)
 
 
-    img.paste(img4, (0, 2048))
-    img.write_jpg("test_tile_p2.jpg")
+# =============================================================================
+# Placeholder/Fallback Functions - NEVER crash, always return usable image
+# =============================================================================
+
+def new_or_placeholder(mode, wh, color, placeholder_color=(255, 0, 255)):
+    """
+    Create new image, or return placeholder if creation fails.
+    
+    NEVER returns None - always returns a usable image.
+    Placeholder is magenta by default (visible error indicator).
+    """
+    result = new(mode, wh, color)
+    if result is not None:
+        return result
+    
+    # Try creating a placeholder
+    log.warning(f"Creating placeholder image {wh[0]}x{wh[1]}")
+    result = new(mode, wh, placeholder_color)
+    if result is not None:
+        return result
+    
+    # Last resort: try smaller size
+    safe_size = (max(4, min(wh[0], 256)), max(4, min(wh[1], 256)))
+    log.warning(f"Creating minimal placeholder {safe_size[0]}x{safe_size[1]}")
+    return new(mode, safe_size, placeholder_color)
 
 
+def load_from_memory_or_placeholder(mem, datalen=None, 
+                                     placeholder_size=(256, 256),
+                                     placeholder_color=(255, 0, 255)):
+    """
+    Load image from memory, or return placeholder if loading fails.
+    
+    NEVER returns None - always returns a usable image.
+    Placeholder is magenta by default (visible error indicator).
+    """
+    if mem and (datalen is None or datalen >= 4):
+        result = load_from_memory(mem, datalen)
+        if result is not None:
+            return result
+    
+    # Return placeholder
+    log.warning(f"Creating placeholder for failed load")
+    return new('RGBA', placeholder_size, placeholder_color)
 
+
+def open_or_placeholder(filename, placeholder_size=(256, 256),
+                        placeholder_color=(255, 0, 255)):
+    """
+    Open file, or return placeholder if open fails.
+    
+    NEVER returns None - always returns a usable image.
+    """
+    if filename:
+        result = open(filename)
+        if result is not None:
+            return result
+    
+    log.warning(f"Creating placeholder for failed open: {filename}")
+    return new('RGBA', placeholder_size, placeholder_color)
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(level=logging.DEBUG)
+    print("AoImage module test")
+    
+    # Basic test
+    img = new('RGBA', (256, 256), (128, 128, 128))
+    if img:
+        print(f"Created: {img}")
+        img.write_jpg("/tmp/test.jpg")
+    else:
+        print("Failed to create image")
