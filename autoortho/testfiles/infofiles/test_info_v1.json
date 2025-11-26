@@ -1,8 +1,0 @@
-{
-    "id": "test",
-    "name": "Test Ortho Set",
-    "ortho_prefix": "z_test_",
-    "overlay_prefix": "y_test_overlays",
-    "ver": "0.0.18",
-    "ortho_dirs": []
-}

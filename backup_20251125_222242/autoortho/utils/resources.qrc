@@ -1,0 +1,12 @@
+<RCC>
+  <qresource prefix="/imgs">
+    <!-- images -->
+    <file alias="ao-icon.png">../imgs/ao-icon.png</file>
+    <file alias="ao-icon.ico">../imgs/ao-icon.ico</file>
+    <file alias="plus-16.png">../imgs/plus-16.png</file>
+    <file alias="minus-16.png">../imgs/minus-16.png</file>
+    <file alias="arrow-204-16.png">../imgs/arrow-204-16.png</file>
+    <file alias="banner1.png">../imgs/banner1.png</file>
+    <file alias="flight1.png">../imgs/flight1.png</file>
+    </qresource>
+</RCC>

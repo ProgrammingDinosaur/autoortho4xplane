@@ -1,0 +1,32 @@
+# Makefile for libpydds_safe.so (Linux)
+# Crash-protected wrappers for external compression libraries
+
+TARGET=libpydds_safe.so
+
+HEADERS=aoimage/crash_guard.h
+OBJECTS=pydds_safe_wrapper.o aoimage/crash_guard.o
+
+CC=gcc
+LD=gcc
+
+CFLAGS+=-O2 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
+	-Iaoimage \
+	-Ilib/linux
+
+LDFLAGS=-shared -rdynamic
+LIBS=-Llib/linux -lispc_texcomp -ldl -lpthread
+
+all: $(TARGET)
+
+pydds_safe_wrapper.o: pydds_safe_wrapper.c $(HEADERS)
+	$(CC) $(CFLAGS) -c pydds_safe_wrapper.c -o $@
+
+aoimage/crash_guard.o: aoimage/crash_guard.c aoimage/crash_guard.h
+	$(CC) $(CFLAGS) -c aoimage/crash_guard.c -o aoimage/crash_guard.o
+
+$(TARGET): $(OBJECTS)
+	$(LD) -o $@ $(LDFLAGS) $(OBJECTS) $(LIBS)
+
+clean:
+	rm -f $(OBJECTS) $(TARGET)
+

@@ -3,7 +3,7 @@ import sys
 
 if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
     # Absolute import is robust under Nuitka for the entry module
-    from macfuse_worker import main as _ao_worker_main
+    from autoortho.platform.macos_fuse_worker import main as _ao_worker_main
     _ao_worker_main()
     os._exit(0)
 
@@ -12,14 +12,14 @@ import logging
 import logging.handlers
 import atexit, signal, threading
 import platform
-from aoconfig import CFG
+from autoortho.core.config import CFG
 from pathlib import Path
 from utils.constants import system_type
 
 # Install crash handler EARLY, before any C extensions load
 # This allows us to log C-level crashes (segfaults, access violations)
 try:
-    from crash_handler import install_crash_handler
+    from autoortho.core.crash_handler import install_crash_handler
     install_crash_handler()
 except Exception as e:
     # Don't fail if crash handler can't be installed
@@ -168,7 +168,7 @@ try:
 except Exception:
     pass
 
-import autoortho
+from autoortho.core import app
 
 if __name__ == "__main__":
     try:

@@ -1,0 +1,39 @@
+# Makefile (autoortho/aoimage) — build aoimage.dylib with static libturbojpeg
+# Uses lib/maclibturbojpeg.a relative to this directory. No Homebrew path recorded.
+
+PKGROOT     := ..
+STATIC_TJ   := lib/maclibturbojpeg.a
+TJ_INC     ?= /opt/homebrew/opt/jpeg-turbo/include
+
+CC          := clang
+ARCH        := arm64
+MIN_MACOS   := 11.0
+
+CFLAGS     += -O2 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
+              -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
+              -I$(TJ_INC)
+
+# aoimage.dylib remains relocatable; no rpath needed for turbojpeg since it's static
+LDFLAGS    := -dynamiclib -undefined dynamic_lookup \
+              -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
+              -Wl,-install_name,@rpath/aoimage.dylib \
+              -Wl,-headerpad_max_install_names
+
+.PHONY: all clean
+all: aoimage.dylib
+
+aoimage.o: aoimage.c aoimage.h crash_guard.h
+	@test -f "$(TJ_INC)/turbojpeg.h" || { \
+	  echo "ERROR: turbojpeg.h not found under TJ_INC=$(TJ_INC)"; exit 1; }
+	$(CC) $(CFLAGS) -c aoimage.c -o $@
+
+crash_guard.o: crash_guard.c crash_guard.h
+	$(CC) $(CFLAGS) -c crash_guard.c -o $@
+
+# Link statically: include code from lib/libturbojpeg.a into aoimage.dylib
+aoimage.dylib: aoimage.o crash_guard.o $(STATIC_TJ)
+	@test -f "$(STATIC_TJ)" || { echo "ERROR: missing $(STATIC_TJ)"; exit 1; }
+	$(CC) -o $@ $(LDFLAGS) aoimage.o crash_guard.o $(STATIC_TJ)
+
+clean:
+	rm -f aoimage.o crash_guard.o aoimage.dylib
