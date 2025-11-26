@@ -114,8 +114,8 @@ max_decode_concurrency = {os.cpu_count() or 1}
 # Guarantees main process NEVER crashes due to library failures
 # Options: off, compression_only, full
 # - off: Direct calls (fastest, may crash)
-# - compression_only: Only DDS compression isolated (~5% slower)
-# - full: All C operations isolated with shared memory (~5% slower, recommended)
+# - compression_only: Only DDS compression isolated (~5 percent slower)
+# - full: All C operations isolated with shared memory (~5 percent slower, recommended)
 safe_mode = off
 
 [scenery]
