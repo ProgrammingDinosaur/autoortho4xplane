@@ -5,7 +5,7 @@ import ast
 import pprint
 import configparser
 from types import SimpleNamespace
-from utils.constants import system_type
+from autoortho.utils.constants import system_type
 
 import logging
 log = logging.getLogger(__name__)

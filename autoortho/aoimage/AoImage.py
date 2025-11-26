@@ -4,7 +4,7 @@ import os
 import sys
 from ctypes import *
 
-from utils.constants import system_type
+from autoortho.utils.constants import system_type
 import logging
 log = logging.getLogger(__name__)
 
@@ -310,7 +310,7 @@ _aoi.aoimage_crop_and_upscale.argtypes = (POINTER(AoImage), POINTER(AoImage), c_
 # This catches crashes in C code that Python cannot intercept
 try:
     import atexit
-    from utils.constants import LOGS_DIR
+    from autoortho.utils.constants import LOGS_DIR
     
     # Check if crash guard functions are available
     if hasattr(_aoi, 'aoimage_crash_guard_init'):

@@ -18,7 +18,7 @@ import signal
 import logging
 import traceback
 from datetime import datetime
-from utils.constants import LOGS_DIR
+from autoortho.utils.constants import LOGS_DIR
 
 
 log = logging.getLogger(__name__)

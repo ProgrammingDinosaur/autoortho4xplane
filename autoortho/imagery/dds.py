@@ -7,7 +7,7 @@ from io import BytesIO
 from binascii import hexlify
 from ctypes import *
 #from PIL import Image
-from aoimage import AoImage as Image
+from autoortho.aoimage import AoImage as Image
 
 import threading
 
@@ -15,7 +15,7 @@ import threading
 
 #from memory_profiler import profile
 from autoortho.core.config import CFG
-from utils.constants import system_type
+from autoortho.utils.constants import system_type
 
 import logging
 log = logging.getLogger(__name__)
@@ -29,19 +29,21 @@ class rgba_surface(Structure):
         ('stride', c_uint32)
     ]
 
-#_stb = CDLL("/usr/lib/x86_64-linux-gnu/libstb.so")
+# Get the autoortho package root (one level up from imagery/)
+_autoortho_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
 if system_type == 'linux':
     print("Linux detected")
-    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'linux', 'lib_stb_dxt.so')
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'linux', 'libispc_texcomp.so')
+    _stb_path = os.path.join(_autoortho_root, 'lib', 'linux', 'lib_stb_dxt.so')
+    _ispc_path = os.path.join(_autoortho_root, 'lib', 'linux', 'libispc_texcomp.so')
 elif system_type == 'windows':
     print("Windows detected")
-    _stb_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'stb_dxt.dll')
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'windows', 'ispc_texcomp.dll')
+    _stb_path = os.path.join(_autoortho_root, 'lib', 'windows', 'stb_dxt.dll')
+    _ispc_path = os.path.join(_autoortho_root, 'lib', 'windows', 'ispc_texcomp.dll')
 elif system_type == 'darwin':
     print("macOS detected")
     _stb_path = None
-    _ispc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'lib', 'macos', 'libispc_texcomp.dylib')
+    _ispc_path = os.path.join(_autoortho_root, 'lib', 'macos', 'libispc_texcomp.dylib')
 else:
     print("System is not supported")
     exit()

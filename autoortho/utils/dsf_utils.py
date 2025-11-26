@@ -8,7 +8,7 @@ from logging import getLogger
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 from autoortho.core.config import CFG
-from utils.constants import system_type
+from autoortho.utils.constants import system_type
 
 from enum import Enum
 

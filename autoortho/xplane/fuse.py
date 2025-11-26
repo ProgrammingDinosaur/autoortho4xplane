@@ -15,7 +15,7 @@ from collections import defaultdict
 from functools import wraps, lru_cache
 
 from autoortho.core.config import CFG
-from utils.constants import system_type
+from autoortho.utils.constants import system_type
 import logging
 log = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ class AutoOrtho(Operations):
         self.root = os.path.abspath(root)
         self.cache_dir = cache_dir
 
-        self.tc = getortho.TileCacher(cache_dir)
+        self.tc = tiles.TileCacher(cache_dir)
     
         #self.path_condition = threading.Condition()
         #self.read_lock = threading.Lock()

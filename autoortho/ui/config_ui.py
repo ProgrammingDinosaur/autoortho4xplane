@@ -13,11 +13,11 @@ import re
 import webbrowser
 import requests
 from packaging import version
-import utils.resources_rc
-from utils.constants import MAPTYPES, system_type
-from utils.mappers import map_kubilus_region_to_simheaven_region
-from utils.dsf_utils import DsfUtils, dsf_utils
-from utils.mount_utils import cleanup_mountpoint
+import autoortho.utils.resources_rc
+from autoortho.utils.constants import MAPTYPES, system_type
+from autoortho.utils.mappers import map_kubilus_region_to_simheaven_region
+from autoortho.utils.dsf_utils import DsfUtils, dsf_utils
+from autoortho.utils.mount_utils import cleanup_mountpoint
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -34,7 +34,7 @@ from PySide6.QtGui import (
 )
 
 from autoortho.imagery import downloader
-from version import __version__
+from autoortho.version import __version__
 
 log = logging.getLogger(__name__)
 
@@ -3082,7 +3082,7 @@ class ConfigUI(QMainWindow):
             if not data:
                 return
             latest_tag, html_url = data
-            from version import __version__ as current_version
+            from autoortho.version import __version__ as current_version
             latest_ver = self._parse_version(latest_tag)
             current_ver = self._parse_version(current_version)
             if latest_ver is None or current_ver is None:

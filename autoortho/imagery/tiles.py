@@ -21,11 +21,11 @@ from autoortho.imagery import dds
 
 import requests
 import psutil
-from aoimage import AoImage
+from autoortho.aoimage import AoImage
 
 from autoortho.core.config import CFG
 from autoortho.ui.stats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat
-from utils.constants import (
+from autoortho.utils.constants import (
     system_type, 
     CURRENT_CPU_COUNT,
     EARTH_RADIUS_M,
@@ -34,7 +34,7 @@ from utils.constants import (
     PRIORITY_MIPMAP_WEIGHT,
     LOOKAHEAD_TIME_SEC,
 )
-from utils.apple_token_service import apple_token_service
+from autoortho.utils.apple_token_service import apple_token_service
 
 from autoortho.xplane.datareftrack import dt as datareftracker
 

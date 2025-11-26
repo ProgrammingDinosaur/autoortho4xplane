@@ -24,17 +24,19 @@ from multiprocessing.managers import BaseManager
 
 from autoortho.core import config
 from autoortho.ui import stats
-from autoortho.platform import windows
-from autoortho.platform import macos
-from utils.mount_utils import (
+from autoortho.platforms import windows
+from autoortho.platforms import macos
+from autoortho.xplane import fuse
+from autoortho.imagery import tiles
+from autoortho.utils.mount_utils import (
     cleanup_mountpoint,
     _is_nuitka_compiled,
     is_only_ao_placeholder,
     clear_ao_placeholder,
 )
-from utils.constants import MAPTYPES, system_type
+from autoortho.utils.constants import MAPTYPES, system_type
 
-from version import __version__
+from autoortho.version import __version__
 
 import logging
 log = logging.getLogger(__name__)
@@ -97,7 +99,7 @@ def _get_or_create_stats_store():
     """Factory used by the StatsManager server process to expose a singleton store."""
     global _SERVER_STATS_STORE
     if _SERVER_STATS_STORE is None:
-        _SERVER_STATS_STORE = aostats.StatsStore()
+        _SERVER_STATS_STORE = stats.StatsStore()
     return _SERVER_STATS_STORE
 
 
@@ -114,7 +116,7 @@ def setupmount(mountpoint, systemtype):
         try:
             if systemtype in ("winfsp-FUSE", "dokan-FUSE"):
                 try:
-                    winsetup.force_unmount(mountpoint)
+                    windows.force_unmount(mountpoint)
                 except Exception as exc:
                     log.debug(f"Windows force_unmount preflight failed: {exc}")
             elif systemtype == "macOS":
@@ -200,13 +202,13 @@ def setupmount(mountpoint, systemtype):
     if systemtype == "Linux-FUSE":
         pass
     elif systemtype == "dokan-FUSE":
-        if not winsetup.setup_dokan_mount(mountpoint):
+        if not windows.setup_dokan_mount(mountpoint):
             raise MountError(f"Failed to setup mount point {mountpoint}!")
     elif systemtype == "winfsp-FUSE":
-        if not winsetup.setup_winfsp_mount(mountpoint):
+        if not windows.setup_winfsp_mount(mountpoint):
             raise MountError(f"Failed to setup mount point {mountpoint}!")
     elif systemtype == "macOS":
-        if not macsetup.setup_macfuse_mount(mountpoint):
+        if not macos.setup_macfuse_mount(mountpoint):
             raise MountError(f"Failed to setup mount point {mountpoint}!")
     else:
         raise MountError(f"Unknown system type: {systemtype} for mount {mountpoint}")
@@ -236,7 +238,7 @@ def diagnose(CFG):
             try:
                 if system_type == 'darwin':
                     # Require an actual FUSE mount on macOS; placeholders can mask failures
-                    ret = macsetup.is_macfuse_mount(mount)
+                    ret = macos.is_macfuse_mount(mount)
                 else:
                     ret = os.path.isdir(os.path.join(mount, 'textures'))
             except Exception:
@@ -259,7 +261,7 @@ def diagnose(CFG):
         log.info(f"    {root}")
         try:
             if system_type == 'darwin':
-                ret = macsetup.is_macfuse_mount(mount)
+                ret = macos.is_macfuse_mount(mount)
             else:
                 ret = os.path.isdir(os.path.join(mount, 'textures'))
         except Exception:
@@ -274,7 +276,7 @@ def diagnose(CFG):
         if maptype == "Use tile default":
             continue
         with tempfile.TemporaryDirectory() as tmpdir:
-            c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
+            c = tiles.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
             ret = c.get()
             if ret:
                 log.info(f"    Maptype: {maptype} OK!")
@@ -363,7 +365,7 @@ class AOMount:
         # Obtain a proxy to the server-owned store and bind helpers to it so
         # that all stats updates/readouts go through the shared store.
         store_proxy = mgr.get_store()
-        aostats.bind_local_store(store_proxy)
+        stats.bind_local_store(store_proxy)
         self._shared_store = store_proxy
         host, port = mgr.address
         log.info(f"StatsManager listening on {host}:{port}")
@@ -476,7 +478,7 @@ class AOMount:
                 try:
                     # Update this process's own memory heartbeat so it's counted
                     try:
-                        aostats.update_process_memory_stat()
+                        stats.update_process_memory_stat()
                     except Exception:
                         pass
 
@@ -738,18 +740,18 @@ class AOMount:
                 # Cleanup any orphaned mounts from previous crashes
                 # This prevents EXCEPTION_IN_PAGE_ERROR in X-Plane
                 try:
-                    winsetup.cleanup_orphaned_mounts()
+                    windows.cleanup_orphaned_mounts()
                 except Exception as e:
                     log.warning(f"Failed to cleanup orphaned mounts (non-fatal): {e}")
                 
-                systemtype, libpath = winsetup.find_win_libs()
+                systemtype, libpath = windows.find_win_libs()
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
                     import mfusepy
                     from autoortho.xplane import fuse
                     mfusepy._libfuse = ctypes.CDLL(libpath)
-                    autoortho_fuse.run(
-                            autoortho_fuse.AutoOrtho(root),
+                fuse.run(
+                        fuse.AutoOrtho(root),
                             mount,
                             mount.split('/')[-1],
                             nothreads
@@ -762,12 +764,12 @@ class AOMount:
                 except Exception as _e:
                     log.debug(f"Placeholder pre-clear failed (ignored): {_e}")
 
-                if not macsetup.setup_macfuse_mount(mountpoint):
+                if not macos.setup_macfuse_mount(mountpoint):
                     # Second chance: if it's only our placeholder but we didn't clear earlier, clear now and retry.
                     try:
                         if os.path.isdir(mountpoint) and is_only_ao_placeholder(mountpoint):
                             clear_ao_placeholder(mountpoint)
-                            if not macsetup.setup_macfuse_mount(mountpoint):
+                            if not macos.setup_macfuse_mount(mountpoint):
                                 raise MountError(f"Failed to setup mount point {mountpoint}!")
                         else:
                             raise MountError(f"Failed to setup mount point {mountpoint}!")
@@ -788,8 +790,8 @@ class AOMount:
                     log.info("Running in FUSE mode.")
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
                     from autoortho.xplane import fuse
-                    autoortho_fuse.run(
-                            autoortho_fuse.AutoOrtho(root),
+                fuse.run(
+                        fuse.AutoOrtho(root),
                             mount,
                             mount.split('/')[-1],
                             nothreads
@@ -835,9 +837,9 @@ class AOMount:
                         subprocess.run(["umount", "-l", mountpoint],
                                     check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif system_type == 'windows':
-                    log.info(f"Force unmounting {mountpoint} via winsetup.force_unmount")
+                    log.info(f"Force unmounting {mountpoint} via windows.force_unmount")
                     try:
-                        winsetup.force_unmount(mountpoint)  # implement this in winsetup for both backends
+                        windows.force_unmount(mountpoint)  # implement this in winsetup for both backends
                     except Exception as exc:
                         log.warning(f"Windows force unmount failed: {exc}")
             except Exception as exc:
@@ -891,7 +893,7 @@ def main():
 
     args = parser.parse_args()
 
-    CFG = aoconfig.CFG
+    CFG = config.CFG
     if args.configure or (CFG.general.showconfig and not args.headless):
         # Show cfgui at start
         run_headless = False
