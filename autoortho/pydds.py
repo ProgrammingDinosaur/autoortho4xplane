@@ -80,6 +80,57 @@ except Exception as e:
     log.error("AutoOrtho cannot continue without this library.")
     raise
 
+# Load crash-protected wrappers for compression libraries
+# These wrappers catch crashes in external libraries (ispc_texcomp, stb_dxt)
+# that Python cannot intercept, providing graceful degradation and crash logs
+_safe_wrapper = None
+_has_safe_wrappers = False
+
+try:
+    if system_type == 'windows':
+        _safe_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'pydds_safe.dll')
+    elif system_type == 'linux':
+        _safe_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'libpydds_safe.so')
+    elif system_type == 'darwin':
+        _safe_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'libpydds_safe.dylib')
+    
+    if os.path.exists(_safe_path):
+        _safe_wrapper = CDLL(_safe_path)
+        
+        # Initialize crash guard in wrapper
+        from utils.constants import LOGS_DIR
+        _safe_wrapper.pydds_safe_init.argtypes = [c_char_p]
+        _safe_wrapper.pydds_safe_init.restype = None
+        log_dir = LOGS_DIR.encode('utf-8') if isinstance(LOGS_DIR, str) else LOGS_DIR
+        _safe_wrapper.pydds_safe_init(log_dir)
+        
+        # Set argtypes for safe wrappers
+        _safe_wrapper.safe_CompressBlocksBC1.argtypes = [POINTER(rgba_surface), c_char_p]
+        _safe_wrapper.safe_CompressBlocksBC1.restype = c_int
+        
+        _safe_wrapper.safe_CompressBlocksBC3.argtypes = [POINTER(rgba_surface), c_char_p]
+        _safe_wrapper.safe_CompressBlocksBC3.restype = c_int
+        
+        _has_safe_wrappers = True
+        log.info(f"Loaded crash-protected compression wrappers from {_safe_path}")
+        
+        # Register cleanup
+        import atexit
+        def cleanup_safe_wrapper():
+            try:
+                if _safe_wrapper and hasattr(_safe_wrapper, 'pydds_safe_cleanup'):
+                    _safe_wrapper.pydds_safe_cleanup()
+            except:
+                pass
+        atexit.register(cleanup_safe_wrapper)
+    else:
+        log.info(f"Safe compression wrappers not found at {_safe_path}")
+        log.info("Using direct compression calls (less crash protection)")
+        
+except Exception as e:
+    log.warning(f"Could not load safe compression wrappers: {e}")
+    log.warning("Using direct compression calls (less crash protection)")
+
 DDSD_CAPS = 0x00000001          # dwCaps/dwCaps2 is enabled. 
 DDSD_HEIGHT = 0x00000002                # dwHeight is enabled. 
 DDSD_WIDTH = 0x00000004                 # dwWidth is enabled. Required for all textures. 
@@ -441,7 +492,17 @@ class DDS(Structure):
             # CRITICAL FIX #3: Add error handling for C calls
             try:
                 log.debug("DDS.compress: Calling CompressBlocksBC3")
-                _ispc.CompressBlocksBC3(s, outdata)
+                
+                # Use safe wrapper if available (crash protection)
+                if _has_safe_wrappers:
+                    compress_result = _safe_wrapper.safe_CompressBlocksBC3(s, outdata)
+                    if compress_result == 0:
+                        log.error("DDS.compress: CompressBlocksBC3 crashed (see c_crash.log)")
+                        return None
+                else:
+                    # Direct call (less safe)
+                    _ispc.CompressBlocksBC3(s, outdata)
+                
                 log.debug("DDS.compress: CompressBlocksBC3 succeeded")
                 result = True
             except Exception as e:
@@ -473,7 +534,17 @@ class DDS(Structure):
             # CRITICAL FIX #3: Add error handling for C calls
             try:
                 log.debug("DDS.compress: Calling CompressBlocksBC1")
-                _ispc.CompressBlocksBC1(s, outdata)
+                
+                # Use safe wrapper if available (crash protection)
+                if _has_safe_wrappers:
+                    compress_result = _safe_wrapper.safe_CompressBlocksBC1(s, outdata)
+                    if compress_result == 0:
+                        log.error("DDS.compress: CompressBlocksBC1 crashed (see c_crash.log)")
+                        return None
+                else:
+                    # Direct call (less safe)
+                    _ispc.CompressBlocksBC1(s, outdata)
+                
                 log.debug("DDS.compress: CompressBlocksBC1 succeeded")
                 result = True
             except Exception as e:

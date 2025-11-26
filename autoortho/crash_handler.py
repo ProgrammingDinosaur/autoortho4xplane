@@ -125,7 +125,20 @@ def _install_unix_handlers():
 
 
 def _install_windows_handlers():
-    """Install Windows SEH (Structured Exception Handling)."""
+    """
+    Install Windows SEH (Structured Exception Handling).
+    
+    NOTE: Python's Windows exception handling has significant limitations.
+    Crashes in C extensions (aoimage.dll, ispc_texcomp.dll, stb_dxt.dll) often
+    bypass Python's exception handlers entirely and cannot be caught.
+    
+    When AutoOrtho crashes:
+    1. WinFSP/Dokan virtual filesystem becomes orphaned
+    2. X-Plane gets EXCEPTION_IN_PAGE_ERROR trying to read DDS files
+    3. crash_handler.py may not be able to log the crash
+    
+    Mitigation: cleanup_orphaned_mounts() on startup handles orphaned mounts.
+    """
     try:
         import ctypes
         import ctypes.wintypes
@@ -139,7 +152,7 @@ def _install_windows_handlers():
         EXCEPTION_STACK_OVERFLOW = 0xC00000FD
         
         exception_names = {
-            EXCEPTION_ACCESS_VIOLATION: "Access Violation",
+            EXCEPTION_ACCESS_VIOLATION: "Access Violation (0xC0000005)",
             EXCEPTION_ARRAY_BOUNDS_EXCEEDED: "Array Bounds Exceeded",
             EXCEPTION_DATATYPE_MISALIGNMENT: "Datatype Misalignment",
             EXCEPTION_FLT_DIVIDE_BY_ZERO: "Float Divide by Zero",
@@ -161,8 +174,10 @@ def _install_windows_handlers():
             return 1
         
         # This is complex and may not work reliably with Python
-        # Better to use Windows Error Reporting (WER) or minidump generation
-        log.info("Windows SEH handler installation attempted (limited functionality)")
+        # Crashes in C code often bypass this handler completely
+        log.warning("Windows SEH handler has LIMITED functionality")
+        log.warning("Crashes in C extensions (aoimage.dll, ispc_texcomp.dll) may not be caught")
+        log.info("See logs for more details if crashes occur")
         
     except ImportError:
         log.warning("Could not install Windows exception handler (ctypes not available)")

@@ -4,7 +4,7 @@ TARGET=main.exe
 JPGT=./libjpeg-turbo-gcc64
 
 HEADERS=$(wildcard *.h)
-OBJECTS=aoimage.o
+OBJECTS=aoimage.o crash_guard.o
 
 CC=x86_64-w64-mingw32-gcc
 LD=x86_64-w64-mingw32-gcc

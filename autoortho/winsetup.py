@@ -244,3 +244,60 @@ def force_unmount(path):
                 continue
     except Exception as e:
         log.debug(f"force_unmount({path}) failed (ignored): {e}")
+
+
+def cleanup_orphaned_mounts():
+    """
+    Cleanup any orphaned WinFSP/Dokan mounts from previous crashes.
+    
+    This should be called on startup to ensure clean state.
+    When AutoOrtho crashes, the virtual filesystem can be left mounted
+    but not responding, causing EXCEPTION_IN_PAGE_ERROR in X-Plane.
+    """
+    import glob
+    from aoconfig import CFG
+    
+    try:
+        # Get configured mount paths from scenery packs
+        if not hasattr(CFG, 'scenery_packs') or not CFG.scenery_packs:
+            return
+        
+        log.info("Checking for orphaned mounts from previous crashes...")
+        
+        for pack in CFG.scenery_packs:
+            if not hasattr(pack, 'textures'):
+                continue
+            
+            texture_path = pack.textures
+            if not texture_path or not os.path.exists(texture_path):
+                continue
+            
+            # Check if this is a symlink/junction to a mount point
+            if os.path.islink(texture_path):
+                target = os.readlink(texture_path)
+                
+                # Try to access the mount - if it fails, it's orphaned
+                try:
+                    # Attempt to list directory - this will fail for orphaned mounts
+                    os.listdir(target)
+                    log.debug(f"Mount point {target} is healthy")
+                except (OSError, PermissionError) as e:
+                    log.warning(f"Detected orphaned mount at {target}: {e}")
+                    log.info(f"Attempting to cleanup orphaned mount: {target}")
+                    force_unmount(target)
+                    
+                    # Give it a moment to cleanup
+                    import time
+                    time.sleep(1)
+                    
+                    # Verify cleanup
+                    try:
+                        os.listdir(target)
+                        log.info(f"Mount point {target} is now accessible")
+                    except:
+                        log.warning(f"Mount point {target} still inaccessible after cleanup")
+        
+        log.info("Orphaned mount cleanup complete")
+        
+    except Exception as e:
+        log.warning(f"Failed to cleanup orphaned mounts: {e}")

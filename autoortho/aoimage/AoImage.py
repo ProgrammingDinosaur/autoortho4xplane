@@ -306,6 +306,41 @@ _aoi.aoimage_copy.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32)
 _aoi.aoimage_desaturate.argtypes = (POINTER(AoImage), c_float)
 _aoi.aoimage_crop_and_upscale.argtypes = (POINTER(AoImage), POINTER(AoImage), c_uint32, c_uint32, c_uint32, c_uint32, c_uint32)
 
+# Initialize C-level crash guard for production use
+# This catches crashes in C code that Python cannot intercept
+try:
+    import atexit
+    from utils.constants import LOGS_DIR
+    
+    # Check if crash guard functions are available
+    if hasattr(_aoi, 'aoimage_crash_guard_init'):
+        _aoi.aoimage_crash_guard_init.argtypes = [c_char_p]
+        _aoi.aoimage_crash_guard_init.restype = None
+        
+        # Initialize with log directory
+        log_dir = LOGS_DIR.encode('utf-8') if isinstance(LOGS_DIR, str) else LOGS_DIR
+        _aoi.aoimage_crash_guard_init(log_dir)
+        log.info(f"C-level crash protection enabled (log: {LOGS_DIR}/c_crash.log)")
+        
+        # Register cleanup for shutdown
+        if hasattr(_aoi, 'aoimage_crash_guard_cleanup'):
+            _aoi.aoimage_crash_guard_cleanup.argtypes = []
+            _aoi.aoimage_crash_guard_cleanup.restype = None
+            
+            def cleanup_crash_guard():
+                try:
+                    _aoi.aoimage_crash_guard_cleanup()
+                except Exception:
+                    pass
+            
+            atexit.register(cleanup_crash_guard)
+    else:
+        log.warning("Crash guard not available in aoimage (compiled without crash_guard)")
+        
+except Exception as e:
+    log.warning(f"Could not initialize C crash guard: {e}")
+    log.warning("Continuing without crash protection")
+
 def main():
     logging.basicConfig(level = logging.DEBUG)
     width = 16

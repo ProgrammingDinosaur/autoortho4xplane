@@ -735,6 +735,13 @@ class AOMount:
 
         try:
             if system_type == 'windows':
+                # Cleanup any orphaned mounts from previous crashes
+                # This prevents EXCEPTION_IN_PAGE_ERROR in X-Plane
+                try:
+                    winsetup.cleanup_orphaned_mounts()
+                except Exception as e:
+                    log.warning(f"Failed to cleanup orphaned mounts (non-fatal): {e}")
+                
                 systemtype, libpath = winsetup.find_win_libs()
                 with setupmount(mountpoint, systemtype) as mount:
                     log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")

@@ -7,9 +7,20 @@
 #include <turbojpeg.h>
 
 #include "aoimage.h"
+#include "crash_guard.h"
 
 #define TRUE 1
 #define FALSE 0
+
+/* Crash guard initialization - called from Python at module load */
+AOIAPI void aoimage_crash_guard_init(const char* log_dir) {
+    crash_guard_init(log_dir);
+}
+
+/* Crash guard cleanup - called from Python at module shutdown */
+AOIAPI void aoimage_crash_guard_cleanup(void) {
+    crash_guard_cleanup();
+}
 
 AOIAPI void aoimage_delete(aoimage_t *img) {
     // Prevent double-free by atomically clearing pointer first
@@ -409,13 +420,28 @@ AOIAPI int32_t aoimage_from_memory(aoimage_t *img, const uint8_t *data, uint32_t
 
     //printf("Pixel format: %d\n", TJPF_RGBA);
 
-    if (tjDecompress2(tjh, data, len, img_buff, width, 0, height, TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
-        const char *err_str = tjGetErrorStr2(tjh);
-        if (err_str != NULL) {
-            strncpy(img->errmsg, err_str, sizeof(img->errmsg) - 1);
-            img->errmsg[sizeof(img->errmsg) - 1] = '\0';  // Ensure null termination
+    // Protect JPEG decompression with crash guard
+    // This catches crashes in turbojpeg that Python cannot intercept
+    int decompress_result;
+    CRASH_GUARDED_CALL(
+        decompress_result,
+        tjDecompress2(tjh, data, len, img_buff, width, 0, height, TJPF_RGBA, TJFLAG_FASTDCT),
+        "tjDecompress2"
+    );
+
+    if (decompress_result < 0) {
+        if (decompress_result == 0) {
+            // Crash detected (see c_crash.log)
+            strcpy(img->errmsg, "tjDecompress2 crashed (see c_crash.log)");
         } else {
-            strcpy(img->errmsg, "tjDecompress2 failed (no error string)");
+            // Normal tjDecompress2 error
+            const char *err_str = tjGetErrorStr2(tjh);
+            if (err_str != NULL) {
+                strncpy(img->errmsg, err_str, sizeof(img->errmsg) - 1);
+                img->errmsg[sizeof(img->errmsg) - 1] = '\0';  // Ensure null termination
+            } else {
+                strcpy(img->errmsg, "tjDecompress2 failed (no error string)");
+            }
         }
         goto err;
     }

@@ -15,3 +15,7 @@ downloads/
 release/
 *.bin
 .version
+docs/developer/
+docs/internal/
+examples/
+scripts/

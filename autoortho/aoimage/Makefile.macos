@@ -22,15 +22,18 @@ LDFLAGS    := -dynamiclib -undefined dynamic_lookup \
 .PHONY: all clean
 all: aoimage.dylib
 
-aoimage.o: aoimage.c aoimage.h
+aoimage.o: aoimage.c aoimage.h crash_guard.h
 	@test -f "$(TJ_INC)/turbojpeg.h" || { \
 	  echo "ERROR: turbojpeg.h not found under TJ_INC=$(TJ_INC)"; exit 1; }
 	$(CC) $(CFLAGS) -c aoimage.c -o $@
 
+crash_guard.o: crash_guard.c crash_guard.h
+	$(CC) $(CFLAGS) -c crash_guard.c -o $@
+
 # Link statically: include code from lib/libturbojpeg.a into aoimage.dylib
-aoimage.dylib: aoimage.o $(STATIC_TJ)
+aoimage.dylib: aoimage.o crash_guard.o $(STATIC_TJ)
 	@test -f "$(STATIC_TJ)" || { echo "ERROR: missing $(STATIC_TJ)"; exit 1; }
-	$(CC) -o $@ $(LDFLAGS) aoimage.o $(STATIC_TJ)
+	$(CC) -o $@ $(LDFLAGS) aoimage.o crash_guard.o $(STATIC_TJ)
 
 clean:
-	rm -f aoimage.o aoimage.dylib
+	rm -f aoimage.o crash_guard.o aoimage.dylib
