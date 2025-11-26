@@ -539,7 +539,7 @@ AOIAPI int32_t aoimage_paste(aoimage_t *img, const aoimage_t *p_img, uint32_t x,
 AOIAPI int32_t aoimage_crop(aoimage_t *img, const aoimage_t *c_img, uint32_t x, uint32_t y) {
     // Runtime validation (replaces asserts)
     if (img == NULL || img->ptr == NULL) {
-        if (c_img) strcpy(c_img->errmsg, "source image is NULL");
+        // Can't write error to c_img (const) - just return failure
         return FALSE;
     }
     if (c_img == NULL || c_img->ptr == NULL) {
