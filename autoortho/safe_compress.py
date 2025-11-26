@@ -249,7 +249,7 @@ class SafeCompressor:
         
         for attempt in range(retries + 1):
             if attempt > 0:
-                log.debug(f"Compression retry {attempt}/{retries}")
+                log.info(f"DDS compression retry {attempt}/{retries} (previous: {last_error})")
                 time.sleep(RETRY_DELAY)
             
             # Submit to worker
@@ -270,21 +270,21 @@ class SafeCompressor:
                                 return result[2]
                             else:
                                 last_error = result[2]
-                                log.debug(f"Compress attempt {attempt+1} failed: {last_error}")
+                                log.info(f"DDS compress attempt {attempt+1} failed: {last_error}")
                                 break  # Try retry
                     except Empty:
                         continue
                 else:
                     # Timeout
                     last_error = "timeout"
-                    log.debug(f"Compress attempt {attempt+1} timed out")
+                    log.info(f"DDS compress attempt {attempt+1} timed out")
                     
             except Exception as e:
                 last_error = str(e)
-                log.debug(f"Compress attempt {attempt+1} exception: {e}")
+                log.info(f"DDS compress attempt {attempt+1} exception: {e}")
         
         # All retries exhausted
-        log.warning(f"Compression failed after {retries+1} attempts: {last_error}")
+        log.warning(f"DDS compression FAILED after {retries+1} attempts: {last_error}")
         return get_placeholder_dds(width, height, dxt_format)
     
     def _compress_direct_with_fallback(self, width, height, data, 

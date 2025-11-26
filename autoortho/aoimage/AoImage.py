@@ -414,11 +414,18 @@ def load_from_memory(mem, datalen=None, use_safe_mode=None):
     
     if use_safe_mode:
         # SAFE MODE: All C operations in subprocess with shared memory
-        # Do NOT fall back to direct calls - that defeats the purpose!
+        # Returns None on failure to allow caller to use fallbacks (e.g., higher mipmap)
         try:
             # Use shared memory worker (optimized)
             from shared_memory_worker import shm_load_jpeg
-            width, height, rgba_data = shm_load_jpeg(mem)
+            result = shm_load_jpeg(mem)
+            
+            if result is None:
+                # Worker failed - return None to allow fallback
+                log.debug("Safe mode: Worker returned None, allowing fallback")
+                return None
+            
+            width, height, rgba_data = result
             
             # Create AoImage from raw RGBA data
             img = new('RGBA', (width, height), (0, 0, 0))
@@ -427,11 +434,11 @@ def load_from_memory(mem, datalen=None, use_safe_mode=None):
                 img._set_data(rgba_data)
                 return img
             else:
-                log.warning("Safe mode: Failed to create image from worker result")
-                return None
+                log.debug("Safe mode: Failed to create image from worker result")
+                return None  # Allow fallback
         except Exception as e:
-            log.error(f"Safe mode load exception: {e}")
-            return None  # Return None, do NOT fall back to direct!
+            log.warning(f"Safe mode load exception: {e}")
+            return None  # Return None to allow fallback
     
     # Direct load (only used when safe_mode is OFF)
     img = AoImage()

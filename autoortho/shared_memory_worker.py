@@ -473,23 +473,35 @@ class SharedMemoryWorkerPool:
                 except Exception as e:
                     log.error(f"Failed to restart worker {i}: {e}")
     
-    def load_jpeg(self, jpeg_data, timeout=TASK_TIMEOUT, retries=RETRY_COUNT):
+    def load_jpeg(self, jpeg_data, timeout=TASK_TIMEOUT, retries=RETRY_COUNT,
+                  return_none_on_failure=True):
         """
         Load JPEG data and return (width, height, rgba_bytes).
         
         Uses shared memory for zero-copy transfer.
-        Retries on failure before returning placeholder.
-        Returns placeholder on final failure. NEVER crashes main process.
+        Retries on failure before giving up.
+        
+        Args:
+            jpeg_data: JPEG bytes to decode
+            timeout: Timeout per attempt
+            retries: Number of retry attempts
+            return_none_on_failure: If True, return None on failure (allows fallbacks)
+                                    If False, return placeholder (magenta)
+        
+        Returns:
+            (width, height, rgba_bytes) on success, None or placeholder on failure.
+            NEVER crashes main process.
         """
         if not self._started:
             if not self.start():
-                return self._placeholder_rgba(256, 256)
+                log.warning("JPEG load: Worker pool failed to start")
+                return None if return_none_on_failure else self._placeholder_rgba(256, 256)
         
         last_error = None
         
         for attempt in range(retries + 1):
             if attempt > 0:
-                log.debug(f"JPEG load retry {attempt}/{retries}")
+                log.info(f"JPEG load retry {attempt}/{retries} (previous: {last_error})")
                 time.sleep(RETRY_DELAY)
                 self._check_and_restart_workers()
             
@@ -519,7 +531,7 @@ class SharedMemoryWorkerPool:
                         result = self.result_queue.get(timeout=1)
                         
                         if result[0] == "init_error":
-                            log.error(f"Worker init failed: {result[2]}")
+                            log.warning(f"Worker init failed: {result[2]}")
                             continue
                         
                         if result[0] == task_id:
@@ -529,7 +541,7 @@ class SharedMemoryWorkerPool:
                                 return (width, height, rgba_data)
                             else:
                                 last_error = result[2]
-                                log.debug(f"Load attempt {attempt+1} failed: {last_error}")
+                                log.info(f"JPEG decode attempt {attempt+1} failed: {last_error}")
                                 break  # Exit inner loop, try retry
                                 
                     except Empty:
@@ -538,37 +550,55 @@ class SharedMemoryWorkerPool:
                 else:
                     # Timeout - try retry
                     last_error = "timeout"
-                    log.debug(f"Load attempt {attempt+1} timed out")
+                    log.info(f"JPEG decode attempt {attempt+1} timed out")
                     
             except Exception as e:
                 last_error = str(e)
-                log.debug(f"Load attempt {attempt+1} exception: {e}")
+                log.info(f"JPEG decode attempt {attempt+1} exception: {e}")
                 
             finally:
                 self.buffer_pool.release(input_buf)
                 self.buffer_pool.release(output_buf)
         
-        # All retries exhausted
-        log.warning(f"JPEG load failed after {retries+1} attempts: {last_error}")
-        return self._placeholder_rgba(256, 256)
+        # All retries exhausted - log at WARNING level
+        log.warning(f"JPEG load FAILED after {retries+1} attempts: {last_error} "
+                   f"(fallback will be used)")
+        
+        if return_none_on_failure:
+            return None  # Allow caller to use fallback (higher mipmap)
+        else:
+            return self._placeholder_rgba(256, 256)
     
     def compress_dds(self, width, height, rgba_data, dxt_format="BC1", ispc=True, 
-                     timeout=TASK_TIMEOUT, retries=RETRY_COUNT):
+                     timeout=TASK_TIMEOUT, retries=RETRY_COUNT,
+                     return_none_on_failure=False):
         """
         Compress RGBA to DDS format.
         
-        Retries on failure before returning placeholder.
+        Retries on failure before giving up.
+        
+        Args:
+            width, height: Image dimensions
+            rgba_data: RGBA pixel bytes
+            dxt_format: "BC1" or "BC3"
+            ispc: Use ISPC compressor
+            timeout: Timeout per attempt
+            retries: Number of retry attempts
+            return_none_on_failure: If True, return None on failure
+                                    If False, return placeholder (default for DDS)
+        
         Returns DDS bytes. NEVER crashes main process.
         """
         if not self._started:
             if not self.start():
-                return self._placeholder_dds(width, height, dxt_format)
+                log.warning("DDS compress: Worker pool failed to start")
+                return None if return_none_on_failure else self._placeholder_dds(width, height, dxt_format)
         
         last_error = None
         
         for attempt in range(retries + 1):
             if attempt > 0:
-                log.debug(f"DDS compress retry {attempt}/{retries}")
+                log.info(f"DDS compress retry {attempt}/{retries} (previous: {last_error})")
                 time.sleep(RETRY_DELAY)
                 self._check_and_restart_workers()
             
@@ -600,7 +630,7 @@ class SharedMemoryWorkerPool:
                                 return dds_data
                             else:
                                 last_error = result[2]
-                                log.debug(f"Compress attempt {attempt+1} failed: {last_error}")
+                                log.info(f"DDS compress attempt {attempt+1} failed: {last_error}")
                                 break  # Try retry
                                 
                     except Empty:
@@ -608,19 +638,23 @@ class SharedMemoryWorkerPool:
                         continue
                 else:
                     last_error = "timeout"
-                    log.debug(f"Compress attempt {attempt+1} timed out")
+                    log.info(f"DDS compress attempt {attempt+1} timed out")
                     
             except Exception as e:
                 last_error = str(e)
-                log.debug(f"Compress attempt {attempt+1} exception: {e}")
+                log.info(f"DDS compress attempt {attempt+1} exception: {e}")
                 
             finally:
                 self.buffer_pool.release(input_buf)
                 self.buffer_pool.release(output_buf)
         
-        # All retries exhausted
-        log.warning(f"DDS compress failed after {retries+1} attempts: {last_error}")
-        return self._placeholder_dds(width, height, dxt_format)
+        # All retries exhausted - log at WARNING level
+        log.warning(f"DDS compress FAILED after {retries+1} attempts: {last_error}")
+        
+        if return_none_on_failure:
+            return None
+        else:
+            return self._placeholder_dds(width, height, dxt_format)
     
     def _placeholder_rgba(self, width, height):
         """Create placeholder RGBA data (magenta)."""

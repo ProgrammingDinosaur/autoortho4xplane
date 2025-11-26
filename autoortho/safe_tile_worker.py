@@ -312,18 +312,25 @@ class TileWorkerPool:
             log.error(f"Submit error: {e}")
             return None
     
-    def load_jpeg_safe(self, jpeg_data, placeholder_size=(256, 256), retries=RETRY_COUNT):
+    def load_jpeg_safe(self, jpeg_data, placeholder_size=(256, 256), retries=RETRY_COUNT,
+                        return_none_on_failure=True):
         """
-        Load JPEG safely with retries, returns (width, height, rgba_data) or placeholder.
+        Load JPEG safely with retries.
         
-        Retries on failure before returning placeholder.
-        NEVER crashes, NEVER returns None.
+        Args:
+            jpeg_data: JPEG bytes
+            placeholder_size: Size if placeholder needed
+            retries: Number of retry attempts
+            return_none_on_failure: If True, return None (allows fallbacks)
+                                    If False, return placeholder
+        
+        NEVER crashes main process.
         """
         last_error = None
         
         for attempt in range(retries + 1):
             if attempt > 0:
-                log.debug(f"JPEG load retry {attempt}/{retries}")
+                log.info(f"JPEG load retry {attempt}/{retries} (previous: {last_error})")
                 time.sleep(RETRY_DELAY)
                 self._check_workers()
             
@@ -331,20 +338,33 @@ class TileWorkerPool:
             if result:
                 return result
             
-            last_error = "submit failed"
+            last_error = "worker failed"
         
         # All retries exhausted
-        log.warning(f"JPEG load failed after {retries+1} attempts")
-        w, h = placeholder_size
-        return (w, h, _create_placeholder_rgba(w, h))
+        log.warning(f"JPEG load FAILED after {retries+1} attempts: {last_error} "
+                   f"(fallback will be used)")
+        
+        if return_none_on_failure:
+            return None  # Allow caller to use fallback
+        else:
+            w, h = placeholder_size
+            return (w, h, _create_placeholder_rgba(w, h))
     
     def compress_dds_safe(self, width, height, rgba_data, dxt_format="BC1", ispc=True,
-                          retries=RETRY_COUNT):
+                          retries=RETRY_COUNT, return_none_on_failure=False):
         """
-        Compress to DDS safely with retries, returns DDS data or placeholder.
+        Compress to DDS safely with retries.
         
-        Retries on failure before returning placeholder.
-        NEVER crashes, NEVER returns None.
+        Args:
+            width, height: Image dimensions
+            rgba_data: RGBA pixel bytes
+            dxt_format: "BC1" or "BC3"
+            ispc: Use ISPC compressor
+            retries: Number of retry attempts
+            return_none_on_failure: If True, return None
+                                    If False, return placeholder (default)
+        
+        NEVER crashes main process.
         """
         from safe_compress import get_placeholder_dds
         
@@ -352,7 +372,7 @@ class TileWorkerPool:
         
         for attempt in range(retries + 1):
             if attempt > 0:
-                log.debug(f"DDS compress retry {attempt}/{retries}")
+                log.info(f"DDS compress retry {attempt}/{retries} (previous: {last_error})")
                 time.sleep(RETRY_DELAY)
                 self._check_workers()
             
@@ -360,11 +380,15 @@ class TileWorkerPool:
             if result:
                 return result
             
-            last_error = "submit failed"
+            last_error = "worker failed"
         
         # All retries exhausted
-        log.warning(f"DDS compress failed after {retries+1} attempts")
-        return get_placeholder_dds(width, height, dxt_format)
+        log.warning(f"DDS compress FAILED after {retries+1} attempts: {last_error}")
+        
+        if return_none_on_failure:
+            return None
+        else:
+            return get_placeholder_dds(width, height, dxt_format)
 
 
 # Global pool instance (lazy initialized)
