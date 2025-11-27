@@ -2,6 +2,7 @@ ZIP?=zip
 VERSION?=0.0.0
 # Sanitize VERSION for use in filenames (replace any non-safe char with '-')
 SAFE_VERSION:=$(shell echo "$(VERSION)" | sed -e 's/[^A-Za-z0-9._-]/-/g')
+CODE_NAME:=$(shell grep UBUNTU_CODENAME /etc/os-release | cut -d= -f2)
 .PHONY: mac_app
 SHELL := /bin/bash
 .ONESHELL:
@@ -12,13 +13,13 @@ autoortho.pyz:
 	python3 -m pip install -U -r ./build/autoortho/build-reqs.txt --target ./build/autoortho
 	cd build && python3 -m zipapp -p "/usr/bin/env python3" autoortho
 
-lin_bin: autoortho_lin_$(SAFE_VERSION).bin
-autoortho_lin_$(SAFE_VERSION).bin: autoortho/*.py
-	docker run --rm -v `pwd`:/code ubuntu:noble /bin/bash -c "cd /code; ./buildreqs.sh; . .venv/bin/activate; time make bin VERSION=$(VERSION)"
+lin_bin: autoortho_lin_$(SAFE_VERSION)_${CODE_NAME}.bin
+autoortho_lin_$(SAFE_VERSION)_${CODE_NAME}.bin: autoortho/*.py
+	docker run --rm -v `pwd`:/code ubuntu:${CODE_NAME} /bin/bash -c "cd /code; ./buildreqs.sh; . .venv/bin/activate; time make bin VERSION=$(VERSION)"
 	mv autoortho_lin.bin $@
 
-lin_tar: autoortho_linux_$(SAFE_VERSION).tar.gz
-autoortho_linux_$(SAFE_VERSION).tar.gz: autoortho_lin_$(SAFE_VERSION).bin
+lin_tar: autoortho_linux_$(SAFE_VERSION)_${CODE_NAME}.tar.gz
+autoortho_linux_$(SAFE_VERSION)_${CODE_NAME}.tar.gz: autoortho_lin_$(SAFE_VERSION)_${CODE_NAME}.bin
 	chmod a+x $<
 	tar -czf $@ $<
 

@@ -29,7 +29,10 @@ on:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
 
@@ -56,7 +59,7 @@ jobs:
     - name: Save artifact
       uses: actions/upload-artifact@v4
       with:
-        name: linbin
+        name: linbin_${{ matrix.os }}
         path: autoortho_linux_*.tar.gz
 
     - name: Release
@@ -66,7 +69,6 @@ jobs:
         files: autoortho_linux_*.tar.gz
         tag_name: ${{ inputs.relname }}
         prerelease: ${{ inputs.prerelease }}
-        make_latest: ${{ inputs.make_latest }}
         body: ${{ inputs.releasebody }}
 
 
@@ -113,7 +115,6 @@ jobs:
         files: AutoOrtho_mac_*.zip
         tag_name: ${{ inputs.relname }}
         prerelease: ${{ inputs.prerelease }}
-        make_latest: ${{ inputs.make_latest }}
         body: ${{ inputs.releasebody }}
 
 
@@ -165,5 +166,4 @@ jobs:
           autoortho_win_*.zip
         tag_name: ${{ inputs.relname }}
         prerelease: ${{ inputs.prerelease }}
-        make_latest: ${{ inputs.make_latest }}
         body: ${{ inputs.releasebody }}

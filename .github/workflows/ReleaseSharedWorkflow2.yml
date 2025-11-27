@@ -38,7 +38,10 @@ on:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
 
     env:
       VERNAME: ${{ inputs.version }} 
@@ -63,7 +66,7 @@ jobs:
     - name: Save artifact
       uses: actions/upload-artifact@v4
       with:
-        name: linbin
+        name: linbin_${{ matrix.os }}
         path: autoortho_lin_*.bin
 
     - name: Release
