@@ -41,18 +41,29 @@ You have to start X-Plane separately from this tool.  It's also best to start X-
 
 ## Linux Issues
 
-### When using the binary release on Linux I get an 'SSL: CERTIFICATE_VERIFY_FAILED' error 
-You may need to specify the SSL_CERT_DIR your particular operating system
-uses.  For example:
+### IOError: [Errno 24] Too Many Open Files
+On some Linux distrubtions they set the minimum open files limits. This is 1024. Since AutoOrtho is modifying and creating a large number of files at the same time, it can easily hit this limit.
 
-```
-SSL_CERT_DIR=/etc/ssl/certs ./autoortho_lin.bin
-```
-Note - Possibly fixed in 1.1.0 and newer See [Issue #11](https://github.com/ProgrammingDinosaur/autoortho4xplane/issues/11)
+*To confirm*
+Run the following command and see if the result is in the 4,096 at a minumum.
+'ulimit -n'
 
-### FUSE errors ands trange behaviors on ARCH based systems.
-Arch and some other systems keep FUSE2 and FUSE3 seperate when it comes to their userspace binaries (the part AutoOrtho calls to mount and map folders). Other systems like Debian based platforms (e.g. Linux Mint, Ubuntu, Etc) just use FUSE3 binaries/libraries for both FUSE2 and FUSE3 support risking breaking compatability for select usecases. Luckely AutoOrtho is not one of these, but this leaves Arch support broken for now. A solution has been identified in a python FUSE support project that expands support to FUSE3 nativly.
-Until resolved - a Debian based release might be your best bet. The Linux version of X-Plane 12 itself is developed on LTS releases of ubuntu, so that or their Linux Mint counterparts might be a safe starting point if you must have ortho under linux.
+While doing this you can also check the hard limit thats system wide. This should be in the 100,000s or millions in most cases.
+'ulimit -Hn'
+
+*Fixing by setting a higher limit temporarely*
+Open a new terminal window.
+
+This command will set a filesystem max file lmit just in case we are accidently hitting into that limit too...
+'sudo sysctl -w fs.inotify.max_user_watches=100000'
+
+Now we will set our user/process limit to something more workable with generating ortho dynamically...
+'ulimit -S -n 8192'
+
+When you check your 'ulimit -n' you should now see it at 8k (8192). Now, in the same terminal window, we can launch our autoortho binary:
+'./autoortho_lin_1.4.2.bin'
+
+Note: when you close your terminal window that you entered these commands into (or start another) it will no longer have this raised limit. This is a python safegaurd, not a flaw. It helps protect you against scenerios where touching a large number of files can indicate issues (e.g. resource exhaustion, ransomeware attacks, bad code, etc).
 
 ### On Linux this does not start/gives a FUSE error
 Make sure that your `/etc/fuse.conf` files is set to `user_allow_other`.  You may need to uncomment a line.
