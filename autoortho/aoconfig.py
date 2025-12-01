@@ -161,8 +161,13 @@ prefer_winfsp = True
 
         # Always load initially
         self.ready = self.load()
-        # Save to update new defaults
-        self.save()
+        # Save to update new defaults - but ONLY in main process!
+        # Subprocesses (spawn context or macOS workers) should not overwrite config
+        import multiprocessing
+        is_main_process = multiprocessing.current_process().name == 'MainProcess'
+        is_mac_fuse_worker = os.environ.get("AO_RUN_MODE") == "macfuse_worker"
+        if is_main_process and not is_mac_fuse_worker:
+            self.save()
 
 
     def load(self):

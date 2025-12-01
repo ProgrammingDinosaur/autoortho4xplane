@@ -38,13 +38,27 @@ log = logging.getLogger(__name__)
 # Configuration
 WORKER_COUNT = max(2, (os.cpu_count() or 4) // 2)
 TASK_TIMEOUT = 45  # seconds
-MAX_BUFFER_SIZE = 16 * 1024 * 1024  # 16MB max (4096x4096 RGBA)
-# Buffer pool sized for concurrent operations: each task needs 2 buffers
-# With WORKER_COUNT workers and potential FUSE thread concurrency
-BUFFER_POOL_SIZE = max(16, WORKER_COUNT * 4)
+MAX_BUFFER_SIZE = 512 * 1024 * 1024  # 512MB max (supports 8192x8192 RGBA for zoom 17)
 RETRY_COUNT = 2  # Number of retries before returning placeholder
 RETRY_DELAY = 0.1  # Seconds between retries
 BUFFER_ACQUIRE_TIMEOUT = 2.0  # Max time to wait for a buffer
+
+
+def _get_buffer_pool_size() -> int:
+    """Calculate buffer pool size based on memory limit setting."""
+    try:
+        from aoconfig import CFG
+        # Use up to 25% of cache_mem_limit for shared memory buffers
+        mem_limit_gb = float(getattr(CFG.cache, 'cache_mem_limit', 4))
+        mem_for_buffers_mb = int(mem_limit_gb * 1024 * 0.25)  # 25% of limit
+        buffer_size_mb = MAX_BUFFER_SIZE // (1024 * 1024)
+        pool_size = max(4, mem_for_buffers_mb // buffer_size_mb)
+        log.debug(f"Buffer pool: {pool_size} buffers ({buffer_size_mb}MB each, "
+                  f"{mem_limit_gb}GB limit)")
+        return pool_size
+    except Exception:
+        # Fallback if config not available
+        return max(4, WORKER_COUNT)
 
 # Placeholder color (magenta - visible error indicator)
 PLACEHOLDER_COLOR = (255, 0, 255)
@@ -196,7 +210,7 @@ class BufferPool:
     tracked separately and cleaned up on release.
     """
 
-    def __init__(self, pool_size: int = BUFFER_POOL_SIZE,
+    def __init__(self, pool_size: int = 4,
                  buffer_size: int = MAX_BUFFER_SIZE):
         self.pool_size = pool_size
         self.buffer_size = buffer_size
@@ -577,9 +591,9 @@ class SharedMemoryWorkerPool:
             return True
 
         try:
-            # Create buffer pool
+            # Create buffer pool (size based on memory limit setting)
             self.buffer_pool = BufferPool(
-                pool_size=BUFFER_POOL_SIZE,
+                pool_size=_get_buffer_pool_size(),
                 buffer_size=MAX_BUFFER_SIZE
             )
             self.buffer_pool.initialize()

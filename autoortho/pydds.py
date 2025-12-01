@@ -398,6 +398,11 @@ class DDS(Structure):
             # Use shared memory worker (optimized full protection)
             try:
                 from shared_memory_worker import shm_compress_dds
+                # Convert pointer to bytes if needed (data_ptr returns int)
+                if isinstance(data, int):
+                    import ctypes
+                    data_size = width * height * 4  # RGBA
+                    data = ctypes.string_at(data, data_size)
                 result = shm_compress_dds(width, height, data,
                                           dxt_format=self.dxt_format,
                                           ispc=self.ispc)
@@ -414,6 +419,11 @@ class DDS(Structure):
             # Use queue-based worker (compression only)
             try:
                 from safe_compress import safe_compress as _safe_compress
+                # Convert pointer to bytes if needed (data_ptr returns int)
+                if isinstance(data, int):
+                    import ctypes
+                    data_size = width * height * 4  # RGBA
+                    data = ctypes.string_at(data, data_size)
                 result = _safe_compress(width, height, data, 
                                         dxt_format=self.dxt_format, 
                                         ispc=self.ispc)
