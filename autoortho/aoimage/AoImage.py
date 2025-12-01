@@ -11,7 +11,7 @@ import sys
 from ctypes import (
     Structure, CDLL, POINTER,
     c_uint64, c_uint32, c_int32, c_float, c_char, c_char_p,
-    create_string_buffer
+    create_string_buffer, memmove
 )
 
 from utils.constants import system_type
@@ -211,7 +211,7 @@ class AoImage(Structure):
         
         try:
             # Copy bytes into existing buffer
-            ctypes.memmove(self._data, rgba_bytes, expected_size)
+            memmove(self._data, rgba_bytes, expected_size)
             return True
         except Exception as e:
             log.error(f"_set_data exception: {e}")
