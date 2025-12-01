@@ -21,7 +21,7 @@ autoortho_lin_$(SAFE_VERSION)_${CODE_NAME}.bin: autoortho/*.py
 lin_tar: autoortho_linux_$(SAFE_VERSION)_${CODE_NAME}.tar.gz
 autoortho_linux_$(SAFE_VERSION)_${CODE_NAME}.tar.gz: autoortho_lin_$(SAFE_VERSION)_${CODE_NAME}.bin
 	chmod a+x $<
-	tar -czf $@ $<
+	tar -czf $@ --transform='s|_$(CODE_NAME)||' $<
 
 enter:
 	docker run --rm -it -v `pwd`:/code ubuntu:focal /bin/bash
