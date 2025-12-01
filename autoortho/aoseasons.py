@@ -259,6 +259,15 @@ class AoDsfSeason():
 
 class AoSeasonCache():
 
+    # astro seasons start dates: 80, 172, 264, 355]
+
+
+    # for our purpose define full season when within +- 10 days
+
+
+    astro_seasons = [90, 162, 182, 254, 274, 344, 364, 70, 90]
+
+
     def __init__(self, cache_dir):
         self.cache_dir = cache_dir
         self.cfg_saturation = [float(CFG.seasons.spr_saturation), float(CFG.seasons.sum_saturation),
@@ -306,6 +315,34 @@ class AoSeasonCache():
             return [0.0, 1.0, 0.0, 0.0]
 
         season_days.append(season_days[0])
+
+        # Some tiles (e.g. (47,13) = LOWS) have bogus values e.g. e < s for summer or overlapping seasons
+        # So do a sanity check
+        invalid = False
+
+        if lat > 0:             # only northern hemisphere for now
+            wrapped = False
+            eprev = -1
+
+            for i in range(4):
+                s = season_days[2 * i]
+                e = season_days[2 * i + 1]
+
+                if e < s:
+                    if wrapped:
+                        invalid = True  # double wrap
+                        break
+                    else:
+                        if s < eprev:
+                            invalid = True  # overlapping
+                            break
+                        wrapped = True
+                eprev = e
+
+        if invalid:
+            log.info(f"Reverting to astronomical seasons for ({lat:0.2f}, {lon:0.2f})")
+            season_days = self.astro_seasons # revert to the astronomical season
+
         #print(season_days)
 
         if day is None:
@@ -351,7 +388,7 @@ class AoSeasonCache():
                 weights[i + 1] = 1.0 - weights[i]
             return weights
 
-        log.warning(f"Oh no, could not match {day} to {season_days}")
+        log.warning(f"Oh no, at ({lat:0.2f}, {lon:0.2f}) could not match {day} to {season_days}")
         return [0.0, 1.0, 0.0, 0.0]
 
     def _season_info_rc(self, row, col, zoom, day = None):
