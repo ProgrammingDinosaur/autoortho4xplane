@@ -125,6 +125,7 @@ jobs:
 
     env:
       VERNAME: ${{ inputs.version }} 
+      LDFLAGS: -Wl,-Map=autoortho.map # Assuming gcc (mingw64 compiler)
 
     steps:
     - uses: actions/checkout@v3

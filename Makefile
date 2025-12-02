@@ -113,6 +113,7 @@ AutoOrtho_win_$(SAFE_VERSION).exe: __main__.dist
 win_zip: autoortho_win_$(SAFE_VERSION).zip
 autoortho_win_$(SAFE_VERSION).zip: __main__.dist
 	mv __main__.dist autoortho_release
+	if [ -f __main__.build/autoortho.map ]; then cp __main__.build/autoortho.map autoortho_release; fi
 	$(ZIP) $@ autoortho_release
 
 testperf:
