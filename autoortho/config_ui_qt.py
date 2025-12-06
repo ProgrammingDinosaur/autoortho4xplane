@@ -1274,6 +1274,43 @@ class ConfigUI(QMainWindow):
         threads_layout.addStretch()
         autoortho_layout.addLayout(threads_layout)
 
+        # Fetch Workers slider (process-isolated fetching)
+        fetch_workers_layout = QHBoxLayout()
+        fetch_workers_layout.setSpacing(10)
+        fetch_workers_label = QLabel("Fetch Workers:")
+        fetch_workers_label.setToolTip(
+            "Number of separate processes for downloading images.\n\n"
+            "Each worker has its own connection pool.\n"
+            "If a network library crashes, only the worker dies.\n"
+            "Main process stays alive and worker restarts automatically."
+        )
+        fetch_workers_layout.addWidget(fetch_workers_label)
+        
+        self.fetch_workers_slider = ModernSlider()
+        self.fetch_workers_slider.setRange(0, 8)
+        current_fetch_workers = int(getattr(self.cfg.pydds, 'fetch_workers', 0))
+        self.fetch_workers_slider.setValue(current_fetch_workers)
+        self.fetch_workers_slider.setObjectName('fetch_workers')
+        self.fetch_workers_slider.setToolTip(
+            "0: Disabled (use threads, default)\n"
+            "  • Traditional threaded fetching\n"
+            "  • Network library crash = AutoOrtho crash\n\n"
+            "1-8: Process-isolated fetch workers\n"
+            "  • Crash isolation for network operations\n"
+            "  • Each worker has dedicated connection pool\n"
+            "  • ~40MB memory per worker\n"
+            "  • Recommended: 2-4 for most systems"
+        )
+        fetch_workers_layout.addWidget(self.fetch_workers_slider)
+        
+        self.fetch_workers_label = QLabel(f"{current_fetch_workers}")
+        self.fetch_workers_slider.valueChanged.connect(
+            lambda v: self.fetch_workers_label.setText(f"{v}")
+        )
+        fetch_workers_layout.addWidget(self.fetch_workers_label)
+        fetch_workers_layout.addStretch()
+        autoortho_layout.addLayout(fetch_workers_layout)
+
         missing_color_layout = QHBoxLayout()
         missing_color_layout.setSpacing(10)
         missing_color_label = QLabel("Missing Tile Color:")
@@ -2861,6 +2898,7 @@ class ConfigUI(QMainWindow):
                 self.max_decode_slider.value()
             )
             self.cfg.pydds.safe_mode = self.safe_mode_combo.currentText()
+            self.cfg.pydds.fetch_workers = str(self.fetch_workers_slider.value())
 
             # General settings
             self.cfg.general.gui = self.gui_check.isChecked()

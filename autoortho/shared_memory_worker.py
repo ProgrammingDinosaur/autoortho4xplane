@@ -38,23 +38,31 @@ log = logging.getLogger(__name__)
 # Configuration
 WORKER_COUNT = max(2, (os.cpu_count() or 4) // 2)
 TASK_TIMEOUT = 45  # seconds
-MAX_BUFFER_SIZE = 512 * 1024 * 1024  # 512MB max (supports 8192x8192 RGBA for zoom 17)
+
+# Tiered buffer strategy:
+# - Pool buffers: 64 MB (handles zoom ≤16, 4096x4096 RGBA)
+# - Large buffers: Created on-demand for zoom 17+ (8192x8192 = 256 MB)
+POOL_BUFFER_SIZE = 64 * 1024 * 1024   # 64 MB for pool (zoom ≤16)
+MAX_BUFFER_SIZE = 512 * 1024 * 1024   # 512 MB max for large textures
+
 RETRY_COUNT = 2  # Number of retries before returning placeholder
 RETRY_DELAY = 0.1  # Seconds between retries
 BUFFER_ACQUIRE_TIMEOUT = 2.0  # Max time to wait for a buffer
+LARGE_BUFFER_CACHE_SIZE = 2  # Max large buffers to keep cached
+LARGE_BUFFER_IDLE_TIMEOUT = 30.0  # Seconds before releasing idle large buffers
 
 
 def _get_buffer_pool_size() -> int:
     """Calculate buffer pool size based on memory limit setting."""
     try:
         from aoconfig import CFG
-        # Use up to 25% of cache_mem_limit for shared memory buffers
+        # Use up to 10% of cache_mem_limit for pool buffers (small, always allocated)
         mem_limit_gb = float(getattr(CFG.cache, 'cache_mem_limit', 4))
-        mem_for_buffers_mb = int(mem_limit_gb * 1024 * 0.25)  # 25% of limit
-        buffer_size_mb = MAX_BUFFER_SIZE // (1024 * 1024)
-        pool_size = max(4, mem_for_buffers_mb // buffer_size_mb)
-        log.debug(f"Buffer pool: {pool_size} buffers ({buffer_size_mb}MB each, "
-                  f"{mem_limit_gb}GB limit)")
+        mem_for_pool_mb = int(mem_limit_gb * 1024 * 0.10)  # 10% of limit
+        buffer_size_mb = POOL_BUFFER_SIZE // (1024 * 1024)
+        pool_size = max(4, min(16, mem_for_pool_mb // buffer_size_mb))
+        log.debug(f"Buffer pool: {pool_size} x {buffer_size_mb}MB buffers "
+                  f"(mem limit: {mem_limit_gb}GB)")
         return pool_size
     except Exception:
         # Fallback if config not available
@@ -204,25 +212,30 @@ class SharedBuffer:
 
 class BufferPool:
     """
-    Pool of pre-allocated shared memory buffers.
-
-    Reuses buffers to avoid allocation overhead. Temporary buffers are
-    tracked separately and cleaned up on release.
+    Tiered pool of shared memory buffers for optimal memory usage.
+    
+    Strategy:
+    - Pool buffers (64 MB): Pre-allocated, handles zoom ≤16 (most common)
+    - Large buffers (up to 512 MB): Created on-demand for zoom 17+, cached briefly
+    
+    This minimizes memory usage while handling variable tile sizes efficiently.
     """
 
     def __init__(self, pool_size: int = 4,
-                 buffer_size: int = MAX_BUFFER_SIZE):
+                 buffer_size: int = POOL_BUFFER_SIZE):
         self.pool_size = pool_size
-        self.buffer_size = buffer_size
+        self.buffer_size = buffer_size  # Pool buffer size (64 MB)
         self.buffers: List[SharedBuffer] = []
         self.available: List[SharedBuffer] = []
-        self._temp_buffers: List[SharedBuffer] = []  # Track temp buffers
+        # Large buffer cache (for zoom 17+)
+        self._large_buffers: List[Tuple[SharedBuffer, float]] = []  # (buffer, last_used)
+        self._temp_buffers: List[SharedBuffer] = []  # Track all temp buffers for cleanup
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._initialized = False
 
     def initialize(self) -> None:
-        """Create the buffer pool."""
+        """Create the buffer pool with small (64 MB) buffers."""
         if self._initialized:
             return
 
@@ -232,7 +245,7 @@ class BufferPool:
                 buf = SharedBuffer(
                     name=f"ao_pool_{os.getpid()}_{i}",
                     create=True,
-                    size=self.buffer_size
+                    size=self.buffer_size  # 64 MB pool buffers
                 )
                 self.buffers.append(buf)
                 self.available.append(buf)
@@ -241,20 +254,31 @@ class BufferPool:
                 log.error(f"Failed to create pool buffer {i}: {e}")
 
         self._initialized = True
+        pool_mb = (self.buffer_size * created_count) // (1024 * 1024)
         log.info(
-            f"Buffer pool initialized with {created_count}/{self.pool_size} "
-            "buffers"
+            f"Buffer pool initialized: {created_count} x {self.buffer_size // (1024*1024)}MB "
+            f"= {pool_mb}MB total"
         )
 
     def acquire(
-            self, timeout: float = BUFFER_ACQUIRE_TIMEOUT
+            self, timeout: float = BUFFER_ACQUIRE_TIMEOUT,
+            min_size: int = 0
     ) -> Optional[SharedBuffer]:
         """
-        Get a free buffer from the pool.
-
-        Returns None if no buffer available within timeout (instead of creating
-        temporary buffer, which caused issues with worker attachment).
+        Get a buffer that can hold at least min_size bytes.
+        
+        Args:
+            timeout: Max time to wait for a buffer
+            min_size: Minimum required buffer size (0 = use pool buffer)
+        
+        Returns:
+            SharedBuffer or None if unavailable
         """
+        # Check if we need a large buffer
+        if min_size > self.buffer_size:
+            return self._acquire_large_buffer(min_size, timeout)
+        
+        # Try to get a pool buffer
         deadline = time.time() + timeout
 
         with self._condition:
@@ -272,7 +296,6 @@ class BufferPool:
                 self._condition.wait(timeout=min(0.1, remaining))
 
         # No pooled buffer available - create temporary one
-        # Note: Workers will need to dynamically attach to this
         log.debug("Buffer pool exhausted, creating temporary buffer")
         try:
             temp_buf = SharedBuffer(create=True, size=self.buffer_size)
@@ -283,25 +306,84 @@ class BufferPool:
             log.error(f"Failed to create temporary buffer: {e}")
             return None
 
+    def _acquire_large_buffer(
+            self, min_size: int, timeout: float
+    ) -> Optional[SharedBuffer]:
+        """Get or create a large buffer for zoom 17+ textures."""
+        # Round up to nearest 64 MB for reusability
+        rounded_size = ((min_size + 64 * 1024 * 1024 - 1) // (64 * 1024 * 1024)) * (64 * 1024 * 1024)
+        rounded_size = min(rounded_size, MAX_BUFFER_SIZE)
+        
+        with self._lock:
+            # First, clean up old large buffers
+            self._cleanup_large_buffers()
+            
+            # Try to find a cached large buffer that fits
+            for i, (buf, last_used) in enumerate(self._large_buffers):
+                if buf.size >= min_size + SharedBuffer.HEADER_SIZE:
+                    # Reuse this buffer
+                    self._large_buffers.pop(i)
+                    buf.status = SharedBuffer.STATUS_FREE
+                    log.debug(f"Reusing cached large buffer ({buf.size // (1024*1024)}MB)")
+                    return buf
+        
+        # Create new large buffer
+        try:
+            log.info(f"Creating large buffer: {rounded_size // (1024*1024)}MB for {min_size // (1024*1024)}MB data")
+            large_buf = SharedBuffer(create=True, size=rounded_size)
+            with self._lock:
+                self._temp_buffers.append(large_buf)
+            return large_buf
+        except Exception as e:
+            log.error(f"Failed to create large buffer ({rounded_size // (1024*1024)}MB): {e}")
+            return None
+
+    def _cleanup_large_buffers(self) -> None:
+        """Remove idle large buffers (called with lock held)."""
+        now = time.time()
+        # Keep only recent buffers up to cache limit
+        active = []
+        for buf, last_used in self._large_buffers:
+            age = now - last_used
+            if age < LARGE_BUFFER_IDLE_TIMEOUT and len(active) < LARGE_BUFFER_CACHE_SIZE:
+                active.append((buf, last_used))
+            else:
+                # Release old buffer
+                log.debug(f"Releasing idle large buffer ({buf.size // (1024*1024)}MB, age={age:.1f}s)")
+                try:
+                    buf.unlink()
+                    buf.close()
+                except Exception:
+                    pass
+        self._large_buffers = active
+
     def release(self, buf: SharedBuffer) -> None:
-        """Return a buffer to the pool."""
+        """Return a buffer to the pool or cache large buffers for reuse."""
         if buf is None:
             return
 
         with self._condition:
             if buf in self.buffers:
+                # Pool buffer - return to pool
                 buf.status = SharedBuffer.STATUS_FREE
                 if buf not in self.available:
                     self.available.append(buf)
                 self._condition.notify()  # Wake up waiting acquirers
             elif buf in self._temp_buffers:
-                # Temporary buffer - clean it up
-                self._temp_buffers.remove(buf)
-                try:
-                    buf.close()
-                    buf.unlink()
-                except Exception:
-                    pass
+                # Check if this is a large buffer worth caching
+                is_large = buf.size > self.buffer_size + SharedBuffer.HEADER_SIZE
+                if is_large and len(self._large_buffers) < LARGE_BUFFER_CACHE_SIZE:
+                    # Cache large buffer for reuse
+                    self._large_buffers.append((buf, time.time()))
+                    log.debug(f"Cached large buffer ({buf.size // (1024*1024)}MB) for reuse")
+                else:
+                    # Small temp buffer or cache full - clean it up
+                    self._temp_buffers.remove(buf)
+                    try:
+                        buf.close()
+                        buf.unlink()
+                    except Exception:
+                        pass
             else:
                 # Unknown buffer - just close it
                 try:
@@ -325,6 +407,15 @@ class BufferPool:
                     buf.unlink()
                 except Exception:
                     pass
+
+            # Clean up large buffer cache
+            for buf, _ in self._large_buffers:
+                try:
+                    buf.close()
+                    buf.unlink()
+                except Exception:
+                    pass
+            self._large_buffers.clear()
 
             # Clean up any remaining temporary buffers
             for buf in self._temp_buffers:
@@ -831,13 +922,20 @@ class SharedMemoryWorkerPool:
                 break
 
             # Acquire buffers with reduced timeout
+            # Input: JPEG is small, pool buffer is fine
+            # Output: Could be large RGBA (up to 8K for zoom 17)
             buffer_timeout = min(BUFFER_ACQUIRE_TIMEOUT, attempt_timeout / 3)
             input_buf = self.buffer_pool.acquire(timeout=buffer_timeout)
             if not input_buf:
                 last_error = "failed to acquire input buffer"
                 continue
 
-            output_buf = self.buffer_pool.acquire(timeout=buffer_timeout)
+            # For output, estimate max RGBA size from JPEG size
+            # Typical JPEG compression is 10-20x, assume worst case 30x
+            estimated_rgba = min(len(jpeg_data) * 30, MAX_BUFFER_SIZE)
+            output_buf = self.buffer_pool.acquire(
+                timeout=buffer_timeout, min_size=estimated_rgba
+            )
             if not output_buf:
                 self.buffer_pool.release(input_buf)
                 last_error = "failed to acquire output buffer"
@@ -940,13 +1038,19 @@ class SharedMemoryWorkerPool:
                 last_error = "overall timeout"
                 break
 
-            # Acquire buffers
+            # Calculate required buffer size for this image
+            rgba_size = width * height * 4
+            
+            # Acquire buffers (will get large buffers if needed)
             buffer_timeout = min(BUFFER_ACQUIRE_TIMEOUT, attempt_timeout / 3)
-            input_buf = self.buffer_pool.acquire(timeout=buffer_timeout)
+            input_buf = self.buffer_pool.acquire(
+                timeout=buffer_timeout, min_size=rgba_size
+            )
             if not input_buf:
                 last_error = "failed to acquire input buffer"
                 continue
 
+            # Output buffer can be smaller (DDS is compressed)
             output_buf = self.buffer_pool.acquire(timeout=buffer_timeout)
             if not output_buf:
                 self.buffer_pool.release(input_buf)

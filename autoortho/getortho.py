@@ -50,6 +50,52 @@ except Exception:
     _MAX_DECODE = CURRENT_CPU_COUNT
 _decode_sem = threading.Semaphore(_MAX_DECODE)
 
+def _use_fetch_workers() -> bool:
+    """Check if fetch workers are enabled in config."""
+    try:
+        return int(getattr(CFG.pydds, 'fetch_workers', 0)) > 0
+    except Exception:
+        return False
+
+
+def _get_fetch_pool():
+    """Get the global fetch worker pool (created on first use, cleaned up on exit)."""
+    from fetch_worker import get_fetch_worker_pool
+    return get_fetch_worker_pool()
+
+
+def _do_fetch(url: str, headers: dict, timeout: tuple = (5, 20), 
+              session=None) -> tuple:
+    """
+    Fetch a URL using either fetch workers or session.
+    
+    Returns: (status_code, data, error_msg)
+        - status_code: HTTP status code (0 if connection error)
+        - data: Response bytes or None
+        - error_msg: Error message or None
+    """
+    if _use_fetch_workers():
+        pool = _get_fetch_pool()
+        result = pool.fetch(url, headers, timeout)
+        if result.status == "ok":
+            return (result.status_code, result.data, None)
+        else:
+            return (0, None, result.error_msg)
+    else:
+        # Use traditional session
+        if session is None:
+            session = requests
+        try:
+            resp = session.get(url, headers=headers, timeout=timeout)
+            data = resp.content
+            status_code = resp.status_code
+            resp.close()
+            return (status_code, data, None)
+        except requests.Timeout as e:
+            return (0, None, f"Timeout: {e}")
+        except Exception as e:
+            return (0, None, str(e))
+
 
 # Track average fetch times
 tile_stats = StatTracker(20, 12)
@@ -657,21 +703,29 @@ class Chunk(object):
 
         log.debug(f"Requesting {self.url} ..")
         
-        resp = None
+        data = None
         try:
-
-            resp = session.get(self.url, headers=header, timeout=(5, 20))
-            status_code = resp.status_code
+            # Use fetch workers if enabled, otherwise use session
+            status_code, data, fetch_error = _do_fetch(
+                self.url, header, timeout=(5, 20), session=session
+            )
+            
+            if fetch_error:
+                log.warning(f"Fetch error for {self}: {fetch_error}")
+                bump_many({"req_err": 1, "fetch_error": 1})
+                return False
 
             if self.maptype.upper() == "APPLE" and status_code in (403, 410):
                 log.warning("APPLE tile got %s; rotating token and retrying", status_code)
                 apple_token_service.reset_apple_maps_token()
                 MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
                 self.url = MAPTYPES[self.maptype.upper()]
-                if resp is not None:
-                    resp.close()
-                resp = session.get(self.url, headers=header, timeout=(5, 20))
-                status_code = resp.status_code
+                status_code, data, fetch_error = _do_fetch(
+                    self.url, header, timeout=(5, 20), session=session
+                )
+                if fetch_error:
+                    log.warning(f"Apple retry fetch error: {fetch_error}")
+                    return False
 
             if status_code != 200:
                 log.warning(f"Failed with status {status_code} to get chunk {self}" + (" on server " + server if self.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
@@ -720,14 +774,13 @@ class Chunk(object):
 
             bump("req_ok")
 
-            data = resp.content
-
-            if _is_jpeg(data[:3]):
+            # data is already fetched by _do_fetch
+            if data and _is_jpeg(data[:3]):
                 log.debug(f"Data for {self} is JPEG")
                 self.data = data
             else:
                 # FFD8FF identifies image as a JPEG
-                log.debug(f"Loading file {self} not a JPEG! {data[:3]} URL: {self.url}")
+                log.debug(f"Loading file {self} not a JPEG! {data[:3] if data else 'None'} URL: {self.url}")
             #    return False
                 self.data = b''
 
@@ -736,9 +789,6 @@ class Chunk(object):
         except Exception as err:
             log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
             return False
-        finally:
-            if resp:
-                resp.close()
 
         self.fetchtime = time.monotonic() - self.starttime
 
@@ -1306,10 +1356,15 @@ class Tile(object):
                 bump(f'chunk_permanent_fail_{chunk.failure_reason}')
             
             # Smart timeout: only wait for download, not decode
-            # If skip_download_wait is True, go straight to fallbacks (for chunks that never started)
+            # If skip_download_wait is True, check if download completed anyway before fallbacks
             if skip_download_wait:
-                chunk_ready = False
-                log.debug(f"Chunk {chunk} never started downloading, skipping wait and going to fallbacks")
+                # Even though we're skipping the wait, check if download finished during grace period
+                if chunk.ready.is_set() and chunk.data:
+                    chunk_ready = True
+                    log.debug(f"Chunk {chunk} download completed during grace period, using it")
+                else:
+                    chunk_ready = False
+                    log.debug(f"Chunk {chunk} still not ready, going to fallbacks")
             elif chunk.ready.is_set():
                 # Download already complete, just needs decode
                 chunk_ready = True
@@ -1394,7 +1449,10 @@ class Tile(object):
         active_futures = {}
         
         start_time = time.time()
-        max_total_wait = max(10.0, self.maxchunk_wait * 10)  # At least 10s, or 10x maxwait
+        effective_maxwait = self.get_maxwait()  # Respects suspend_maxwait during startup
+        # Cap batch timeout to reasonable values even during startup
+        # Individual chunks get more time (effective_maxwait), but batch shouldn't wait forever
+        max_total_wait = min(60.0, max(10.0, effective_maxwait * 3))  # 10-60 seconds max per tile
         
         try:
             while len(processed_chunks) < len(chunks):
@@ -1471,54 +1529,100 @@ class Tile(object):
                     # No active futures yet, wait a bit before checking for started downloads
                     time.sleep(0.01)  # Check 5x more frequently
             
-            # Wait for any remaining futures to complete
-            for future in concurrent.futures.as_completed(active_futures.keys()):
+            # Wait for any remaining futures to complete (with timeout to avoid blocking forever)
+            # Track chunks that need fallback processing
+            chunks_needing_fallback = []
+            
+            if active_futures:
+                # Give pending futures time to complete, but cap to avoid long delays
+                # Even during startup, we don't want to wait forever per tile
+                grace_period = min(15.0, max(5.0, effective_maxwait))  # 5-15 seconds max
                 try:
-                    chunk, chunk_img, start_x, start_y = future.result()
-                    if chunk_img:
-                        # PHASE 2 FIX #6: Validate coordinates before paste
-                        if start_x >= 0 and start_y >= 0:
-                            if not new_im.paste(chunk_img, (start_x, start_y)):
-                                log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
-                        else:
-                            log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
-                except Exception as exc:
-                    log.error(f"Chunk processing failed: {exc}")
+                    done, pending = concurrent.futures.wait(
+                        active_futures.keys(),
+                        timeout=grace_period,
+                        return_when=concurrent.futures.ALL_COMPLETED
+                    )
+                    
+                    # Process completed futures
+                    for future in done:
+                        try:
+                            chunk, chunk_img, start_x, start_y = future.result()
+                            if chunk_img:
+                                if start_x >= 0 and start_y >= 0:
+                                    if not new_im.paste(chunk_img, (start_x, start_y)):
+                                        log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                                else:
+                                    log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
+                        except Exception as exc:
+                            # Future failed - add chunk to fallback list
+                            chunk = active_futures.get(future)
+                            if chunk:
+                                chunks_needing_fallback.append(chunk)
+                            log.debug(f"Chunk processing failed, will use fallback: {exc}")
+                    
+                    # Collect chunks from pending futures for fallback processing
+                    if pending:
+                        log.debug(f"Grace period ({grace_period:.1f}s) expired with {len(pending)} chunks still processing")
+                    for future in pending:
+                        chunk = active_futures.get(future)
+                        if chunk:
+                            chunks_needing_fallback.append(chunk)
+                            log.debug(f"Chunk {chunk} timed out after grace period, will use fallback")
+                        # Cancel the pending future
+                        future.cancel()
+                        
+                except Exception as e:
+                    log.warning(f"Error waiting for futures: {e}")
             
             # CRITICAL: Process any chunks that never started downloading
             # These would otherwise be left as missing color patches
             unprocessed_chunks = [c for c in chunks if id(c) not in processed_chunks and not c.permanent_failure]
-            if unprocessed_chunks:
-                log.info(f"Processing {len(unprocessed_chunks)} chunks that never started downloading (fallback only)")
+            
+            # Combine with chunks that timed out or failed
+            all_fallback_chunks = unprocessed_chunks + chunks_needing_fallback
+            
+            if all_fallback_chunks:
+                log.info(f"Processing {len(all_fallback_chunks)} chunks via fallback "
+                        f"({len(unprocessed_chunks)} never started, {len(chunks_needing_fallback)} timed out)")
                 
-                # Submit ALL unprocessed chunks in parallel (not serial!)
-                unprocessed_futures = {}
-                for chunk in unprocessed_chunks:
+                # Submit ALL fallback chunks in parallel
+                fallback_futures = {}
+                for chunk in all_fallback_chunks:
                     # Use skip_download_wait=True to go straight to fallbacks
                     future = executor.submit(process_chunk, chunk, skip_download_wait=True)
-                    unprocessed_futures[future] = chunk
+                    fallback_futures[future] = chunk
                     processed_chunks.add(id(chunk))
                 
-                # Process results as they complete (parallel, not serial)
-                for future in concurrent.futures.as_completed(unprocessed_futures.keys(), timeout=10):
-                    try:
-                        chunk, chunk_img, start_x, start_y = future.result()
-                        if chunk_img:
-                            # PHASE 2 FIX #6: Validate coordinates before paste
-                            if start_x >= 0 and start_y >= 0:
-                                if not new_im.paste(chunk_img, (start_x, start_y)):
-                                    log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                # Process results as they complete (with generous timeout for fallback)
+                try:
+                    for future in concurrent.futures.as_completed(fallback_futures.keys(), timeout=15):
+                        try:
+                            chunk, chunk_img, start_x, start_y = future.result()
+                            if chunk_img:
+                                # PHASE 2 FIX #6: Validate coordinates before paste
+                                if start_x >= 0 and start_y >= 0:
+                                    if not new_im.paste(chunk_img, (start_x, start_y)):
+                                        log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                                else:
+                                    log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
                             else:
-                                log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
-                        else:
+                                bump('chunk_missing_count')
+                        except Exception as exc:
+                            chunk = fallback_futures.get(future, "unknown")
+                            log.debug(f"Fallback failed for chunk {chunk}: {exc}")
                             bump('chunk_missing_count')
-                    except Exception as exc:
-                        chunk = unprocessed_futures.get(future, "unknown")
-                        log.debug(f"Fallback failed for unprocessed chunk {chunk}: {exc}")
-                        bump('chunk_missing_count')
+                except concurrent.futures.TimeoutError:
+                    log.warning(f"Fallback processing timed out, some chunks may be missing")
                     
         finally:
-            executor.shutdown(wait=True)
+            # Shutdown executor without blocking indefinitely
+            # Python 3.9+ supports cancel_futures parameter
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # Python < 3.9 doesn't have cancel_futures
+                executor.shutdown(wait=False)
 
         if complete_img and mipmap <= self.max_mipmap:
             log.debug(f"GET_IMG: Save complete image for later...")

@@ -11,8 +11,10 @@ import logging
 log = logging.getLogger(__name__)
 
 class SectionParser(object):
-    true = ['true','1', 'yes', 'on']
-    false = ['false', '0', 'no', 'off']
+    # Note: '0' and '1' removed from boolean lists to prevent numeric values
+    # like fetch_workers=0 from being parsed as False
+    true = ['true', 'yes', 'on']
+    false = ['false', 'no', 'off']
 
     def __init__(self, /, **kwargs):
         for k, v in kwargs.items():
@@ -20,7 +22,7 @@ class SectionParser(object):
             sv = '' if v is None else str(v)
             s = sv.strip()
 
-            # Detect booleans
+            # Detect booleans (text-based only, not '0' or '1')
             if s.lower() in self.true:
                 parsed_val = True
             elif s.lower() in self.false:
@@ -117,6 +119,10 @@ max_decode_concurrency = {os.cpu_count() or 1}
 # - compression_only: Only DDS compression isolated (~5 percent slower)
 # - full: All C operations isolated with shared memory (~5 percent slower, recommended)
 safe_mode = off
+# Number of fetch worker processes (0 = disabled, use threads instead)
+# Each worker has its own connection pool for crash isolation
+# Recommended: 2-4 for most systems, higher for fast connections
+fetch_workers = 0
 
 [scenery]
 # Don't cleanup downloads

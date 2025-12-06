@@ -145,6 +145,13 @@ def _global_shutdown(signum=None, frame=None):
     except Exception:
         pass
 
+    # Shutdown fetch worker pool if it was used
+    try:
+        from fetch_worker import shutdown_fetch_worker_pool
+        shutdown_fetch_worker_pool()
+    except Exception:
+        pass
+
     # Join remaining non-daemon threads (best effort)
     try:
         for t in threading.enumerate():
