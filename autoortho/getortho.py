@@ -58,8 +58,29 @@ def _use_fetch_workers() -> bool:
         return False
 
 
+def _use_shared_pool() -> bool:
+    """Check if we should use the shared pool (Mac worker mode)."""
+    return os.environ.get('AO_FETCH_ADDR') is not None
+
+
+def _get_chunk_pool():
+    """Get the chunk fetch pool (local or shared client based on mode)."""
+    if _use_shared_pool():
+        # Mac worker mode - use shared pool via FetchClient
+        from fetch_worker import get_fetch_client
+        client = get_fetch_client()
+        if client:
+            return client
+        # Fall back to local pool if client fails
+        log.warning("FetchClient connection failed, using local pool")
+    
+    # Local mode - use local ChunkFetchPool
+    from fetch_worker import get_chunk_fetch_pool
+    return get_chunk_fetch_pool()
+
+
 def _get_fetch_pool():
-    """Get the global fetch worker pool (created on first use, cleaned up on exit)."""
+    """Get the global fetch worker pool (legacy, created on first use)."""
     from fetch_worker import get_fetch_worker_pool
     return get_fetch_worker_pool()
 
@@ -538,6 +559,43 @@ class Chunk(object):
     def __repr__(self):
         return f"Chunk({self.col},{self.row},{self.maptype},{self.zoom},{self.priority})"
 
+    def build_url(self, idx=0) -> tuple:
+        """
+        Build the URL and headers for this chunk without making the request.
+        
+        Args:
+            idx: Server index for round-robin server selection
+            
+        Returns:
+            (url, headers) tuple ready for HTTP request
+        """
+        server_num = idx % len(self.serverlist)
+        server = self.serverlist[server_num]
+        quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
+
+        MAPID = "s2cloudless-2023_3857"
+        MATRIXSET = "g"
+        MAPTYPES = {
+            "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
+            "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
+            "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
+            "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
+            "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
+        }
+
+        url = MAPTYPES.get(self.maptype.upper(), MAPTYPES["EOX"])
+        self.url = url
+        
+        headers = {"user-agent": "curl/7.68.0"}
+        if self.maptype.upper() == "EOX":
+            headers['referer'] = 'https://s2maps.eu/'
+        
+        return (url, headers)
+
     def get_cache(self):
         if os.path.isfile(self.cache_path):
             bump('chunk_hit')
@@ -1007,9 +1065,17 @@ class Tile(object):
         self._create_chunks(quick_zoom)
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom)
 
-        for chunk in self.chunks[zoom]:
-            chunk_getter.submit(chunk)
+        # Submit all chunks
+        use_bank_queue = _use_fetch_workers()
+        for idx, chunk in enumerate(self.chunks[zoom]):
+            if use_bank_queue:
+                url, headers = chunk.build_url(idx)
+                chunk.download_started.set()
+                _get_chunk_pool().submit(chunk, url, headers)
+            else:
+                chunk_getter.submit(chunk)
 
+        # Wait for all chunks
         for chunk in self.chunks[zoom]:
             ret = chunk.ready.wait()
             if not ret:
@@ -1269,8 +1335,10 @@ class Tile(object):
 
         log.debug(f"GET_IMG: {self} : Retrieve mipmap for ZOOM: {zoom} MIPMAP: {mipmap}")
         data_updated = False
-        log.debug(f"GET_IMG: {self} submitting chunks for zoom {zoom}.")
-        for chunk in chunks:
+        use_bank_queue = _use_fetch_workers()
+        
+        log.debug(f"GET_IMG: {self} submitting chunks for zoom {zoom} (bank_queue={use_bank_queue}).")
+        for idx, chunk in enumerate(chunks):
             if not chunk.ready.is_set():
                 log.debug(f"GET_IMG: Submitting chunk {chunk} for zoom {zoom}")
                 # INVERTED: Lower detail (higher mipmap) = lower priority number (more urgent)
@@ -1291,7 +1359,15 @@ class Tile(object):
                     chunk.row, chunk.col, chunk.zoom, base_priority
                 )
                 
-                chunk_getter.submit(chunk)
+                # Submit to appropriate pool
+                if use_bank_queue:
+                    # Bank queue: external process workers
+                    url, headers = chunk.build_url(idx)
+                    chunk.download_started.set()  # Mark as started immediately
+                    _get_chunk_pool().submit(chunk, url, headers)
+                else:
+                    # Traditional: in-process thread pool
+                    chunk_getter.submit(chunk)
                 data_updated = True
             else:
                 log.debug(f"GET_IMG: Chunk {chunk} already ready - reusing for mipmap {mipmap}")
@@ -1439,7 +1515,7 @@ class Tile(object):
                 
             return (chunk, chunk_img, start_x, start_y)
         
-        # Process chunks lazily - only after their download has started
+        # Process chunks - either using Bank Queue (simple) or traditional batching
         max_pool_workers = min(CURRENT_CPU_COUNT, len(chunks), _MAX_DECODE)
         
         processed_chunks = set()
@@ -1450,137 +1526,164 @@ class Tile(object):
         
         start_time = time.time()
         effective_maxwait = self.get_maxwait()  # Respects suspend_maxwait during startup
-        # Cap batch timeout to reasonable values even during startup
-        # Individual chunks get more time (effective_maxwait), but batch shouldn't wait forever
-        max_total_wait = min(60.0, max(10.0, effective_maxwait * 3))  # 10-60 seconds max per tile
         
         try:
-            while len(processed_chunks) < len(chunks):
-                # Safety timeout check
-                if time.time() - start_time > max_total_wait:
-                    chunks_abandoned = len(chunks) - len(processed_chunks)
-                    if chunks_abandoned > 0:
-                        bump('chunk_missing_count', chunks_abandoned)
-                    log.warning(f"Lazy submission timeout after {max_total_wait}s, "
-                               f"processed {len(processed_chunks)}/{len(chunks)} chunks, abandoned {chunks_abandoned}")
-                    break
+            if use_bank_queue:
+                # ===== BANK QUEUE: Simple sequential processing =====
+                # External workers handle downloads, we just wait for each chunk
+                # No batch timeouts needed - each chunk has its own maxwait
+                log.debug(f"GET_IMG: Using Bank Queue processing for {len(chunks)} chunks")
                 
-                # Smart early exit - if all started downloads are done, exit
-                # Only use early exit when spatial priorities are active (during flight)
-                # to avoid incomplete mipmaps during initial load or tests
-                if datareftracker.data_valid and datareftracker.connected:
-                    chunks_started = sum(1 for c in chunks if c.download_started.is_set())
-                    if chunks_started > 0 and len(processed_chunks) >= chunks_started:
-                        chunks_never_started = len(chunks) - chunks_started
-                        if chunks_never_started > 0:
-                            log.debug(f"Early exit: {chunks_never_started} chunks never started")
-                        break
-                
-                # Find chunks whose downloads have started but haven't been submitted for processing yet
+                # Submit all chunks for processing immediately
+                # Since downloads are in external processes, we can process as chunks become ready
                 for chunk in chunks:
                     chunk_id = id(chunk)
-                    if chunk_id in processed_chunks:
-                        continue
                     
-                    # Skip permanently failed chunks immediately
+                    # Skip permanently failed chunks
                     if chunk.permanent_failure:
                         processed_chunks.add(chunk_id)
                         bump('chunk_missing_count')
                         continue
                     
-                    # Submit when download has started
-                    if chunk.download_started.is_set():
-                        future = executor.submit(process_chunk, chunk)
-                        active_futures[future] = chunk
-                        processed_chunks.add(chunk_id)
+                    # Submit for processing - process_chunk handles waiting with maxwait
+                    future = executor.submit(process_chunk, chunk)
+                    active_futures[future] = chunk
+                    processed_chunks.add(chunk_id)
                 
-                # Process any completed futures
+                # Process results as they complete
+                for future in concurrent.futures.as_completed(active_futures.keys()):
+                    try:
+                        chunk, chunk_img, start_x, start_y = future.result()
+                        completed += 1
+                        if chunk_img:
+                            if start_x >= 0 and start_y >= 0:
+                                if not new_im.paste(chunk_img, (start_x, start_y)):
+                                    log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                            else:
+                                log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
+                            try:
+                                chunk_img.close()
+                            except Exception:
+                                pass
+                    except Exception as exc:
+                        log.error(f"Chunk processing failed: {exc}")
+                    
+                    # Progress logging
+                    if total_chunks and (completed % max(1, total_chunks // 4) == 0):
+                        log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
+                
+                # No fallback processing needed - process_chunk handles all fallbacks internally
+                all_fallback_chunks = []
+                
+            else:
+                # ===== TRADITIONAL: Batch processing with timeouts =====
+                # Cap batch timeout to reasonable values even during startup
+                max_total_wait = min(60.0, max(10.0, effective_maxwait * 3))
+                
+                while len(processed_chunks) < len(chunks):
+                    # Safety timeout check
+                    if time.time() - start_time > max_total_wait:
+                        chunks_abandoned = len(chunks) - len(processed_chunks)
+                        if chunks_abandoned > 0:
+                            bump('chunk_missing_count', chunks_abandoned)
+                        log.warning(f"Lazy submission timeout after {max_total_wait}s, "
+                                   f"processed {len(processed_chunks)}/{len(chunks)} chunks, abandoned {chunks_abandoned}")
+                        break
+                    
+                    # Smart early exit - if all started downloads are done, exit
+                    if datareftracker.data_valid and datareftracker.connected:
+                        chunks_started = sum(1 for c in chunks if c.download_started.is_set())
+                        if chunks_started > 0 and len(processed_chunks) >= chunks_started:
+                            chunks_never_started = len(chunks) - chunks_started
+                            if chunks_never_started > 0:
+                                log.debug(f"Early exit: {chunks_never_started} chunks never started")
+                            break
+                    
+                    # Find chunks whose downloads have started but haven't been submitted for processing
+                    for chunk in chunks:
+                        chunk_id = id(chunk)
+                        if chunk_id in processed_chunks:
+                            continue
+                        
+                        if chunk.permanent_failure:
+                            processed_chunks.add(chunk_id)
+                            bump('chunk_missing_count')
+                            continue
+                        
+                        if chunk.download_started.is_set():
+                            future = executor.submit(process_chunk, chunk)
+                            active_futures[future] = chunk
+                            processed_chunks.add(chunk_id)
+                    
+                    # Process any completed futures
+                    if active_futures:
+                        done, pending = concurrent.futures.wait(
+                            active_futures.keys(), 
+                            timeout=0.025,
+                            return_when=concurrent.futures.FIRST_COMPLETED
+                        )
+                        
+                        for future in done:
+                            try:
+                                chunk, chunk_img, start_x, start_y = future.result()
+                                completed += 1
+                                if chunk_img:
+                                    if start_x >= 0 and start_y >= 0:
+                                        if not new_im.paste(chunk_img, (start_x, start_y)):
+                                            log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                                    else:
+                                        log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
+                                    try:
+                                        chunk_img.close()
+                                    except Exception:
+                                        pass
+                            except Exception as exc:
+                                log.error(f"Chunk processing failed: {exc}")
+                            finally:
+                                del active_futures[future]
+                            if total_chunks and (completed % max(1, total_chunks // 4) == 0):
+                                log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
+                    else:
+                        time.sleep(0.01)
+                
+                # Handle remaining futures and collect fallback chunks
+                chunks_needing_fallback = []
+                
                 if active_futures:
-                    done, pending = concurrent.futures.wait(
-                        active_futures.keys(), 
-                        timeout=0.025,  # Check 4x more frequently
-                        return_when=concurrent.futures.FIRST_COMPLETED
-                    )
-                    
-                    for future in done:
-                        try:
-                            chunk, chunk_img, start_x, start_y = future.result()
-                            completed += 1
-                            if chunk_img:
-                                # PHASE 2 FIX #6: Validate coordinates before paste
-                                if start_x >= 0 and start_y >= 0:
-                                    if not new_im.paste(chunk_img, (start_x, start_y)):
-                                        log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
-                                else:
-                                    log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
-                                # Free native buffer immediately after paste
-                                try:
-                                    chunk_img.close()
-                                except Exception:
-                                    pass
-                        except Exception as exc:
-                            log.error(f"Chunk processing failed: {exc}")
-                        finally:
-                            del active_futures[future]
-                        # Progress logging
-                        if total_chunks and (completed % max(1, total_chunks // 4) == 0):
-                            log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
-                else:
-                    # No active futures yet, wait a bit before checking for started downloads
-                    time.sleep(0.01)  # Check 5x more frequently
-            
-            # Wait for any remaining futures to complete (with timeout to avoid blocking forever)
-            # Track chunks that need fallback processing
-            chunks_needing_fallback = []
-            
-            if active_futures:
-                # Give pending futures time to complete, but cap to avoid long delays
-                # Even during startup, we don't want to wait forever per tile
-                grace_period = min(15.0, max(5.0, effective_maxwait))  # 5-15 seconds max
-                try:
-                    done, pending = concurrent.futures.wait(
-                        active_futures.keys(),
-                        timeout=grace_period,
-                        return_when=concurrent.futures.ALL_COMPLETED
-                    )
-                    
-                    # Process completed futures
-                    for future in done:
-                        try:
-                            chunk, chunk_img, start_x, start_y = future.result()
-                            if chunk_img:
-                                if start_x >= 0 and start_y >= 0:
-                                    if not new_im.paste(chunk_img, (start_x, start_y)):
-                                        log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
-                                else:
-                                    log.warning(f"GET_IMG: Skipping chunk with invalid coordinates ({start_x},{start_y})")
-                        except Exception as exc:
-                            # Future failed - add chunk to fallback list
+                    grace_period = min(15.0, max(5.0, effective_maxwait))
+                    try:
+                        done, pending = concurrent.futures.wait(
+                            active_futures.keys(),
+                            timeout=grace_period,
+                            return_when=concurrent.futures.ALL_COMPLETED
+                        )
+                        
+                        for future in done:
+                            try:
+                                chunk, chunk_img, start_x, start_y = future.result()
+                                if chunk_img:
+                                    if start_x >= 0 and start_y >= 0:
+                                        if not new_im.paste(chunk_img, (start_x, start_y)):
+                                            log.warning(f"GET_IMG: paste() failed for chunk at ({start_x},{start_y})")
+                            except Exception as exc:
+                                chunk = active_futures.get(future)
+                                if chunk:
+                                    chunks_needing_fallback.append(chunk)
+                                log.debug(f"Chunk processing failed, will use fallback: {exc}")
+                        
+                        if pending:
+                            log.debug(f"Grace period ({grace_period:.1f}s) expired with {len(pending)} chunks still processing")
+                        for future in pending:
                             chunk = active_futures.get(future)
                             if chunk:
                                 chunks_needing_fallback.append(chunk)
-                            log.debug(f"Chunk processing failed, will use fallback: {exc}")
-                    
-                    # Collect chunks from pending futures for fallback processing
-                    if pending:
-                        log.debug(f"Grace period ({grace_period:.1f}s) expired with {len(pending)} chunks still processing")
-                    for future in pending:
-                        chunk = active_futures.get(future)
-                        if chunk:
-                            chunks_needing_fallback.append(chunk)
-                            log.debug(f"Chunk {chunk} timed out after grace period, will use fallback")
-                        # Cancel the pending future
-                        future.cancel()
-                        
-                except Exception as e:
-                    log.warning(f"Error waiting for futures: {e}")
-            
-            # CRITICAL: Process any chunks that never started downloading
-            # These would otherwise be left as missing color patches
-            unprocessed_chunks = [c for c in chunks if id(c) not in processed_chunks and not c.permanent_failure]
-            
-            # Combine with chunks that timed out or failed
-            all_fallback_chunks = unprocessed_chunks + chunks_needing_fallback
+                            future.cancel()
+                            
+                    except Exception as e:
+                        log.warning(f"Error waiting for futures: {e}")
+                
+                unprocessed_chunks = [c for c in chunks if id(c) not in processed_chunks and not c.permanent_failure]
+                all_fallback_chunks = unprocessed_chunks + chunks_needing_fallback
             
             if all_fallback_chunks:
                 log.info(f"Processing {len(all_fallback_chunks)} chunks via fallback "
@@ -1670,9 +1773,16 @@ class Tile(object):
                     log.debug(f"Cascading fallback: found cached chunk at mipmap {fallback_mipmap}")
                 else:
                     # Not in cache, try to download it (with shorter timeout)
-                    chunk_getter.submit(fallback_chunk)
+                    fallback_timeout = min(3.0, self.get_maxwait() / 2)
+                    if _use_fetch_workers():
+                        # Bank queue: external workers
+                        url, headers = fallback_chunk.build_url()
+                        fallback_chunk.download_started.set()
+                        _get_chunk_pool().submit(fallback_chunk, url, headers)
+                    else:
+                        chunk_getter.submit(fallback_chunk)
                     # Wait with reduced timeout (don't want to cascade delays)
-                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=min(3.0, self.get_maxwait() / 2))
+                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=fallback_timeout)
                     if not fallback_chunk_ready:
                         log.debug(f"Cascading fallback: mipmap {fallback_mipmap} also timed out, trying next level")
                         fallback_chunk.close()
@@ -2373,7 +2483,21 @@ def shutdown():
 
     global chunk_getter
 
-    # 1. Stop background download threads
+    # 1. Stop fetch client (Mac worker mode)
+    try:
+        from fetch_worker import shutdown_fetch_client
+        shutdown_fetch_client()
+    except Exception as _err:
+        log.debug(f"FetchClient stop error: {_err}")
+
+    # 2. Stop chunk fetch pool (local external workers)
+    try:
+        from fetch_worker import shutdown_chunk_fetch_pool
+        shutdown_chunk_fetch_pool()
+    except Exception as _err:
+        log.debug(f"ChunkFetchPool stop error: {_err}")
+
+    # 3. Stop background download threads (traditional)
     try:
         if chunk_getter is not None:
             chunk_getter.stop()

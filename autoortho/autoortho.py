@@ -314,6 +314,8 @@ class AOMount:
 
         if system_type == "darwin":
             self.start_log_server()
+            # Start shared fetch pool for Mac (all mounts share one pool)
+            self.start_fetch_manager()
 
     def start_log_server(self):
         """Start once in the parent. Returns (host, port) bound on 127.0.0.1."""
@@ -389,6 +391,44 @@ class AOMount:
         self.stats_addr = None
         return
 
+    def start_fetch_manager(self, authkey: bytes = b'AOFETCH'):
+        """Start the shared fetch pool manager for Mac (all mounts share one pool)."""
+        try:
+            # Check if fetch workers are enabled
+            fetch_workers = int(getattr(self.cfg.pydds, 'fetch_workers', 0))
+            if fetch_workers <= 0:
+                log.info("Fetch workers disabled, skipping FetchManager")
+                self.fetch_manager = None
+                self.fetch_addr = None
+                self.fetch_auth = None
+                return
+            
+            from fetch_worker import start_fetch_manager
+            mgr, addr = start_fetch_manager(authkey)
+            self.fetch_manager = mgr
+            self.fetch_addr = addr
+            self.fetch_auth = authkey
+            log.info(f"FetchManager started on {addr} for shared fetch pool")
+        except Exception as e:
+            log.error(f"Failed to start FetchManager: {e}")
+            self.fetch_manager = None
+            self.fetch_addr = None
+            self.fetch_auth = None
+
+    def stop_fetch_manager(self, join_timeout: float = 2.0):
+        """Stop the shared fetch pool manager."""
+        mgr = getattr(self, "fetch_manager", None)
+        if mgr:
+            try:
+                from fetch_worker import stop_fetch_manager
+                stop_fetch_manager(mgr)
+            except Exception as e:
+                log.error(f"Error stopping fetch manager: {e}")
+        self.fetch_manager = None
+        self.fetch_addr = None
+        self.fetch_auth = None
+        return
+
     def launch_macfuse_worker(
             self, root: str,
             mountpoint: str,
@@ -397,6 +437,8 @@ class AOMount:
             stats_addr=None,
             stats_auth=None,
             log_addr=None,
+            fetch_addr=None,
+            fetch_auth=None,
     ) -> subprocess.Popen:
         log.info(f"AutoOrtho:  root: {root}  mountpoint: {mountpoint}")
 
@@ -407,6 +449,14 @@ class AOMount:
 
         if log_addr:
             env['AO_LOG_ADDR'] = log_addr
+
+        # Pass shared fetch pool address (for global shared worker pool)
+        if fetch_addr:
+            env['AO_FETCH_ADDR'] = fetch_addr
+            env['AO_FETCH_AUTH'] = fetch_auth.decode('utf-8') if fetch_auth else 'AOFETCH'
+        
+        # Set unique worker ID for result routing
+        env['AO_WORKER_ID'] = volname or str(os.getpid())
 
         env['AO_RUN_MODE'] = 'macfuse_worker'
 
@@ -706,6 +756,8 @@ class AOMount:
 
         if system_type == "darwin":
             self.stop_macfuse_workers()
+            # Stop shared fetch pool after workers are done
+            self.stop_fetch_manager()
 
         self.stop_stats_manager()
 
@@ -772,7 +824,9 @@ class AOMount:
                 volname = mountpoint.split('/')[-1]
                 process = self.launch_macfuse_worker(
                     root, mountpoint, volname, nothreads,
-                    self.stats_addr, self.stats_auth, self.log_addr
+                    self.stats_addr, self.stats_auth, self.log_addr,
+                    getattr(self, 'fetch_addr', None),
+                    getattr(self, 'fetch_auth', None)
                 )
                 self.mac_os_procs.append(process)
             else:

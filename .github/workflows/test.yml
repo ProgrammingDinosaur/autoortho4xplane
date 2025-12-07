@@ -21,7 +21,7 @@ jobs:
     - name: Test
       run: |
         cd autoortho
-        pytest --log-level=DEBUG -v test_getortho.py test_pydds.py test_downloader.py
+        pytest --log-level=DEBUG -v tests/test_getortho.py tests/test_pydds.py tests/test_downloader.py
 
 
   test-windows:
@@ -40,7 +40,7 @@ jobs:
           python -m pip install -U -r requirements.txt
 
     - name: Test
-      run: cd autoortho && python -m pytest -v test_getortho.py test_pydds.py test_downloader.py
+      run: cd autoortho && python -m pytest -v tests/test_getortho.py tests/test_pydds.py tests/test_downloader.py
 
 
   test-macos:
@@ -59,4 +59,4 @@ jobs:
           python -m pip install -U -r requirements.txt
 
     - name: Test
-      run: cd autoortho && python -m pytest -v test_getortho.py test_pydds.py test_downloader.py
+      run: cd autoortho && python -m pytest -v tests/test_getortho.py tests/test_pydds.py tests/test_downloader.py
