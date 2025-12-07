@@ -701,6 +701,12 @@ class FetchClient:
                                 except Exception:
                                     pass
                         
+                        # Store HTTP status code for sync fetch support
+                        try:
+                            chunk._http_status_code = result.status_code
+                        except Exception:
+                            pass
+                        
                         # Signal ready - wakes up waiters!
                         try:
                             chunk.ready.set()
@@ -713,6 +719,84 @@ class FetchClient:
                 log.debug(f"FetchClient dispatcher error: {e}")
             
             time.sleep(POLL_INTERVAL)
+    
+    def fetch(self, url: str, headers: Dict[str, str],
+              timeout: Tuple[float, float] = (5, 20)) -> 'ChunkResult':
+        """
+        Synchronous fetch - blocks until result is ready.
+        
+        This is a convenience method for simple fetch operations that don't
+        need the full async chunk model.
+        
+        Args:
+            url: URL to fetch
+            headers: HTTP headers
+            timeout: (connect_timeout, read_timeout)
+            
+        Returns:
+            ChunkResult with status, data, etc.
+        """
+        # Create a minimal chunk-like object for the fetch
+        class SyncChunk:
+            def __init__(self):
+                self.chunk_id = f"sync_{id(self)}_{time.time()}"
+                self.ready = threading.Event()
+                self.download_started = threading.Event()
+                self.data = None
+                self.permanent_failure = False
+                self.failure_reason = None
+                self._http_status_code = 0  # Will be set by dispatcher
+        
+        chunk = SyncChunk()
+        
+        # Submit and wait
+        self.submit(chunk, url, headers, timeout)
+        
+        # Wait for result with timeout (connect + read + buffer)
+        wait_timeout = timeout[0] + timeout[1] + 5
+        if chunk.ready.wait(timeout=wait_timeout):
+            status_code = getattr(chunk, '_http_status_code', 0) or 0
+            if chunk.data:
+                return ChunkResult(
+                    request_id=0,
+                    status="ok",
+                    status_code=status_code or 200,
+                    data=chunk.data,
+                    error_msg=None,
+                    worker_id=self._worker_id,
+                    chunk_id=chunk.chunk_id
+                )
+            elif chunk.permanent_failure:
+                return ChunkResult(
+                    request_id=0,
+                    status="permanent_failure",
+                    status_code=status_code,
+                    data=None,
+                    error_msg=chunk.failure_reason or "Permanent failure",
+                    worker_id=self._worker_id,
+                    chunk_id=chunk.chunk_id
+                )
+            else:
+                return ChunkResult(
+                    request_id=0,
+                    status="error",
+                    status_code=status_code,
+                    data=None,
+                    error_msg="No data received",
+                    worker_id=self._worker_id,
+                    chunk_id=chunk.chunk_id
+                )
+        else:
+            # Timeout
+            return ChunkResult(
+                request_id=0,
+                status="timeout",
+                status_code=0,
+                data=None,
+                error_msg=f"Timeout after {wait_timeout}s",
+                worker_id=self._worker_id,
+                chunk_id=chunk.chunk_id
+            )
     
     def stop(self) -> None:
         """Stop the client."""
@@ -839,6 +923,12 @@ class ChunkFetchPool:
                                 except Exception:
                                     pass
                         
+                        # Store HTTP status code for sync fetch support
+                        try:
+                            chunk._http_status_code = result.status_code
+                        except Exception:
+                            pass
+                        
                         try:
                             chunk.download_started.set()
                         except Exception:
@@ -955,6 +1045,86 @@ class ChunkFetchPool:
             return -1
         
         return id(chunk)
+    
+    def fetch(self, url: str, headers: Dict[str, str],
+              timeout: Tuple[float, float] = (5, 20)) -> 'ChunkResult':
+        """
+        Synchronous fetch - blocks until result is ready.
+        
+        This is a convenience method for simple fetch operations that don't
+        need the full async chunk model.
+        
+        Args:
+            url: URL to fetch
+            headers: HTTP headers
+            timeout: (connect_timeout, read_timeout)
+            
+        Returns:
+            ChunkResult with status, data, etc.
+        """
+        import threading
+        
+        # Create a minimal chunk-like object for the fetch
+        class SyncChunk:
+            def __init__(self):
+                self.chunk_id = f"sync_{id(self)}_{time.time()}"
+                self.ready = threading.Event()
+                self.download_started = threading.Event()
+                self.data = None
+                self.permanent_failure = False
+                self.failure_reason = None
+                self._http_status_code = 0  # Will be set by dispatcher
+        
+        chunk = SyncChunk()
+        
+        # Submit and wait
+        self.submit(chunk, url, headers, timeout)
+        
+        # Wait for result with timeout (connect + read + buffer)
+        wait_timeout = timeout[0] + timeout[1] + 5
+        if chunk.ready.wait(timeout=wait_timeout):
+            status_code = getattr(chunk, '_http_status_code', 0) or 0
+            if chunk.data:
+                return ChunkResult(
+                    request_id=0,
+                    status="ok",
+                    status_code=status_code or 200,
+                    data=chunk.data,
+                    error_msg=None,
+                    worker_id="local",
+                    chunk_id=chunk.chunk_id
+                )
+            elif chunk.permanent_failure:
+                return ChunkResult(
+                    request_id=0,
+                    status="permanent_failure",
+                    status_code=status_code,
+                    data=None,
+                    error_msg=chunk.failure_reason or "Permanent failure",
+                    worker_id="local",
+                    chunk_id=chunk.chunk_id
+                )
+            else:
+                return ChunkResult(
+                    request_id=0,
+                    status="error",
+                    status_code=status_code,
+                    data=None,
+                    error_msg="No data received",
+                    worker_id="local",
+                    chunk_id=chunk.chunk_id
+                )
+        else:
+            # Timeout
+            return ChunkResult(
+                request_id=0,
+                status="timeout",
+                status_code=0,
+                data=None,
+                error_msg=f"Timeout after {wait_timeout}s",
+                worker_id="local",
+                chunk_id=chunk.chunk_id
+            )
     
     def stop(self) -> None:
         """Stop the worker pool."""

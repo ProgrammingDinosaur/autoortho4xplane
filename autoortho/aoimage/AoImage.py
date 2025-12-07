@@ -525,6 +525,33 @@ _aoi.aoimage_crop_and_upscale.argtypes = (
 # Placeholder/Fallback Functions - NEVER crash, always return usable image
 # =============================================================================
 
+def _create_minimal_fallback_image():
+    """
+    Create an absolute minimum fallback image (4x4 magenta).
+    This is the last resort when all other creation attempts fail.
+    Returns AoImage or None (only if C library is completely broken).
+    """
+    img = AoImage()
+    try:
+        if _aoi.aoimage_create(img, 4, 4, 255, 0, 255):
+            return img
+    except Exception:
+        pass
+    return None
+
+
+# Pre-create a fallback image at module load time as ultimate backup
+_FALLBACK_IMAGE = None
+
+
+def _get_fallback_image():
+    """Get a guaranteed fallback image. Creates one if needed."""
+    global _FALLBACK_IMAGE
+    if _FALLBACK_IMAGE is None:
+        _FALLBACK_IMAGE = _create_minimal_fallback_image()
+    return _FALLBACK_IMAGE
+
+
 def new_or_placeholder(mode, wh, color, placeholder_color=(255, 0, 255)):
     """
     Create new image, or return placeholder if creation fails.
@@ -536,16 +563,27 @@ def new_or_placeholder(mode, wh, color, placeholder_color=(255, 0, 255)):
     if result is not None:
         return result
     
-    # Try creating a placeholder
+    # Try creating a placeholder at requested size
     log.warning(f"Creating placeholder image {wh[0]}x{wh[1]}")
     result = new(mode, wh, placeholder_color)
     if result is not None:
         return result
     
-    # Last resort: try smaller size
+    # Try smaller safe size
     safe_size = (max(4, min(wh[0], 256)), max(4, min(wh[1], 256)))
     log.warning(f"Creating minimal placeholder {safe_size[0]}x{safe_size[1]}")
-    return new(mode, safe_size, placeholder_color)
+    result = new(mode, safe_size, placeholder_color)
+    if result is not None:
+        return result
+    
+    # Last resort: return pre-created fallback or create minimal 4x4
+    log.error(f"All placeholder attempts failed, using fallback image")
+    fallback = _get_fallback_image()
+    if fallback is not None:
+        return fallback
+    
+    # Ultimate fallback: create inline (should never reach here)
+    return _create_minimal_fallback_image() or new('RGBA', (4, 4), (255, 0, 255))
 
 
 def load_from_memory_or_placeholder(mem, datalen=None, 
@@ -562,9 +600,9 @@ def load_from_memory_or_placeholder(mem, datalen=None,
         if result is not None:
             return result
     
-    # Return placeholder
+    # Return placeholder using guaranteed-to-succeed function
     log.warning(f"Creating placeholder for failed load")
-    return new('RGBA', placeholder_size, placeholder_color)
+    return new_or_placeholder('RGBA', placeholder_size, placeholder_color)
 
 
 def open_or_placeholder(filename, placeholder_size=(256, 256),
@@ -580,7 +618,7 @@ def open_or_placeholder(filename, placeholder_size=(256, 256),
             return result
     
     log.warning(f"Creating placeholder for failed open: {filename}")
-    return new('RGBA', placeholder_size, placeholder_color)
+    return new_or_placeholder('RGBA', placeholder_size, placeholder_color)
 
 
 if __name__ == "__main__":

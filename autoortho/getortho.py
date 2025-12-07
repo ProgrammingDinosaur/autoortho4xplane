@@ -93,14 +93,19 @@ def _do_fetch(url: str, headers: dict, timeout: tuple = (5, 20),
     Returns: (status_code, data, error_msg)
         - status_code: HTTP status code (0 if connection error)
         - data: Response bytes or None
-        - error_msg: Error message or None
+        - error_msg: Error message or None (only for connection/timeout errors)
     """
     if _use_fetch_workers():
         pool = _get_fetch_pool()
         result = pool.fetch(url, headers, timeout)
         if result.status == "ok":
             return (result.status_code, result.data, None)
+        elif result.status in ("http_error", "permanent_failure"):
+            # HTTP errors: return status code but no error_msg
+            # This matches session behavior and lets caller handle based on status
+            return (result.status_code, None, None)
         else:
+            # Connection/timeout errors: return error_msg
             return (0, None, result.error_msg)
     else:
         # Use traditional session
@@ -747,7 +752,8 @@ class Chunk(object):
 
         MAPTYPES_WITH_SERVER = ["YNDX", "EOX", "GO2"]
 
-        self.url = MAPTYPES[self.maptype.upper()]
+        # Use .get() with fallback to EOX for unknown maptypes (consistent with build_url)
+        self.url = MAPTYPES.get(self.maptype.upper(), MAPTYPES["EOX"])
         #log.debug(f"{self} getting {url}")
         header = {
                 "user-agent": "curl/7.68.0"
