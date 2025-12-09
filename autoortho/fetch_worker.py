@@ -45,7 +45,7 @@ log = logging.getLogger(__name__)
 
 # Configuration
 DEFAULT_WORKER_COUNT = 4
-CONNECTION_POOL_SIZE = 50  # connections per worker
+CONNECTION_POOL_SIZE = 100  # connections per worker
 CHUNK_TIMEOUT = 60.0  # Max time for any chunk before considered lost
 TIMEOUT_CHECK_INTERVAL = 1.0  # How often to check for stale chunks
 POLL_INTERVAL = 0.05  # How often clients poll for results (50ms)
@@ -892,21 +892,46 @@ class ChunkFetchPool:
         last_timeout_check = time.time()
         last_health_check = time.time()
         
+        # Batch size for draining results - process multiple per iteration
+        BATCH_SIZE = 50
+        
         while not self._stop_event.is_set():
             try:
+                # Drain up to BATCH_SIZE results from queue
+                results = []
                 try:
+                    # First one can block briefly
                     result = self.result_queue.get(timeout=0.1)
+                    if result:
+                        results.append(result)
+                    
+                    # Drain more without blocking
+                    for _ in range(BATCH_SIZE - 1):
+                        try:
+                            result = self.result_queue.get_nowait()
+                            if result:
+                                results.append(result)
+                        except Empty:
+                            break
                 except Empty:
-                    result = None
+                    pass
                 
-                if result and isinstance(result, ChunkResult):
-                    chunk_id = result.chunk_id
+                # Process batch with single lock acquisition
+                if results:
+                    chunks_to_update = []
                     
                     with self._lock:
-                        chunk = self._chunks.pop(chunk_id, None)
-                        self._submit_times.pop(chunk_id, None)
+                        for result in results:
+                            if not isinstance(result, ChunkResult):
+                                continue
+                            chunk_id = result.chunk_id
+                            chunk = self._chunks.pop(chunk_id, None)
+                            self._submit_times.pop(chunk_id, None)
+                            if chunk:
+                                chunks_to_update.append((chunk, result))
                     
-                    if chunk:
+                    # Update chunks outside the lock
+                    for chunk, result in chunks_to_update:
                         if result.status == "ok":
                             chunk.data = result.data
                             self._stats['completed'] += 1

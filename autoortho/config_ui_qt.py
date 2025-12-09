@@ -1287,7 +1287,7 @@ class ConfigUI(QMainWindow):
         fetch_workers_layout.addWidget(fetch_workers_label)
         
         self.fetch_workers_slider = ModernSlider()
-        self.fetch_workers_slider.setRange(0, 8)
+        self.fetch_workers_slider.setRange(0, 10)
         current_fetch_workers = int(getattr(self.cfg.pydds, 'fetch_workers', 0))
         self.fetch_workers_slider.setValue(current_fetch_workers)
         self.fetch_workers_slider.setObjectName('fetch_workers')

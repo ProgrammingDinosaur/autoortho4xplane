@@ -1086,6 +1086,17 @@ class Tile(object):
             ret = chunk.ready.wait()
             if not ret:
                 log.error("Failed to get chunk.")
+            elif use_bank_queue and chunk.data and not getattr(chunk, '_postprocessed', False):
+                # Bank queue path: do post-processing that Chunk.get() would normally do
+                chunk._postprocessed = True
+                data_len = len(chunk.data)
+                if data_len > 0:
+                    bump("req_ok")
+                    bump("bytes_dl", data_len)
+                    try:
+                        chunk.save_cache()
+                    except Exception as cache_err:
+                        log.debug(f"Cache save failed for {chunk}: {cache_err}")
 
         return True
    
@@ -1461,6 +1472,21 @@ class Tile(object):
             if chunk_ready and chunk.data:
                 # We returned and have data!
                 log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Ready and found chunk data.")
+                
+                # Bank queue path: do post-processing that Chunk.get() would normally do
+                # (stats update and cache write)
+                if use_bank_queue and not getattr(chunk, '_postprocessed', False):
+                    chunk._postprocessed = True  # Only process once
+                    data_len = len(chunk.data) if chunk.data else 0
+                    if data_len > 0:
+                        bump("req_ok")
+                        bump("bytes_dl", data_len)
+                        # Save to cache in background to avoid blocking
+                        try:
+                            chunk.save_cache()
+                        except Exception as cache_err:
+                            log.debug(f"Cache save failed for {chunk}: {cache_err}")
+                
                 try:
                     with _decode_sem:
                         chunk_img = AoImage.load_from_memory(chunk.data)
@@ -1504,6 +1530,19 @@ class Tile(object):
                     chunk_ready = chunk.ready.wait(maxwait)
                 if chunk_ready and chunk.data:
                     log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, SUCCESS!")
+                    
+                    # Bank queue path: do post-processing for retry success too
+                    if use_bank_queue and not getattr(chunk, '_postprocessed', False):
+                        chunk._postprocessed = True
+                        data_len = len(chunk.data) if chunk.data else 0
+                        if data_len > 0:
+                            bump("req_ok")
+                            bump("bytes_dl", data_len)
+                            try:
+                                chunk.save_cache()
+                            except Exception as cache_err:
+                                log.debug(f"Cache save failed for {chunk}: {cache_err}")
+                    
                     try:
                         with _decode_sem:
                             chunk_img = AoImage.load_from_memory(chunk.data)
@@ -1796,6 +1835,18 @@ class Tile(object):
             
             # We have the chunk data, decode and upscale it
             if fallback_chunk.data:
+                # Bank queue path: do post-processing for fallback chunks
+                if _use_fetch_workers() and not getattr(fallback_chunk, '_postprocessed', False):
+                    fallback_chunk._postprocessed = True
+                    data_len = len(fallback_chunk.data)
+                    if data_len > 0:
+                        bump("req_ok")
+                        bump("bytes_dl", data_len)
+                        try:
+                            fallback_chunk.save_cache()
+                        except Exception as cache_err:
+                            log.debug(f"Cache save failed for {fallback_chunk}: {cache_err}")
+                
                 try:
                     with _decode_sem:
                         fallback_img = AoImage.load_from_memory(fallback_chunk.data)
