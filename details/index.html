@@ -734,6 +734,38 @@ recommend enabling <code>high_zl_airports</code></p>
 results.</p>
 <p>Higher zoom levels will lead to increased resource usage and longer delays
 initially starting up flights.</p>
+<h1 id="building-from-source">Building from Source</h1>
+<h2 id="build-system">Build System</h2>
+<p>AutoOrtho uses <strong>PyInstaller</strong> to create standalone executables for all platforms (Linux, Windows, macOS). PyInstaller bundles the Python interpreter and all dependencies into a single distributable package.</p>
+<h2 id="requirements">Requirements</h2>
+<p>Install build dependencies:</p>
+<pre><code class="language-bash">pip install -r requirements.txt
+pip install -r requirements-build.txt
+</code></pre>
+<h2 id="building">Building</h2>
+<p>The <code>Makefile</code> provides targets for each platform:</p>
+<pre><code class="language-bash"># Linux (creates .tar.gz)
+make lin_tar VERSION=1.0.0
+
+# macOS (creates .app bundle and .zip)
+make mac_app VERSION=1.0.0
+make mac_zip VERSION=1.0.0
+
+# Windows (creates installer .exe and .zip)
+make win_exe VERSION=1.0.0
+make win_zip VERSION=1.0.0
+</code></pre>
+<h2 id="output-structure">Output Structure</h2>
+<p>PyInstaller creates a bundled application with the following structure:</p>
+<ul>
+<li><strong>Executable</strong>: The main binary (<code>autoortho</code>, <code>autoortho.exe</code>)</li>
+<li><strong><code>ao_files/</code> folder</strong>: Contains the Python runtime, compiled bytecode, and all dependencies</li>
+</ul>
+<p>The <code>ao_files</code> folder is essential for the application to run. It replaces PyInstaller's default <code>_internal</code> folder with a more descriptive name.</p>
+<h2 id="development">Development</h2>
+<p>To run from source without building:</p>
+<pre><code class="language-bash">python -m autoortho
+</code></pre>
 
 
 

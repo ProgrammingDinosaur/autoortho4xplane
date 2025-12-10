@@ -498,6 +498,34 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#application-file-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Application File Structure
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Application File Structure">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#important-do-not-delete-the-ao_files-folder" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Important: Do NOT delete the ao_files folder!
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#general-issues" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -582,21 +610,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#when-using-the-binary-release-on-linux-i-get-an-ssl-certificate_verify_failed-error" class="md-nav__link">
+  <a href="#ioerror-errno-24-too-many-open-files" class="md-nav__link">
     <span class="md-ellipsis">
       
-        When using the binary release on Linux I get an 'SSL: CERTIFICATE_VERIFY_FAILED' error
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#fuse-errors-ands-trange-behaviors-on-arch-based-systems" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        FUSE errors ands trange behaviors on ARCH based systems.
+        IOError: [Errno 24] Too Many Open Files
       
     </span>
   </a>
@@ -930,6 +947,34 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#application-file-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Application File Structure
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Application File Structure">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#important-do-not-delete-the-ao_files-folder" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Important: Do NOT delete the ao_files folder!
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#general-issues" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1014,21 +1059,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#when-using-the-binary-release-on-linux-i-get-an-ssl-certificate_verify_failed-error" class="md-nav__link">
+  <a href="#ioerror-errno-24-too-many-open-files" class="md-nav__link">
     <span class="md-ellipsis">
       
-        When using the binary release on Linux I get an 'SSL: CERTIFICATE_VERIFY_FAILED' error
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#fuse-errors-ands-trange-behaviors-on-arch-based-systems" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        FUSE errors ands trange behaviors on ARCH based systems.
+        IOError: [Errno 24] Too Many Open Files
       
     </span>
   </a>
@@ -1294,6 +1328,32 @@
 
 
 <h1 id="faq-and-troubleshooting">FAQ and Troubleshooting</h1>
+<h2 id="application-file-structure">Application File Structure</h2>
+<h3 id="important-do-not-delete-the-ao_files-folder">Important: Do NOT delete the <code>ao_files</code> folder!</h3>
+<p>When you extract AutoOrtho (Windows zip or macOS app), you'll see a folder structure like this:</p>
+<p><strong>Windows (zip extraction):</strong></p>
+<pre><code>autoortho_release/
+├── autoortho.exe          ← Main executable
+├── ao_files/              ← REQUIRED - Contains Python runtime and dependencies
+│   ├── (many files...)
+│   └── ...
+└── ...
+</code></pre>
+<p><strong>macOS (app bundle):</strong></p>
+<pre><code>AutoOrtho.app/
+└── Contents/
+    ├── MacOS/
+    │   ├── autoortho      ← Main executable
+    │   └── ao_files/      ← REQUIRED - Contains Python runtime and dependencies
+    └── ...
+</code></pre>
+<p>The <code>ao_files</code> folder contains the bundled Python interpreter and all required libraries. <strong>If you delete this folder, AutoOrtho will not work!</strong></p>
+<p>Common mistakes:
+- Moving only the <code>.exe</code> file to another location (without <code>ao_files</code>)
+- "Cleaning up" by deleting folders that look like temporary files
+- Anti-virus software quarantining files from this folder</p>
+<p>If AutoOrtho suddenly stops working after it previously worked, check that the <code>ao_files</code> folder is intact and in the same directory as the executable.</p>
+<hr />
 <h2 id="general-issues">General Issues</h2>
 <h3 id="i-see-occasional-blurry-andor-green-tiles">I see occasional blurry and/or green tiles</h3>
 <p>There is a timeout for how long the system waits for individual satellite
@@ -1324,15 +1384,22 @@ unless other issues are seen.</p>
 <p>You have to start X-Plane separately from this tool.  It's also best to start X-Plane <em>after</em> starting autoortho so that all new files and directories are picked up.</p>
 <hr />
 <h2 id="linux-issues">Linux Issues</h2>
-<h3 id="when-using-the-binary-release-on-linux-i-get-an-ssl-certificate_verify_failed-error">When using the binary release on Linux I get an 'SSL: CERTIFICATE_VERIFY_FAILED' error</h3>
-<p>You may need to specify the SSL_CERT_DIR your particular operating system
-uses.  For example:</p>
-<pre><code>SSL_CERT_DIR=/etc/ssl/certs ./autoortho_lin.bin
-</code></pre>
-<p>Note - Possibly fixed in 1.1.0 and newer See <a href="https://github.com/ProgrammingDinosaur/autoortho4xplane/issues/11">Issue #11</a></p>
-<h3 id="fuse-errors-ands-trange-behaviors-on-arch-based-systems">FUSE errors ands trange behaviors on ARCH based systems.</h3>
-<p>Arch and some other systems keep FUSE2 and FUSE3 seperate when it comes to their userspace binaries (the part AutoOrtho calls to mount and map folders). Other systems like Debian based platforms (e.g. Linux Mint, Ubuntu, Etc) just use FUSE3 binaries/libraries for both FUSE2 and FUSE3 support risking breaking compatability for select usecases. Luckely AutoOrtho is not one of these, but this leaves Arch support broken for now. A solution has been identified in a python FUSE support project that expands support to FUSE3 nativly.
-Until resolved - a Debian based release might be your best bet. The Linux version of X-Plane 12 itself is developed on LTS releases of ubuntu, so that or their Linux Mint counterparts might be a safe starting point if you must have ortho under linux.</p>
+<h3 id="ioerror-errno-24-too-many-open-files">IOError: [Errno 24] Too Many Open Files</h3>
+<p>On some Linux distrubtions they set the minimum open files limits. This is 1024. Since AutoOrtho is modifying and creating a large number of files at the same time, it can easily hit this limit.</p>
+<p><em>To confirm</em>
+Run the following command and see if the result is in the 4,096 at a minumum.
+'ulimit -n'</p>
+<p>While doing this you can also check the hard limit thats system wide. This should be in the 100,000s or millions in most cases.
+'ulimit -Hn'</p>
+<p><em>Fixing by setting a higher limit temporarely</em>
+Open a new terminal window.</p>
+<p>This command will set a filesystem max file lmit just in case we are accidently hitting into that limit too...
+'sudo sysctl -w fs.inotify.max_user_watches=100000'</p>
+<p>Now we will set our user/process limit to something more workable with generating ortho dynamically...
+'ulimit -S -n 8192'</p>
+<p>When you check your 'ulimit -n' you should now see it at 8k (8192). Now, in the same terminal window, we can launch our autoortho binary:
+'./autoortho_lin_1.4.2.bin'</p>
+<p>Note: when you close your terminal window that you entered these commands into (or start another) it will no longer have this raised limit. This is a python safegaurd, not a flaw. It helps protect you against scenerios where touching a large number of files can indicate issues (e.g. resource exhaustion, ransomeware attacks, bad code, etc).</p>
 <h3 id="on-linux-this-does-not-startgives-a-fuse-error">On Linux this does not start/gives a FUSE error</h3>
 <p>Make sure that your <code>/etc/fuse.conf</code> files is set to <code>user_allow_other</code>.  You may need to uncomment a line.</p>
 <h3 id="the-program-crashed-and-now-i-get-an-error-when-autoortho-attempts-to-mount">The program crashed and now I get an error when AutoOrtho attempts to mount</h3>

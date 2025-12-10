@@ -981,9 +981,21 @@ experimental ATM:</p>
 <li>If you haven't install MacFuse or Fuse-T. Fuse-T was used for testing the mac binary but both should work.</li>
 <li>Download the most recent packaged release (autortho_mac_####.zip) <a href="https://github.com/ProgrammingDinosaur/autoortho/releases/latest">from here</a></li>
 <li>Unzip on the location you want.</li>
-<li>Run the program <code>AutoOrtho.App</code></li>
-<li><strong>Important</strong> This program is currently unsigned, a warning will appear on first run, you need to go into Settings -&gt; Privacy and Security -&gt; Allow <code>AutoOrtho.App</code> execution -&gt; Open Anyway.</li>
-<li>Configure your settings and paths for your system </li>
+<li>Run the program <code>AutoOrtho.app</code></li>
+<li>
+<p><strong>Important: macOS Quarantine Warning</strong> - This program is currently unsigned. On first run, macOS will block it from opening. You have two options to fix this:</p>
+<p><strong>Option A (Recommended):</strong> Remove the quarantine attribute using Terminal:
+<code>bash
+xattr -d com.apple.quarantine /path/to/AutoOrtho.app</code>
+<em>Tip: You can drag the AutoOrtho.app onto the Terminal window to auto-fill the path.</em></p>
+<p><strong>Option B:</strong> Use System Settings:
+- Go to <strong>Settings → Privacy and Security</strong>
+- Scroll down to find the message about <code>AutoOrtho.app</code> being blocked
+- Click <strong>Open Anyway</strong></p>
+</li>
+<li>
+<p>Configure your settings and paths for your system </p>
+</li>
 <li>Download and setup an ortho set from the 'Scenery' tab.</li>
 <li>Click 'Run' to run the program</li>
 <li>Configure your scenery_packs.ini file appropriately</li>
