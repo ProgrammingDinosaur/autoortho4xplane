@@ -1617,7 +1617,7 @@ Each zoom level requires 4× more resources. Lowering your max zoom dramatically
 <p><strong>Recommended settings for minimal missing tiles:</strong></p>
 <pre><code class="language-ini">maptype_override_zoom = 16
 use_time_budget = True
-tile_time_budget = 20.0
+tile_time_budget = 300.0
 fallback_level = full
 fallback_extends_budget = True
 </code></pre>
@@ -1641,18 +1641,19 @@ fallback_extends_budget = True
 <p>Stuttering occurs when X-Plane waits for AutoOrtho to provide imagery. To minimize stutters:</p>
 <ol>
 <li><strong>Use Time Budget System:</strong> Keep <code>use_time_budget = True</code> (default)</li>
-<li><strong>Use reasonable budget:</strong> Set <code>tile_time_budget</code> to 5-10 seconds</li>
+<li><strong>Use reasonable budget:</strong> Set <code>tile_time_budget</code> to 180-300 seconds</li>
 <li><strong>Use cache-only fallbacks:</strong> Set <code>fallback_level = cache</code> to avoid network delays during fallbacks</li>
 <li><strong>Enable prefetching:</strong> Keep <code>prefetch_enabled = True</code> to download tiles ahead of your aircraft</li>
-<li><strong>Increase prefetch lookahead:</strong> Set <code>prefetch_lookahead = 60</code> or higher for faster aircraft</li>
+<li><strong>Increase prefetch lookahead:</strong> Set <code>prefetch_lookahead = 30</code> or higher for faster aircraft</li>
 </ol>
 <p><strong>Recommended settings for stutter-free flying:</strong></p>
 <pre><code class="language-ini">use_time_budget = True
-tile_time_budget = 5.0
+tile_time_budget = 180
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
-prefetch_lookahead = 60
+prefetch_lookahead = 30
+max_zoom_level = 16
 </code></pre>
 <p><strong>Trade-off:</strong> You may see occasional blurry or missing tiles, but your flight will be smoother.</p>
 <hr />
@@ -1667,7 +1668,7 @@ prefetch_lookahead = 60
 </ol>
 <p><strong>To speed up startup:</strong>
 - <strong>Lower your Max Zoom Level</strong> - This has the biggest impact! ZL16→ZL15 is 4× faster
-- Use a lower <code>tile_time_budget</code> (5-10 seconds)
+- Use a lower <code>tile_time_budget</code> (180-300 seconds)
 - Enable <code>suspend_maxwait = True</code> to use extended timeouts only during startup
 - The second time you load the same area will be faster (cached data)</p>
 <p><strong>Zoom Level Resource Scaling:</strong>
@@ -1745,9 +1746,9 @@ prefetch_lookahead = 60
 <p><strong>Example:</strong> With <code>maxwait = 1.5s</code> and 256 chunks:
 - Worst case: 256 × 1.5s = 384 seconds (due to serial execution)
 - Actual time varies widely based on parallelism</p>
-<p><strong>Example:</strong> With <code>tile_time_budget = 10s</code>:
-- Always completes in 10 seconds (predictable)
-- May have some missing chunks if network is slow</p>
+<p><strong>Example:</strong> With <code>tile_time_budget = 180s</code>:
+- Always release a tile to X-Plane within 180 seconds (predictable)
+- May have some missing chunks if network is slow or zoom level is high</p>
 <p><strong>Recommendation:</strong> Keep <code>use_time_budget = True</code> to use the new predictable system.</p>
 <h3 id="i-see-a-messge-in-the-logs-but-otherwise-things-work-fine">I see a messge in the logs, but otherwise things work fine.</h3>
 <p>The log will log various things, typically info and warnings can be ignored

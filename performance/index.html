@@ -2393,9 +2393,9 @@ maptype_override_zoom = 16
 <h4 id="tile-time-budget-tile_time_budget">Tile Time Budget (<code>tile_time_budget</code>)</h4>
 <ul>
 <li><strong>Type:</strong> Float (seconds)</li>
-<li><strong>Default:</strong> 5.0</li>
-<li><strong>Range:</strong> 0.5 - 30.0 seconds</li>
-<li><strong>Config file:</strong> <code>tile_time_budget = 5.0</code></li>
+<li><strong>Default:</strong> 180</li>
+<li><strong>Range:</strong> 60 - 600 seconds</li>
+<li><strong>Config file:</strong> <code>tile_time_budget = 180.0</code></li>
 </ul>
 <p>The maximum wall-clock time for a <strong>complete tile</strong> (all mipmap levels combined). This budget measures <strong>active processing time only</strong> - queue wait time doesn't count. The budget starts when AutoOrtho actually begins processing the tile's chunks, not when the tile is first requested.</p>
 <table>
@@ -2408,17 +2408,17 @@ maptype_override_zoom = 16
 </thead>
 <tbody>
 <tr>
-<td>3.0 - 5.0s</td>
+<td>60 - 120.0s</td>
 <td>Fast/smooth experience</td>
 <td>Quicker loading, but more partial tiles</td>
 </tr>
 <tr>
-<td>5.0 - 15.0s</td>
+<td>120.0 - 300.0s</td>
 <td>Balanced</td>
 <td>Good quality with reasonable loading times</td>
 </tr>
 <tr>
-<td>15.0 - 30.0s</td>
+<td>300 - 600.0s</td>
 <td>Maximum quality</td>
 <td>Complete tiles, but longer loading times</td>
 </tr>
@@ -2432,6 +2432,7 @@ maptype_override_zoom = 16
 5. Any incomplete areas use the configured <code>missing_color</code></p>
 <p><strong>Note:</strong> Queue wait time (when other tiles are being processed first) does NOT count against the budget. This ensures fair time allocation even when many tiles are requested simultaneously.</p>
 <p><strong>Note:</strong> Each tile covers a large geographic area (approximately 1 square degree of latitude/longitude at zoom 16). Higher budgets allow more time for all chunks to download and process.</p>
+<p><strong>Note:</strong> The effectiveness of this setting will also depend on your configured max zoom level. Higher zoom levels with lower budget times will result in faster loading but lots of missing tiles.</p>
 <hr />
 <h3 id="fallback-system">Fallback System</h3>
 <p>When chunks fail to download in time, the fallback system provides alternative imagery to prevent missing tiles.</p>
@@ -2805,34 +2806,38 @@ maptype_override_zoom = 16
 <h2 id="recommended-configurations">Recommended Configurations</h2>
 <h3 id="stutter-free-flying-prioritize-performance">Stutter-Free Flying (Prioritize Performance)</h3>
 <pre><code class="language-ini">use_time_budget = True
-tile_time_budget = 5.0
+tile_time_budget = 120.0
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
-prefetch_lookahead = 45
+prefetch_lookahead = 30
+max_zoom_level = 16
 </code></pre>
 <h3 id="maximum-quality-prioritize-imagery">Maximum Quality (Prioritize Imagery)</h3>
 <pre><code class="language-ini">use_time_budget = True
-tile_time_budget = 20.0
+tile_time_budget = 300
 fallback_level = full
 fallback_extends_budget = True
 prefetch_enabled = True
 prefetch_lookahead = 60
+max_zoom_level = 17
 </code></pre>
 <h3 id="slow-internet-connection">Slow Internet Connection</h3>
 <pre><code class="language-ini">use_time_budget = True
-tile_time_budget = 15.0
+tile_time_budget = 180
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
 prefetch_lookahead = 90
+max_zoom_level = 16
 </code></pre>
 <h3 id="weak-cpu-limited-system">Weak CPU / Limited System</h3>
 <pre><code class="language-ini">use_time_budget = True
-tile_time_budget = 3.0
+tile_time_budget = 180
 fallback_level = none
 fallback_extends_budget = False
 prefetch_enabled = False
+max_zoom_level = 15
 </code></pre>
 <hr />
 <h2 id="understanding-the-statistics">Understanding the Statistics</h2>
