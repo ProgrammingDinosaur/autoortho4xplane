@@ -292,6 +292,25 @@
   
   
     <li class="md-tabs__item">
+      <a href="../performance/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Performance Tuning Guide
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
       <a href="../scenery/" class="md-tabs__link">
         
   
@@ -487,6 +506,56 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#performance-tuning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance Tuning
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#dynamic-zoom-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dynamic Zoom Levels
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#simbrief-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SimBrief Integration
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="SimBrief Integration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#route-calculation-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Route Calculation Settings
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -564,6 +633,33 @@
     
   
     Info Attributions and Other Projects
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Tuning Guide
   
 
     
@@ -673,6 +769,56 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#performance-tuning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance Tuning
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#dynamic-zoom-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dynamic Zoom Levels
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#simbrief-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SimBrief Integration
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="SimBrief Integration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#route-calculation-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Route Calculation Settings
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -715,6 +861,60 @@
 <p>This folder can be set to any convenient location with enough space for scenery downloads (20-30GB per).</p>
 <h2 id="user-config-file-location">User config file location</h2>
 <p>The configuration file <code>.autoortho</code> is located in the user's home directory.  </p>
+<h2 id="performance-tuning">Performance Tuning</h2>
+<p>AutoOrtho includes advanced performance settings that allow you to balance image quality against loading times and stuttering. These settings are available in the Settings tab under "Performance Tuning".</p>
+<p>Key settings include:
+- <strong>Tile Time Budget</strong> - Maximum time to wait for a tile before returning results
+- <strong>Fallback Level</strong> - How aggressively to find replacement imagery for failed chunks
+- <strong>Spatial Prefetching</strong> - Proactively download tiles ahead of your aircraft
+- <strong>Dynamic Zoom Levels</strong> - Automatically adjust imagery quality based on altitude</p>
+<p>For detailed configuration options and recommended settings for different use cases, see the <a href="../performance/">Performance Tuning Guide</a>.</p>
+<p>For troubleshooting missing tiles or stuttering issues, see the <a href="../faq/#missing-color-tiles">FAQ</a>.</p>
+<h2 id="dynamic-zoom-levels">Dynamic Zoom Levels</h2>
+<p>AutoOrtho can automatically adjust imagery zoom levels based on your altitude Above Ground Level (AGL). This provides:
+- Higher detail imagery when flying low
+- Lower detail (faster loading) imagery at high altitudes
+- Terrain-aware calculations — flying at 10,000ft MSL over 5,000ft mountains uses higher quality than 10,000ft over ocean</p>
+<p>Configure quality steps in <strong>Settings</strong> → <strong>Imagery</strong> → <strong>Dynamic Zoom Mode</strong>.</p>
+<p>See the <a href="../performance/#dynamic-zoom-levels">Performance Tuning Guide</a> for detailed configuration.</p>
+<h2 id="simbrief-integration">SimBrief Integration</h2>
+<p>AutoOrtho can integrate with your SimBrief account to use your flight plan data for:
+- <strong>Dynamic Zoom</strong>: Use planned altitudes at waypoints instead of velocity predictions
+- <strong>Prefetching</strong>: Download tiles along your actual flight path ahead of time</p>
+<p>To set up SimBrief integration:
+1. Go to <strong>Settings</strong> → <strong>Setup</strong> tab
+2. Enter your <strong>SimBrief User ID</strong>
+3. Click <strong>Fetch Flight Data</strong> after filing your flight plan
+4. Enable the toggle to use flight data for calculations
+5. Optionally adjust the <strong>Route Calculation Settings</strong> that appear below the toggle</p>
+<h3 id="route-calculation-settings">Route Calculation Settings</h3>
+<p>When flight data is loaded and the "Use Flight Data" toggle is enabled, additional settings become available:</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Route Consideration Radius</strong></td>
+<td>How far (nm) to look for waypoints when calculating tile altitude. Larger values are more conservative.</td>
+</tr>
+<tr>
+<td><strong>Route Deviation Threshold</strong></td>
+<td>Maximum distance (nm) off-route before falling back to DataRef-based calculations.</td>
+</tr>
+<tr>
+<td><strong>Route Prefetch Radius</strong></td>
+<td>How far (nm) around waypoints to prefetch tiles. Larger values prefetch more tiles.</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>ℹ Real-time Changes:</strong> These settings take effect immediately when modified — no restart required. Use <strong>Save Config</strong> to persist your values for future sessions.</p>
+</blockquote>
+<p>See the <a href="../performance/#simbrief-integration">Performance Tuning Guide</a> for detailed information and limitations.</p>
 
 
 
