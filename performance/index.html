@@ -1351,34 +1351,6 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Troubleshooting">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#long-x-plane-loading-times" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Long X-Plane Loading Times
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#other-common-issues" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Other Common Issues
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
 </li>
       
     </ul>
@@ -2223,34 +2195,6 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Troubleshooting">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#long-x-plane-loading-times" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Long X-Plane Loading Times
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#other-common-issues" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Other Common Issues
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
 </li>
       
     </ul>
@@ -2912,10 +2856,6 @@ maptype_override_zoom = 16
 - ✅ Better initial scenery quality (fewer blurry/missing tiles at flight start)
 - ✅ Reduces low-resolution and placeholder tiles
 - ⚠️ May increase initial scenery loading time</p>
-<blockquote>
-<p><strong>⚠️ Tip: Long X-Plane Loading Times?</strong><br />
-If you're experiencing significantly longer X-Plane loading times, try setting <strong>"Allow extra loading time during startup"</strong> to <strong>Off</strong>. This option can dramatically increase scenery loading times, especially when combined with higher zoom levels or slower internet connections. Disabling it will use the normal time budgets during startup, resulting in faster loads at the cost of potentially lower initial scenery quality.</p>
-</blockquote>
 <hr />
 <h2 id="recommended-configurations">Recommended Configurations</h2>
 <h3 id="stutter-free-flying-prioritize-performance">Stutter-Free Flying (Prioritize Performance)</h3>
@@ -3334,16 +3274,6 @@ default_to_exclusion = True
 </table>
 <hr />
 <h2 id="troubleshooting">Troubleshooting</h2>
-<h3 id="long-x-plane-loading-times">Long X-Plane Loading Times</h3>
-<p>If X-Plane takes significantly longer to load scenery with AutoOrtho enabled, the most common cause is the <strong>"Allow extra loading time during startup"</strong> setting (<code>suspend_maxwait</code>). This option extends timeout values by 10× during initial scenery loading, which can add substantial time to X-Plane's startup.</p>
-<p><strong>To reduce loading times:</strong></p>
-<ol>
-<li>Go to <strong>Settings</strong> → <strong>Advanced Settings</strong></li>
-<li>Set <strong>"Allow extra loading time during startup"</strong> to <strong>Off</strong></li>
-<li>This will use normal time budgets during startup, resulting in faster loads</li>
-</ol>
-<p><strong>Note:</strong> Disabling this may result in some tiles loading at lower quality initially, but they will reload at full quality as you fly.</p>
-<h3 id="other-common-issues">Other Common Issues</h3>
 <p>See the <a href="../faq/#missing-color-tiles">FAQ</a> for common issues related to:
 - Missing color (green) tiles
 - Long loading times
