@@ -880,7 +880,7 @@
 <h2 id="simbrief-integration">SimBrief Integration</h2>
 <p>AutoOrtho can integrate with your SimBrief account to use your flight plan data for:
 - <strong>Dynamic Zoom</strong>: Use planned altitudes at waypoints instead of velocity predictions
-- <strong>Prefetching</strong>: Download tiles along your actual flight path ahead of time</p>
+- <strong>Prefetching</strong>: Download tiles along your actual flight path, prioritized by time-to-encounter using SimBrief's calculated flight times</p>
 <p>To set up SimBrief integration:
 1. Go to <strong>Settings</strong> → <strong>Setup</strong> tab
 2. Enter your <strong>SimBrief User ID</strong>
@@ -907,7 +907,7 @@
 </tr>
 <tr>
 <td><strong>Route Prefetch Radius</strong></td>
-<td>How far (nm) around waypoints to prefetch tiles. Larger values prefetch more tiles.</td>
+<td>How far (nm) perpendicular to your route to prefetch tiles. The path is sampled uniformly along the route; this controls the width of coverage.</td>
 </tr>
 </tbody>
 </table>

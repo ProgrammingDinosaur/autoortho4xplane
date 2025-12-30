@@ -855,22 +855,22 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#legacy-settings" class="md-nav__link">
+  <a href="#per-chunk-timeout-settings" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Legacy Settings
+        Per-Chunk Timeout Settings
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Legacy Settings">
+    <nav class="md-nav" aria-label="Per-Chunk Timeout Settings">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#max-wait-maxwait" class="md-nav__link">
+  <a href="#per-chunk-max-wait-maxwait" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Max Wait (maxwait)
+        Per-Chunk Max Wait (maxwait)
       
     </span>
   </a>
@@ -878,10 +878,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#suspend-max-wait-at-startup-suspend_maxwait" class="md-nav__link">
+  <a href="#extended-loading-at-startup-suspend_maxwait" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Suspend Max Wait at Startup (suspend_maxwait)
+        Extended Loading at Startup (suspend_maxwait)
       
     </span>
   </a>
@@ -1350,6 +1350,34 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#long-x-plane-loading-times" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Long X-Plane Loading Times
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#other-common-issues" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Other Common Issues
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1699,22 +1727,22 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#legacy-settings" class="md-nav__link">
+  <a href="#per-chunk-timeout-settings" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Legacy Settings
+        Per-Chunk Timeout Settings
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Legacy Settings">
+    <nav class="md-nav" aria-label="Per-Chunk Timeout Settings">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#max-wait-maxwait" class="md-nav__link">
+  <a href="#per-chunk-max-wait-maxwait" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Max Wait (maxwait)
+        Per-Chunk Max Wait (maxwait)
       
     </span>
   </a>
@@ -1722,10 +1750,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#suspend-max-wait-at-startup-suspend_maxwait" class="md-nav__link">
+  <a href="#extended-loading-at-startup-suspend_maxwait" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Suspend Max Wait at Startup (suspend_maxwait)
+        Extended Loading at Startup (suspend_maxwait)
       
     </span>
   </a>
@@ -2194,6 +2222,34 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#long-x-plane-loading-times" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Long X-Plane Loading Times
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#other-common-issues" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Other Common Issues
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -2709,11 +2765,16 @@ maptype_override_zoom = 16
 <li><strong>Config file:</strong> <code>prefetch_enabled = True</code></li>
 </ul>
 <p>When enabled, AutoOrtho monitors your aircraft's position, heading, and speed to predict which tiles you'll need next and downloads them in advance.</p>
-<p><strong>How it works:</strong>
+<p><strong>How it works:</strong></p>
+<p><em>With SimBrief flight data loaded:</em>
+1. AutoOrtho follows your actual flight plan, interpolating between waypoints
+2. Uses SimBrief's calculated times (accounting for winds and climb/descent)
+3. Prioritizes tiles by time-to-encounter (closest tiles first)
+4. Downloads tiles uniformly along your entire route</p>
+<p><em>Without SimBrief (velocity-based):</em>
 1. AutoOrtho tracks your aircraft's heading and ground speed
-2. It calculates which tiles are in your flight path
-3. It downloads those tiles in the background before you reach them
-4. When X-Plane requests those tiles, they're already cached</p>
+2. It calculates which tiles are in your flight path ahead
+3. It downloads those tiles in the background before you reach them</p>
 <p><strong>Prefetching with Dynamic Zoom:</strong></p>
 <p>When Dynamic Zoom is enabled, the prefetcher uses your predicted AGL altitude at each prefetch location to determine the appropriate zoom level. This means:
 - Tiles prefetched for a descent will be at higher zoom levels
@@ -2785,23 +2846,76 @@ maptype_override_zoom = 16
 - Medium flights / Jets: 10-20 minutes<br />
 - Long haul / Fast jets: 20-30 minutes</p>
 <hr />
-<h3 id="legacy-settings">Legacy Settings</h3>
-<p>These settings are from the original timeout system and are still available for compatibility.</p>
-<h4 id="max-wait-maxwait">Max Wait (<code>maxwait</code>)</h4>
+<h3 id="per-chunk-timeout-settings">Per-Chunk Timeout Settings</h3>
+<p>These settings work <strong>alongside</strong> the tile time budget to control individual chunk download behavior.</p>
+<h4 id="per-chunk-max-wait-maxwait">Per-Chunk Max Wait (<code>maxwait</code>)</h4>
 <ul>
 <li><strong>Type:</strong> Float (seconds)</li>
-<li><strong>Default:</strong> 1.5</li>
-<li><strong>Config file:</strong> <code>maxwait = 1.5</code></li>
+<li><strong>Default:</strong> 5.0</li>
+<li><strong>Range:</strong> 0.1 - 10.0</li>
+<li><strong>Config file:</strong> <code>maxwait = 5.0</code></li>
+<li><strong>UI:</strong> Settings → Advanced Settings → Per-chunk max wait</li>
 </ul>
-<p>The per-chunk timeout used when the time budget system is disabled. Each chunk waits up to this long before timing out.</p>
-<p><strong>Note:</strong> When <code>use_time_budget = True</code>, this setting is largely superseded by <code>tile_time_budget</code>.</p>
-<h4 id="suspend-max-wait-at-startup-suspend_maxwait">Suspend Max Wait at Startup (<code>suspend_maxwait</code>)</h4>
+<p>Maximum time to wait for a <strong>single chunk</strong> to download. This works in combination with the tile time budget:</p>
+<ul>
+<li><strong>Tile Time Budget:</strong> Total time for the entire tile (all 256 chunks)</li>
+<li><strong>Per-Chunk Max Wait:</strong> Maximum time for each individual chunk download</li>
+</ul>
+<p>A chunk will stop waiting when <strong>either</strong> limit is reached, whichever comes first. This prevents a single slow chunk from consuming the entire tile budget.</p>
+<p><strong>How it works:</strong></p>
+<pre><code>For each chunk:
+  wait_time = min(remaining_tile_budget, maxwait)
+  wait for chunk up to wait_time
+</code></pre>
+<p><strong>Recommended values:</strong>
+| Network Speed | Recommended <code>maxwait</code> |
+|--------------|----------------------|
+| Fast (fiber) | 2.0 seconds |
+| Normal (cable/DSL) | 5.0 seconds (default) |
+| Slow/unreliable | 10.0 seconds |</p>
+<p><strong>When time budget is disabled:</strong> This becomes the sole timeout mechanism — each chunk waits up to <code>maxwait</code> seconds independently, which can result in much longer total tile times (up to 256 × maxwait for a full tile).</p>
+<h4 id="extended-loading-at-startup-suspend_maxwait">Extended Loading at Startup (<code>suspend_maxwait</code>)</h4>
 <ul>
 <li><strong>Type:</strong> Boolean</li>
 <li><strong>Default:</strong> True</li>
 <li><strong>Config file:</strong> <code>suspend_maxwait = True</code></li>
+<li><strong>UI:</strong> Settings → Advanced Settings → "Allow extra loading time during startup"</li>
 </ul>
-<p>When enabled, uses a much longer timeout during X-Plane startup to ensure initial tiles load completely before flight begins.</p>
+<p>When enabled, AutoOrtho uses significantly longer timeouts during X-Plane's initial scenery load (before the flight starts). This ensures tiles load at full quality before you begin flying.</p>
+<p><strong>Startup behavior when enabled:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Normal Flight</th>
+<th>During Startup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tile Time Budget</td>
+<td>As configured</td>
+<td><strong>10× the configured value</strong></td>
+</tr>
+<tr>
+<td>Per-Chunk Max Wait</td>
+<td>As configured</td>
+<td><strong>20 seconds</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Example:</strong> With <code>tile_time_budget = 180</code> and <code>maxwait = 5.0</code>:
+- During startup: 1800s tile budget, 20s per-chunk wait
+- During flight: 180s tile budget, 5s per-chunk wait</p>
+<p><strong>How startup is detected:</strong> AutoOrtho considers you to be in "startup mode" until X-Plane's DataRef connection is established, which happens when the flight becomes active (after the "Reading new scenery files" splash screen).</p>
+<p><strong>Trade-offs:</strong>
+- ✅ Better initial scenery quality (fewer blurry/missing tiles at flight start)
+- ✅ Reduces low-resolution and placeholder tiles
+- ⚠️ May increase initial scenery loading time</p>
+<blockquote>
+<p><strong>⚠️ Tip: Long X-Plane Loading Times?</strong><br />
+If you're experiencing significantly longer X-Plane loading times, try setting <strong>"Allow extra loading time during startup"</strong> to <strong>Off</strong>. This option can dramatically increase scenery loading times, especially when combined with higher zoom levels or slower internet connections. Disabling it will use the normal time budgets during startup, resulting in faster loads at the cost of potentially lower initial scenery quality.</p>
+</blockquote>
 <hr />
 <h2 id="recommended-configurations">Recommended Configurations</h2>
 <h3 id="stutter-free-flying-prioritize-performance">Stutter-Free Flying (Prioritize Performance)</h3>
@@ -3024,13 +3138,18 @@ default_to_exclusion = True
 - Uses the <strong>highest</strong> ground elevation — accounts for mountains
 - AGL = lowest_MSL - highest_ground = most conservative (highest quality) result</p>
 <h4 id="prefetching-with-simbrief">Prefetching with SimBrief</h4>
-<p>Instead of prefetching based on velocity vector prediction, AutoOrtho follows your actual flight path:</p>
+<p>Instead of prefetching based on velocity vector prediction, AutoOrtho follows your actual flight path with time-based prioritization:</p>
 <ol>
-<li>Gets upcoming waypoints from your SimBrief flight plan</li>
-<li>For each waypoint, calculates the appropriate zoom level based on planned AGL altitude</li>
-<li>Prefetches tiles around each waypoint at the correct zoom level</li>
-<li>Only prefetches when the download queue is not busy (priority tiles come first)</li>
+<li><strong>Projects your position onto the route</strong> — finds exactly where you are on the flight plan</li>
+<li><strong>Calculates your "current time"</strong> — interpolates between waypoint times based on position</li>
+<li><strong>Walks forward along the entire path</strong> — interpolating between waypoints at regular intervals (not just around waypoints)</li>
+<li><strong>Uses SimBrief's planned times</strong> — accounts for winds, climb/descent speeds, and holds</li>
+<li><strong>Calculates time-to-encounter</strong> for each point along the path</li>
+<li><strong>Prioritizes tiles by time</strong> — tiles you'll reach sooner are prefetched first</li>
+<li><strong>Stops at the configured lookahead time</strong> — doesn't waste bandwidth on distant tiles</li>
 </ol>
+<p><strong>Key advantage:</strong> The path is uniformly sampled between waypoints, so even long oceanic legs or direct routes with distant waypoints get full coverage. Tiles are downloaded in the order you'll actually encounter them.</p>
+<p><strong>Example:</strong> If your next waypoint is 200nm away but you'll pass near a tile in 5 minutes, that tile is prefetched before tiles near the waypoint itself.</p>
 <h3 id="configuration-options">Configuration Options</h3>
 <p>These settings are available in <strong>Settings</strong> → <strong>Setup</strong> → <strong>SimBrief Integration</strong> when flight data is loaded and the "Use Flight Data" toggle is enabled.</p>
 <table>
@@ -3059,7 +3178,7 @@ default_to_exclusion = True
 <td>Route Prefetch Radius</td>
 <td>40 nm</td>
 <td>10-150 nm</td>
-<td>Radius around waypoints for pre-fetching tiles. Larger values prefetch more tiles but use more bandwidth.</td>
+<td>Radius around path points for pre-fetching tiles. Larger values prefetch more tiles perpendicular to your route.</td>
 </tr>
 </tbody>
 </table>
@@ -3215,6 +3334,16 @@ default_to_exclusion = True
 </table>
 <hr />
 <h2 id="troubleshooting">Troubleshooting</h2>
+<h3 id="long-x-plane-loading-times">Long X-Plane Loading Times</h3>
+<p>If X-Plane takes significantly longer to load scenery with AutoOrtho enabled, the most common cause is the <strong>"Allow extra loading time during startup"</strong> setting (<code>suspend_maxwait</code>). This option extends timeout values by 10× during initial scenery loading, which can add substantial time to X-Plane's startup.</p>
+<p><strong>To reduce loading times:</strong></p>
+<ol>
+<li>Go to <strong>Settings</strong> → <strong>Advanced Settings</strong></li>
+<li>Set <strong>"Allow extra loading time during startup"</strong> to <strong>Off</strong></li>
+<li>This will use normal time budgets during startup, resulting in faster loads</li>
+</ol>
+<p><strong>Note:</strong> Disabling this may result in some tiles loading at lower quality initially, but they will reload at full quality as you fly.</p>
+<h3 id="other-common-issues">Other Common Issues</h3>
 <p>See the <a href="../faq/#missing-color-tiles">FAQ</a> for common issues related to:
 - Missing color (green) tiles
 - Long loading times
