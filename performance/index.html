@@ -755,6 +755,34 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#startup-loading-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Startup Loading Behavior
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Startup Loading Behavior">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#suspend-maxwait-suspend_maxwait" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Suspend Maxwait (suspend_maxwait)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#dynamic-zoom-levels" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1350,6 +1378,34 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#long-x-plane-loading-times" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Long X-Plane Loading Times
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#other-common-issues" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Other Common Issues
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1599,6 +1655,34 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#startup-loading-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Startup Loading Behavior
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Startup Loading Behavior">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#suspend-maxwait-suspend_maxwait" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Suspend Maxwait (suspend_maxwait)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#dynamic-zoom-levels" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2194,6 +2278,34 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#long-x-plane-loading-times" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Long X-Plane Loading Times
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#other-common-issues" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Other Common Issues
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -2581,6 +2693,57 @@ maptype_override_zoom = 16
 - <strong>Total worst-case time:</strong> 10s + 12s = <strong>22 seconds</strong></p>
 <p><strong>Recommendation:</strong> Start with 3.0s. If you see fallbacks timing out (check logs), increase to 5.0s. If loading is too slow, decrease to 1.5s.</p>
 <hr />
+<h3 id="startup-loading-behavior">Startup Loading Behavior</h3>
+<h4 id="suspend-maxwait-suspend_maxwait">Suspend Maxwait (<code>suspend_maxwait</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Boolean (True/False)</li>
+<li><strong>Default:</strong> True</li>
+<li><strong>Config file:</strong> <code>suspend_maxwait = True</code></li>
+</ul>
+<p>When enabled, AutoOrtho extends timeout values during initial scenery loading (before the first flight begins). This allows more time for downloads to complete during the initial load, resulting in fewer missing tiles when the flight starts.</p>
+<p><strong>How it works:</strong>
+- AutoOrtho detects the "loading" phase by tracking if X-Plane has <strong>ever</strong> sent flight data via UDP
+- During initial loading (before first connection), the tile time budget is multiplied by 10×
+- Once the flight begins (X-Plane starts sending position data), normal timeouts resume permanently
+- <strong>Important:</strong> Temporary disconnects (e.g., from stuttering) do NOT re-enable extended timeouts</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Time Budget Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Initial loading (never connected)</td>
+<td><code>tile_time_budget × 10</code></td>
+</tr>
+<tr>
+<td>Flying (UDP connected)</td>
+<td><code>tile_time_budget</code> (normal)</td>
+</tr>
+<tr>
+<td>Temporary disconnect (stutter)</td>
+<td><code>tile_time_budget</code> (normal - no penalty)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Stall Detection:</strong>
+AutoOrtho monitors download progress and will log warnings if downloads appear stalled:
+- After 60 seconds with no successful downloads: <code>"Downloads appear slow..."</code> warning
+- After 180 seconds with no successful downloads: <code>"⚠️ DOWNLOADS STALLED..."</code> warning</p>
+<p>These warnings help identify server-side throttling vs client-side issues.</p>
+<p><strong>Note:</strong> If you experience very long loading times (&gt;5 minutes stuck at "Reading scenery files"), this may indicate:
+- Server throttling (especially with BI/Bing imagery during high-traffic periods)
+- Network connectivity issues
+- Very high zoom level with slow internet connection</p>
+<p><strong>Troubleshooting Long Loading Times:</strong>
+1. Check AutoOrtho logs for "Downloads appear slow" or "DOWNLOADS STALLED" warnings - these indicate server throttling
+2. Try a different imagery source (GO2, EOX) to rule out server-specific issues
+3. Lower your max zoom level temporarily to reduce download volume
+4. Ensure your file cache is enabled - subsequent flights load much faster
+5. If issues persist, set <code>suspend_maxwait = False</code> for stricter timeouts during loading (may result in more missing tiles initially)</p>
+<hr />
 <h3 id="dynamic-zoom-levels">Dynamic Zoom Levels</h3>
 <p>The Dynamic Zoom system automatically adjusts imagery quality based on your altitude Above Ground Level (AGL). This provides higher detail when flying low and saves resources at high altitudes where detail matters less.</p>
 <h4 id="why-agl-instead-of-msl">Why AGL Instead of MSL?</h4>
@@ -2856,6 +3019,10 @@ maptype_override_zoom = 16
 - ✅ Better initial scenery quality (fewer blurry/missing tiles at flight start)
 - ✅ Reduces low-resolution and placeholder tiles
 - ⚠️ May increase initial scenery loading time</p>
+<blockquote>
+<p><strong>⚠️ Tip: Long X-Plane Loading Times?</strong><br />
+If you're experiencing significantly longer X-Plane loading times, try setting <strong>"Allow extra loading time during startup"</strong> to <strong>Off</strong>. This option can dramatically increase scenery loading times, especially when combined with higher zoom levels or slower internet connections. Disabling it will use the normal time budgets during startup, resulting in faster loads at the cost of potentially lower initial scenery quality.</p>
+</blockquote>
 <hr />
 <h2 id="recommended-configurations">Recommended Configurations</h2>
 <h3 id="stutter-free-flying-prioritize-performance">Stutter-Free Flying (Prioritize Performance)</h3>
@@ -3274,6 +3441,16 @@ default_to_exclusion = True
 </table>
 <hr />
 <h2 id="troubleshooting">Troubleshooting</h2>
+<h3 id="long-x-plane-loading-times">Long X-Plane Loading Times</h3>
+<p>If X-Plane takes significantly longer to load scenery with AutoOrtho enabled, the most common cause is the <strong>"Allow extra loading time during startup"</strong> setting (<code>suspend_maxwait</code>). This option extends timeout values by 10× during initial scenery loading, which can add substantial time to X-Plane's startup.</p>
+<p><strong>To reduce loading times:</strong></p>
+<ol>
+<li>Go to <strong>Settings</strong> → <strong>Advanced Settings</strong></li>
+<li>Set <strong>"Allow extra loading time during startup"</strong> to <strong>Off</strong></li>
+<li>This will use normal time budgets during startup, resulting in faster loads</li>
+</ol>
+<p><strong>Note:</strong> Disabling this may result in some tiles loading at lower quality initially, but they will reload at full quality as you fly.</p>
+<h3 id="other-common-issues">Other Common Issues</h3>
 <p>See the <a href="../faq/#missing-color-tiles">FAQ</a> for common issues related to:
 - Missing color (green) tiles
 - Long loading times
