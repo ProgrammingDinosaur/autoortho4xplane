@@ -1122,6 +1122,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#decision-preservation-during-scenery-reload" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decision Preservation During Scenery Reload
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#example-configuration" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2018,6 +2029,17 @@
         
       </ul>
     </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#decision-preservation-during-scenery-reload" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decision Preservation During Scenery Reload
+      
+    </span>
+  </a>
   
 </li>
         
@@ -3119,15 +3141,17 @@ max_zoom_level = 15
 <p>When time exclusion is active:</p>
 <ol>
 <li>AutoOrtho monitors the simulator's local time via the <code>sim/time/local_time_sec</code> dataref</li>
-<li>During the exclusion period, DSF files are hidden from X-Plane</li>
-<li>X-Plane falls back to its default scenery (which often has better night lighting)</li>
+<li>During the exclusion period, DSF file reads are <strong>redirected</strong> to X-Plane's global scenery</li>
+<li>X-Plane uses its default scenery (which often has better night lighting)</li>
 <li>When the exclusion period ends, AutoOrtho scenery becomes available again</li>
 </ol>
+<p><strong>Important:</strong> DSF files are never hidden from X-Plane. X-Plane indexes DSF files at flight load time, so hiding them would cause missing terrain. Instead, AutoOrtho redirects reads to the corresponding global scenery DSF files, ensuring terrain data is always available.</p>
 <h3 id="safety-features">Safety Features</h3>
 <p>The time exclusion system includes important safety features:</p>
 <ul>
-<li><strong>Active DSF Protection:</strong> DSF files that are currently in use by X-Plane will NOT be hidden, even if the exclusion period starts. This prevents crashes or graphical glitches.</li>
-<li><strong>Gradual Transition:</strong> Only new DSF requests are blocked during exclusion. Previously loaded scenery continues to work until X-Plane naturally releases it.</li>
+<li><strong>Active DSF Protection:</strong> DSF files that are currently in use by X-Plane will NOT be redirected, even if the exclusion period starts. This prevents crashes or graphical glitches.</li>
+<li><strong>Gradual Transition:</strong> Only new DSF requests are redirected during exclusion. Previously loaded scenery continues to work until X-Plane naturally releases it.</li>
+<li><strong>Global Scenery Fallback:</strong> When redirecting, AutoOrtho looks for the equivalent DSF in X-Plane's Global Scenery folder. If not found, the original AutoOrtho file is served.</li>
 </ul>
 <h3 id="configuration">Configuration</h3>
 <h4 id="enable-time-exclusion-enabled">Enable Time Exclusion (<code>enabled</code>)</h4>
@@ -3182,6 +3206,50 @@ max_zoom_level = 15
 <p><strong>When to keep disabled:</strong>
 - You prefer AutoOrtho to work normally during loading screens
 - You only want exclusion to apply when sim time is confirmed</p>
+<h3 id="decision-preservation-during-scenery-reload">Decision Preservation During Scenery Reload</h3>
+<p>Once the simulator time becomes available and AutoOrtho determines the correct exclusion state, this decision is <strong>preserved</strong> during temporary disconnections such as when you trigger "Reload Scenery" in X-Plane.</p>
+<p><strong>Why this matters:</strong></p>
+<p>Without decision preservation, the following problem would occur:
+1. You start a flight with "Default to Exclusion" enabled
+2. Time exclusion activates initially (no sim time available yet)
+3. Sim time becomes available (e.g., 15:00 / 3 PM) → exclusion deactivates correctly
+4. You trigger "Reload Scenery" in X-Plane
+5. During reload, sim time temporarily becomes unavailable
+6. ❌ Without preservation: exclusion would incorrectly re-activate
+7. ✅ With preservation: exclusion stays inactive (correct behavior)</p>
+<p><strong>How it works:</strong></p>
+<ul>
+<li>When sim time is received, AutoOrtho records both the time and the exclusion decision</li>
+<li>If sim time becomes temporarily unavailable (during reload), the last decision is preserved</li>
+<li>The preserved decision is updated whenever new sim time data is received</li>
+<li>Normal time-based transitions still work (crossing into/out of exclusion hours)</li>
+</ul>
+<p><strong>Limitations:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Limitation</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Persists until restart</strong></td>
+<td>The preserved decision remains until AutoOrtho is fully restarted</td>
+</tr>
+<tr>
+<td><strong>To reset behavior</strong></td>
+<td>Quit and restart AutoOrtho to return to the <code>default_to_exclusion</code> initial behavior</td>
+</tr>
+<tr>
+<td><strong>Updates on new time</strong></td>
+<td>If sim time indicates a state change (e.g., crossing into night), it will update when time becomes available again</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>💡 Tip:</strong> If you notice the exclusion state is "stuck" after multiple scenery reloads, simply restart AutoOrtho to reset to the configured default behavior.</p>
+</blockquote>
 <h3 id="example-configuration">Example Configuration</h3>
 <p>To disable AutoOrtho between 10 PM and 6 AM (night hours):</p>
 <pre><code class="language-ini">[time_exclusion]

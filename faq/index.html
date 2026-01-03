@@ -662,6 +662,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#time-exclusion-re-activated-after-scenery-reload" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Time exclusion re-activated after scenery reload
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#i-see-a-messge-in-the-logs-but-otherwise-things-work-fine" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1232,6 +1243,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#time-exclusion-re-activated-after-scenery-reload" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Time exclusion re-activated after scenery reload
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#i-see-a-messge-in-the-logs-but-otherwise-things-work-fine" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1750,6 +1772,14 @@ max_zoom_level = 16
 - Always release a tile to X-Plane within 180 seconds (predictable)
 - May have some missing chunks if network is slow or zoom level is high</p>
 <p><strong>Recommendation:</strong> Keep <code>use_time_budget = True</code> to use the new predictable system.</p>
+<h3 id="time-exclusion-re-activated-after-scenery-reload">Time exclusion re-activated after scenery reload</h3>
+<p><strong>Symptom:</strong> You have "Default to Exclusion" enabled, the exclusion correctly deactivated when sim time showed daytime, but after triggering "Reload Scenery" the exclusion incorrectly re-activated and you see global scenery instead of orthos.</p>
+<p><strong>Solution:</strong> This issue has been fixed. AutoOrtho now preserves the exclusion decision made based on actual sim time during temporary disconnections (like scenery reload).</p>
+<p>If you're still experiencing this issue:
+1. Make sure you're running the latest version of AutoOrtho
+2. If the state seems "stuck", restart AutoOrtho to reset to the default behavior</p>
+<p><strong>Technical details:</strong> When X-Plane reloads scenery, the UDP connection temporarily disconnects, making sim time unavailable. AutoOrtho now remembers the last decision made with real sim time and uses it during these brief disconnections, rather than falling back to the <code>default_to_exclusion</code> setting.</p>
+<p>See <a href="../performance/#decision-preservation-during-scenery-reload">Time Exclusion - Decision Preservation</a> for more details.</p>
 <h3 id="i-see-a-messge-in-the-logs-but-otherwise-things-work-fine">I see a messge in the logs, but otherwise things work fine.</h3>
 <p>The log will log various things, typically info and warnings can be ignored
 unless other issues are seen.</p>
