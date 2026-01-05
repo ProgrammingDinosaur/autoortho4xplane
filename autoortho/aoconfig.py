@@ -187,6 +187,15 @@ predictive_dds_build_interval_ms = 500
 #   - Pro: Faster prebuilds, no extra I/O
 #   - Con: Failed chunks show missing color instead of fallback data
 predictive_dds_use_fallbacks = True
+# DDS builder worker count (0 = auto-detect based on CPU cores)
+# With Python 3.14 free-threading: uses half of CPU cores
+# With Python <= 3.13 (GIL): uses 1 worker (single-threaded)
+dds_builder_workers = 0
+# Maximum concurrent decode operations (0 = auto-detect)
+# Higher values benefit from Python 3.14 free-threading
+max_decode_concurrency = 0
+# Cache writer worker count (0 = auto-detect, typically 2-8)
+cache_writer_workers = 0
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False

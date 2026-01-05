@@ -78,8 +78,8 @@ import geocoder
 
 # Import PyQt6 modules
 
-from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QIcon
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtGui import QIcon
 
 try:
     from autoortho import config_ui_qt as config_ui

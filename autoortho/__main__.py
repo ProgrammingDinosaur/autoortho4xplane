@@ -29,9 +29,9 @@ except ImportError:
     from aoconfig import CFG
 
 try:
-    from autoortho.utils.constants import system_type
+    from autoortho.utils.constants import system_type, CURRENT_CPU_COUNT
 except ImportError:
-    from utils.constants import system_type
+    from utils.constants import system_type, CURRENT_CPU_COUNT
 
 # Install crash handler EARLY, before any C extensions load
 # This allows us to log C-level crashes (segfaults, access violations)
@@ -180,6 +180,24 @@ def setuplogs():
     log = logging.getLogger(__name__)
     log.info(f"Setup logs: {log_dir}")
     log.info(f"File log level: {file_log_level_str}, Console log level: {console_log_level_str}")
+    
+    # Log Python version and free-threading status
+    log.info(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} "
+             f"on {platform.system()} ({platform.machine()})")
+    log.info(f"CPU cores available: {CURRENT_CPU_COUNT}")
+    
+    # Free-threading status (Python 3.14+)
+    if sys.version_info >= (3, 14):
+        if hasattr(sys, '_is_gil_enabled'):
+            gil_enabled = sys._is_gil_enabled()
+            if gil_enabled:
+                log.info("Free-threading: AVAILABLE (GIL enabled - set PYTHON_GIL=0 to disable)")
+            else:
+                log.info("Free-threading: ENABLED (no GIL) - parallel DDS processing active")
+        else:
+            log.info("Free-threading: NOT AVAILABLE (standard Python build)")
+    else:
+        log.info(f"Free-threading: NOT AVAILABLE (requires Python 3.14+, current: {sys.version_info.major}.{sys.version_info.minor})")
 
 
 # If SSL_CERT_DIR is not set, default to /etc/ssl/certs when available for Linux users.

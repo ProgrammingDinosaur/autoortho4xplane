@@ -45,7 +45,7 @@ try:
 except ImportError:
     from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
 
-from PySide6.QtWidgets import (
+from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QScrollArea,
@@ -54,10 +54,10 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QInputDialog,
     QHeaderView
 )
-from PySide6.QtCore import (
+from PyQt6.QtCore import (
     Qt, QThread, Signal, QTimer, QSize, QPoint, QObject, QEvent
 )
-from PySide6.QtGui import (
+from PyQt6.QtGui import (
     QPixmap, QIcon, QColor, QWheelEvent, QCursor
 )
 
@@ -2463,6 +2463,55 @@ class ConfigUI(QMainWindow):
         threads_layout.addStretch()
         autoortho_layout.addLayout(threads_layout)
 
+        # ═══════════════════════════════════════════════════════════════════
+        # PYTHON 3.14 FREE-THREADING OPTIONS
+        # ═══════════════════════════════════════════════════════════════════
+        # DDS Builder Workers
+        dds_workers_layout = QHBoxLayout()
+        dds_workers_label = QLabel("DDS Builder Workers:")
+        dds_workers_label.setToolTip(
+            "Number of parallel DDS builder threads (0 = auto-detect).\n\n"
+            "With Python 3.14+ free-threading:\n"
+            "  - Auto: Uses half of CPU cores\n"
+            "  - Higher values = faster background DDS building\n\n"
+            "With Python 3.13 and earlier (GIL mode):\n"
+            "  - Auto: Uses 1 worker (single-threaded)\n"
+            "  - Higher values have limited benefit due to GIL"
+        )
+        dds_workers_layout.addWidget(dds_workers_label)
+        
+        self.dds_builder_workers_spinbox = ModernSpinBox()
+        self.dds_builder_workers_spinbox.setFocusPolicy(Qt.StrongFocus)
+        self.dds_builder_workers_spinbox.setRange(0, 16)
+        initial_dds_workers = int(getattr(self.cfg.autoortho, 'dds_builder_workers', 0))
+        self.dds_builder_workers_spinbox.setValue(initial_dds_workers)
+        self.dds_builder_workers_spinbox.setObjectName('dds_builder_workers')
+        self.dds_builder_workers_spinbox.setToolTip("0 = auto-detect based on CPU cores and threading mode")
+        dds_workers_layout.addWidget(self.dds_builder_workers_spinbox)
+        dds_workers_layout.addStretch()
+        autoortho_layout.addLayout(dds_workers_layout)
+        
+        # Cache Writer Workers
+        cache_workers_layout = QHBoxLayout()
+        cache_workers_label = QLabel("Cache Writer Workers:")
+        cache_workers_label.setToolTip(
+            "Number of parallel cache writer threads (0 = auto-detect).\n\n"
+            "Higher values can improve SSD write performance.\n"
+            "Auto-detect: 4 (GIL mode) or up to 8 (free-threading)"
+        )
+        cache_workers_layout.addWidget(cache_workers_label)
+        
+        self.cache_writer_workers_spinbox = ModernSpinBox()
+        self.cache_writer_workers_spinbox.setFocusPolicy(Qt.StrongFocus)
+        self.cache_writer_workers_spinbox.setRange(0, 16)
+        initial_cache_workers = int(getattr(self.cfg.autoortho, 'cache_writer_workers', 0))
+        self.cache_writer_workers_spinbox.setValue(initial_cache_workers)
+        self.cache_writer_workers_spinbox.setObjectName('cache_writer_workers')
+        self.cache_writer_workers_spinbox.setToolTip("0 = auto-detect (typically 4-8 workers)")
+        cache_workers_layout.addWidget(self.cache_writer_workers_spinbox)
+        cache_workers_layout.addStretch()
+        autoortho_layout.addLayout(cache_workers_layout)
+
         missing_color_layout = QHBoxLayout()
         missing_color_layout.setSpacing(10)
         missing_color_label = QLabel("Missing Tile Color:")
@@ -4134,7 +4183,7 @@ class ConfigUI(QMainWindow):
                 self.cache_thread = None
             # If invoked during shutdown, finalize closing without blocking UI
             if for_exit:
-                from PySide6.QtCore import QTimer
+                from PyQt6.QtCore import QTimer
                 QTimer.singleShot(0, self._finalize_shutdown)
 
     def on_install_scenery(self, region_id):
@@ -4601,6 +4650,15 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
             )
+            
+            # Python 3.14 free-threading options
+            self.cfg.autoortho.dds_builder_workers = str(
+                self.dds_builder_workers_spinbox.value()
+            )
+            self.cfg.autoortho.cache_writer_workers = str(
+                self.cache_writer_workers_spinbox.value()
+            )
+            
             self.cfg.autoortho.missing_color = [self.missing_color.red(),
                                                 self.missing_color.green(),
                                                 self.missing_color.blue()]
@@ -5105,7 +5163,7 @@ class ConfigUI(QMainWindow):
             self.close()
         except Exception:
             # As a fallback, force quit the application
-            from PySide6.QtWidgets import QApplication
+            from PyQt6.QtWidgets import QApplication
             app = QApplication.instance()
             if app is not None:
                 app.quit()

@@ -4,7 +4,28 @@
 # It bundles the Python interpreter and all dependencies.
 #
 # Install with: pip install -r requirements-build.txt
+#
+# =============================================================================
+# PYTHON 3.14+ FREE-THREADING BUILD NOTES
+# =============================================================================
+# For optimal performance, build with Python 3.14t (free-threading build):
+#
+# 1. Install Python 3.14t:
+#    - macOS: brew install python@3.14 (with --with-freethreading if available)
+#    - pyenv: pyenv install 3.14.0t
+#    - GitHub Actions: uses: actions/setup-python@v5 with python-version: '3.14t'
+#
+# 2. Create venv with free-threading Python:
+#    python3.14t -m venv .venv
+#    source .venv/bin/activate
+#
+# 3. Build with free-threading enabled:
+#    PYTHON_GIL=0 pyinstaller autoortho.spec
+#
+# The resulting executable will use free-threading for parallel DDS processing.
+# =============================================================================
 
 pyinstaller>=6.17.0
     # Primary build tool - creates standalone executables
     # Uses real CPython interpreter for maximum compatibility
+    # Note: PyInstaller 6.5+ supports Python 3.14 free-threading builds

@@ -9,6 +9,11 @@ Usage:
     pyinstaller autoortho.spec
 
 The resulting executable will be in dist/autoortho/
+
+Python 3.14+ Free-Threading Notes:
+    - Build with Python 3.14t (free-threading build) for optimal performance
+    - The bundled app will automatically enable free-threading if available
+    - Set PYTHON_GIL=0 environment variable to enable at runtime
 """
 
 import sys
@@ -16,6 +21,19 @@ import os
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 block_cipher = None
+
+# =============================================================================
+# Free-Threading Detection (Python 3.14+)
+# =============================================================================
+# Check if we're building with a free-threading Python
+FREE_THREADING_BUILD = False
+if sys.version_info >= (3, 14) and hasattr(sys, '_is_gil_enabled'):
+    FREE_THREADING_BUILD = True
+    print(f"Building with Python {sys.version_info.major}.{sys.version_info.minor} "
+          f"(free-threading {'enabled' if not sys._is_gil_enabled() else 'available'})")
+else:
+    print(f"Building with Python {sys.version_info.major}.{sys.version_info.minor} "
+          f"(standard build, free-threading not available)")
 
 # Determine platform
 if sys.platform == 'win32':
@@ -147,9 +165,9 @@ if sys.platform == 'darwin':
 # Hidden imports (modules that PyInstaller might miss)
 # =============================================================================
 hiddenimports = [
-    'PySide6.QtCore',
-    'PySide6.QtGui',
-    'PySide6.QtWidgets',
+    'PyQt6.QtCore',
+    'PyQt6.QtGui',
+    'PyQt6.QtWidgets',
     'geocoder',
     'geocoder.osm',
     'psutil',
@@ -175,6 +193,18 @@ elif sys.platform == 'win32':
     ])
 
 # =============================================================================
+# Runtime Hooks
+# =============================================================================
+# Runtime hooks run before the main application starts
+runtime_hooks_list = []
+
+# Add free-threading runtime hook if building with Python 3.14+
+freethreading_hook = os.path.join(autoortho_path, 'runtime_hook_freethreading.py')
+if os.path.exists(freethreading_hook):
+    runtime_hooks_list.append(freethreading_hook)
+    print(f"Added free-threading runtime hook: {freethreading_hook}")
+
+# =============================================================================
 # Analysis
 # =============================================================================
 a = Analysis(
@@ -185,7 +215,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=runtime_hooks_list,
     excludes=[
         'tkinter',
         'matplotlib',

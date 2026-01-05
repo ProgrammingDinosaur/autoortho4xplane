@@ -25,9 +25,11 @@ except ImportError:
     from aoconfig import CFG
 
 try:
-    from autoortho.utils.constants import system_type
+    from autoortho.utils.constants import system_type, FREE_THREADING_ENABLED
 except ImportError:
-    from utils.constants import system_type
+    from utils.constants import system_type, FREE_THREADING_ENABLED
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import logging
 log = logging.getLogger(__name__)
@@ -715,6 +717,114 @@ class DDS(Structure):
         # Dump header (use main lock for header writes)
         with self.lock:
             self.dump_header()
+
+    def gen_mipmaps_parallel(self, img, startmipmap=0, maxmipmaps=99):
+        """
+        Generate mipmaps with parallel compression (Python 3.14+ free-threading).
+        
+        Each mipmap level's compression is independent, allowing true parallel
+        execution. Image reduction (halving) must still be sequential due to
+        data dependencies.
+        
+        Args:
+            img: Source AoImage
+            startmipmap: Starting mipmap level
+            maxmipmaps: Maximum mipmap level to generate
+        """
+        if maxmipmaps > self.smallest_mm:
+            maxmipmaps = self.smallest_mm
+        
+        # Step 1: Prepare all reduced images sequentially (data dependency)
+        mipmap_images = []
+        current_img = img
+        
+        # Initial reduction if starting above mipmap 0
+        if startmipmap > 0:
+            steps = 0
+            width = current_img.size[0]
+            desired_width = self.width >> startmipmap
+            while width > desired_width:
+                width >>= 1
+                steps += 1
+            if steps > 0:
+                current_img = current_img.reduce_2(steps)
+        
+        # Build list of (mipmap_level, image) for all levels
+        for level in range(startmipmap, maxmipmaps + 1):
+            mipmap_images.append((level, current_img))
+            if level < maxmipmaps and level < self.smallest_mm:
+                current_img = current_img.reduce_2()
+        
+        # Step 2: Compress all mipmaps in parallel
+        def compress_single(level_img_pair):
+            level, mip_img = level_img_pair
+            mipmap_lock = self.mipmap_locks[level]
+            
+            with mipmap_lock:
+                if self.mipmap_list[level].retrieved:
+                    return (level, None)  # Already done
+                
+                img_ref = mip_img
+                imgdata = img_ref.data_ptr()
+                width, height = img_ref.size
+                
+                try:
+                    dxtdata = self.compress(width, height, imgdata)
+                except Exception as e:
+                    log.error(f"Parallel compress failed for mipmap {level}: {e}")
+                    return (level, None)
+                
+                return (level, dxtdata)
+        
+        # Limit parallelism to avoid overwhelming the system
+        max_compress_workers = min(4, len(mipmap_images))
+        
+        with ThreadPoolExecutor(max_workers=max_compress_workers) as executor:
+            futures = {executor.submit(compress_single, pair): pair[0] 
+                       for pair in mipmap_images}
+            
+            for future in as_completed(futures):
+                level = futures[future]
+                try:
+                    result_level, dxtdata = future.result()
+                    if dxtdata is not None:
+                        self.mipmap_list[result_level].databuffer = BytesIO(initial_bytes=dxtdata)
+                        self.mipmap_list[result_level].retrieved = True
+                        
+                        # Handle smallest mipmap duplication (same as sequential)
+                        if result_level == self.smallest_mm:
+                            for mm in self.mipmap_list[self.smallest_mm:]:
+                                if mm.idx > result_level:
+                                    mm.databuffer = BytesIO(initial_bytes=dxtdata)
+                                    mm.retrieved = True
+                except Exception as e:
+                    log.error(f"Mipmap {level} compression failed: {e}")
+        
+        # Dump header (use main lock for header writes)
+        with self.lock:
+            self.dump_header()
+
+    def gen_mipmaps_auto(self, img, startmipmap=0, maxmipmaps=99, compress_bytes=0):
+        """
+        Auto-select sequential or parallel mipmap generation based on threading mode.
+        
+        Uses parallel compression when:
+        - Python 3.14+ free-threading is enabled
+        - compress_bytes is 0 (full mipmaps, not partial)
+        - More than 2 mipmaps need generation
+        
+        Args:
+            img: Source AoImage
+            startmipmap: Starting mipmap level
+            maxmipmaps: Maximum mipmap level to generate
+            compress_bytes: Limit compression to number of bytes (0 = full)
+        """
+        if (FREE_THREADING_ENABLED and 
+            compress_bytes == 0 and 
+            (maxmipmaps - startmipmap) > 2):
+            return self.gen_mipmaps_parallel(img, startmipmap, maxmipmaps)
+        else:
+            return self.gen_mipmaps(img, startmipmap, maxmipmaps, compress_bytes)
 
 
 def to_dds(img, outpath):

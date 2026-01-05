@@ -3,6 +3,14 @@ VERSION?=0.0.0
 # Sanitize VERSION for use in filenames (replace any non-safe char with '-')
 SAFE_VERSION:=$(shell echo "$(VERSION)" | sed -e 's/[^A-Za-z0-9._-]/-/g')
 CODE_NAME:=$(shell grep UBUNTU_CODENAME /etc/os-release | cut -d= -f2)
+
+# =============================================================================
+# Python 3.14 Free-Threading Configuration
+# =============================================================================
+# Set PYTHON_GIL=0 to enable free-threading mode in Python 3.14+
+# This allows true parallel execution without the GIL
+export PYTHON_GIL?=0
+
 .PHONY: mac_app clean
 SHELL := /bin/bash
 .ONESHELL:

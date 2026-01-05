@@ -37,7 +37,9 @@ jobs:
       contents: write
 
     env:
-      VERNAME: ${{ inputs.version }} 
+      VERNAME: ${{ inputs.version }}
+      # Enable free-threading mode for Python 3.14+
+      PYTHON_GIL: "0"
 
     steps:
     - uses: actions/checkout@v3
@@ -52,6 +54,8 @@ jobs:
       run: |
         echo "${{ inputs.internalver }}" > autoortho/.version
 
+    # Note: Linux build uses Docker with buildreqs.sh which handles
+    # Python 3.14 free-threading installation automatically
     - name: Build
       run: |
         make lin_tar VERSION=${{ env.VERNAME }}
@@ -79,13 +83,24 @@ jobs:
 
     env:
       VERNAME: ${{ inputs.version }}
+      # Enable free-threading mode for Python 3.14+
+      PYTHON_GIL: "0"
 
     steps:
     - uses: actions/checkout@v3
 
-    - uses: actions/setup-python@v3
+    # Use Python 3.14t for free-threading support
+    # The 't' suffix indicates the free-threading build
+    - uses: actions/setup-python@v5
       with:
-        python-version: '3.12'
+        python-version: '3.14t'
+        allow-prereleases: true
+
+    - name: Verify Python and free-threading
+      run: |
+        python3 --version
+        python3 -c "import sys; print('Free-threading available:', hasattr(sys, '_is_gil_enabled'))"
+        python3 -c "import sys; print('GIL enabled:', sys._is_gil_enabled() if hasattr(sys, '_is_gil_enabled') else 'N/A')"
 
     - name: Setup
       run: |
@@ -124,14 +139,25 @@ jobs:
       contents: write
 
     env:
-      VERNAME: ${{ inputs.version }} 
+      VERNAME: ${{ inputs.version }}
+      # Enable free-threading mode for Python 3.14+
+      PYTHON_GIL: "0"
 
     steps:
     - uses: actions/checkout@v3
    
-    - uses: actions/setup-python@v3
+    # Use Python 3.14t for free-threading support
+    # The 't' suffix indicates the free-threading build
+    - uses: actions/setup-python@v5
       with:
-        python-version: '3.12'
+        python-version: '3.14t'
+        allow-prereleases: true
+
+    - name: Verify Python and free-threading
+      run: |
+          python --version
+          python -c "import sys; print('Free-threading available:', hasattr(sys, '_is_gil_enabled'))"
+          python -c "import sys; print('GIL enabled:', sys._is_gil_enabled() if hasattr(sys, '_is_gil_enabled') else 'N/A')"
 
     - name: Setup 
       run: |

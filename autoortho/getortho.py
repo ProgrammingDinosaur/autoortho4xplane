@@ -51,6 +51,7 @@ try:
         PRIORITY_DIRECTION_WEIGHT,
         PRIORITY_MIPMAP_WEIGHT,
         LOOKAHEAD_TIME_SEC,
+        FREE_THREADING_ENABLED,
     )
 except ImportError:
     from utils.constants import (
@@ -61,6 +62,7 @@ except ImportError:
         PRIORITY_DIRECTION_WEIGHT,
         PRIORITY_MIPMAP_WEIGHT,
         LOOKAHEAD_TIME_SEC,
+        FREE_THREADING_ENABLED,
     )
 
 try:
@@ -112,11 +114,24 @@ def create_http_session(pool_size=10):
     return session
 
 
-# JPEG decode concurrency: auto-tuned for optimal performance
-# Decode is memory-bound, not CPU-bound, so we can safely exceed CPU count
-# Each decode uses ~256KB RAM, so even 64 concurrent = only ~16MB
-_MAX_DECODE = min(CURRENT_CPU_COUNT * 4, 64)
-_decode_sem = threading.Semaphore(_MAX_DECODE)
+# ============================================================================
+# JPEG DECODE CONCURRENCY CONFIGURATION
+# ============================================================================
+# With GIL: Limiting concurrent decodes reduces contention overhead
+# With free-threading: Can use more parallelism effectively
+# ============================================================================
+if FREE_THREADING_ENABLED:
+    # Free-threaded: higher concurrency, limited by CPU cores
+    # No semaphore needed - threads run truly in parallel
+    _MAX_DECODE = CURRENT_CPU_COUNT * 2
+    from contextlib import nullcontext
+    _decode_sem = nullcontext()
+else:
+    # GIL mode: keep existing throttling to avoid contention
+    # Decode is memory-bound, not CPU-bound, so we can safely exceed CPU count
+    # Each decode uses ~256KB RAM, so even 64 concurrent = only ~16MB
+    _MAX_DECODE = min(CURRENT_CPU_COUNT * 4, 64)
+    _decode_sem = threading.Semaphore(_MAX_DECODE)
 
 
 # Track average fetch times
@@ -617,44 +632,53 @@ class Getter(object):
             log.warning(f"Failed to initialize thread-local session: {_e}")
             self.localdata.session = requests.Session()
         
-        while self.WORKING.is_set():
-            try:
-                obj, args, kwargs = self.queue.get(timeout=5)
-                #log.debug(f"Got: {obj} {args} {kwargs}")
-            except Empty:
-                #log.debug(f"timeout, continue")
-                #log.info(f"Got {self.counter}")
-                continue
+        try:
+            while self.WORKING.is_set():
+                try:
+                    obj, args, kwargs = self.queue.get(timeout=5)
+                    #log.debug(f"Got: {obj} {args} {kwargs}")
+                except Empty:
+                    #log.debug(f"timeout, continue")
+                    #log.info(f"Got {self.counter}")
+                    continue
 
-            #STATS.setdefault('count', 0) + 1
-            bump('count', 1)
+                #STATS.setdefault('count', 0) + 1
+                bump('count', 1)
 
-            try:
-                # Mark chunk as in-flight (Chunk always has these attributes)
-                obj.in_queue = False
-                obj.in_flight = True
-                
-                if not self.get(obj, *args, **kwargs):
-                    # Check if chunk is permanently failed before re-submitting
+                try:
+                    # Mark chunk as in-flight (Chunk always has these attributes)
+                    obj.in_queue = False
+                    obj.in_flight = True
+                    
+                    if not self.get(obj, *args, **kwargs):
+                        # Check if chunk is permanently failed before re-submitting
+                        if obj.permanent_failure:
+                            log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
+                            continue
+                        log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
+                        # CRITICAL: Clear in_flight BEFORE re-submitting, otherwise submit()
+                        # will see in_flight=True and silently drop the chunk!
+                        obj.in_flight = False
+                        self.submit(obj, *args, **kwargs)
+                except Exception as err:
+                    log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
+                    # Don't re-submit if permanently failed
                     if obj.permanent_failure:
-                        log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
+                        log.debug(f"Chunk {obj} permanently failed during exception, not re-submitting")
                         continue
-                    log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
-                    # CRITICAL: Clear in_flight BEFORE re-submitting, otherwise submit()
-                    # will see in_flight=True and silently drop the chunk!
+                    # CRITICAL: Clear in_flight BEFORE re-submitting
                     obj.in_flight = False
                     self.submit(obj, *args, **kwargs)
-            except Exception as err:
-                log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
-                # Don't re-submit if permanently failed
-                if obj.permanent_failure:
-                    log.debug(f"Chunk {obj} permanently failed during exception, not re-submitting")
-                    continue
-                # CRITICAL: Clear in_flight BEFORE re-submitting
-                obj.in_flight = False
-                self.submit(obj, *args, **kwargs)
-            finally:
-                obj.in_flight = False
+                finally:
+                    obj.in_flight = False
+        finally:
+            # Cleanup session on thread exit (important with more threads in free-threading mode)
+            session = getattr(self.localdata, 'session', None)
+            if session and hasattr(session, 'close'):
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
     def get(obj, *args, **kwargs):
         raise NotImplementedError
@@ -713,11 +737,25 @@ log.info(f"chunk_getter: {chunk_getter}")
 # waiting for disk I/O to complete. Cache writes are fire-and-forget since
 # a failed write only affects future cache hits, not current processing.
 #
-# Using 2 workers: cache writes are I/O-bound, not CPU-bound, so a small pool
-# is sufficient. More workers would just contend on disk I/O.
+# Worker count is dynamic based on threading mode:
+# - With free-threading: more I/O parallelism benefits SSDs
+# - With GIL: 2-4 workers sufficient for I/O-bound work
 # ============================================================================
+def _get_cache_writer_workers() -> int:
+    """Get optimal cache writer worker count based on config and threading mode."""
+    configured = int(getattr(CFG.autoortho, 'cache_writer_workers', 0))
+    if configured > 0:
+        return min(configured, 16)
+    
+    if FREE_THREADING_ENABLED:
+        # Free-threaded: more I/O parallelism benefits SSDs
+        return min(CURRENT_CPU_COUNT, 8)
+    else:
+        # GIL mode: I/O-bound, 2-4 workers sufficient
+        return 4
+
 _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=2, 
+    max_workers=_get_cache_writer_workers(), 
     thread_name_prefix="cache_writer"
 )
 
@@ -770,7 +808,7 @@ def flush_cache_writer(timeout=30.0):
     finally:
         # Recreate the executor for subsequent operations
         _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2,
+            max_workers=_get_cache_writer_workers(),
             thread_name_prefix="cache_writer"
         )
 
@@ -2269,8 +2307,10 @@ class BackgroundDDSBuilder:
     Builds DDS textures from fully-downloaded tiles in the background.
     
     Design principles:
-    1. Single-threaded: Avoids CPU contention, predictable load
-    2. Rate-limited: Minimum interval between builds to prevent micro-stutters
+    1. Parallel execution: Uses thread pool for true parallelism (Python 3.14+)
+       - With free-threading: Multiple workers for parallel DDS builds
+       - With GIL: Single worker to avoid contention
+    2. Rate-limited: Minimum interval between build submissions
     3. Priority queue: Build tiles in submission order (FIFO for fairness)
     4. Interruptible: Can pause/stop cleanly during shutdown
     """
@@ -2279,48 +2319,81 @@ class BackgroundDDSBuilder:
     MAX_QUEUE_SIZE = 100
     
     def __init__(self, prebuilt_cache: PrebuiltDDSCache, 
-                 build_interval_sec: float = 0.5):
+                 build_interval_sec: float = 0.1,
+                 num_workers: int = None):
         """
         Args:
             prebuilt_cache: Cache to store completed DDS buffers
-            build_interval_sec: Minimum time between builds (rate limiting)
+            build_interval_sec: Minimum time between build submissions per worker
+            num_workers: Number of parallel build workers (None = auto-detect)
         """
         self._queue = Queue(maxsize=self.MAX_QUEUE_SIZE)
-        self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._prebuilt_cache = prebuilt_cache
         self._build_interval = build_interval_sec
         self._builds_completed = 0
         self._builds_failed = 0
         self._last_build_time = 0.0
+        
+        # Determine worker count based on threading mode
+        if num_workers is None:
+            if FREE_THREADING_ENABLED:
+                # Free-threaded: use half of CPU cores for background work
+                # Leave headroom for X-Plane and foreground tile requests
+                num_workers = max(2, CURRENT_CPU_COUNT // 2)
+            else:
+                # GIL mode: single worker avoids contention
+                num_workers = 1
+        
+        self._num_workers = num_workers
+        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._dispatcher_thread: Optional[threading.Thread] = None
     
     def start(self) -> None:
-        """Start the background builder thread."""
-        if self._thread is not None and self._thread.is_alive():
+        """Start the background builder thread pool."""
+        if self._dispatcher_thread is not None and self._dispatcher_thread.is_alive():
             return
         
         self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._build_loop,
-            name="BackgroundDDSBuilder",
+        
+        # Create thread pool for parallel DDS builds
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self._num_workers,
+            thread_name_prefix="DDSBuilder"
+        )
+        
+        # Dispatcher thread pulls from queue and submits to pool
+        self._dispatcher_thread = threading.Thread(
+            target=self._dispatch_loop,
+            name="DDSDispatcher",
             daemon=True
         )
-        self._thread.start()
-        log.info(f"BackgroundDDSBuilder started (interval={self._build_interval*1000:.0f}ms)")
+        self._dispatcher_thread.start()
+        
+        mode = "free-threaded" if FREE_THREADING_ENABLED else "GIL"
+        log.info(f"BackgroundDDSBuilder started ({mode} mode, "
+                 f"workers={self._num_workers}, interval={self._build_interval*1000:.0f}ms)")
     
     def stop(self) -> None:
-        """Stop the background builder thread."""
+        """Stop the background builder thread pool."""
         self._stop_event.set()
         
-        if self._thread is not None:
-            # Put a sentinel to unblock the queue.get()
+        # Put sentinel values to unblock queue.get()
+        for _ in range(self._num_workers + 1):
             try:
                 self._queue.put_nowait(None)
             except Full:
-                pass
-            
-            self._thread.join(timeout=5.0)
-            self._thread = None
+                break
+        
+        # Shutdown thread pool
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+        
+        # Wait for dispatcher
+        if self._dispatcher_thread is not None:
+            self._dispatcher_thread.join(timeout=2.0)
+            self._dispatcher_thread = None
         
         log.info(f"BackgroundDDSBuilder stopped "
                 f"(built={self._builds_completed}, failed={self._builds_failed})")
@@ -2353,8 +2426,8 @@ class BackgroundDDSBuilder:
             log.debug(f"BackgroundDDSBuilder: Queue full, skipping {tile.id}")
             return False
     
-    def _build_loop(self) -> None:
-        """Main build loop - runs in background thread."""
+    def _dispatch_loop(self) -> None:
+        """Dispatch loop - pulls tiles from queue and submits to thread pool."""
         while not self._stop_event.is_set():
             try:
                 # Non-blocking get with timeout for clean shutdown
@@ -2368,7 +2441,7 @@ class BackgroundDDSBuilder:
             
             priority, tile = item
             
-            # Rate limiting: ensure minimum interval between builds
+            # Rate limiting: ensure minimum interval between build submissions
             elapsed = time.monotonic() - self._last_build_time
             if elapsed < self._build_interval:
                 sleep_time = self._build_interval - elapsed
@@ -2377,8 +2450,15 @@ class BackgroundDDSBuilder:
                     # Stop requested during sleep
                     continue
             
-            # Build the DDS
-            self._build_tile_dds(tile)
+            # Submit to thread pool instead of building inline
+            # Each worker can now run in parallel (with free-threading)
+            if self._executor is not None:
+                try:
+                    self._executor.submit(self._build_tile_dds, tile)
+                except RuntimeError:
+                    # Executor shut down
+                    break
+            
             self._last_build_time = time.monotonic()
     
     def _build_tile_dds(self, tile) -> None:
@@ -2623,16 +2703,23 @@ def start_predictive_dds(tile_cacher=None) -> None:
     cache_mb = int(getattr(CFG.autoortho, 'predictive_dds_cache_mb', 512))
     cache_mb = max(128, min(2048, cache_mb))  # Clamp to valid range
     
-    build_interval_ms = int(getattr(CFG.autoortho, 'predictive_dds_build_interval_ms', 500))
-    build_interval_ms = max(100, min(2000, build_interval_ms))
+    # Reduced default interval for faster throughput with parallel workers
+    build_interval_ms = int(getattr(CFG.autoortho, 'predictive_dds_build_interval_ms', 100))
+    build_interval_ms = max(50, min(1000, build_interval_ms))
     build_interval_sec = build_interval_ms / 1000.0
+    
+    # Worker count from config or auto-detect
+    workers = int(getattr(CFG.autoortho, 'dds_builder_workers', 0))
+    if workers <= 0:
+        workers = None  # Auto-detect based on threading mode
     
     # Initialize components
     prebuilt_dds_cache = PrebuiltDDSCache(max_memory_bytes=cache_mb * 1024 * 1024)
     
     background_dds_builder = BackgroundDDSBuilder(
         prebuilt_cache=prebuilt_dds_cache,
-        build_interval_sec=build_interval_sec
+        build_interval_sec=build_interval_sec,
+        num_workers=workers
     )
     
     tile_completion_tracker = TileCompletionTracker(
@@ -3233,6 +3320,38 @@ class Tile(object):
     def __repr__(self):
         return f"Tile({self.col}, {self.row}, {self.maptype}, {self.tilename_zoom}, min_zoom={self.min_zoom}, max_zoom={self.max_zoom}, max_mm={self.max_mipmap})"
 
+    def _batch_check_chunk_cache(self, chunks: list) -> None:
+        """
+        Check cache status for multiple chunks in parallel.
+        
+        With Python 3.14 free-threading, parallel cache checking can reduce
+        initialization latency for tiles with many chunks.
+        
+        Args:
+            chunks: List of Chunk objects to check
+        """
+        if not FREE_THREADING_ENABLED or len(chunks) < 4:
+            # Not worth parallelizing for small counts or GIL mode
+            # Chunks already check cache during __init__
+            return
+        
+        # Only check chunks that aren't already ready
+        uncached = [c for c in chunks if not c.ready.is_set()]
+        if len(uncached) < 4:
+            return
+        
+        def check_cache(chunk):
+            try:
+                if chunk.get_cache():
+                    chunk.download_started.set()
+                    chunk.ready.set()
+            except Exception:
+                pass
+            return chunk
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(uncached))) as executor:
+            list(executor.map(check_cache, uncached))
+
     @locked
     def _create_chunks(self, quick_zoom=0, min_zoom=None):
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom, min_zoom)
@@ -3247,6 +3366,9 @@ class Tile(object):
                     # Pass tile_id for completion tracking (predictive DDS generation)
                     chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir, tile_id=self.id)
                     self.chunks[zoom].append(chunk)
+            
+            # With free-threading, do parallel cache check for better initialization
+            self._batch_check_chunk_cache(self.chunks[zoom])
         else:
             log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
 
@@ -4077,8 +4199,15 @@ class Tile(object):
         # Instead of polling for download_started, submit all chunks upfront.
         # Each worker will wait on its chunk's ready event, sleeping efficiently.
         # This removes polling overhead (~25ms per iteration) and lets the executor
-        # manage scheduling. The _decode_sem already limits concurrent decodes.
-        max_pool_workers = min(CURRENT_CPU_COUNT, len(chunks), _MAX_DECODE)
+        # manage scheduling.
+        if FREE_THREADING_ENABLED:
+            # Free-threaded: can use more workers effectively for true parallelism
+            # Cap at 32 to prevent excessive thread creation for tiles with many chunks
+            max_pool_workers = min(CURRENT_CPU_COUNT * 2, len(chunks), 32)
+        else:
+            # GIL mode: limit workers to reduce contention
+            # The _decode_sem already limits concurrent decodes
+            max_pool_workers = min(CURRENT_CPU_COUNT, len(chunks), _MAX_DECODE)
         
         total_chunks = len(chunks)
         completed = 0
