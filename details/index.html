@@ -788,7 +788,78 @@ initially starting up flights.</p>
 <pre><code class="language-bash">pip install -r requirements.txt
 pip install -r requirements-build.txt
 </code></pre>
-<h2 id="building">Building</h2>
+<h2 id="building-the-native-pipeline">Building the Native Pipeline</h2>
+<p>The native pipeline (<code>aopipeline</code>) requires additional dependencies and must be built separately for each platform.</p>
+<h3 id="macos-arm64x86_64">macOS (ARM64/x86_64)</h3>
+<p><strong>Prerequisites:</strong></p>
+<pre><code class="language-bash">brew install libomp jpeg-turbo curl
+</code></pre>
+<p><strong>Build:</strong></p>
+<pre><code class="language-bash">cd autoortho/aopipeline
+make -f Makefile.macos
+# Output: lib/macos/libaopipeline.dylib
+</code></pre>
+<h3 id="linux">Linux</h3>
+<p><strong>Prerequisites:</strong></p>
+<pre><code class="language-bash"># Debian/Ubuntu
+sudo apt-get install libomp-dev libturbojpeg0-dev libcurl4-openssl-dev
+
+# Fedora/RHEL
+sudo dnf install libomp-devel turbojpeg-devel libcurl-devel
+</code></pre>
+<p><strong>Build:</strong></p>
+<pre><code class="language-bash">cd autoortho/aopipeline
+make -f Makefile.linux
+# Output: lib/linux/libaopipeline.so
+</code></pre>
+<h3 id="windows-mingw-w64">Windows (MinGW-w64)</h3>
+<p><strong>Prerequisites:</strong>
+- MinGW-w64 toolchain
+- TurboJPEG library
+- libcurl for Windows</p>
+<p><strong>Build:</strong></p>
+<pre><code class="language-bash">cd autoortho/aopipeline
+make -f Makefile.mingw64
+# Output: lib/windows/aopipeline.dll
+</code></pre>
+<h3 id="native-pipeline-components">Native Pipeline Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Dependencies</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>aocache.c</code></td>
+<td>OpenMP</td>
+<td>Parallel batch file I/O</td>
+</tr>
+<tr>
+<td><code>aodecode.c</code></td>
+<td>TurboJPEG, OpenMP</td>
+<td>Parallel JPEG decoding</td>
+</tr>
+<tr>
+<td><code>aodds.c</code></td>
+<td>ISPC texcomp, OpenMP</td>
+<td>DDS texture compression</td>
+</tr>
+<tr>
+<td><code>aohttp.c</code></td>
+<td>libcurl</td>
+<td>Native HTTP client</td>
+</tr>
+</tbody>
+</table>
+<h3 id="fallback-behavior">Fallback Behavior</h3>
+<p>If the native library is not available:
+- AutoOrtho automatically falls back to the Python implementation
+- All functionality works, just slower for CPU-intensive operations
+- Log messages indicate which path is used</p>
+<h2 id="building-the-application">Building the Application</h2>
 <p>The <code>Makefile</code> provides targets for each platform:</p>
 <pre><code class="language-bash"># Linux (creates .tar.gz)
 make lin_tar VERSION=1.0.0

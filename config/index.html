@@ -518,6 +518,56 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#native-pipeline-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native Pipeline Settings
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Native Pipeline Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#native-pipeline-threads-native_pipeline_threads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native Pipeline Threads (native_pipeline_threads)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#predictive-dds-disk-cache-ephemeral_dds_cache_mb" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Predictive DDS Disk Cache (ephemeral_dds_cache_mb)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#apple-maps-caveat" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Apple Maps Caveat
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#dynamic-zoom-levels" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -781,6 +831,56 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#native-pipeline-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native Pipeline Settings
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Native Pipeline Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#native-pipeline-threads-native_pipeline_threads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native Pipeline Threads (native_pipeline_threads)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#predictive-dds-disk-cache-ephemeral_dds_cache_mb" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Predictive DDS Disk Cache (ephemeral_dds_cache_mb)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#apple-maps-caveat" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Apple Maps Caveat
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#dynamic-zoom-levels" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -870,6 +970,87 @@
 - <strong>Dynamic Zoom Levels</strong> - Automatically adjust imagery quality based on altitude</p>
 <p>For detailed configuration options and recommended settings for different use cases, see the <a href="../performance/">Performance Tuning Guide</a>.</p>
 <p>For troubleshooting missing tiles or stuttering issues, see the <a href="../faq/#missing-color-tiles">FAQ</a>.</p>
+<h2 id="native-pipeline-settings">Native Pipeline Settings</h2>
+<p>AutoOrtho includes a high-performance native pipeline that significantly improves DDS texture building speed. These settings control the native components.</p>
+<h3 id="native-pipeline-threads-native_pipeline_threads">Native Pipeline Threads (<code>native_pipeline_threads</code>)</h3>
+<ul>
+<li><strong>Type:</strong> Integer</li>
+<li><strong>Default:</strong> 0 (auto-detect)</li>
+<li><strong>Config file:</strong> <code>native_pipeline_threads = 0</code></li>
+</ul>
+<p>Controls how many CPU threads the native pipeline uses for parallel operations (cache I/O, JPEG decoding, DDS compression).</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>0</strong></td>
+<td>Auto-detect CPU cores, use all available (recommended)</td>
+</tr>
+<tr>
+<td><strong>1</strong></td>
+<td>Single-threaded mode (lowest CPU usage, slowest builds)</td>
+</tr>
+<tr>
+<td><strong>2-N</strong></td>
+<td>Limit to N threads (balance performance vs other apps)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Recommendation:</strong> Leave at 0 unless you need to limit CPU usage for other applications.</p>
+<h3 id="predictive-dds-disk-cache-ephemeral_dds_cache_mb">Predictive DDS Disk Cache (<code>ephemeral_dds_cache_mb</code>)</h3>
+<ul>
+<li><strong>Type:</strong> Integer (megabytes)</li>
+<li><strong>Default:</strong> 4096</li>
+<li><strong>Range:</strong> 1024 - 16384</li>
+<li><strong>Config file:</strong> <code>ephemeral_dds_cache_mb = 4096</code></li>
+</ul>
+<p>Size of the disk cache for pre-built DDS textures. The predictive DDS system builds tiles in the background and stores them on disk for instant serving when X-Plane requests them.</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>1024-4096</strong></td>
+<td>Balanced - good for most systems</td>
+</tr>
+<tr>
+<td><strong>8192</strong></td>
+<td>Large flights - covers more waypoints</td>
+</tr>
+<tr>
+<td><strong>16384</strong></td>
+<td>Maximum capacity - long-haul flights</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Why disk-only caching?</strong></p>
+<p>AutoOrtho uses disk-only caching (no dedicated RAM cache) because:
+- <strong>SSD reads are fast enough:</strong> Reading a pre-built DDS from disk takes ~1-2ms, which is negligible compared to the ~100-500ms build time it saves
+- <strong>OS file cache handles hot files:</strong> Your operating system automatically keeps frequently accessed files in RAM
+- <strong>Simpler memory management:</strong> No need to configure RAM limits - the OS handles it naturally
+- <strong>Session-based:</strong> Cache is fresh every session, avoiding stale texture issues</p>
+<p><strong>Key properties:</strong>
+- Uses OS temp directory (not your JPEG cache)
+- Automatically cleaned when AutoOrtho exits
+- Fresh cache every session (no stale tiles)
+- OS file cache keeps hot files in RAM automatically</p>
+<p><strong>Recommendation:</strong> 4096MB for most users. Increase to 8192-16384MB for long-haul flights covering many tiles.</p>
+<h3 id="apple-maps-caveat">Apple Maps Caveat</h3>
+<p>When using Apple Maps (<code>APPLE</code>) as your imagery source, downloads <strong>always use the Python HTTP client</strong> instead of the native libcurl client. This is because Apple Maps requires:
+- Dynamic authentication tokens
+- Token refresh on 403/410 errors
+- Special header handling</p>
+<p>Other imagery sources (BI, EOX, ARC, NAIP, USGS, FIREFLY, YNDX, GO2) use the faster native HTTP client when available.</p>
+<p>See the <a href="../performance/#native-pipeline-architecture">Performance Tuning Guide</a> for detailed architecture information.</p>
 <h2 id="dynamic-zoom-levels">Dynamic Zoom Levels</h2>
 <p>AutoOrtho can automatically adjust imagery zoom levels based on your altitude Above Ground Level (AGL). This provides:
 - Higher detail imagery when flying low

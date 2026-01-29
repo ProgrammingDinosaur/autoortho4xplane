@@ -551,6 +551,45 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#performance-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance Features
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Performance Features">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#native-pipeline-high-performance-mode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native Pipeline (High Performance Mode)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#additional-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Additional Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#known-issues-and-limits" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -897,6 +936,45 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#performance-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance Features
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Performance Features">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#native-pipeline-high-performance-mode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native Pipeline (High Performance Mode)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#additional-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Additional Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#known-issues-and-limits" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1060,6 +1138,28 @@ well.  MacOS very likely <em>should</em> work, but I have no way of testing it.<
 <p>I have done testing on Windows 10 with the
 <a href="https://github.com/dokan-dev/dokany/releases/latest">Dokan</a> project.
 This does appear to work fine, but this is not how I use this project, so it's not my primary concern.</p>
+<h2 id="performance-features">Performance Features</h2>
+<p>AutoOrtho includes advanced performance optimizations to minimize stuttering and reduce loading times:</p>
+<h3 id="native-pipeline-high-performance-mode">Native Pipeline (High Performance Mode)</h3>
+<p>AutoOrtho includes a <strong>native C pipeline</strong> that dramatically improves DDS texture building performance by bypassing Python's Global Interpreter Lock:</p>
+<ul>
+<li><strong>10-20x faster</strong> DDS texture building</li>
+<li><strong>True multi-core parallelism</strong> via OpenMP</li>
+<li><strong>Native HTTP client</strong> with connection pooling for faster downloads</li>
+</ul>
+<p>The native pipeline is automatically used when available. See the <a href="performance/#native-pipeline-architecture">Performance Tuning Guide</a> for details.</p>
+<blockquote>
+<p><strong>Note:</strong> Apple Maps downloads always use the Python HTTP client due to its special authentication requirements. Other imagery sources use the faster native client.</p>
+</blockquote>
+<h3 id="additional-features">Additional Features</h3>
+<ul>
+<li><strong>Spatial Prefetching</strong>: Downloads tiles ahead of your aircraft</li>
+<li><strong>SimBrief Integration</strong>: Uses your flight plan for smarter prefetching</li>
+<li><strong>Dynamic Zoom</strong>: Automatically adjusts quality based on altitude</li>
+<li><strong>Time Budget System</strong>: Predictable tile loading times</li>
+</ul>
+<p>See the <a href="performance/">Performance Tuning Guide</a> for configuration options.</p>
+<hr />
 <h2 id="known-issues-and-limits">Known issues and limits</h2>
 <ul>
 <li>Currently I try to limit the memory usage, though it's possible it
@@ -1074,6 +1174,7 @@ This does appear to work fine, but this is not how I use this project, so it's n
 <li>Windows has too many variations with how filesystems are handled, links are
   done, intrusive malware detection systems, etc and will likely always be
   slower and more difficult to use with this project.</li>
+<li><strong>Apple Maps</strong> always uses Python HTTP client (not native) due to special authentication requirements.</li>
 </ul>
 <h2 id="todos">TODOS</h2>
 <ul>

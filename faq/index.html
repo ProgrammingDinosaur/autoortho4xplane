@@ -640,6 +640,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#what-is-the-native-pipeline-and-do-i-need-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What is the Native Pipeline and do I need it?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-are-apple-maps-downloads-slower-than-other-sources" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why are Apple Maps downloads slower than other sources?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#i-changed-the-settings-but-nothing-seems-different" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1221,6 +1243,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#what-is-the-native-pipeline-and-do-i-need-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What is the Native Pipeline and do I need it?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-are-apple-maps-downloads-slower-than-other-sources" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why are Apple Maps downloads slower than other sources?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#i-changed-the-settings-but-nothing-seems-different" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1734,6 +1778,26 @@ max_zoom_level = 16
 </tbody>
 </table>
 <p>For detailed explanations, see the <a href="../performance/">Performance Tuning Guide</a>.</p>
+<hr />
+<h3 id="what-is-the-native-pipeline-and-do-i-need-it">What is the Native Pipeline and do I need it?</h3>
+<p>The <strong>native pipeline</strong> (<code>aopipeline</code>) is an optional high-performance component that dramatically speeds up DDS texture building (10-20x faster). It's written in C and uses true multi-threading via OpenMP.</p>
+<p><strong>Do you need it?</strong> 
+- If it's available for your platform (included in releases), it's used automatically
+- If not available, AutoOrtho falls back to the Python implementation
+- All features work either way; native is just faster</p>
+<p><strong>Benefit:</strong> Significantly fewer stutters, especially during initial scenery load or when flying fast/low.</p>
+<p>See the <a href="../performance/#native-pipeline-architecture">Native Pipeline Architecture</a> for technical details.</p>
+<hr />
+<h3 id="why-are-apple-maps-downloads-slower-than-other-sources">Why are Apple Maps downloads slower than other sources?</h3>
+<p><strong>Apple Maps always uses the Python HTTP client</strong>, not the native libcurl client. This is intentional because Apple Maps requires:</p>
+<ol>
+<li><strong>Dynamic authentication</strong>: Tokens must be fetched via DuckDuckGo proxy</li>
+<li><strong>Token rotation</strong>: On 403/410 errors, the token must be refreshed</li>
+<li><strong>Special headers</strong>: Requires <code>Authorization: Bearer</code> headers</li>
+</ol>
+<p>The Python path handles all this authentication flow correctly. Other imagery sources (BI, EOX, ARC, NAIP, USGS, FIREFLY, YNDX, GO2) use the faster native HTTP client.</p>
+<p><strong>Impact:</strong> Apple Maps initial loading may be 2-3x slower than other sources. Once cached, performance is identical.</p>
+<p><strong>Workaround:</strong> Consider using an alternative imagery source if download speed is critical.</p>
 <hr />
 <h3 id="i-changed-the-settings-but-nothing-seems-different">I changed the settings but nothing seems different</h3>
 <ol>
