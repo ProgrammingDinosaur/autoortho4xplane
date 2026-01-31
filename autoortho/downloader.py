@@ -49,6 +49,12 @@ class SeasonsApplyStatus(Enum):
     APPLIED = "applied"
 
 
+class RoughnessApplyStatus(Enum):
+    NOT_APPLIED = "not_applied"
+    PARTIALLY_APPLIED = "partially_applied"
+    APPLIED = "applied"
+
+
 class Zip(object):
     # A zip object that may be made up of one or more files
 
@@ -411,6 +417,7 @@ class Release(object):
     ver = "0.0.0"
     url = ""
     seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
+    roughness_apply_status = RoughnessApplyStatus.NOT_APPLIED
     install_name = ""
 
     installed = False
@@ -445,6 +452,11 @@ class Release(object):
         self.processed_dsf_seasons = {}
         self.total_dsfs = 0
         self.missing_xp_tiles = {}
+        # SUPER_ROUGHNESS patching tracking
+        self.ter_files = {}
+        self.processed_ter_roughness = {}
+        self.total_ters = 0
+        self.roughness_value = None
 
         #if os.path.exists(self.info_path):
         #    self.load(self.info_path)
@@ -496,6 +508,34 @@ class Release(object):
             self.seasons_apply_status = SeasonsApplyStatus.APPLIED
         else:
             self.seasons_apply_status = SeasonsApplyStatus.PARTIALLY_APPLIED
+
+        # Determine SUPER_ROUGHNESS status
+        ter_files = getattr(self, 'ter_files', {})
+        processed_ter_roughness = getattr(self, 'processed_ter_roughness', {})
+        total_ters = getattr(self, 'total_ters', 0)
+        self.roughness_value = getattr(self, 'roughness_value', None)
+
+        # Count total processed ter files
+        total_processed_ters = 0
+        for subfolder, files_dict in processed_ter_roughness.items():
+            if isinstance(files_dict, dict):
+                total_processed_ters += len(files_dict)
+            else:
+                total_processed_ters += len(files_dict) if files_dict else 0
+
+        # Count total expected ter files
+        total_expected_ters = 0
+        for subfolder, files in ter_files.items():
+            total_expected_ters += len(files) if files else 0
+
+        if not ter_files and not processed_ter_roughness:
+            self.roughness_apply_status = RoughnessApplyStatus.NOT_APPLIED
+        elif total_processed_ters >= total_expected_ters and total_expected_ters > 0:
+            self.roughness_apply_status = RoughnessApplyStatus.APPLIED
+        elif total_processed_ters > 0:
+            self.roughness_apply_status = RoughnessApplyStatus.PARTIALLY_APPLIED
+        else:
+            self.roughness_apply_status = RoughnessApplyStatus.NOT_APPLIED
 
         detected_info_ver = info.get('info_ver')
         if self.ortho_dirs and detected_info_ver is None:

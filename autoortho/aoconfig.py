@@ -360,6 +360,13 @@ fal_saturation = 80.0
 win_saturation = 55.0
 compress_dsf = True
 
+[terrain]
+# Default SUPER_ROUGHNESS value for .ter files (0.0 to 1.0)
+# Higher values make terrain less reflective/shiny at sunset/sunrise
+default_roughness = 1.0
+# Number of workers for .ter file patching
+ter_patch_workers = 8
+
 [windows]
 prefer_winfsp = True
 
@@ -375,6 +382,17 @@ end_time = 05:00
 # Useful to ensure night flights start with default scenery from the beginning.
 # When disabled, AutoOrtho works normally until sim time confirms exclusion.
 default_to_exclusion = False
+# Use sun position instead of clock time for exclusion decisions.
+# When enabled, exclusion is based on sun elevation angle rather than fixed time windows.
+# This is more accurate across seasons, latitudes, and with time acceleration.
+use_sun_position = False
+# Sun elevation threshold to switch to night mode (degrees).
+# Nautical twilight (-12) is when artificial lights dominate the landscape.
+# Range: -18 (astronomical twilight) to 0 (horizon).
+sun_night_threshold = -12.0
+# Sun elevation threshold to switch to day mode (degrees).
+# Should be higher than night threshold to provide hysteresis and prevent rapid toggling.
+sun_day_threshold = -10.0
 
 [simbrief]
 # SimBrief user ID for flight plan integration

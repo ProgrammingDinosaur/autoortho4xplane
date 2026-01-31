@@ -243,6 +243,8 @@ class DatarefTracker(object):
          "Local time (seconds since midnight)", 0),
         ("sim/flightmodel2/position/pressure_altitude", "ft",
          "Pressure altitude in standard atmosphere", 0),
+        ("sim/graphics/scenery/sun_pitch_degrees", "°",
+         "Sun elevation angle from horizontal (v9.40.0+)", 1),
     ]
     # fmt:on
 
@@ -266,6 +268,7 @@ class DatarefTracker(object):
         self.spd = -1.0
         self.local_time_sec = -1.0  # Local time (seconds since midnight)
         self.pressure_alt = -1.0  # Pressure altitude in feet
+        self.sun_pitch = -999.0  # Sun elevation angle (-90 to +90, -999 = invalid)
         self.connected = False
         self.data_valid = False
         self.has_ever_connected = False  # True once first connection established
@@ -375,8 +378,8 @@ class DatarefTracker(object):
 
         Returns:
             dict: Flight data with keys 'lat', 'lon', 'alt', 'hdg',
-                  'spd', 'local_time_sec', 'pressure_alt', 'connected',
-                  'data_valid', 'timestamp'.
+                  'spd', 'local_time_sec', 'pressure_alt', 'sun_pitch',
+                  'connected', 'data_valid', 'timestamp'.
                   Returns None if not connected or data is invalid.
         """
         with self._lock:
@@ -390,6 +393,7 @@ class DatarefTracker(object):
                 'spd': self.spd,
                 'local_time_sec': self.local_time_sec,
                 'pressure_alt': self.pressure_alt,
+                'sun_pitch': self.sun_pitch,
                 'connected': self.connected,
                 'data_valid': self.data_valid,
                 'timestamp': time.time()
@@ -418,6 +422,26 @@ class DatarefTracker(object):
             if not self.connected or not self.data_valid:
                 return -1.0
             return self.pressure_alt
+
+    def get_sun_pitch(self):
+        """
+        Thread-safe getter for sun pitch (elevation angle).
+
+        The sun pitch is the angle of the sun above or below the horizon:
+        - Positive values: sun is above the horizon (daytime)
+        - Zero: sun is at the horizon (sunrise/sunset)
+        - Negative values: sun is below the horizon (twilight/night)
+          - < -6°: civil twilight ends
+          - < -12°: nautical twilight ends
+          - < -18°: astronomical twilight ends (full night)
+
+        Returns:
+            float: Sun pitch in degrees (-90 to +90), or -999 if not available.
+        """
+        with self._lock:
+            if not self.connected or not self.data_valid:
+                return -999.0
+            return self.sun_pitch
 
     def start(self):
         """Start the UDP listening thread."""
@@ -577,8 +601,8 @@ class DatarefTracker(object):
                     self.connected = True
                     self.has_ever_connected = True  # Permanent flag for startup detection
 
-                # Accept 5, 6, or 7 values for backward compatibility
-                # (6th value is local_time_sec, 7th is pressure_alt)
+                # Accept 5+ values for backward compatibility
+                # (6th=local_time_sec, 7th=pressure_alt, 8th=sun_pitch)
                 if len(values) >= 5:
                     lat = values[0]
                     lon = values[1]
@@ -589,6 +613,8 @@ class DatarefTracker(object):
                     local_time = values[5] if len(values) >= 6 else None
                     # pressure_alt is optional (7th value)
                     pressure_alt = values[6] if len(values) >= 7 else None
+                    # sun_pitch is optional (8th value)
+                    sun_pitch = values[7] if len(values) >= 8 else None
 
                     # Validate position data
                     if self._validate_position(lat, lon, alt):
@@ -603,6 +629,9 @@ class DatarefTracker(object):
                         # Only update pressure_alt if we received it
                         if pressure_alt is not None:
                             self.pressure_alt = pressure_alt
+                        # Only update sun_pitch if we received it
+                        if sun_pitch is not None:
+                            self.sun_pitch = sun_pitch
                         self.data_valid = True
                         
                         # Feed the flight averager (alt is in meters, convert to feet)

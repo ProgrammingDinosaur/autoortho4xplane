@@ -223,6 +223,12 @@ class TimeExclusionManager:
         self._last_sim_time_decision = False  # The last exclusion decision from sim time
         self._last_sim_time_value = -1.0  # The last sim time we saw (for logging)
         
+        # Sun position mode state (for sun-based exclusion)
+        # True = ortho enabled (day mode), False = exclusion active (night mode)
+        self._sun_mode_ortho_enabled = True  # Start in day mode (ortho enabled)
+        self._sun_decision_made = False  # True once we've received valid sun pitch
+        self._last_sun_pitch = -999.0  # Last sun pitch value (for logging)
+        
         # Reference to dataref tracker (set later to avoid circular import)
         self._dataref_tracker = None
         
@@ -336,6 +342,73 @@ class TimeExclusionManager:
             # Time is in range if it's >= start OR < end
             return current_time_sec >= start_sec or current_time_sec < end_sec
     
+    def _check_sun_exclusion_state(self):
+        """
+        Check if exclusion should be active based on sun position.
+        
+        Uses hysteresis to prevent rapid toggling during twilight:
+        - Switch to night (exclusion) when sun drops below night_threshold
+        - Switch to day (ortho) when sun rises above day_threshold
+        
+        The sun pitch is the angle of the sun above/below the horizon:
+        - Positive: sun above horizon (daytime)
+        - Zero: sun at horizon (sunrise/sunset)
+        - Negative: sun below horizon (twilight/night)
+          - < -6°: civil twilight ends
+          - < -12°: nautical twilight ends (default night threshold)
+          - < -18°: astronomical twilight ends (full night)
+        
+        Returns:
+            bool: True if exclusion should be active (night mode)
+        """
+        _, _, _, default_to_exclusion = self._get_config()
+        
+        if self._dataref_tracker is None:
+            return default_to_exclusion
+        
+        sun_pitch = self._dataref_tracker.get_sun_pitch()
+        
+        # Check for invalid sun_pitch (sentinel value -999 or out of valid range)
+        if sun_pitch < -90 or sun_pitch > 90:
+            # Preserve last decision during temporary unavailability
+            if self._sun_decision_made:
+                log.debug(
+                    f"Sun pitch unavailable - preserving last decision: "
+                    f"ortho={'enabled' if self._sun_mode_ortho_enabled else 'disabled'} "
+                    f"(last sun pitch was {self._last_sun_pitch:.1f}°)"
+                )
+                return not self._sun_mode_ortho_enabled
+            # No previous decision - use default
+            return default_to_exclusion
+        
+        # Get thresholds from config
+        night_threshold = getattr(CFG.time_exclusion, 'sun_night_threshold', -12.0)
+        day_threshold = getattr(CFG.time_exclusion, 'sun_day_threshold', -10.0)
+        
+        # Hysteresis logic
+        if self._sun_mode_ortho_enabled:
+            # Currently showing ortho (day mode)
+            if sun_pitch < night_threshold:
+                self._sun_mode_ortho_enabled = False  # Switch to exclusion (night)
+                log.info(
+                    f"Sun exclusion ACTIVATED: sun pitch {sun_pitch:.1f}° < "
+                    f"{night_threshold}° threshold"
+                )
+        else:
+            # Currently in exclusion (night mode)
+            if sun_pitch > day_threshold:
+                self._sun_mode_ortho_enabled = True  # Switch to ortho (day)
+                log.info(
+                    f"Sun exclusion DEACTIVATED: sun pitch {sun_pitch:.1f}° > "
+                    f"{day_threshold}° threshold"
+                )
+        
+        self._sun_decision_made = True
+        self._last_sun_pitch = sun_pitch
+        
+        # exclusion_active = NOT ortho_enabled
+        return not self._sun_mode_ortho_enabled
+    
     def _check_exclusion_state(self):
         """
         Check if time exclusion should be active based on current sim time.
@@ -357,6 +430,13 @@ class TimeExclusionManager:
         
         if not enabled:
             return False
+        
+        # Check if sun-position mode is enabled
+        use_sun = getattr(CFG.time_exclusion, 'use_sun_position', False)
+        if use_sun:
+            return self._check_sun_exclusion_state()
+        
+        # Otherwise use time-based logic below
         
         # Get current sim time from dataref tracker
         if self._dataref_tracker is None:
@@ -628,6 +708,18 @@ class TimeExclusionManager:
                 )
                 global_scenery_available = os.path.isdir(global_path)
             
+            # Get sun position info
+            use_sun = getattr(CFG.time_exclusion, 'use_sun_position', False)
+            sun_pitch = -999.0
+            if self._dataref_tracker:
+                sun_pitch = self._dataref_tracker.get_sun_pitch()
+            sun_night_threshold = getattr(
+                CFG.time_exclusion, 'sun_night_threshold', -12.0
+            )
+            sun_day_threshold = getattr(
+                CFG.time_exclusion, 'sun_day_threshold', -10.0
+            )
+            
             return {
                 'enabled': enabled,
                 'start_time': format_time_from_seconds(start_sec) if start_sec is not None else "N/A",
@@ -643,6 +735,13 @@ class TimeExclusionManager:
                 'sim_time_decision_made': self._sim_time_decision_made,
                 'preserved_decision': self._last_sim_time_decision if self._sim_time_decision_made else None,
                 'preserved_from_time': format_time_from_seconds(self._last_sim_time_value) if self._sim_time_decision_made else "N/A",
+                # Sun position mode info
+                'use_sun_position': use_sun,
+                'sun_pitch': sun_pitch if -90 <= sun_pitch <= 90 else None,
+                'sun_pitch_str': f"{sun_pitch:.1f}°" if -90 <= sun_pitch <= 90 else "N/A",
+                'sun_night_threshold': sun_night_threshold,
+                'sun_day_threshold': sun_day_threshold,
+                'sun_mode_ortho_enabled': self._sun_mode_ortho_enabled,
             }
 
 
