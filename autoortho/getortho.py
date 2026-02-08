@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import logging
 import atexit
+import ctypes
+import gc
 import os
 import re
 import sys
@@ -3750,31 +3752,56 @@ class BackgroundDDSBuilder:
                 
                 priority, tile = item
                 
+                # Drop evicted tiles early to avoid holding
+                # references longer than necessary
+                if getattr(tile, '_closed', False):
+                    bump('prebuilt_dds_skip_closed')
+                    continue
+                
                 if self._executor is not None:
                     with self._active_lock:
                         self._active_builds += 1
-                    self._executor.submit(self._build_tile_wrapper, tile)
+                    self._executor.submit(
+                        self._build_tile_wrapper, tile
+                    )
                     batch_submitted += 1
             
             if batch_submitted > 0:
                 self._last_build_time = time.monotonic()
             else:
-                # Queue was empty - wait for new items with blocking get
+                # Queue was empty - wait for new items
+                # with blocking get
                 try:
                     item = self._queue.get(timeout=1.0)
                     if item is not None:
                         priority, tile = item
-                        if self._executor is not None:
+                        # Drop evicted tiles early
+                        if getattr(tile, '_closed', False):
+                            bump('prebuilt_dds_skip_closed')
+                        elif self._executor is not None:
                             with self._active_lock:
                                 self._active_builds += 1
-                            self._executor.submit(self._build_tile_wrapper, tile)
-                            self._last_build_time = time.monotonic()
+                            self._executor.submit(
+                                self._build_tile_wrapper,
+                                tile
+                            )
+                            self._last_build_time = (
+                                time.monotonic()
+                            )
                 except Empty:
                     continue
     
     def _build_tile_wrapper(self, tile) -> None:
         """Wrapper for _build_tile_dds that handles exceptions and stats."""
         try:
+            # Skip if tile was evicted while queued/waiting
+            if getattr(tile, '_closed', False):
+                log.debug(
+                    "BackgroundDDSBuilder: Skipping closed tile "
+                    f"{tile.id}"
+                )
+                bump('prebuilt_dds_skip_closed')
+                return
             self._build_tile_dds(tile)
         finally:
             with self._active_lock:
@@ -4798,7 +4825,12 @@ def start_predictive_dds(tile_cacher=None) -> None:
         tile_cacher: TileCacher instance (for future use)
     """
     global prebuilt_dds_cache, background_dds_builder, tile_completion_tracker, _bundle_consolidator
-    
+
+    # Prevent duplicate initialization (Windows/Linux: all mounts share one process)
+    if background_dds_builder is not None:
+        log.debug("Predictive DDS already initialized, skipping")
+        return
+
     # Check if enabled
     enabled = getattr(CFG.autoortho, 'predictive_dds_enabled', True)
     if isinstance(enabled, str):
@@ -5509,6 +5541,11 @@ class Tile(object):
         self._last_collected_jpegs = None               # List of JPEG bytes (None for missing)
         self._last_collected_ratio = None               # Ratio of available chunks
         self._last_collected_missing = None             # List of missing chunk indices
+
+        # Closed flag: set by close() so external holders
+        # (BackgroundDDSBuilder, TileCompletionTracker) can detect
+        # evicted tiles and skip stale work.
+        self._closed = False
 
         #self.tile_condition = threading.Condition()
         if min_zoom:
@@ -9858,7 +9895,16 @@ class Tile(object):
         except Exception:
             pass
         
-        # 5) Reset state flags for potential tile reuse
+        # 5) Free batch-to-streaming JPEG data cache
+        # _last_collected_jpegs can hold ~25MB of JPEG bytes per tile.
+        # Without clearing, this data stays attached to the tile object
+        # and can't be GC'd if any external reference keeps the tile alive
+        # (e.g. TileCompletionTracker, BackgroundDDSBuilder queue).
+        self._last_collected_jpegs = None
+        self._last_collected_ratio = None
+        self._last_collected_missing = None
+
+        # 6) Reset state flags for potential tile reuse
         self._lazy_build_attempted = False
         self._aopipeline_attempted = False
         self._tile_time_budget = None
@@ -9867,6 +9913,38 @@ class Tile(object):
         self._is_live = False
         self._live_transition_event = None
         self._active_streaming_builder = None
+
+        # 7) Mark tile as closed so external holders (e.g.
+        # BackgroundDDSBuilder) can skip building from stale data
+        self._closed = True
+
+
+def _release_memory_to_os():
+    """
+    Force the OS to reclaim physical pages from freed Python/C allocations.
+
+    After tile eviction, Python frees objects but the C runtime heap retains
+    the pages. This causes RSS to stay high even though the memory is logically
+    free. Platform-specific calls return those pages to the OS.
+    """
+    gc.collect()
+    if sys.platform == 'linux':
+        try:
+            _libc = ctypes.CDLL("libc.so.6")
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
+    elif sys.platform == 'darwin':
+        try:
+            _libc = ctypes.CDLL("libSystem.B.dylib")
+            _libc.malloc_zone_pressure_relief(None, 0)
+        except Exception:
+            pass
+    elif sys.platform == 'win32':
+        try:
+            ctypes.cdll.msvcrt._heapmin()
+        except Exception:
+            pass
 
 
 class TileCacher(object):
@@ -10198,14 +10276,6 @@ class TileCacher(object):
             #set_stat('tile_mem_hits', self.hits)
             log.debug(f"TILE CACHE:  MISS: {self.misses}  HIT: {self.hits}")
         log.debug(f"NUM OPEN TILES: {len(self.tiles)}.  TOTAL MEM: {cur_mem//1048576} MB")
-        
-        # Log warning if local RSS exceeds expected per-process share significantly
-        # This helps diagnose memory issues on MacOS with multiple worker processes
-        per_process_expected = self.cache_mem_lim // 4
-        if cur_mem > per_process_expected * 1.5:
-            log.warning(f"Memory usage ({cur_mem // (1024**2)}MB) significantly exceeds "
-                       f"expected per-process share ({per_process_expected // (1024**2)}MB). "
-                       f"Open tiles: {len(self.tiles)}")
 
     # -----------------------------
     # LRU helpers and leader logic
@@ -10276,12 +10346,16 @@ class TileCacher(object):
         2. PHASE 2: Close tiles OUTSIDE lock (slow I/O operations)
         
         This prevents blocking _get_tile() and _open_tile() during mass evictions.
+        
+        Also releases external references (TileCompletionTracker) so evicted
+        tiles can be garbage-collected immediately.
         """
         evicted = 0
         BATCH_SIZE = 20  # Balance between lock overhead and responsiveness
         
         while evicted < max_to_evict:
             # PHASE 1: Collect batch to evict (under lock - fast dict ops only)
+            # Store (tile_id, tile) pairs so we can release external refs
             batch = []
             with self.tc_lock:
                 for idx in list(self._lru_candidates()):
@@ -10296,7 +10370,7 @@ class TileCacher(object):
                         continue
                     # Pop from dict immediately - tile is now "orphaned"
                     try:
-                        batch.append(self.tiles.pop(idx))
+                        batch.append((idx, self.tiles.pop(idx)))
                     except KeyError:
                         continue
             
@@ -10305,8 +10379,20 @@ class TileCacher(object):
             
             # PHASE 2: Close tiles OUTSIDE lock (slow I/O operations)
             # This is safe because tiles are already removed from self.tiles
-            for t in batch:
+            for tile_id, t in batch:
                 try:
+                    # Release external references BEFORE close() so the
+                    # tile object can be garbage-collected once close()
+                    # drops the last internal references.
+                    # TileCompletionTracker may hold a strong ref to
+                    # the tile, preventing GC for up to 10 minutes.
+                    if tile_completion_tracker is not None:
+                        try:
+                            tile_completion_tracker.stop_tracking(
+                                tile_id
+                            )
+                        except Exception:
+                            pass
                     t.close()
                 except Exception:
                     pass
@@ -10320,16 +10406,16 @@ class TileCacher(object):
         log.info(f"Started tile clean thread.  Mem limit {self.cache_mem_lim}")
         # Faster cadence when a shared stats store is present (macOS parent)
         fast_mode = self._has_shared_store()
-        poll_interval = 3 if fast_mode else 15
+        # Base poll intervals — used when memory is well below limit.
+        # When memory approaches the limit (>70%), the interval drops
+        # to poll_interval_fast to catch growth before it overshoots.
+        poll_interval_normal = 3 if fast_mode else 10
+        poll_interval_fast = 1
+        poll_interval = poll_interval_normal
         
         # Maximum tile count before forced eviction (prevents memory bloat from tile object overhead)
         # Each tile object costs ~10-50KB in overhead even without loaded data
         max_tile_count = 5000
-        
-        # Per-process memory limit: fraction of global limit for fallback when aggregation fails
-        # MacOS runs each scenery as a separate subprocess, so each worker gets 1/4 of total limit
-        # This prevents any single worker from consuming all available memory
-        per_process_limit = self.cache_mem_lim // 4
         
         # Staleness threshold for global memory stats (seconds)
         # If stats are older than this, they're considered unreliable
@@ -10338,6 +10424,8 @@ class TileCacher(object):
         while True:
             process = psutil.Process(os.getpid())
             cur_mem = process.memory_info().rss
+            total_evicted = 0
+            rss_before_eviction = cur_mem  # Always set so eviction-log block never sees UnboundLocalError
 
             # Publish this process heartbeat + RSS so the parent can aggregate
             try:
@@ -10388,12 +10476,16 @@ class TileCacher(object):
                 effective_mem = global_mem_bytes
                 effective_limit = self.cache_mem_lim
             else:
-                # Fallback: use local memory vs per-process limit
+                # Fallback: use local memory vs cache limit
                 effective_mem = cur_mem
-                effective_limit = per_process_limit
-                if cur_mem > per_process_limit:
-                    log.warning(f"Global memory stats unavailable/stale, using per-process limit "
-                               f"({per_process_limit // (1024**2)}MB). Local RSS: {cur_mem // (1024**2)}MB")
+                effective_limit = self.cache_mem_lim
+                if cur_mem > self.cache_mem_lim:
+                    log.warning(
+                        "Global memory stats unavailable/stale. "
+                        f"Local RSS: {cur_mem // (1024**2)}MB, "
+                        f"limit: "
+                        f"{self.cache_mem_lim // (1024**2)}MB"
+                    )
 
             # Hysteresis target: evict down to limit - headroom
             headroom = max(int(effective_limit * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
@@ -10407,9 +10499,10 @@ class TileCacher(object):
             need_mem_eviction = effective_mem > effective_limit
             if need_mem_eviction or need_tile_count_eviction:
                 if not self._try_acquire_evict_leader():
-                    time.sleep(poll_interval)
+                    time.sleep(poll_interval_fast)
                     continue
-                    
+                rss_before_eviction = process.memory_info().rss
+
             # Evict if too many tiles (regardless of memory)
             if need_tile_count_eviction:
                 target_tile_count = int(max_tile_count * 0.8)  # Evict down to 80% of max
@@ -10417,7 +10510,8 @@ class TileCacher(object):
                 if tiles_to_evict > 0:
                     log.info(f"Tile count eviction: {tile_count} tiles, evicting {tiles_to_evict} to reach {target_tile_count}")
                     # _evict_batch handles its own locking internally
-                    self._evict_batch(tiles_to_evict)
+                    evicted = self._evict_batch(tiles_to_evict)
+                    total_evicted += evicted
 
             # Evict while above target using adaptive batch sizing
             while self.tiles and effective_mem > target_bytes:
@@ -10426,6 +10520,7 @@ class TileCacher(object):
                 adaptive = max(20, int(len(self.tiles) * min(0.10, ratio)))
                 # _evict_batch handles its own locking internally
                 evicted = self._evict_batch(adaptive)
+                total_evicted += evicted
                 if evicted == 0:
                     break
 
@@ -10454,7 +10549,7 @@ class TileCacher(object):
                     effective_limit = self.cache_mem_lim
                 else:
                     effective_mem = cur_mem
-                    effective_limit = per_process_limit
+                    effective_limit = self.cache_mem_lim
                 
                 # Recalculate target with potentially new limit
                 headroom = max(int(effective_limit * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
@@ -10467,6 +10562,16 @@ class TileCacher(object):
                 except Exception:
                     pass
 
+            if total_evicted > 0:
+                _release_memory_to_os()
+                rss_after_release = process.memory_info().rss
+                log.info(
+                    f"Eviction complete: evicted={total_evicted} tiles, "
+                    f"RSS before={rss_before_eviction // (1024**2)}MB, "
+                    f"RSS after release={rss_after_release // (1024**2)}MB, "
+                    f"freed={max(0, rss_before_eviction - rss_after_release) // (1024**2)}MB"
+                )
+
             if MEMTRACE:
                 snapshot = tracemalloc.take_snapshot()
                 top_stats = snapshot.statistics('lineno')
@@ -10475,6 +10580,19 @@ class TileCacher(object):
                 for stat in top_stats[:10]:
                         log.info(stat)
 
+            # Adaptive poll interval: check more frequently when
+            # memory is above 70% of the limit so eviction can
+            # react before the limit is significantly exceeded.
+            # During active tile creation, memory can grow at
+            # ~200-300 MB/s, so a 3-second sleep allows ~700 MB
+            # of overshoot.  A 1-second sleep caps it to ~250 MB.
+            mem_pressure = (
+                effective_mem / max(1, effective_limit)
+            )
+            if mem_pressure > 0.7:
+                poll_interval = poll_interval_fast
+            else:
+                poll_interval = poll_interval_normal
             time.sleep(poll_interval)
 
     def _get_tile(self, row, col, map_type, zoom):

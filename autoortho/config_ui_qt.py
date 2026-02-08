@@ -2708,13 +2708,21 @@ class ConfigUI(QMainWindow):
 
         # Enable/Disable controls
         seasons_toggle_layout = QHBoxLayout()
-        self.seasons_enabled_radio = QRadioButton("Enabled")
-        self.seasons_disabled_radio = QRadioButton("Disabled")
+        # TEMP pyside6 / Python 3.14 QRadioButton workaround
+        # self.seasons_enabled_radio = QRadioButton("Enabled")
+        # self.seasons_disabled_radio = QRadioButton("Disabled")
+        self.seasons_enabled_radio = QCheckBox("Enabled")
+        self.seasons_disabled_radio = QCheckBox("Disabled")
+
         seasons_enabled = bool(self.cfg.seasons.enabled)
         self.seasons_enabled_radio.setChecked(seasons_enabled)
         self.seasons_disabled_radio.setChecked(not seasons_enabled)
-        self.seasons_enabled_radio.toggled.connect(self.on_seasons_enabled_toggled)
-        self.seasons_disabled_radio.toggled.connect(self.on_seasons_enabled_toggled)
+        # TEMP pyside6 / Python 3.14 QRadioButton workaround
+        # self.seasons_enabled_radio.toggled.connect(self.on_seasons_enabled_toggled)
+        # self.seasons_disabled_radio.toggled.connect(self.on_seasons_enabled_toggled)
+        self.seasons_enabled_radio.clicked.connect(self.on_seasons_enabled_checked)
+        self.seasons_disabled_radio.clicked.connect(self.on_seasons_disabled_checked)
+
         seasons_toggle_layout.addWidget(self.seasons_enabled_radio)
         seasons_toggle_layout.addWidget(self.seasons_disabled_radio)
         seasons_toggle_layout.addStretch()
@@ -3221,6 +3229,24 @@ class ConfigUI(QMainWindow):
         try:
             enabled = self.seasons_enabled_radio.isChecked()
             self._set_seasons_controls_enabled(enabled)
+        except Exception:
+            pass
+
+    # TEMP pyside6 / Python 3.14 QRadioButton workaround
+    def on_seasons_enabled_checked(self):
+        try:
+            self.seasons_enabled_radio.setChecked(True)
+            self.seasons_disabled_radio.setChecked(False)
+            self._set_seasons_controls_enabled(True)
+        except Exception:
+            pass
+
+    # TEMP pyside6 / Python 3.14 QRadioButton workaround
+    def on_seasons_disabled_checked(self):
+        try:
+            self.seasons_enabled_radio.setChecked(False)
+            self.seasons_disabled_radio.setChecked(True)
+            self._set_seasons_controls_enabled(False)
         except Exception:
             pass
 

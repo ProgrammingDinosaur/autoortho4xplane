@@ -340,16 +340,24 @@ class BundleConsolidator:
                     retry_counts.pop(tile_key, None)
                     
                 except Exception as e:
-                    log.error(f"Error consolidating tile {tile_key}: {e}")
+                    log.error(
+                        f"Error consolidating tile {tile_key}: {e}"
+                    )
                     with self._stats_lock:
                         self._stats['errors'] += 1
                     if self._on_error:
-                        self._on_error(tile_key, e)
+                        try:
+                            self._on_error(tile_key, e)
+                        except Exception:
+                            pass
                     retry_counts.pop(tile_key, None)
-                
-                # CRITICAL: Free memory immediately after processing
-                # With 300k+ JPEGs/session, holding references causes memory bloat
-                task.jpeg_datas = None
+                finally:
+                    # CRITICAL: Free memory immediately after
+                    # processing.  Using finally guarantees cleanup
+                    # even if _on_error or stats code raises.
+                    # Safe on retry path: jpeg_datas is already
+                    # None before requeue (line 331).
+                    task.jpeg_datas = None
                 
                 # Remove from pending and notify waiters
                 with self._pending_lock:
