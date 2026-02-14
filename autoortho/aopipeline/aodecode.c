@@ -27,18 +27,30 @@
  * 
  * Uses a simple stack-based free list for O(1) acquire/release.
  * Thread safety is provided by a mutex around the free list.
+ * 
+ * Memory Management:
+ * - Fixed pool: Pre-allocated contiguous buffers (fast, no fragmentation)
+ * - Overflow buffers: malloc'd when pool exhausted AND memory_limit allows
+ * - Wait-queue: Condition variable for blocking when limit reached
+ * - Auto-shrink: Overflow buffers freed on release (returns to fixed pool size)
  */
 struct aodecode_pool {
+    /* Fixed pool memory */
     uint8_t* memory;        /* Contiguous allocation for all buffers */
     int32_t buffer_size;    /* Size of each buffer (CHUNK_RGBA_BYTES) */
-    int32_t count;          /* Total number of buffers */
+    int32_t count;          /* Total number of fixed buffers */
     int32_t* free_stack;    /* Stack of free buffer indices */
     int32_t free_top;       /* Top of free stack (number of free buffers) */
-#ifdef AOPIPELINE_WINDOWS
-    CRITICAL_SECTION lock;
-#else
-    pthread_mutex_t lock;
-#endif
+    
+    /* Memory limit and overflow tracking */
+    int64_t memory_limit;       /* Maximum total memory (0 = unlimited) */
+    int64_t overflow_allocated; /* Bytes currently in overflow buffers */
+    int32_t overflow_count;     /* Number of active overflow buffers */
+    int32_t waiters_count;      /* Number of threads waiting for buffer */
+    
+    /* Synchronization */
+    AOMUTEX lock;               /* Mutex for thread safety */
+    AOCOND buffer_available;    /* Condition: buffer released or limit raised */
 };
 
 AODECODE_API aodecode_pool_t* aodecode_create_pool(int32_t count) {
@@ -49,6 +61,12 @@ AODECODE_API aodecode_pool_t* aodecode_create_pool(int32_t count) {
     
     pool->buffer_size = CHUNK_RGBA_BYTES;
     pool->count = count;
+    
+    /* Initialize memory limit and overflow tracking */
+    pool->memory_limit = 0;  /* 0 = unlimited (legacy behavior) */
+    pool->overflow_allocated = 0;
+    pool->overflow_count = 0;
+    pool->waiters_count = 0;
     
     /* Allocate contiguous memory for all buffers */
     pool->memory = (uint8_t*)malloc((size_t)count * CHUNK_RGBA_BYTES);
@@ -71,30 +89,48 @@ AODECODE_API aodecode_pool_t* aodecode_create_pool(int32_t count) {
     }
     pool->free_top = count;
     
-    /* Initialize mutex */
-#ifdef AOPIPELINE_WINDOWS
-    InitializeCriticalSection(&pool->lock);
-#else
-    pthread_mutex_init(&pool->lock, NULL);
-#endif
+    /* Initialize synchronization primitives */
+    AOMUTEX_INIT(pool->lock);
+    AOCOND_INIT(pool->buffer_available);
     
+    return pool;
+}
+
+/**
+ * Create a buffer pool with memory limit.
+ * 
+ * Extended version that sets a memory limit for overflow buffers.
+ * When the limit is reached, acquire will block until a buffer is released.
+ */
+AODECODE_API aodecode_pool_t* aodecode_create_pool_ex(int32_t count, int64_t memory_limit) {
+    aodecode_pool_t* pool = aodecode_create_pool(count);
+    if (pool) {
+        pool->memory_limit = memory_limit;
+    }
     return pool;
 }
 
 AODECODE_API void aodecode_destroy_pool(aodecode_pool_t* pool) {
     if (!pool) return;
     
-#ifdef AOPIPELINE_WINDOWS
-    DeleteCriticalSection(&pool->lock);
-#else
-    pthread_mutex_destroy(&pool->lock);
-#endif
+    /* Destroy synchronization primitives */
+    AOCOND_DESTROY(pool->buffer_available);
+    AOMUTEX_DESTROY(pool->lock);
     
     free(pool->free_stack);
     free(pool->memory);
     free(pool);
 }
 
+/**
+ * Acquire a buffer from the pool.
+ * 
+ * Strategy:
+ * 1. Try fixed pool first (fastest, no fragmentation)
+ * 2. If pool exhausted, try malloc overflow if within memory_limit
+ * 3. If limit reached, wait for buffer to be released
+ * 4. Safety fallback: malloc if wait fails (shouldn't happen)
+ */
 AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
     if (!pool) {
         /* No pool - fallback to malloc */
@@ -102,34 +138,74 @@ AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
     }
     
     uint8_t* buffer = NULL;
+    int64_t fixed_pool_size = (int64_t)pool->count * CHUNK_RGBA_BYTES;
     
-#ifdef AOPIPELINE_WINDOWS
-    EnterCriticalSection(&pool->lock);
-#else
-    pthread_mutex_lock(&pool->lock);
-#endif
+    AOMUTEX_LOCK(pool->lock);
     
-    if (pool->free_top > 0) {
-        /* Pop from free stack */
-        pool->free_top--;
-        int32_t idx = pool->free_stack[pool->free_top];
-        buffer = pool->memory + (idx * CHUNK_RGBA_BYTES);
+    while (1) {
+        /* Step 1: Try fixed pool first (O(1), no fragmentation) */
+        if (pool->free_top > 0) {
+            pool->free_top--;
+            int32_t idx = pool->free_stack[pool->free_top];
+            buffer = pool->memory + (idx * CHUNK_RGBA_BYTES);
+            break;
+        }
+        
+        /* Step 2: Fixed pool exhausted - try overflow malloc if within limit */
+        if (pool->memory_limit == 0) {
+            /* No limit - allow unlimited overflow (legacy behavior) */
+            AOMUTEX_UNLOCK(pool->lock);
+            buffer = (uint8_t*)malloc(CHUNK_RGBA_BYTES);
+            if (buffer) {
+                /* Track overflow outside lock (approximate count is fine) */
+                AOMUTEX_LOCK(pool->lock);
+                pool->overflow_allocated += CHUNK_RGBA_BYTES;
+                pool->overflow_count++;
+                AOMUTEX_UNLOCK(pool->lock);
+            }
+            return buffer;
+        }
+        
+        /* Check if we have room for another overflow buffer */
+        int64_t current_usage = fixed_pool_size + pool->overflow_allocated;
+        if (current_usage + CHUNK_RGBA_BYTES <= pool->memory_limit) {
+            /* Within limit - allocate overflow buffer */
+            pool->overflow_allocated += CHUNK_RGBA_BYTES;
+            pool->overflow_count++;
+            AOMUTEX_UNLOCK(pool->lock);
+            
+            buffer = (uint8_t*)malloc(CHUNK_RGBA_BYTES);
+            if (!buffer) {
+                /* malloc failed - revert tracking */
+                AOMUTEX_LOCK(pool->lock);
+                pool->overflow_allocated -= CHUNK_RGBA_BYTES;
+                pool->overflow_count--;
+                AOMUTEX_UNLOCK(pool->lock);
+                return NULL;
+            }
+            return buffer;
+        }
+        
+        /* Step 3: Limit reached - wait for buffer to be released */
+        pool->waiters_count++;
+        AOCOND_WAIT(pool->buffer_available, pool->lock);
+        pool->waiters_count--;
+        /* Loop back to try again after wakeup */
     }
     
-#ifdef AOPIPELINE_WINDOWS
-    LeaveCriticalSection(&pool->lock);
-#else
-    pthread_mutex_unlock(&pool->lock);
-#endif
-    
-    if (!buffer) {
-        /* Pool exhausted - fallback to malloc */
-        buffer = (uint8_t*)malloc(CHUNK_RGBA_BYTES);
-    }
-    
+    AOMUTEX_UNLOCK(pool->lock);
     return buffer;
 }
 
+/**
+ * Release a buffer back to the pool.
+ * 
+ * Auto-shrink behavior:
+ * - Fixed pool buffers: returned to free stack
+ * - Overflow buffers: freed immediately (auto-shrink to fixed pool size)
+ * 
+ * Signals waiters when buffer becomes available.
+ */
 AODECODE_API void aodecode_release_buffer(aodecode_pool_t* pool, uint8_t* buffer) {
     if (!buffer) return;
     
@@ -139,17 +215,13 @@ AODECODE_API void aodecode_release_buffer(aodecode_pool_t* pool, uint8_t* buffer
         return;
     }
     
-    /* Check if buffer is from the pool */
+    /* Check if buffer is from the fixed pool */
     if (buffer >= pool->memory && 
         buffer < pool->memory + ((size_t)pool->count * CHUNK_RGBA_BYTES)) {
-        /* Calculate buffer index */
+        /* Fixed pool buffer - return to free stack */
         int32_t idx = (int32_t)((buffer - pool->memory) / CHUNK_RGBA_BYTES);
         
-#ifdef AOPIPELINE_WINDOWS
-        EnterCriticalSection(&pool->lock);
-#else
-        pthread_mutex_lock(&pool->lock);
-#endif
+        AOMUTEX_LOCK(pool->lock);
         
         /* Push back to free stack */
         if (pool->free_top < pool->count) {
@@ -157,14 +229,26 @@ AODECODE_API void aodecode_release_buffer(aodecode_pool_t* pool, uint8_t* buffer
             pool->free_top++;
         }
         
-#ifdef AOPIPELINE_WINDOWS
-        LeaveCriticalSection(&pool->lock);
-#else
-        pthread_mutex_unlock(&pool->lock);
-#endif
+        /* Signal waiters if any */
+        if (pool->waiters_count > 0) {
+            AOCOND_SIGNAL(pool->buffer_available);
+        }
+        
+        AOMUTEX_UNLOCK(pool->lock);
     } else {
-        /* Not from pool - must have been malloc'd */
+        /* Overflow buffer - free it (auto-shrink) and update tracking */
         free(buffer);
+        
+        AOMUTEX_LOCK(pool->lock);
+        pool->overflow_allocated -= CHUNK_RGBA_BYTES;
+        pool->overflow_count--;
+        
+        /* Signal waiters if any - memory is now available */
+        if (pool->waiters_count > 0) {
+            AOCOND_SIGNAL(pool->buffer_available);
+        }
+        
+        AOMUTEX_UNLOCK(pool->lock);
     }
 }
 
@@ -181,21 +265,96 @@ AODECODE_API void aodecode_pool_stats(
         return;
     }
     
-#ifdef AOPIPELINE_WINDOWS
-    EnterCriticalSection(&pool->lock);
-#else
-    pthread_mutex_lock(&pool->lock);
-#endif
+    AOMUTEX_LOCK(pool->lock);
     
     if (out_total) *out_total = pool->count;
     if (out_available) *out_available = pool->free_top;
     if (out_acquired) *out_acquired = pool->count - pool->free_top;
     
-#ifdef AOPIPELINE_WINDOWS
-    LeaveCriticalSection(&pool->lock);
-#else
-    pthread_mutex_unlock(&pool->lock);
-#endif
+    AOMUTEX_UNLOCK(pool->lock);
+}
+
+/**
+ * Set the memory limit for a pool.
+ * 
+ * @param pool Pool to configure
+ * @param memory_limit Maximum total memory (0 = unlimited)
+ */
+AODECODE_API void aodecode_pool_set_limit(aodecode_pool_t* pool, int64_t memory_limit) {
+    if (!pool) return;
+    
+    AOMUTEX_LOCK(pool->lock);
+    pool->memory_limit = memory_limit;
+    /* Wake all waiters so they can re-check the new limit */
+    if (pool->waiters_count > 0) {
+        AOCOND_BROADCAST(pool->buffer_available);
+    }
+    AOMUTEX_UNLOCK(pool->lock);
+}
+
+/**
+ * Get the current memory limit.
+ */
+AODECODE_API int64_t aodecode_pool_get_limit(aodecode_pool_t* pool) {
+    if (!pool) return 0;
+    
+    AOMUTEX_LOCK(pool->lock);
+    int64_t limit = pool->memory_limit;
+    AOMUTEX_UNLOCK(pool->lock);
+    
+    return limit;
+}
+
+/**
+ * Get current memory usage.
+ * 
+ * Returns the total memory used by fixed pool + overflow buffers.
+ */
+AODECODE_API int64_t aodecode_pool_get_usage(aodecode_pool_t* pool) {
+    if (!pool) return 0;
+    
+    AOMUTEX_LOCK(pool->lock);
+    int64_t fixed = (int64_t)pool->count * CHUNK_RGBA_BYTES;
+    int64_t overflow = pool->overflow_allocated;
+    AOMUTEX_UNLOCK(pool->lock);
+    
+    return fixed + overflow;
+}
+
+/**
+ * Extended pool statistics.
+ * 
+ * Returns detailed stats including overflow tracking.
+ */
+AODECODE_API void aodecode_pool_stats_ex(
+    aodecode_pool_t* pool,
+    int32_t* out_total,
+    int32_t* out_available,
+    int32_t* out_acquired,
+    int32_t* out_overflow_count,
+    int64_t* out_overflow_bytes,
+    int64_t* out_memory_limit
+) {
+    if (!pool) {
+        if (out_total) *out_total = 0;
+        if (out_available) *out_available = 0;
+        if (out_acquired) *out_acquired = 0;
+        if (out_overflow_count) *out_overflow_count = 0;
+        if (out_overflow_bytes) *out_overflow_bytes = 0;
+        if (out_memory_limit) *out_memory_limit = 0;
+        return;
+    }
+    
+    AOMUTEX_LOCK(pool->lock);
+    
+    if (out_total) *out_total = pool->count;
+    if (out_available) *out_available = pool->free_top;
+    if (out_acquired) *out_acquired = pool->count - pool->free_top;
+    if (out_overflow_count) *out_overflow_count = pool->overflow_count;
+    if (out_overflow_bytes) *out_overflow_bytes = pool->overflow_allocated;
+    if (out_memory_limit) *out_memory_limit = pool->memory_limit;
+    
+    AOMUTEX_UNLOCK(pool->lock);
 }
 
 /*============================================================================

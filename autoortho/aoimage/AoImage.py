@@ -58,18 +58,32 @@ class AoImage(Structure):
                 self._freed = True
             except Exception as e:
                 log.error(f"Error in AoImage.close: {e}")
+
+    def __enter__(self):
+        """Context manager entry - enables 'with AoImage(...) as img:' pattern."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures cleanup on scope exit."""
+        self.close()
+        return False  # Don't suppress exceptions
         
     def convert(self, mode):
         """
         Not really needed as AoImage always loads as RGBA
         """
         assert mode == "RGBA", "Sorry, only conversion to RGBA supported"
-        new = AoImage()
-        if not _aoi.aoimage_2_rgba(self, new):
-            log.debug(f"AoImage.reduce_2 error: {new._errmsg.decode()}")
+        new_img = AoImage()
+        try:
+            if not _aoi.aoimage_2_rgba(self, new_img):
+                log.debug(f"AoImage.convert error: {new_img._errmsg.decode()}")
+                new_img.close()  # Cleanup on failure
+                return None
+            return new_img
+        except Exception as e:
+            log.error(f"AoImage.convert exception: {e}")
+            new_img.close()  # Cleanup on exception
             return None
-
-        return new
 
     def reduce_2(self, steps = 1):
         """
@@ -107,11 +121,13 @@ class AoImage(Structure):
             log.debug(f"AoImage.scale: Scaling {self._width}x{self._height} by {factor}")
             if not _aoi.aoimage_scale(orig, scaled, factor):
                 log.error(f"AoImage.scale error: {scaled._errmsg.decode()}")
+                scaled.close()  # Cleanup on failure
                 return None
             log.debug(f"AoImage.scale: Success, created {scaled._width}x{scaled._height}")
             return scaled
         except Exception as e:
             log.error(f"scale: Exception: {e}")
+            scaled.close()  # Cleanup on exception
             return None
 
     def write_jpg(self, filename, quality = 90):
@@ -214,9 +230,16 @@ class AoImage(Structure):
             New AoImage with dimensions (width * scale_factor, height * scale_factor)
         """
         result = AoImage()
-        if not _aoi.aoimage_crop_and_upscale(self, result, x, y, width, height, scale_factor):
-            raise AOImageException(f"crop_and_upscale failed: {result._errmsg.decode()}")
-        return result
+        try:
+            if not _aoi.aoimage_crop_and_upscale(self, result, x, y, width, height, scale_factor):
+                result.close()  # Cleanup on failure
+                raise AOImageException(f"crop_and_upscale failed: {result._errmsg.decode()}")
+            return result
+        except AOImageException:
+            raise  # Re-raise our exception
+        except Exception as e:
+            result.close()  # Cleanup on exception
+            raise AOImageException(f"crop_and_upscale exception: {e}")
 
     @property
     def size(self):
@@ -226,12 +249,17 @@ class AoImage(Structure):
 def new(mode, wh, color):
     #print(f"{mode}, {wh}, {color}")
     assert(mode == "RGBA")
-    new = AoImage()
-    if not _aoi.aoimage_create(new, wh[0], wh[1], color[0], color[1], color[2]):
-        log.debug(f"AoImage.new error: {new._errmsg.decode()}")
+    new_img = AoImage()
+    try:
+        if not _aoi.aoimage_create(new_img, wh[0], wh[1], color[0], color[1], color[2]):
+            log.debug(f"AoImage.new error: {new_img._errmsg.decode()}")
+            new_img.close()  # Cleanup on failure
+            return None
+        return new_img
+    except Exception as e:
+        log.error(f"AoImage.new exception: {e}")
+        new_img.close()  # Cleanup on exception
         return None
-
-    return new
 
 
 def load_from_memory(mem, datalen=None):
@@ -247,32 +275,38 @@ def load_from_memory(mem, datalen=None):
         log.error(f"AoImage.load_from_memory: data too short ({datalen} bytes)")
         return None
     
-    new = AoImage()
+    new_img = AoImage()
     try:
         # Breadcrumb: Log BEFORE entering C code (helps debug crashes)
         log.debug(f"AoImage: Calling C aoimage_from_memory with {datalen} bytes")
         
         # Keep strong reference to mem to prevent GC during C call
         mem_ref = mem
-        if not _aoi.aoimage_from_memory(new, mem_ref, datalen):
-            log.error(f"AoImage.load_from_memory error: {new._errmsg.decode()}")
+        if not _aoi.aoimage_from_memory(new_img, mem_ref, datalen):
+            log.error(f"AoImage.load_from_memory error: {new_img._errmsg.decode()}")
+            new_img.close()  # Cleanup on failure
             return None
         
         # Breadcrumb: Made it through C code successfully
-        log.debug(f"AoImage: C call succeeded, created {new._width}x{new._height} image")
+        log.debug(f"AoImage: C call succeeded, created {new_img._width}x{new_img._height} image")
+        return new_img
     except Exception as e:
         log.error(f"AoImage.load_from_memory exception: {e}")
+        new_img.close()  # Cleanup on exception
         return None
-
-    return new
 
 def open(filename):
-    new = AoImage()
-    if not _aoi.aoimage_read_jpg(filename.encode(), new):
-        log.debug(f"AoImage.open error for {filename}: {new._errmsg.decode()}")
+    new_img = AoImage()
+    try:
+        if not _aoi.aoimage_read_jpg(filename.encode(), new_img):
+            log.debug(f"AoImage.open error for {filename}: {new_img._errmsg.decode()}")
+            new_img.close()  # Cleanup on failure
+            return None
+        return new_img
+    except Exception as e:
+        log.error(f"AoImage.open exception: {e}")
+        new_img.close()  # Cleanup on exception
         return None
-
-    return new
 
 # init code
 def _get_aoimage_path():

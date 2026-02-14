@@ -341,6 +341,46 @@ class DDS(Structure):
    
         self.compress_count = 0
 
+    def close(self):
+        """Release all BytesIO buffers held by this DDS instance.
+        
+        This should be called when done with the DDS to free memory immediately
+        rather than waiting for garbage collection.
+        """
+        # Close header buffer
+        if hasattr(self, 'header') and self.header is not None:
+            try:
+                self.header.close()
+            except Exception:
+                pass
+            self.header = None
+        
+        # Close all mipmap databuffers
+        if hasattr(self, 'mipmap_list'):
+            for mm in self.mipmap_list:
+                if mm is not None and mm.databuffer is not None:
+                    try:
+                        mm.databuffer.close()
+                    except Exception:
+                        pass
+                    mm.databuffer = None
+
+    def __del__(self):
+        """Safety net - attempt cleanup if close() was never called."""
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        """Context manager entry - enables 'with DDS(...) as dds:' pattern."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - ensures cleanup on scope exit."""
+        self.close()
+        return False  # Don't suppress exceptions
+
     def write(self, filename):
         #self.dump_header()
         with open(filename, 'wb') as h:
@@ -684,6 +724,12 @@ class DDS(Structure):
 
                 # Assign databuffer (still within mipmap_lock)
                 if dxtdata is not None:
+                    # Close old buffer before creating new one to prevent BytesIO accumulation
+                    if self.mipmap_list[mipmap].databuffer is not None:
+                        try:
+                            self.mipmap_list[mipmap].databuffer.close()
+                        except Exception:
+                            pass
                     self.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=dxtdata)
                     if not compress_bytes:
                         self.mipmap_list[mipmap].retrieved = True
@@ -693,6 +739,12 @@ class DDS(Structure):
                     if mipmap == self.smallest_mm:
                         log.debug(f"At MM {mipmap}.  Set the remaining MMs..")
                         for mm in self.mipmap_list[self.smallest_mm:]:
+                            # Close old buffer before creating new one
+                            if mm.databuffer is not None:
+                                try:
+                                    mm.databuffer.close()
+                                except Exception:
+                                    pass
                             mm.databuffer = BytesIO(initial_bytes=dxtdata)
                             mm.retrieved = True
                             mipmap += 1

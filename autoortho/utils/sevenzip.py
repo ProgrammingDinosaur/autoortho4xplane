@@ -223,7 +223,9 @@ class SevenZipFile:
         This uses 7-Zip's stdout extraction: 7zz e archive.7z -so filename
         """
         # Use -so to write to stdout, -y to assume yes
-        result = self._run_7zip(['e', self.archive_path, '-so', name])
+        # Use '--' to prevent filenames starting with '-' from being
+        # interpreted as switches (e.g., '-23+147.dsf' for southern coords)
+        result = self._run_7zip(['e', self.archive_path, '-so', '--', name])
         
         if result.returncode != 0:
             stderr = result.stderr.decode(errors='ignore')

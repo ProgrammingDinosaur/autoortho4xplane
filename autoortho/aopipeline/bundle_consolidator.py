@@ -156,11 +156,14 @@ class BundleConsolidator:
         # Debouncing: track last chunk arrival per tile
         self._last_chunk_time: Dict[str, float] = {}
         self._debounce_lock = threading.Lock()
+        self._last_chunk_time_max = 2000  # Max entries before cleanup
         
         # Per-bundle locks to serialize updates to the same bundle file
         # This prevents race conditions when multiple zoom levels update simultaneously
         self._bundle_locks: Dict[str, threading.Lock] = {}
         self._bundle_locks_lock = threading.Lock()  # Protects _bundle_locks dict
+        self._bundle_locks_max = 500  # Max entries before cleanup
+        self._bundle_locks_cleanup_counter = 0  # Cleanup every N calls
         
         # Per-tile completion events (replaces thundering herd notify_all)
         # Maps tile_prefix (row_col_maptype_) -> Event
@@ -168,6 +171,7 @@ class BundleConsolidator:
         # are woken when that tile completes, avoiding thundering herd
         self._tile_events: Dict[str, threading.Event] = {}
         self._tile_events_lock = threading.Lock()
+        self._tile_events_max = 500  # Max entries before cleanup
         
         # Worker threads (daemon threads for clean shutdown)
         self._workers: List[threading.Thread] = []
@@ -228,7 +232,35 @@ class BundleConsolidator:
         with self._bundle_locks_lock:
             if bundle_path not in self._bundle_locks:
                 self._bundle_locks[bundle_path] = threading.Lock()
+                # Periodic cleanup to prevent unbounded growth
+                self._bundle_locks_cleanup_counter += 1
+                if self._bundle_locks_cleanup_counter >= 100:
+                    self._bundle_locks_cleanup_counter = 0
+                    self._cleanup_bundle_locks_unlocked()
             return self._bundle_locks[bundle_path]
+    
+    def _cleanup_bundle_locks_unlocked(self):
+        """
+        Clean up old bundle locks that are no longer in use.
+        Must be called with _bundle_locks_lock held.
+        """
+        if len(self._bundle_locks) <= self._bundle_locks_max:
+            return
+        
+        # Remove locks that are not currently held
+        # Start from oldest entries (arbitrary order in dict)
+        to_remove = []
+        for path, lock in self._bundle_locks.items():
+            if not lock.locked():
+                to_remove.append(path)
+            if len(self._bundle_locks) - len(to_remove) <= self._bundle_locks_max // 2:
+                break
+        
+        for path in to_remove:
+            del self._bundle_locks[path]
+        
+        if to_remove:
+            log.debug(f"Cleaned up {len(to_remove)} bundle locks")
     
     def _worker_loop(self):
         """Main worker loop - processes consolidation tasks."""
@@ -308,16 +340,24 @@ class BundleConsolidator:
                     retry_counts.pop(tile_key, None)
                     
                 except Exception as e:
-                    log.error(f"Error consolidating tile {tile_key}: {e}")
+                    log.error(
+                        f"Error consolidating tile {tile_key}: {e}"
+                    )
                     with self._stats_lock:
                         self._stats['errors'] += 1
                     if self._on_error:
-                        self._on_error(tile_key, e)
+                        try:
+                            self._on_error(tile_key, e)
+                        except Exception:
+                            pass
                     retry_counts.pop(tile_key, None)
-                
-                # CRITICAL: Free memory immediately after processing
-                # With 300k+ JPEGs/session, holding references causes memory bloat
-                task.jpeg_datas = None
+                finally:
+                    # CRITICAL: Free memory immediately after
+                    # processing.  Using finally guarantees cleanup
+                    # even if _on_error or stats code raises.
+                    # Safe on retry path: jpeg_datas is already
+                    # None before requeue (line 331).
+                    task.jpeg_datas = None
                 
                 # Remove from pending and notify waiters
                 with self._pending_lock:
@@ -372,7 +412,22 @@ class BundleConsolidator:
         with self._tile_events_lock:
             if tile_prefix not in self._tile_events:
                 self._tile_events[tile_prefix] = threading.Event()
+                # Periodic cleanup of old events
+                if len(self._tile_events) > self._tile_events_max:
+                    self._cleanup_tile_events_unlocked()
             return self._tile_events[tile_prefix]
+    
+    def _cleanup_tile_events_unlocked(self):
+        """
+        Clean up old tile events that have been signaled.
+        Must be called with _tile_events_lock held.
+        """
+        # Remove events that are set (completed) - they won't be waited on again
+        to_remove = [k for k, v in self._tile_events.items() if v.is_set()]
+        for k in to_remove[:len(to_remove) // 2]:  # Remove half to avoid thrashing
+            del self._tile_events[k]
+        if to_remove:
+            log.debug(f"Cleaned up {len(to_remove) // 2} tile events")
     
     def _signal_tile_completion(self, tile_key: str):
         """
@@ -487,6 +542,13 @@ class BundleConsolidator:
         tile_key = self._get_tile_key(row, col, maptype)
         with self._debounce_lock:
             self._last_chunk_time[tile_key] = time.time()
+            # Cleanup old entries to prevent unbounded growth
+            if len(self._last_chunk_time) > self._last_chunk_time_max:
+                # Remove entries older than 5 minutes
+                cutoff = time.time() - 300
+                old_keys = [k for k, v in self._last_chunk_time.items() if v < cutoff]
+                for k in old_keys:
+                    del self._last_chunk_time[k]
     
     def _batch_read_jpeg_files(self, paths: List[str]) -> List[Optional[bytes]]:
         """
@@ -945,7 +1007,8 @@ class BundleConsolidator:
                     return False  # Not pending, nothing to wait for
             
             # Check if already completed (quick path)
-            if any(k.startswith(prefix) for k in self._recently_completed):
+            # Snapshot the set to avoid RuntimeError from concurrent modification
+            if any(k.startswith(prefix) for k in set(self._recently_completed)):
                 log.debug(f"BUNDLE_WAIT: Already completed for {prefix}*")
                 return True
             

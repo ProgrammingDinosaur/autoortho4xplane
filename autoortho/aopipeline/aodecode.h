@@ -125,6 +125,65 @@ AODECODE_API void aodecode_pool_stats(
 );
 
 /**
+ * Create a buffer pool with memory limit.
+ * 
+ * Extended version that sets a memory limit for overflow buffers.
+ * When the limit is reached, acquire will block until a buffer is released.
+ * 
+ * @param count         Number of fixed buffers to pre-allocate
+ * @param memory_limit  Maximum total memory (0 = unlimited)
+ * @return Pool handle, or NULL on allocation failure
+ */
+AODECODE_API aodecode_pool_t* aodecode_create_pool_ex(int32_t count, int64_t memory_limit);
+
+/**
+ * Set the memory limit for a pool.
+ * 
+ * Can be called at any time to adjust the limit.
+ * 
+ * @param pool          Pool handle
+ * @param memory_limit  Maximum total memory (0 = unlimited)
+ */
+AODECODE_API void aodecode_pool_set_limit(aodecode_pool_t* pool, int64_t memory_limit);
+
+/**
+ * Get the current memory limit.
+ * 
+ * @param pool  Pool handle
+ * @return Current memory limit (0 = unlimited)
+ */
+AODECODE_API int64_t aodecode_pool_get_limit(aodecode_pool_t* pool);
+
+/**
+ * Get current memory usage.
+ * 
+ * @param pool  Pool handle
+ * @return Total memory used (fixed pool + overflow buffers)
+ */
+AODECODE_API int64_t aodecode_pool_get_usage(aodecode_pool_t* pool);
+
+/**
+ * Extended pool statistics.
+ * 
+ * @param pool              Pool handle
+ * @param out_total         Output: total fixed buffers in pool
+ * @param out_available     Output: currently available fixed buffers
+ * @param out_acquired      Output: currently acquired fixed buffers
+ * @param out_overflow_count Output: number of overflow buffers in use
+ * @param out_overflow_bytes Output: bytes in overflow buffers
+ * @param out_memory_limit  Output: current memory limit
+ */
+AODECODE_API void aodecode_pool_stats_ex(
+    aodecode_pool_t* pool,
+    int32_t* out_total,
+    int32_t* out_available,
+    int32_t* out_acquired,
+    int32_t* out_overflow_count,
+    int64_t* out_overflow_bytes,
+    int64_t* out_memory_limit
+);
+
+/**
  * Decode multiple JPEGs in parallel.
  * 
  * This is the main batch decode function. It decodes all input JPEGs

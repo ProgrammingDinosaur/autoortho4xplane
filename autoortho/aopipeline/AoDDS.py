@@ -34,6 +34,9 @@ from typing import Optional, Tuple, NamedTuple, Union, List
 
 import numpy as np
 
+# Import AoDecode for decode pool management
+from . import AoDecode
+
 log = logging.getLogger(__name__)
 
 # Format constants (match dds_format_t in aodds.h)
@@ -785,6 +788,16 @@ class StreamingBuilder:
         self.release()
         return False
 
+    def __del__(self):
+        """Safety net - release builder if not explicitly released."""
+        try:
+            if not self._released and self._handle is not None:
+                log.warning("StreamingBuilder.__del__: Builder was not released - "
+                           "possible resource leak. Use try/finally or context manager.")
+                self.release()
+        except Exception:
+            pass  # Don't raise in __del__
+
 
 class StreamingBuilderPool:
     """
@@ -823,6 +836,8 @@ class StreamingBuilderPool:
         self._decode_pool = decode_pool
         self._lock = threading.Lock()
         self._available: list = []
+        self._in_use: set = set()  # Track handles currently in use
+        self._total_created = 0  # Total builders ever created
         self._lib = None
         self._initialized = False
         
@@ -943,20 +958,37 @@ class StreamingBuilderPool:
             with self._lock:
                 if self._available:
                     handle = self._available.pop()
+                    self._in_use.add(id(handle))  # Track in-use handle
                     # Reset builder with new config
                     self._lib.aodds_builder_reset(handle, byref(c_config))
-                    return StreamingBuilder(handle, self, self._lib, c_config)
+                    try:
+                        return StreamingBuilder(handle, self, self._lib, c_config)
+                    except Exception:
+                        # Constructor failed - return handle to available pool
+                        self._in_use.discard(id(handle))
+                        self._available.append(handle)
+                        raise
             
             # Pool exhausted - try to create new if under limit
             with self._lock:
-                current_count = len(self._available) + self._pool_size - len(self._available)
+                # Fix: Use actual count of created builders, not buggy calculation
+                current_count = self._total_created
                 if current_count < self._pool_size * 2:
                     # Create new builder
                     handle = self._lib.aodds_builder_create(
                         byref(c_config), self._decode_pool
                     )
                     if handle:
-                        return StreamingBuilder(handle, self, self._lib, c_config)
+                        self._total_created += 1
+                        self._in_use.add(id(handle))  # Track in-use handle
+                        try:
+                            return StreamingBuilder(handle, self, self._lib, c_config)
+                        except Exception:
+                            # Constructor failed - destroy the handle
+                            self._in_use.discard(id(handle))
+                            self._total_created -= 1
+                            self._lib.aodds_builder_destroy(handle)
+                            raise
             
             if time.monotonic() - start > timeout:
                 log.warning(f"StreamingBuilderPool: timeout waiting for builder")
@@ -967,20 +999,185 @@ class StreamingBuilderPool:
     def _return_builder(self, handle: c_void_p) -> None:
         """Return a builder handle to the pool."""
         with self._lock:
+            self._in_use.discard(id(handle))
             self._available.append(handle)
     
     def close(self) -> None:
         """Destroy all builders in the pool."""
         with self._lock:
+            # Destroy available builders
             for handle in self._available:
-                self._lib.aodds_builder_destroy(handle)
+                try:
+                    self._lib.aodds_builder_destroy(handle)
+                except Exception:
+                    pass
             self._available.clear()
+            
+            # Note: in-use builders will be cleaned up when released
+            # Log warning if any builders are still in use
+            if self._in_use:
+                log.warning(f"StreamingBuilderPool.close(): {len(self._in_use)} builders "
+                           f"still in use - they will leak if not released")
+            
+            self._total_created = 0
     
     @property
     def available_count(self) -> int:
         """Number of builders currently available."""
         with self._lock:
             return len(self._available)
+
+
+# ============================================================================
+# Global Decode Pool (for JPEG decoding with memory limits)
+# ============================================================================
+#
+# Memory Management Strategy:
+# 1. FIXED POOL: Pre-allocated buffers for optimal performance (no malloc per decode)
+#    - Size = 2 * cpu_count (allows concurrent decode across all OpenMP threads)
+# 2. DYNAMIC OVERFLOW: If fixed pool busy, malloc new buffers IF within memory limit
+#    - Memory limit = 25% of cache_mem_limit (decode buffers are transient)
+# 3. WAIT QUEUE: If limit reached, block until buffer is released
+# 4. AUTO-SHRINK: Overflow buffers freed immediately on release (returns to fixed pool size)
+#
+# This ensures:
+# - No memory leaks from unbounded buffer allocation
+# - Performance under normal load (fixed pool is fast, no malloc)
+# - Graceful handling of burst load (overflow + wait-queue)
+# - Automatic memory reclamation (auto-shrink)
+
+_default_decode_pool: Optional[AoDecode.BufferPool] = None
+_default_decode_pool_lock = threading.Lock()
+
+
+def _calculate_decode_pool_size() -> int:
+    """
+    Calculate optimal fixed pool size for JPEG decode buffers.
+    
+    Uses 2 * cpu_count to allow concurrent decoding across all OpenMP threads
+    while having headroom for burst requests.
+    
+    Returns:
+        Optimal fixed pool size (minimum 8, maximum 256)
+    """
+    import os
+    cpu_count = os.cpu_count() or 4
+    # 2x CPU count for headroom during burst loads
+    pool_size = cpu_count * 2
+    # Clamp to valid range
+    pool_size = max(8, min(256, pool_size))
+    log.debug(f"Decode pool size: {pool_size} (based on cpu_count={cpu_count})")
+    return pool_size
+
+
+def _calculate_decode_memory_limit() -> int:
+    """
+    Calculate memory limit for decode pool based on cache_mem_limit.
+    
+    Decode buffers are transient (used only during DDS build), so we allocate
+    25% of the total cache_mem_limit for them. This is conservative since
+    most buffers are recycled quickly.
+    
+    Each 256x256 RGBA buffer = 256KB, so 1GB limit = ~4000 potential buffers.
+    
+    Returns:
+        Memory limit in bytes (0 if config unavailable)
+    """
+    try:
+        try:
+            from autoortho.aoconfig import CFG
+        except ImportError:
+            from aoconfig import CFG
+        
+        # cache_mem_limit is in GB
+        cache_limit_gb = float(getattr(CFG.autoortho, 'cache_mem_lim', 4))
+        # Use 25% for decode buffers (they're transient and recycle fast)
+        decode_limit_gb = cache_limit_gb * 0.25
+        decode_limit_bytes = int(decode_limit_gb * 1024 * 1024 * 1024)
+        
+        log.debug(f"Decode pool memory limit: {decode_limit_bytes // (1024*1024)} MB "
+                 f"(25% of cache_mem_limit={cache_limit_gb} GB)")
+        return decode_limit_bytes
+    except Exception as e:
+        log.warning(f"Failed to get cache_mem_limit for decode pool: {e}, using 512MB default")
+        return 512 * 1024 * 1024  # 512 MB default
+
+
+def get_default_decode_pool() -> Optional[AoDecode.BufferPool]:
+    """
+    Get or create the default global decode buffer pool.
+    
+    The decode pool is used by all native JPEG decoding operations to:
+    - Avoid per-decode malloc calls (performance)
+    - Enforce memory limits (resource control)
+    - Provide wait-queue for burst load handling (stability)
+    
+    Pool Configuration:
+    - Fixed pool size: 2 * cpu_count
+    - Memory limit: 25% of cache_mem_limit
+    - Auto-shrink: Overflow buffers freed on release
+    
+    Returns:
+        BufferPool instance, or None if native library unavailable
+    """
+    global _default_decode_pool
+    
+    if _default_decode_pool is None:
+        with _default_decode_pool_lock:
+            if _default_decode_pool is None:
+                try:
+                    pool_size = _calculate_decode_pool_size()
+                    memory_limit = _calculate_decode_memory_limit()
+                    
+                    _default_decode_pool = AoDecode.BufferPool(
+                        count=pool_size,
+                        memory_limit=memory_limit
+                    )
+                    
+                    log.info(f"Global decode pool initialized: "
+                            f"{pool_size} fixed buffers, "
+                            f"{memory_limit // (1024*1024)} MB limit")
+                except Exception as e:
+                    log.warning(f"Failed to create decode pool: {e} - decoding will use malloc fallback")
+                    return None
+    
+    return _default_decode_pool
+
+
+def get_decode_pool_stats() -> Optional[dict]:
+    """
+    Get statistics from the global decode pool.
+    
+    Returns:
+        Dict with pool stats, or None if pool not initialized
+    """
+    pool = get_default_decode_pool()
+    if pool:
+        return pool.stats_ex()
+    return None
+
+
+def shutdown_decode_pool():
+    """
+    Shutdown the global decode pool and free all resources.
+    
+    Should be called during application shutdown.
+    """
+    global _default_decode_pool
+    
+    with _default_decode_pool_lock:
+        if _default_decode_pool is not None:
+            try:
+                stats = _default_decode_pool.stats_ex()
+                if stats['acquired'] > 0 or stats['overflow_count'] > 0:
+                    log.warning(f"Shutting down decode pool with active buffers: "
+                               f"acquired={stats['acquired']}, overflow={stats['overflow_count']}")
+                _default_decode_pool.destroy()
+                log.info("Global decode pool destroyed")
+            except Exception as e:
+                log.warning(f"Error destroying decode pool: {e}")
+            finally:
+                _default_decode_pool = None
 
 
 # Global streaming builder pool (lazily initialized)
@@ -1032,6 +1229,9 @@ def get_default_builder_pool() -> StreamingBuilderPool:
     Pool size is automatically calculated from config:
         pool_size = background_builder_workers + live_builder_concurrency
     
+    The pool is initialized with the global decode pool for memory-managed
+    JPEG decoding.
+    
     This ensures prefetch workers and live requests each have dedicated
     builders and won't starve each other.
     
@@ -1043,9 +1243,82 @@ def get_default_builder_pool() -> StreamingBuilderPool:
         with _default_builder_pool_lock:
             if _default_builder_pool is None:
                 pool_size = _calculate_builder_pool_size()
-                _default_builder_pool = StreamingBuilderPool(pool_size=pool_size)
-                log.info(f"Streaming builder pool initialized: {pool_size} builders")
+                
+                # Get or create the global decode pool for memory-limited JPEG decoding
+                decode_pool = get_default_decode_pool()
+                decode_pool_handle = decode_pool.handle if decode_pool else None
+                
+                _default_builder_pool = StreamingBuilderPool(
+                    pool_size=pool_size,
+                    decode_pool=decode_pool_handle
+                )
+                log.info(f"Streaming builder pool initialized: {pool_size} builders, "
+                        f"decode_pool={'enabled' if decode_pool_handle else 'disabled'}")
     return _default_builder_pool
+
+
+def shutdown_builder_pool():
+    """
+    Shutdown the global streaming builder pool.
+    
+    Should be called during application shutdown.
+    """
+    global _default_builder_pool
+    
+    with _default_builder_pool_lock:
+        if _default_builder_pool is not None:
+            try:
+                _default_builder_pool.close()
+                log.info("Global builder pool destroyed")
+            except Exception as e:
+                log.warning(f"Error destroying builder pool: {e}")
+            finally:
+                _default_builder_pool = None
+
+
+def shutdown_all_pools():
+    """
+    Shutdown all global pools (decode pool and builder pool).
+    
+    Should be called during application shutdown. Shuts down in correct order:
+    1. Builder pool first (stops using decode pool)
+    2. Decode pool last (frees decode buffers)
+    """
+    log.info("Shutting down all native pools...")
+    shutdown_builder_pool()
+    shutdown_decode_pool()
+    log.info("All native pools shut down")
+
+
+def get_all_pool_stats() -> dict:
+    """
+    Get combined statistics from all global pools.
+    
+    Returns dict with:
+        - decode_pool: dict with decode pool stats or None
+        - builder_pool: dict with builder pool info or None
+    """
+    stats = {
+        'decode_pool': None,
+        'builder_pool': None,
+    }
+    
+    # Get decode pool stats
+    decode_stats = get_decode_pool_stats()
+    if decode_stats:
+        stats['decode_pool'] = decode_stats
+    
+    # Get builder pool info
+    with _default_builder_pool_lock:
+        if _default_builder_pool is not None:
+            stats['builder_pool'] = {
+                'pool_size': _default_builder_pool._pool_size,
+                'available': _default_builder_pool.available_count,
+                'in_use': len(_default_builder_pool._in_use),
+                'total_created': _default_builder_pool._total_created,
+            }
+    
+    return stats
 
 
 # ============================================================================

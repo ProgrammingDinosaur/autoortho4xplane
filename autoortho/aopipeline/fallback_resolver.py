@@ -260,32 +260,51 @@ class FallbackResolver:
                 if not data or len(data) < 100:
                     continue
                 
-                # Decode JPEG
-                parent_img = AoImage.open(data)
+                # Decode JPEG using AoImage (loads from memory bytes)
+                parent_img = AoImage.load_from_memory(data)
                 if not parent_img:
                     continue
                 
-                # Calculate crop region for this chunk within parent
-                crop_offset_x = (col % scale_factor) * (256 // scale_factor)
-                crop_offset_y = (row % scale_factor) * (256 // scale_factor)
-                crop_size = 256 // scale_factor
-                
-                # Crop and upscale
-                cropped = parent_img.crop((
-                    crop_offset_x, crop_offset_y,
-                    crop_offset_x + crop_size, crop_offset_y + crop_size
-                ))
-                
-                # Resize to 256x256
-                if crop_size != 256:
-                    cropped = cropped.resize((256, 256), resample=1)  # BILINEAR
-                
-                # Ensure RGBA format
-                if cropped.mode != 'RGBA':
-                    cropped = cropped.convert('RGBA')
-                
-                # Return raw bytes
-                return cropped.tobytes()
+                cropped = None
+                try:
+                    # Calculate crop region for this chunk within parent
+                    crop_offset_x = (col % scale_factor) * (256 // scale_factor)
+                    crop_offset_y = (row % scale_factor) * (256 // scale_factor)
+                    crop_size = 256 // scale_factor
+                    
+                    # Use crop_and_upscale for atomic crop+scale operation
+                    # This is the proper AoImage API (not PIL-style crop/resize)
+                    if crop_size != 256:
+                        # Need to scale up - calculate scale factor to reach 256x256
+                        upscale_factor = 256 // crop_size
+                        cropped = parent_img.crop_and_upscale(
+                            crop_offset_x, crop_offset_y,
+                            crop_size, crop_size,
+                            upscale_factor
+                        )
+                    else:
+                        # No scaling needed - just crop
+                        # Create destination image for crop
+                        cropped = AoImage.new('RGBA', (256, 256), (0, 0, 0, 255))
+                        parent_img.crop(cropped, (crop_offset_x, crop_offset_y))
+                    
+                    if not cropped:
+                        continue
+                    
+                    # Return raw bytes (AoImage is always RGBA)
+                    result = cropped.tobytes()
+                    return result
+                finally:
+                    # Clean up images to free native memory
+                    try:
+                        parent_img.close()
+                    except Exception:
+                        pass
+                    try:
+                        if cropped is not None:
+                            cropped.close()
+                    except Exception:
+                        pass
                 
             except Exception as e:
                 log.debug(f"FallbackResolver: disk cache fallback failed: {e}")

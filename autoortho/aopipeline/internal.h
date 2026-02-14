@@ -55,6 +55,63 @@
   #define AOPIPELINE_EXPORT __attribute__((__visibility__("default")))
 #endif
 
+/* ============================================================================
+ * Cross-Platform Mutex and Condition Variable Macros
+ * ============================================================================
+ * These macros abstract Windows CRITICAL_SECTION/CONDITION_VARIABLE and
+ * POSIX pthread_mutex_t/pthread_cond_t for portable synchronization.
+ */
+#ifdef AOPIPELINE_WINDOWS
+  /* Windows mutex and condition variable types */
+  typedef CRITICAL_SECTION AOMUTEX;
+  typedef CONDITION_VARIABLE AOCOND;
+  
+  /* Mutex operations */
+  #define AOMUTEX_INIT(m)     InitializeCriticalSection(&(m))
+  #define AOMUTEX_DESTROY(m)  DeleteCriticalSection(&(m))
+  #define AOMUTEX_LOCK(m)     EnterCriticalSection(&(m))
+  #define AOMUTEX_UNLOCK(m)   LeaveCriticalSection(&(m))
+  
+  /* Condition variable operations */
+  #define AOCOND_INIT(c)      InitializeConditionVariable(&(c))
+  #define AOCOND_DESTROY(c)   /* No-op on Windows */
+  #define AOCOND_WAIT(c, m)   SleepConditionVariableCS(&(c), &(m), INFINITE)
+  #define AOCOND_SIGNAL(c)    WakeConditionVariable(&(c))
+  #define AOCOND_BROADCAST(c) WakeAllConditionVariable(&(c))
+  
+#else /* POSIX */
+  /* POSIX mutex and condition variable types */
+  typedef pthread_mutex_t AOMUTEX;
+  typedef pthread_cond_t AOCOND;
+  
+  /* Mutex operations */
+  #define AOMUTEX_INIT(m)     pthread_mutex_init(&(m), NULL)
+  #define AOMUTEX_DESTROY(m)  pthread_mutex_destroy(&(m))
+  #define AOMUTEX_LOCK(m)     pthread_mutex_lock(&(m))
+  #define AOMUTEX_UNLOCK(m)   pthread_mutex_unlock(&(m))
+  
+  /* Condition variable operations */
+  #define AOCOND_INIT(c)      pthread_cond_init(&(c), NULL)
+  #define AOCOND_DESTROY(c)   pthread_cond_destroy(&(c))
+  #define AOCOND_WAIT(c, m)   pthread_cond_wait(&(c), &(m))
+  #define AOCOND_SIGNAL(c)    pthread_cond_signal(&(c))
+  #define AOCOND_BROADCAST(c) pthread_cond_broadcast(&(c))
+#endif
+
+/* ============================================================================
+ * Atomic Operations
+ * ============================================================================
+ */
+#ifdef AOPIPELINE_WINDOWS
+  #define ATOMIC_ADD64(ptr, val) InterlockedExchangeAdd64((LONG64*)(ptr), (LONG64)(val))
+  #define ATOMIC_SUB64(ptr, val) InterlockedExchangeAdd64((LONG64*)(ptr), -(LONG64)(val))
+  #define ATOMIC_LOAD64(ptr)     InterlockedCompareExchange64((LONG64*)(ptr), 0, 0)
+#else
+  #define ATOMIC_ADD64(ptr, val) __sync_fetch_and_add((ptr), (val))
+  #define ATOMIC_SUB64(ptr, val) __sync_fetch_and_sub((ptr), (val))
+  #define ATOMIC_LOAD64(ptr)     __sync_fetch_and_add((ptr), 0)
+#endif
+
 /* Utility macros */
 #define AOPIPELINE_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define AOPIPELINE_MAX(a, b) ((a) > (b) ? (a) : (b))

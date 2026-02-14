@@ -131,7 +131,6 @@ class FlightTracker(object):
                 log.info("FT: Flight is starting.")
                 delta = time.time() - self.start_time
                 log.info(f"FT: Time to start was {round(delta/60, 2)} minutes.")
-                STATS['minutes_to_start'] = round(delta/60, 2)
 
             self.connected = True
 

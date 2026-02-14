@@ -23,7 +23,7 @@ Usage:
 
 from ctypes import (
     CDLL, POINTER, Structure, c_void_p,
-    c_char, c_char_p, c_int32, c_uint8, c_uint32,
+    c_char, c_char_p, c_int32, c_int64, c_uint8, c_uint32,
     byref, cast
 )
 import logging
@@ -169,6 +169,25 @@ def _setup_signatures(lib):
     ]
     lib.aodecode_pool_stats.restype = None
     
+    # Extended pool functions
+    lib.aodecode_create_pool_ex.argtypes = [c_int32, c_int64]
+    lib.aodecode_create_pool_ex.restype = c_void_p
+    
+    lib.aodecode_pool_set_limit.argtypes = [c_void_p, c_int64]
+    lib.aodecode_pool_set_limit.restype = None
+    
+    lib.aodecode_pool_get_limit.argtypes = [c_void_p]
+    lib.aodecode_pool_get_limit.restype = c_int64
+    
+    lib.aodecode_pool_get_usage.argtypes = [c_void_p]
+    lib.aodecode_pool_get_usage.restype = c_int64
+    
+    lib.aodecode_pool_stats_ex.argtypes = [
+        c_void_p, POINTER(c_int32), POINTER(c_int32), POINTER(c_int32),
+        POINTER(c_int32), POINTER(c_int64), POINTER(c_int64)
+    ]
+    lib.aodecode_pool_stats_ex.restype = None
+    
     # Batch decode
     lib.aodecode_batch.argtypes = [
         POINTER(DecodeRequest),
@@ -284,17 +303,22 @@ class BufferPool:
     Wrapper for native buffer pool.
     
     Pre-allocates RGBA buffers for efficient chunk decoding.
+    Supports memory limits with overflow buffers and wait-queue.
     """
     
-    def __init__(self, count: int):
+    def __init__(self, count: int, memory_limit: int = 0):
         """
         Create a buffer pool.
         
         Args:
             count: Number of 256x256 RGBA buffers to pre-allocate
+            memory_limit: Maximum memory usage in bytes (0 = unlimited)
         """
         lib = _load_library()
-        self._handle = lib.aodecode_create_pool(count)
+        if memory_limit > 0:
+            self._handle = lib.aodecode_create_pool_ex(count, memory_limit)
+        else:
+            self._handle = lib.aodecode_create_pool(count)
         if not self._handle:
             raise MemoryError(f"Failed to create buffer pool with {count} buffers")
         self._lib = lib
@@ -313,6 +337,18 @@ class BufferPool:
         """Get native pool handle."""
         return self._handle
     
+    def set_memory_limit(self, limit_bytes: int):
+        """Set the memory limit for overflow buffers."""
+        self._lib.aodecode_pool_set_limit(self._handle, limit_bytes)
+    
+    def get_memory_limit(self) -> int:
+        """Get the current memory limit."""
+        return self._lib.aodecode_pool_get_limit(self._handle)
+    
+    def get_memory_usage(self) -> int:
+        """Get current memory usage (fixed + overflow)."""
+        return self._lib.aodecode_pool_get_usage(self._handle)
+    
     def stats(self) -> PoolStats:
         """Get pool statistics."""
         total = c_int32()
@@ -323,6 +359,27 @@ class BufferPool:
         )
         return PoolStats(total.value, available.value, acquired.value)
     
+    def stats_ex(self) -> dict:
+        """Get extended pool statistics including overflow tracking."""
+        total = c_int32()
+        available = c_int32()
+        acquired = c_int32()
+        overflow_count = c_int32()
+        overflow_bytes = c_int64()
+        memory_limit = c_int64()
+        self._lib.aodecode_pool_stats_ex(
+            self._handle, byref(total), byref(available), byref(acquired),
+            byref(overflow_count), byref(overflow_bytes), byref(memory_limit)
+        )
+        return {
+            'total': total.value,
+            'available': available.value,
+            'acquired': acquired.value,
+            'overflow_count': overflow_count.value,
+            'overflow_bytes': overflow_bytes.value,
+            'memory_limit': memory_limit.value,
+        }
+    
     def __repr__(self) -> str:
         s = self.stats()
         return f"BufferPool(total={s.total}, available={s.available}, acquired={s.acquired})"
@@ -332,17 +389,18 @@ class BufferPool:
 # Public API
 # ============================================================================
 
-def create_pool(count: int = 256) -> BufferPool:
+def create_pool(count: int = 256, memory_limit: int = 0) -> BufferPool:
     """
     Create a buffer pool for efficient memory reuse.
     
     Args:
         count: Number of 256x256 RGBA buffers to pre-allocate
+        memory_limit: Maximum memory usage in bytes (0 = unlimited)
     
     Returns:
         BufferPool instance
     """
-    return BufferPool(count)
+    return BufferPool(count, memory_limit)
 
 
 def batch_decode(

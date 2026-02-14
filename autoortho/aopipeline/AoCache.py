@@ -22,9 +22,9 @@ Usage:
 """
 
 from ctypes import (
-    CDLL, POINTER, Structure, 
+    CDLL, POINTER, Structure,
     c_char, c_char_p, c_int32, c_int64, c_uint8, c_uint32,
-    byref, cast, create_string_buffer
+    cast
 )
 import logging
 import os
@@ -450,28 +450,20 @@ def read_file(path: str) -> Optional[bytes]:
     Convenience function for reading one file when batch operations
     aren't needed.
     
+    Note: This uses the batch API internally to ensure proper memory
+    management (no memory leaks).
+    
     Args:
         path: File path to read
     
     Returns:
         File contents as bytes, or None if read failed.
     """
-    lib = _load_library()
-    
-    if isinstance(path, str):
-        path = path.encode('utf-8')
-    
-    data_ptr = POINTER(c_uint8)()
-    length = c_uint32()
-    
-    if lib.aocache_read_file(path, byref(data_ptr), byref(length)):
-        # Copy data to Python bytes
-        result = bytes(data_ptr[:length.value])
-        # Note: We need to free this memory, but the single-file API
-        # doesn't expose a free function. For now, accept the leak
-        # or use batch_read_cache for proper memory management.
-        return result
-    
+    # Use batch_read_cache for proper memory management
+    # This avoids the memory leak in the single-file native API
+    results = batch_read_cache([path], validate_jpeg=False)
+    if results and results[0][1]:  # (data, success)
+        return results[0][0]
     return None
 
 

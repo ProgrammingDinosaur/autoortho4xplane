@@ -15,7 +15,7 @@ try:
 except ImportError:
     import flighttrack
 
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from functools import wraps, lru_cache
 
 try:
@@ -331,7 +331,8 @@ class AutoOrtho(Operations):
         self.startup = True
         self._lock = threading.RLock()
         self._tile_locks = defaultdict(threading.Lock)
-        self._size_cache = {}
+        self._size_cache = OrderedDict()  # LRU cache for DDS sizes
+        self._size_cache_max = 5000  # Max entries before LRU eviction
         self._ft_started = False
         self._ft_start_lock = threading.Lock()
         
@@ -607,18 +608,32 @@ class AutoOrtho(Operations):
     def _get_dds_size_cached(self, row, col, maptype, zoom):
         """Get DDS size from cache or compute it.
         
-        Uses _size_cache dict which can be updated with actual tile sizes
-        when tiles are opened (see open() method). This allows the cache
-        to reflect real sizes once known, rather than being stuck with
-        computed approximations.
+        Uses _size_cache OrderedDict with LRU eviction to prevent unbounded
+        memory growth. Cache can be updated with actual tile sizes when tiles
+        are opened (see open() method).
         """
         key = (row, col, maptype, zoom)
         dds_size = self._size_cache.get(key)
-        if dds_size is None:
-            dds_size = self._calculate_dds_size(str(zoom))
-            # Store computed size for future calls until actual size is known
-            self._size_cache[key] = dds_size
+        if dds_size is not None:
+            # Move to end for LRU
+            self._size_cache.move_to_end(key)
+            return dds_size
+        
+        dds_size = self._calculate_dds_size(str(zoom))
+        # Evict oldest entries if at limit
+        while len(self._size_cache) >= self._size_cache_max:
+            self._size_cache.popitem(last=False)
+        self._size_cache[key] = dds_size
         return dds_size
+    
+    def _set_dds_size_cached(self, row, col, maptype, zoom, size):
+        """Set actual DDS size in cache with LRU eviction."""
+        key = (row, col, maptype, zoom)
+        # Evict oldest entries if at limit
+        while len(self._size_cache) >= self._size_cache_max:
+            self._size_cache.popitem(last=False)
+        self._size_cache[key] = size
+        self._size_cache.move_to_end(key)
 
     def _getattr_dds(self, path, match, now):
         """Get attributes for virtual DDS files."""
@@ -769,7 +784,7 @@ class AutoOrtho(Operations):
     def mkdir(self, path, mode):
         return os.mkdir(self._full_path(path), mode)
 
-    @lru_cache
+    @lru_cache(maxsize=128)
     def statfs(self, path):
         #log.info(f"STATFS: {path}")
         full_path = self._full_path(path)
@@ -867,7 +882,7 @@ class AutoOrtho(Operations):
             
             t = self.tc._open_tile(row, col, maptype, zoom)
             try:
-                self._size_cache[(row, col, maptype, zoom)] = t.dds.total_size
+                self._set_dds_size_cached(row, col, maptype, zoom, t.dds.total_size)
             except Exception:
                 log.debug(f"OPEN: Failed getting cache size for tile at {path}")
                 pass

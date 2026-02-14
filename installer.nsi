@@ -4,7 +4,7 @@
 ;!define PY_MAJOR_VERSION "3.14"
 ;!define BITNESS "32"
 !define ARCH_TAG ""
-;!define INSTALLER_NAME "AutoOrtho_2.0.0.exe"
+;!define INSTALLER_NAME "AutoOrtho_2.0.3.exe"
 !define INSTALLER_NAME "AutoOrtho.exe"
 !define PRODUCT_ICON "ao-icon.ico"
 

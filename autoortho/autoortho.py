@@ -556,8 +556,12 @@ class AOMount:
                                     total_rss += val
                                     proc_count += 1
                         try:
-                            # 'proc_count' is not required externally; only publish cur_mem_mb
+                            # Publish aggregated memory stats
                             self._shared_store.set('cur_mem_mb', total_rss // 1048576)
+                            # Add timestamp for staleness detection by workers
+                            self._shared_store.set('cur_mem_mb_ts', int(time.time()))
+                            # Publish proc_count for debugging memory discrepancies
+                            self._shared_store.set('mem_proc_count', proc_count)
                         except Exception:
                             pass
                     except Exception:
@@ -567,9 +571,6 @@ class AOMount:
                     try:
                         keys = self._shared_store.keys()
                         mm_counts = {}
-                        mm_averages = {}
-                        p_counts = {}
-                        p_averages = {}
                         for k in keys:
                             if not isinstance(k, str):
                                 continue
@@ -579,39 +580,15 @@ class AOMount:
                                 except Exception:
                                     continue
                                 cnt = int(self._shared_store.get(k, 0) or 0)
-                                tot = int(self._shared_store.get(f'mm_time_total_ms:{mm}', 0) or 0)
                                 if cnt > 0:
                                     mm_counts[mm] = cnt
-                                    mm_averages[mm] = round(tot / cnt / 1000.0, 3)
-                            elif k.startswith('partial_mm_count:'):
-                                try:
-                                    mm = int(k.split(':', 1)[1])
-                                except Exception:
-                                    continue
-                                cnt = int(self._shared_store.get(k, 0) or 0)
-                                tot = int(self._shared_store.get(f'partial_mm_time_total_ms:{mm}', 0) or 0)
-                                if cnt > 0:
-                                    p_counts[mm] = cnt
-                                    p_averages[mm] = round(tot / cnt / 1000.0, 3)
-                        # Publish aggregated views only when non-empty; otherwise remove
+                        # Publish aggregated counts only when non-empty; otherwise remove
                         try:
                             if mm_counts:
                                 self._shared_store.set('mm_counts', mm_counts)
-                                self._shared_store.set('mm_averages', mm_averages)
                             else:
                                 try:
                                     self._shared_store.delete('mm_counts')
-                                    self._shared_store.delete('mm_averages')
-                                except Exception:
-                                    pass
-
-                            if p_counts:
-                                self._shared_store.set('partial_mm_counts', p_counts)
-                                self._shared_store.set('partial_mm_averages', p_averages)
-                            else:
-                                try:
-                                    self._shared_store.delete('partial_mm_counts')
-                                    self._shared_store.delete('partial_mm_averages')
                                 except Exception:
                                     pass
                         except Exception:
@@ -621,17 +598,20 @@ class AOMount:
 
                     snap = self._shared_store.snapshot()
                     # Hide internal per-process and batching keys from logs
+                    # Keep proc_mem_mb for debugging memory issues
                     try:
                         def _is_internal(k):
                             return (
                                 (isinstance(k, str) and (
                                     k.startswith('proc_mem_rss_bytes') or
                                     k.startswith('proc_alive_ts') or
+                                    k.startswith('proc_threads') or
+                                    k.startswith('last_tile_access_ts') or
                                     k.startswith('mm_count:') or
                                     k.startswith('mm_time_total_ms:') or
                                     k.startswith('partial_mm_count:') or
                                     k.startswith('partial_mm_time_total_ms:')
-                                )) or k in ('proc_count',)
+                                )) or k in ('proc_count', 'cur_mem_mb_ts')
                             )
                         filtered = {k: v for k, v in snap.items() if not _is_internal(k)}
                     except Exception:
@@ -639,7 +619,7 @@ class AOMount:
 
                     # Ensure nested dicts are logged with numerically sorted keys
                     try:
-                        for _name in ('mm_counts', 'mm_averages', 'partial_mm_counts', 'partial_mm_averages'):
+                        for _name in ('mm_counts',):
                             _val = filtered.get(_name)
                             if isinstance(_val, dict) and _val:
                                 try:
