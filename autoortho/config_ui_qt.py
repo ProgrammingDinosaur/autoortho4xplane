@@ -276,8 +276,14 @@ class AddRoughnessWorker(QThread):
     def run(self):
         """Run the worker thread"""
         try:
-            from autoortho.utils.ter_utils import ter_utils
+            try:
+                from autoortho.utils.ter_utils import ter_utils
+            except ImportError:
+                from utils.ter_utils import ter_utils
             log.info(f"Adding SUPER_ROUGHNESS {self.roughness_value} to {self.scenery_name}")
+
+            # Notify UI that scanning is in progress before the slow scan begins
+            self.progress.emit(self.scenery_name, {"stage": "scanning"})
 
             def progress_callback(progress_data):
                 self.progress.emit(self.scenery_name, progress_data)
@@ -311,7 +317,10 @@ class RestoreRoughnessWorker(QThread):
     def run(self):
         """Run the worker thread"""
         try:
-            from autoortho.utils.ter_utils import ter_utils
+            try:
+                from autoortho.utils.ter_utils import ter_utils
+            except ImportError:
+                from utils.ter_utils import ter_utils
             log.info(f"Removing SUPER_ROUGHNESS from {self.scenery_name}")
 
             def progress_callback(progress_data):
@@ -3444,15 +3453,16 @@ class ConfigUI(QMainWindow):
 
         self.settings_layout.addWidget(flightdata_group)
 
-        # Time Exclusion Settings group
-        time_exclusion_group = QGroupBox("Time Exclusion Settings")
+        # Night Exclusion Settings group (sun-position based)
+        time_exclusion_group = QGroupBox("Night Exclusion (Sun Position)")
         time_exclusion_layout = QVBoxLayout()
         time_exclusion_group.setLayout(time_exclusion_layout)
 
         # Info label
         time_exclusion_info = QLabel(
-            "Configure a time range during which AutoOrtho scenery will be disabled.\n"
-            "X-Plane will use default scenery during this time (e.g., for night flying)."
+            "Automatically disable orthophoto scenery at night based on the sun's\n"
+            "position. X-Plane will use default scenery with night lighting instead.\n"
+            "Works accurately across seasons, latitudes, and with time acceleration."
         )
         time_exclusion_info.setStyleSheet("color: #888; font-size: 11px;")
         time_exclusion_info.setWordWrap(True)
@@ -3461,106 +3471,39 @@ class ConfigUI(QMainWindow):
         time_exclusion_layout.addSpacing(5)
 
         # Enable checkbox
-        self.time_exclusion_enabled_check = QCheckBox("Enable time-based exclusion")
+        self.time_exclusion_enabled_check = QCheckBox("Enable night exclusion")
         time_exclusion_enabled = getattr(self.cfg.time_exclusion, 'enabled', False)
         self.time_exclusion_enabled_check.setChecked(time_exclusion_enabled)
         self.time_exclusion_enabled_check.setObjectName('time_exclusion_enabled')
         self.time_exclusion_enabled_check.setToolTip(
-            "When enabled, AutoOrtho scenery will be hidden from X-Plane\n"
-            "during the specified time range (based on simulator local time).\n"
-            "X-Plane will fall back to default scenery during this period.\n"
-            "Useful for night flying when satellite imagery is less useful."
+            "When enabled, AutoOrtho scenery will be automatically disabled at night\n"
+            "based on the sun's elevation angle (sun_pitch_degrees dataref).\n"
+            "X-Plane will fall back to default scenery with night lighting.\n"
+            "Hysteresis prevents rapid toggling during twilight transitions."
         )
         self.time_exclusion_enabled_check.toggled.connect(self._on_time_exclusion_toggled)
         time_exclusion_layout.addWidget(self.time_exclusion_enabled_check)
 
-        # Time range inputs
-        time_range_layout = QHBoxLayout()
-        
-        # Start time
-        start_time_label = QLabel("Start time:")
-        start_time_label.setToolTip("Start of exclusion period (24-hour format HH:MM)")
-        time_range_layout.addWidget(start_time_label)
-        
-        self.time_exclusion_start_edit = QLineEdit(
-            str(getattr(self.cfg.time_exclusion, 'start_time', '22:00'))
-        )
-        self.time_exclusion_start_edit.setObjectName('time_exclusion_start_time')
-        self.time_exclusion_start_edit.setMaximumWidth(80)
-        self.time_exclusion_start_edit.setPlaceholderText("HH:MM")
-        self.time_exclusion_start_edit.setToolTip(
-            "Start time for exclusion in 24-hour format (e.g., 22:00 for 10 PM)"
-        )
-        time_range_layout.addWidget(self.time_exclusion_start_edit)
-        
-        time_range_layout.addSpacing(20)
-        
-        # End time
-        end_time_label = QLabel("End time:")
-        end_time_label.setToolTip("End of exclusion period (24-hour format HH:MM)")
-        time_range_layout.addWidget(end_time_label)
-        
-        self.time_exclusion_end_edit = QLineEdit(
-            str(getattr(self.cfg.time_exclusion, 'end_time', '06:00'))
-        )
-        self.time_exclusion_end_edit.setObjectName('time_exclusion_end_time')
-        self.time_exclusion_end_edit.setMaximumWidth(80)
-        self.time_exclusion_end_edit.setPlaceholderText("HH:MM")
-        self.time_exclusion_end_edit.setToolTip(
-            "End time for exclusion in 24-hour format (e.g., 06:00 for 6 AM)"
-        )
-        time_range_layout.addWidget(self.time_exclusion_end_edit)
-        
-        time_range_layout.addStretch()
-        time_exclusion_layout.addLayout(time_range_layout)
-
-        # Example label
-        time_example_label = QLabel(
-            "Example: 22:00 to 06:00 hides AutoOrtho during night hours"
-        )
-        time_example_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
-        time_exclusion_layout.addWidget(time_example_label)
-
         time_exclusion_layout.addSpacing(5)
 
         # Default to exclusion checkbox
-        self.time_exclusion_default_check = QCheckBox("Start Flight with AutoOrtho Exclusion")
+        self.time_exclusion_default_check = QCheckBox("Start flight with exclusion active")
         default_to_exclusion = getattr(self.cfg.time_exclusion, 'default_to_exclusion', False)
         self.time_exclusion_default_check.setChecked(default_to_exclusion)
         self.time_exclusion_default_check.setObjectName('time_exclusion_default')
         self.time_exclusion_default_check.setToolTip(
             "When enabled, AutoOrtho will start with exclusion active until X-Plane starts\n"
-            "sending sim time data. This ensures night flights start with default scenery from the very beginning. Useful for night flights.\n\n"
-            "When disabled, AutoOrtho will start with normal operation until X-Plane starts sending sim time data."
+            "sending sun position data. This ensures night flights start with default scenery.\n\n"
+            "When disabled, AutoOrtho works normally until sun data confirms exclusion."
         )
         time_exclusion_layout.addWidget(self.time_exclusion_default_check)
 
-        time_exclusion_layout.addSpacing(10)
-
-        # Sun Position Mode section
-        sun_position_label = QLabel("Sun Position Mode")
-        sun_position_label.setStyleSheet("font-weight: bold; margin-top: 5px;")
-        time_exclusion_layout.addWidget(sun_position_label)
-
-        # Use sun position checkbox
-        self.use_sun_position_check = QCheckBox("Use sun position instead of clock time")
-        use_sun_position = getattr(self.cfg.time_exclusion, 'use_sun_position', False)
-        self.use_sun_position_check.setChecked(use_sun_position)
-        self.use_sun_position_check.setObjectName('time_exclusion_use_sun')
-        self.use_sun_position_check.setToolTip(
-            "When enabled, exclusion is based on the sun's position (elevation angle)\n"
-            "rather than fixed time windows. This is more accurate across seasons,\n"
-            "latitudes, and with time acceleration in the simulator.\n\n"
-            "The sun pitch dataref (sim/graphics/scenery/sun_pitch_degrees) is used\n"
-            "to determine day/night. Requires X-Plane 9.40.0 or later."
-        )
-        self.use_sun_position_check.toggled.connect(self._on_use_sun_position_toggled)
-        time_exclusion_layout.addWidget(self.use_sun_position_check)
+        time_exclusion_layout.addSpacing(5)
 
         # Sun threshold inputs
         sun_threshold_widget = QWidget()
         sun_threshold_layout = QHBoxLayout(sun_threshold_widget)
-        sun_threshold_layout.setContentsMargins(20, 0, 0, 0)
+        sun_threshold_layout.setContentsMargins(0, 0, 0, 0)
 
         night_threshold_label = QLabel("Night threshold:")
         sun_threshold_layout.addWidget(night_threshold_label)
@@ -3595,7 +3538,8 @@ class ConfigUI(QMainWindow):
         self.sun_day_threshold_spin.setObjectName('time_exclusion_sun_day')
         self.sun_day_threshold_spin.setToolTip(
             "Sun elevation angle to switch to day mode (ortho enabled).\n"
-            "Should be higher than night threshold to provide hysteresis."
+            "Should be higher than night threshold to provide hysteresis\n"
+            "and prevent rapid toggling during twilight."
         )
         self.sun_day_threshold_spin.setMaximumWidth(80)
         sun_threshold_layout.addWidget(self.sun_day_threshold_spin)
@@ -3605,18 +3549,15 @@ class ConfigUI(QMainWindow):
 
         # Sun position info label
         sun_info_label = QLabel(
-            "Nautical twilight (-12°) is when artificial lights dominate the landscape."
+            "Nautical twilight (-12°) is when artificial lights dominate the landscape.\n"
+            "The 2° gap between thresholds provides hysteresis to prevent flickering."
         )
-        sun_info_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic; margin-left: 20px;")
+        sun_info_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+        sun_info_label.setWordWrap(True)
         time_exclusion_layout.addWidget(sun_info_label)
 
-        # Set initial enabled state for time inputs and sun inputs
+        # Set initial enabled state for controls
         self._set_time_exclusion_controls_enabled(time_exclusion_enabled)
-        self._set_sun_position_controls_enabled(time_exclusion_enabled and use_sun_position)
-        # Disable time fields when sun position mode is enabled
-        if use_sun_position:
-            self.time_exclusion_start_edit.setEnabled(False)
-            self.time_exclusion_end_edit.setEnabled(False)
 
         self.settings_layout.addWidget(time_exclusion_group)
 
@@ -3702,7 +3643,7 @@ class ConfigUI(QMainWindow):
             pass
 
     def _on_time_exclusion_toggled(self):
-        """Handle time exclusion checkbox toggle."""
+        """Handle night exclusion checkbox toggle."""
         try:
             enabled = self.time_exclusion_enabled_check.isChecked()
             self._set_time_exclusion_controls_enabled(enabled)
@@ -3710,42 +3651,10 @@ class ConfigUI(QMainWindow):
             pass
 
     def _set_time_exclusion_controls_enabled(self, enabled):
-        """Enable/disable time exclusion time input fields."""
+        """Enable/disable night exclusion controls."""
         try:
-            if hasattr(self, 'time_exclusion_start_edit'):
-                self.time_exclusion_start_edit.setEnabled(enabled)
-            if hasattr(self, 'time_exclusion_end_edit'):
-                self.time_exclusion_end_edit.setEnabled(enabled)
             if hasattr(self, 'time_exclusion_default_check'):
                 self.time_exclusion_default_check.setEnabled(enabled)
-            # Sun position controls
-            if hasattr(self, 'use_sun_position_check'):
-                self.use_sun_position_check.setEnabled(enabled)
-            # Update sun threshold controls based on both enabled and use_sun_position
-            use_sun = False
-            if hasattr(self, 'use_sun_position_check'):
-                use_sun = self.use_sun_position_check.isChecked()
-            self._set_sun_position_controls_enabled(enabled and use_sun)
-        except Exception:
-            pass
-
-    def _on_use_sun_position_toggled(self):
-        """Handle use sun position checkbox toggle."""
-        try:
-            enabled = self.time_exclusion_enabled_check.isChecked()
-            use_sun = self.use_sun_position_check.isChecked()
-            self._set_sun_position_controls_enabled(enabled and use_sun)
-            # Disable time fields when sun position mode is enabled
-            if hasattr(self, 'time_exclusion_start_edit'):
-                self.time_exclusion_start_edit.setEnabled(enabled and not use_sun)
-            if hasattr(self, 'time_exclusion_end_edit'):
-                self.time_exclusion_end_edit.setEnabled(enabled and not use_sun)
-        except Exception:
-            pass
-
-    def _set_sun_position_controls_enabled(self, enabled):
-        """Enable/disable sun position threshold controls."""
-        try:
             if hasattr(self, 'sun_night_threshold_spin'):
                 self.sun_night_threshold_spin.setEnabled(enabled)
             if hasattr(self, 'sun_day_threshold_spin'):
@@ -4143,13 +4052,13 @@ class ConfigUI(QMainWindow):
         button = self.findChild(QPushButton, f"scenery-options-{region_id}")
         if button:
             button.setEnabled(False)
-            button.setText("Patching...")
+            button.setText("Scanning...")
 
         progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if progress_bar:
             progress_bar.setVisible(True)
-            progress_bar.setRange(0, 100)
-            progress_bar.setValue(0)
+            progress_bar.setRange(0, 0)  # indeterminate while scanning
+            progress_bar.setFormat("Scanning for .ter files...")
 
         # Create worker thread
         worker = AddRoughnessWorker(region_id, self.cfg.paths.scenery_path, roughness_value)
@@ -4195,8 +4104,31 @@ class ConfigUI(QMainWindow):
     def on_add_roughness_progress(self, region_id, progress_data):
         """Update SUPER_ROUGHNESS patching progress."""
         progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
-        if progress_bar and "pcnt_done" in progress_data:
+        if not progress_bar:
+            return
+
+        stage = progress_data.get("stage")
+        if stage == "scanning":
+            # Show indeterminate progress while scanning for .ter files
+            progress_bar.setVisible(True)
+            progress_bar.setRange(0, 0)  # indeterminate / "busy" animation
+            progress_bar.setFormat("Scanning for .ter files...")
+            return
+
+        if "pcnt_done" in progress_data:
+            # Switch back to determinate mode once patching starts
+            progress_bar.setRange(0, 100)
             progress_bar.setValue(progress_data["pcnt_done"])
+            files_done = progress_data.get('files_done')
+            files_total = progress_data.get('files_total')
+            if files_done is not None and files_total:
+                progress_bar.setFormat(f"{files_done}/{files_total}")
+            else:
+                progress_bar.setFormat("%p%")
+            # Update button text from "Scanning..." to "Patching..."
+            button = self.findChild(QPushButton, f"scenery-options-{region_id}")
+            if button and button.text() == "Scanning...":
+                button.setText("Patching...")
 
     def on_add_roughness_finished(self, region_id, success):
         """Handle SUPER_ROUGHNESS patching completion."""
@@ -5764,18 +5696,11 @@ class ConfigUI(QMainWindow):
             self.cfg.seasons.fal_saturation = str(self.fal_sat_slider.value())
             self.cfg.seasons.win_saturation = str(self.win_sat_slider.value())
 
-            # Time exclusion settings
+            # Night exclusion settings (sun-position based)
             if hasattr(self, 'time_exclusion_enabled_check'):
                 self.cfg.time_exclusion.enabled = self.time_exclusion_enabled_check.isChecked()
-            if hasattr(self, 'time_exclusion_start_edit'):
-                self.cfg.time_exclusion.start_time = self.time_exclusion_start_edit.text()
-            if hasattr(self, 'time_exclusion_end_edit'):
-                self.cfg.time_exclusion.end_time = self.time_exclusion_end_edit.text()
             if hasattr(self, 'time_exclusion_default_check'):
                 self.cfg.time_exclusion.default_to_exclusion = self.time_exclusion_default_check.isChecked()
-            # Sun position settings
-            if hasattr(self, 'use_sun_position_check'):
-                self.cfg.time_exclusion.use_sun_position = self.use_sun_position_check.isChecked()
             if hasattr(self, 'sun_night_threshold_spin'):
                 self.cfg.time_exclusion.sun_night_threshold = self.sun_night_threshold_spin.value()
             if hasattr(self, 'sun_day_threshold_spin'):

@@ -371,21 +371,15 @@ ter_patch_workers = 8
 prefer_winfsp = True
 
 [time_exclusion]
-# Enable time-based AutoOrtho exclusion. When active during the specified time range,
-# AutoOrtho's scenery will be hidden and X-Plane will use its default scenery instead.
+# Enable sun-position-based AutoOrtho exclusion.
+# When active, AutoOrtho scenery is disabled at night and X-Plane uses its default scenery.
+# The sun elevation angle (from sim/graphics/scenery/sun_pitch_degrees) determines day/night.
+# This is accurate across seasons, latitudes, and with time acceleration.
 enabled = False
-# Start time for exclusion in 24-hour format (HH:MM), e.g. "22:00" for 10 PM
-start_time = 23:00
-# End time for exclusion in 24-hour format (HH:MM), e.g. "06:00" for 6 AM
-end_time = 05:00
-# When enabled, assume exclusion is active until sim time is available.
+# When enabled, assume exclusion is active until sun position data is available.
 # Useful to ensure night flights start with default scenery from the beginning.
-# When disabled, AutoOrtho works normally until sim time confirms exclusion.
+# When disabled, AutoOrtho works normally until sun data confirms exclusion.
 default_to_exclusion = False
-# Use sun position instead of clock time for exclusion decisions.
-# When enabled, exclusion is based on sun elevation angle rather than fixed time windows.
-# This is more accurate across seasons, latitudes, and with time acceleration.
-use_sun_position = False
 # Sun elevation threshold to switch to night mode (degrees).
 # Nautical twilight (-12) is when artificial lights dominate the landscape.
 # Range: -18 (astronomical twilight) to 0 (horizon).

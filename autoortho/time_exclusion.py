@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 
 """
-Time Exclusion Manager for AutoOrtho.
+Sun-Position Exclusion Manager for AutoOrtho.
 
-This module provides time-based exclusion functionality that allows users to
-disable AutoOrtho's scenery during specific time ranges in the simulator.
-When active, AutoOrtho's DSF files are redirected to X-Plane's global default
-scenery, ensuring terrain data is always available.
+This module provides sun-position-based exclusion functionality that allows
+AutoOrtho to automatically disable orthophoto scenery at night and fall back
+to X-Plane's default scenery (which includes night lighting).
+
+The exclusion decision is based on the sun's elevation angle (sun pitch),
+obtained from X-Plane's sim/graphics/scenery/sun_pitch_degrees dataref.
+This approach is robust against time acceleration, manual time changes,
+seasons, and latitudes.
+
+Hysteresis is used to prevent rapid toggling during twilight:
+- Switch to night (exclusion) when sun drops below night_threshold (-12°)
+- Switch to day (ortho) when sun rises above day_threshold (-10°)
 
 The manager ensures safe transitions by:
 - Tracking which DSF files are currently in use
@@ -19,25 +27,10 @@ Instead, we redirect reads to global scenery DSF files.
 
 Decision Preservation During Temporary Disconnections:
 ------------------------------------------------------
-When the simulator time becomes available, the exclusion state is determined
-based on actual sim time rather than the default_to_exclusion setting. This
-decision is preserved across temporary disconnections (e.g., scenery reload).
-
-This prevents a common issue where:
-1. User starts with "default to exclusion" enabled
-2. Time exclusion is initially active
-3. Sim time becomes available and shows daytime → exclusion deactivates
-4. User triggers "Reload Scenery" in X-Plane
-5. During reload, sim time is temporarily unavailable
-6. WITHOUT preservation: exclusion would re-activate (using default)
-7. WITH preservation: exclusion stays inactive (using preserved decision)
-
-IMPORTANT LIMITATIONS:
-- The preserved decision persists until AutoOrtho is fully restarted
-- To reset to the default_to_exclusion behavior, quit and restart AutoOrtho
-- The preserved decision is updated whenever new sim time is received
-- If sim time indicates a change in exclusion state (e.g., crossing into
-  night time), the state will update accordingly when time becomes available
+Once a decision has been made based on valid sun pitch data, that decision
+is preserved across temporary disconnections (e.g., scenery reload). This
+prevents exclusion from being incorrectly re-activated during reloads when
+the actual sun position indicated it should be inactive.
 
 Usage:
     from time_exclusion import time_exclusion_manager
@@ -146,56 +139,15 @@ def _find_global_scenery_dsf(folder, filename):
     return None
 
 
-def parse_time_string(time_str):
-    """
-    Parse a time string in HH:MM format to seconds since midnight.
-    
-    Args:
-        time_str: Time string in HH:MM format (e.g., "22:00", "06:30")
-        
-    Returns:
-        int: Seconds since midnight, or None if parsing fails
-    """
-    try:
-        time_str = str(time_str).strip()
-        if ':' in time_str:
-            parts = time_str.split(':')
-            hours = int(parts[0])
-            minutes = int(parts[1]) if len(parts) > 1 else 0
-            if 0 <= hours <= 23 and 0 <= minutes <= 59:
-                return hours * 3600 + minutes * 60
-        else:
-            # Try parsing as raw seconds
-            return int(float(time_str))
-    except (ValueError, TypeError) as e:
-        log.warning(f"Failed to parse time string '{time_str}': {e}")
-        return None
-
-
-def format_time_from_seconds(seconds):
-    """
-    Format seconds since midnight to HH:MM string.
-    
-    Args:
-        seconds: Seconds since midnight
-        
-    Returns:
-        str: Time string in HH:MM format
-    """
-    if seconds < 0:
-        return "??:??"
-    hours = int(seconds // 3600) % 24
-    minutes = int((seconds % 3600) // 60)
-    return f"{hours:02d}:{minutes:02d}"
-
-
 class TimeExclusionManager:
     """
-    Manages time-based exclusion of AutoOrtho scenery.
+    Manages sun-position-based exclusion of AutoOrtho scenery.
     
-    This class monitors the simulator's local time and determines when
-    AutoOrtho's DSF files should be hidden from X-Plane. It safely handles
-    transitions by tracking which DSFs are currently in use.
+    This class monitors the sun's elevation angle via X-Plane's
+    sun_pitch_degrees dataref and determines when AutoOrtho's DSF files
+    should be redirected to X-Plane's global scenery (night mode).
+    
+    Hysteresis prevents rapid toggling during twilight transitions.
     """
     
     def __init__(self):
@@ -210,20 +162,7 @@ class TimeExclusionManager:
         self._last_check_time = 0
         self._check_interval = 1.0  # Check every second
         
-        # Track if sim time has become available (for one-time logging)
-        self._sim_time_was_available = False
-        
-        # Preserve the last exclusion decision made based on actual sim time.
-        # This allows us to maintain the correct state during temporary disconnections
-        # (e.g., scenery reload) without falling back to the default_to_exclusion setting.
-        # Once we've made a decision based on sim time, we preserve it until:
-        # - A new sim time value causes a different decision
-        # - AutoOrtho is restarted
-        self._sim_time_decision_made = False  # True once we've used real sim time
-        self._last_sim_time_decision = False  # The last exclusion decision from sim time
-        self._last_sim_time_value = -1.0  # The last sim time we saw (for logging)
-        
-        # Sun position mode state (for sun-based exclusion)
+        # Sun position mode state
         # True = ortho enabled (day mode), False = exclusion active (night mode)
         self._sun_mode_ortho_enabled = True  # Start in day mode (ortho enabled)
         self._sun_decision_made = False  # True once we've received valid sun pitch
@@ -273,8 +212,7 @@ class TimeExclusionManager:
         
         while self._monitor_running:
             try:
-                # Check if time exclusion is enabled
-                enabled, _, _, _ = self._get_config()
+                enabled = getattr(CFG.time_exclusion, 'enabled', False)
                 if enabled:
                     # Trigger a state check (this updates the cache and logs changes)
                     self.is_exclusion_active()
@@ -291,58 +229,7 @@ class TimeExclusionManager:
             self._monitor_thread.join(timeout=2.0)
         log.debug("Time exclusion monitor stopped")
     
-    def _get_config(self):
-        """
-        Get current time exclusion configuration.
-        
-        Returns:
-            tuple: (enabled, start_seconds, end_seconds, default_to_exclusion) 
-                   or (False, None, None, False) if disabled/invalid
-        """
-        try:
-            enabled = getattr(CFG.time_exclusion, 'enabled', False)
-            if not enabled:
-                return (False, None, None, False)
-            
-            start_str = getattr(CFG.time_exclusion, 'start_time', '22:00')
-            end_str = getattr(CFG.time_exclusion, 'end_time', '06:00')
-            default_to_exclusion = getattr(CFG.time_exclusion, 'default_to_exclusion', False)
-            
-            start_sec = parse_time_string(start_str)
-            end_sec = parse_time_string(end_str)
-            
-            if start_sec is None or end_sec is None:
-                log.warning(f"Invalid time exclusion config: start={start_str}, end={end_str}")
-                return (False, None, None, False)
-            
-            return (True, start_sec, end_sec, default_to_exclusion)
-        except Exception as e:
-            log.debug(f"Error reading time exclusion config: {e}")
-            return (False, None, None, False)
-    
-    def _is_time_in_range(self, current_time_sec, start_sec, end_sec):
-        """
-        Check if current time falls within the exclusion range.
-        
-        Handles overnight ranges (e.g., 22:00 to 06:00).
-        
-        Args:
-            current_time_sec: Current time in seconds since midnight
-            start_sec: Start of exclusion range (seconds since midnight)
-            end_sec: End of exclusion range (seconds since midnight)
-            
-        Returns:
-            bool: True if current time is within the exclusion range
-        """
-        if start_sec <= end_sec:
-            # Normal range (e.g., 09:00 to 17:00)
-            return start_sec <= current_time_sec < end_sec
-        else:
-            # Overnight range (e.g., 22:00 to 06:00)
-            # Time is in range if it's >= start OR < end
-            return current_time_sec >= start_sec or current_time_sec < end_sec
-    
-    def _check_sun_exclusion_state(self):
+    def _check_exclusion_state(self):
         """
         Check if exclusion should be active based on sun position.
         
@@ -361,7 +248,13 @@ class TimeExclusionManager:
         Returns:
             bool: True if exclusion should be active (night mode)
         """
-        _, _, _, default_to_exclusion = self._get_config()
+        enabled = getattr(CFG.time_exclusion, 'enabled', False)
+        if not enabled:
+            return False
+        
+        default_to_exclusion = getattr(
+            CFG.time_exclusion, 'default_to_exclusion', False
+        )
         
         if self._dataref_tracker is None:
             return default_to_exclusion
@@ -382,8 +275,12 @@ class TimeExclusionManager:
             return default_to_exclusion
         
         # Get thresholds from config
-        night_threshold = getattr(CFG.time_exclusion, 'sun_night_threshold', -12.0)
-        day_threshold = getattr(CFG.time_exclusion, 'sun_day_threshold', -10.0)
+        night_threshold = getattr(
+            CFG.time_exclusion, 'sun_night_threshold', -12.0
+        )
+        day_threshold = getattr(
+            CFG.time_exclusion, 'sun_day_threshold', -10.0
+        )
         
         # Hysteresis logic
         if self._sun_mode_ortho_enabled:
@@ -392,7 +289,8 @@ class TimeExclusionManager:
                 self._sun_mode_ortho_enabled = False  # Switch to exclusion (night)
                 log.info(
                     f"Sun exclusion ACTIVATED: sun pitch {sun_pitch:.1f}° < "
-                    f"{night_threshold}° threshold"
+                    f"{night_threshold}° threshold - "
+                    f"DSF reads will redirect to global scenery"
                 )
         else:
             # Currently in exclusion (night mode)
@@ -400,7 +298,8 @@ class TimeExclusionManager:
                 self._sun_mode_ortho_enabled = True  # Switch to ortho (day)
                 log.info(
                     f"Sun exclusion DEACTIVATED: sun pitch {sun_pitch:.1f}° > "
-                    f"{day_threshold}° threshold"
+                    f"{day_threshold}° threshold - "
+                    f"DSF reads will use AutoOrtho scenery"
                 )
         
         self._sun_decision_made = True
@@ -409,83 +308,9 @@ class TimeExclusionManager:
         # exclusion_active = NOT ortho_enabled
         return not self._sun_mode_ortho_enabled
     
-    def _check_exclusion_state(self):
-        """
-        Check if time exclusion should be active based on current sim time.
-        
-        Decision Preservation Logic:
-        - When sim time first becomes available, we make a decision based on actual time
-        - If sim time becomes temporarily unavailable (e.g., during scenery reload),
-          we preserve the last sim-time-based decision rather than falling back to the
-          default_to_exclusion setting
-        - This prevents exclusion from being incorrectly re-activated during reloads
-          when the actual sim time indicated it should be inactive
-        - The preserved decision persists until AutoOrtho is restarted or new sim time
-          is received that would change the decision
-        
-        Returns:
-            bool: True if exclusion should be active
-        """
-        enabled, start_sec, end_sec, default_to_exclusion = self._get_config()
-        
-        if not enabled:
-            return False
-        
-        # Check if sun-position mode is enabled
-        use_sun = getattr(CFG.time_exclusion, 'use_sun_position', False)
-        if use_sun:
-            return self._check_sun_exclusion_state()
-        
-        # Otherwise use time-based logic below
-        
-        # Get current sim time from dataref tracker
-        if self._dataref_tracker is None:
-            # No dataref tracker available - use default behavior
-            return default_to_exclusion
-        
-        current_time = self._dataref_tracker.get_local_time_sec()
-        
-        if current_time < 0:
-            # No valid sim time available
-            if self._sim_time_was_available:
-                self._sim_time_was_available = False
-                log.debug("Sim time no longer available (temporary disconnection)")
-            
-            # KEY CHANGE: If we previously made a decision based on actual sim time,
-            # preserve that decision during temporary disconnections (e.g., scenery reload).
-            # This prevents the issue where exclusion gets re-activated during reload
-            # when actual sim time had already determined it should be inactive.
-            if self._sim_time_decision_made:
-                log.debug(
-                    f"Sim time unavailable - preserving last sim-time decision: "
-                    f"exclusion={'active' if self._last_sim_time_decision else 'inactive'} "
-                    f"(last sim time was {format_time_from_seconds(self._last_sim_time_value)})"
-                )
-                return self._last_sim_time_decision
-            
-            # No previous sim-time decision - use configured default
-            if default_to_exclusion:
-                log.debug("Sim time not available - defaulting to exclusion active")
-            return default_to_exclusion
-        
-        # Log once when sim time first becomes available
-        if not self._sim_time_was_available:
-            self._sim_time_was_available = True
-            log.info(f"Sim time now available: {format_time_from_seconds(current_time)}")
-        
-        # Calculate exclusion state based on actual sim time
-        should_exclude = self._is_time_in_range(current_time, start_sec, end_sec)
-        
-        # Store this decision for use during temporary disconnections
-        self._sim_time_decision_made = True
-        self._last_sim_time_decision = should_exclude
-        self._last_sim_time_value = current_time
-        
-        return should_exclude
-    
     def is_exclusion_active(self):
         """
-        Check if time exclusion is currently active.
+        Check if sun-position exclusion is currently active.
         
         This method caches the result and only rechecks periodically
         for performance.
@@ -504,48 +329,8 @@ class TimeExclusionManager:
             if current_time - self._last_check_time < self._check_interval:
                 return self._exclusion_active
             
-            old_state = self._exclusion_active
             self._exclusion_active = self._check_exclusion_state()
             self._last_check_time = current_time
-            
-            # Log state changes
-            if old_state != self._exclusion_active:
-                if self._exclusion_active:
-                    enabled, start_sec, end_sec, default_to_excl = self._get_config()
-                    current_time_sec = self._dataref_tracker.get_local_time_sec() if self._dataref_tracker else -1
-                    if current_time_sec < 0:
-                        # Sim time not available - check why exclusion was activated
-                        if self._sim_time_decision_made and self._last_sim_time_decision:
-                            # Preserved decision from previous sim time (shouldn't normally happen
-                            # for activation since we preserve the last decision, but handle it)
-                            log.info(
-                                f"Time exclusion ACTIVATED - DSF reads will redirect to global scenery "
-                                f"(using preserved decision from sim time {format_time_from_seconds(self._last_sim_time_value)}) "
-                                f"(exclusion range: {format_time_from_seconds(start_sec)} - {format_time_from_seconds(end_sec)})"
-                            )
-                        else:
-                            # Using default setting (no sim time ever received)
-                            log.info(
-                                f"Time exclusion ACTIVATED - DSF reads will redirect to global scenery "
-                                f"(sim time not yet available, using default) "
-                                f"(exclusion range: {format_time_from_seconds(start_sec)} - {format_time_from_seconds(end_sec)})"
-                            )
-                    else:
-                        log.info(
-                            f"Time exclusion ACTIVATED at sim time {format_time_from_seconds(current_time_sec)} "
-                            f"- DSF reads will redirect to global scenery "
-                            f"(exclusion range: {format_time_from_seconds(start_sec)} - {format_time_from_seconds(end_sec)})"
-                        )
-                else:
-                    current_time_sec = self._dataref_tracker.get_local_time_sec() if self._dataref_tracker else -1
-                    if current_time_sec < 0 and self._sim_time_decision_made:
-                        # Deactivated due to preserved decision
-                        log.info(
-                            f"Time exclusion DEACTIVATED - DSF reads will use AutoOrtho scenery "
-                            f"(preserving decision from sim time {format_time_from_seconds(self._last_sim_time_value)})"
-                        )
-                    else:
-                        log.info("Time exclusion DEACTIVATED - DSF reads will use AutoOrtho scenery")
             
             return self._exclusion_active
     
@@ -621,9 +406,9 @@ class TimeExclusionManager:
     
     def get_redirect_path(self, path):
         """
-        Get the redirect path for a DSF file during time exclusion.
+        Get the redirect path for a DSF file during sun exclusion.
         
-        When time exclusion is active, DSF files should be served from
+        When exclusion is active (night), DSF files should be served from
         X-Plane's global scenery instead of AutoOrtho's scenery. This ensures:
         1. X-Plane always sees DSF files (proper indexing)
         2. Terrain data is always available
@@ -666,7 +451,7 @@ class TimeExclusionManager:
         you just need to know if redirection is happening (e.g., for logging).
         
         Returns:
-            bool: True if time exclusion is active
+            bool: True if exclusion is active
         """
         return self.is_exclusion_active()
     
@@ -690,14 +475,11 @@ class TimeExclusionManager:
         Get current status information for display.
         
         Returns:
-            dict: Status information including enabled state, time range,
-                  current exclusion state, active DSF count, and redirect status
+            dict: Status information including enabled state,
+                  current exclusion state, active DSF count, and sun position
         """
         with self._lock:
-            enabled, start_sec, end_sec, default_to_excl = self._get_config()
-            current_time = -1
-            if self._dataref_tracker:
-                current_time = self._dataref_tracker.get_local_time_sec()
+            enabled = getattr(CFG.time_exclusion, 'enabled', False)
             
             # Check if global scenery is available
             xplane_path = getattr(CFG.paths, 'xplane_path', '')
@@ -709,7 +491,6 @@ class TimeExclusionManager:
                 global_scenery_available = os.path.isdir(global_path)
             
             # Get sun position info
-            use_sun = getattr(CFG.time_exclusion, 'use_sun_position', False)
             sun_pitch = -999.0
             if self._dataref_tracker:
                 sun_pitch = self._dataref_tracker.get_sun_pitch()
@@ -722,29 +503,19 @@ class TimeExclusionManager:
             
             return {
                 'enabled': enabled,
-                'start_time': format_time_from_seconds(start_sec) if start_sec is not None else "N/A",
-                'end_time': format_time_from_seconds(end_sec) if end_sec is not None else "N/A",
-                'default_to_exclusion': default_to_excl,
                 'exclusion_active': self._exclusion_active,
-                'redirect_active': self._exclusion_active,  # Redirect is now the mechanism
-                'current_sim_time': format_time_from_seconds(current_time) if current_time >= 0 else "N/A",
-                'sim_time_available': current_time >= 0,
+                'redirect_active': self._exclusion_active,
                 'active_dsf_count': len(self._active_dsfs),
                 'global_scenery_available': global_scenery_available,
-                # Preserved decision info (for debugging and status display)
-                'sim_time_decision_made': self._sim_time_decision_made,
-                'preserved_decision': self._last_sim_time_decision if self._sim_time_decision_made else None,
-                'preserved_from_time': format_time_from_seconds(self._last_sim_time_value) if self._sim_time_decision_made else "N/A",
-                # Sun position mode info
-                'use_sun_position': use_sun,
+                # Sun position info
                 'sun_pitch': sun_pitch if -90 <= sun_pitch <= 90 else None,
                 'sun_pitch_str': f"{sun_pitch:.1f}°" if -90 <= sun_pitch <= 90 else "N/A",
                 'sun_night_threshold': sun_night_threshold,
                 'sun_day_threshold': sun_day_threshold,
                 'sun_mode_ortho_enabled': self._sun_mode_ortho_enabled,
+                'sun_decision_made': self._sun_decision_made,
             }
 
 
 # Singleton instance
 time_exclusion_manager = TimeExclusionManager()
-
