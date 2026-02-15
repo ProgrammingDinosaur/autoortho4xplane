@@ -149,6 +149,9 @@ class Zip(object):
                 return
 
             for dir in zip_path.iterdir():
+                # Some zip files have a directory with this name.  Invalid and unexpected!
+                if dir.name == "*":
+                    continue
                 os.makedirs(os.path.join(destpath, dir.name), exist_ok=True)
                 for entry in (zip_path / dir.name).iterdir():
                     with (
