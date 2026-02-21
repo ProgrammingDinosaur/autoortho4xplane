@@ -369,6 +369,60 @@ def enumerate_bundles(cache_dir: str) -> list:
     return bundles
 
 
+def get_dds_cache_dir(cache_dir: str, row: int, col: int, zoom: int, maptype: str) -> str:
+    """
+    Get the directory path for a cached DDS file based on DSF coordinates.
+    
+    Mirrors the bundle directory hierarchy for consistency.
+    
+    Directory structure:
+        {cache_dir}/dds_cache/{10°_band}/{1°_tile}/{maptype}/
+    
+    Args:
+        cache_dir: Base cache directory
+        row: Tile row
+        col: Tile column
+        zoom: Zoom level (used for coordinate conversion)
+        maptype: Map source identifier (e.g., "BI", "APPLE")
+    
+    Returns:
+        Directory path for the DDS cache file
+    """
+    lat_band, lon_band = tile_to_dsf_10deg_band(row, col, zoom)
+    lat_1deg, lon_1deg = tile_to_dsf_coords(row, col, zoom)
+    
+    band_name = format_dsf_band(lat_band, lon_band)
+    tile_name = format_dsf_name(lat_1deg, lon_1deg)
+    
+    return os.path.join(cache_dir, "dds_cache", band_name, tile_name, maptype)
+
+
+def get_dds_cache_path(cache_dir: str, row: int, col: int,
+                       maptype: str, zoom: int, max_zoom: int) -> str:
+    """
+    Get the full path for a cached DDS file.
+    
+    Path format:
+        {cache_dir}/dds_cache/{10°_band}/{1°_tile}/{maptype}/{row}_{col}_z{max_zoom}.dds
+    
+    The _z{max_zoom} suffix distinguishes DDS files for different effective
+    zoom levels of the same tile (e.g., 4096x4096 at ZL16 vs 8192x8192 at ZL17).
+    
+    Args:
+        cache_dir: Base cache directory
+        row: Tile row
+        col: Tile column
+        maptype: Map source identifier
+        zoom: Zoom level (used for coordinate conversion to find DSF tile)
+        max_zoom: Effective maximum zoom level for DDS dimensions
+    
+    Returns:
+        Full path to the DDS cache file (without extension - caller appends .dds or .ddm)
+    """
+    dds_dir = get_dds_cache_dir(cache_dir, row, col, zoom, maptype)
+    return os.path.join(dds_dir, f"{row}_{col}_z{max_zoom}")
+
+
 # For compatibility with existing code that uses row/col convention
 def tile_row_col_to_dsf_key(row: int, col: int, zoom: int) -> str:
     """

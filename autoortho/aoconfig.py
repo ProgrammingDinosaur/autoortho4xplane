@@ -234,6 +234,18 @@ predictive_dds_use_fallbacks = True
 # Uses temp directory, auto-cleaned on session end
 # Recommended: 4096 (balanced), 8192 (large flights), 16384 (max capacity)
 ephemeral_dds_cache_mb = 4096
+# Persistent DDS cache - stores pre-built DDS textures across sessions
+# Eliminates JPEG decode + DXT compress on subsequent loads (~1-2ms read vs ~390ms rebuild)
+# Set to 0 to disable persistent DDS caching
+# Recommended: 4096 (balanced), 8192 (large regions), 0 (disk constrained)
+persistent_dds_cache_mb = 4096
+# Disk budget enforcement - automatically cleans up old cache data
+# When total cache exceeds file_cache_size, oldest data is evicted
+# Categories: bundles (source JPEGs), DDS cache (compiled textures)
+disk_budget_enabled = True
+# Percentage of file_cache_size allocated to persistent DDS cache (10-60)
+# Remaining budget split: bundles get most, orphan JPEGs get least
+dds_budget_pct = 40
 # Maximum threads for native pipeline (0 = auto from CPU cores)
 # Controls parallelism for cache I/O, JPEG decoding, and DDS compression
 # Lower values reduce CPU usage but slow down DDS building

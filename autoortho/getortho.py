@@ -2962,7 +2962,7 @@ def stop_prefetcher():
 #
 # Components:
 # 1. TileCompletionTracker - Monitors chunk downloads, detects when all ready
-# 2. PrebuiltDDSCache - Stores pre-built DDS for instant serving
+# 2. DynamicDDSCache - Stores pre-built DDS for instant serving
 # 3. BackgroundDDSBuilder - Builds DDS from completed tiles in background
 # ============================================================================
 
@@ -3204,481 +3204,23 @@ class TileCompletionTracker:
             return len(self._tracked_tiles)
 
 
-class PrebuiltDDSCache:
-    """
-    Cache for pre-built DDS byte buffers.
-    
-    Stores completed DDS textures built by BackgroundDDSBuilder.
-    These are served directly to X-Plane on cache hit, avoiding
-    the decode+compress overhead.
-    
-    Memory Management:
-    - Has its own memory limit (separate from tile cache)
-    - Uses LRU eviction when limit is reached
-    - Prebuilt tiles are evicted BEFORE active tiles
-    
-    Thread Safety:
-    - Reads and writes are protected by RLock
-    - Multiple FUSE threads may read concurrently
-    - Single builder thread writes
-    """
-    
-    def __init__(self, max_memory_bytes: int = 512 * 1024 * 1024):
-        """
-        Args:
-            max_memory_bytes: Maximum memory for prebuilt DDS (default 512MB)
-        """
-        self._lock = threading.RLock()
-        self._cache: OrderedDict = OrderedDict()
-        self._memory_used = 0
-        self._max_memory = max_memory_bytes
-        self._hits = 0
-        self._misses = 0
-    
-    def get(self, tile_id: str) -> Optional[bytes]:
-        """
-        Retrieve pre-built DDS bytes for a tile.
-        
-        Returns None if not in cache (cache miss).
-        Updates LRU order on hit.
-        
-        Thread-safe: may be called from multiple FUSE threads.
-        """
-        with self._lock:
-            if tile_id not in self._cache:
-                self._misses += 1
-                return None
-            
-            # Move to end (most recently used)
-            self._cache.move_to_end(tile_id)
-            self._hits += 1
-            return self._cache[tile_id]
-    
-    def store(self, tile_id: str, dds_bytes: bytes) -> None:
-        """
-        Store pre-built DDS bytes.
-        
-        Evicts oldest entries if memory limit exceeded.
-        
-        Thread-safe: called from builder thread.
-        """
-        if not dds_bytes:
-            return
-        
-        size = len(dds_bytes)
-        
-        with self._lock:
-            # Remove existing entry if present
-            if tile_id in self._cache:
-                old_size = len(self._cache[tile_id])
-                del self._cache[tile_id]
-                self._memory_used -= old_size
-            
-            # Evict until we have room
-            while self._memory_used + size > self._max_memory and self._cache:
-                oldest_id, oldest_bytes = self._cache.popitem(last=False)
-                self._memory_used -= len(oldest_bytes)
-                log.debug(f"PrebuiltDDSCache: Evicted {oldest_id} to make room")
-            
-            # Store new entry
-            self._cache[tile_id] = dds_bytes
-            self._memory_used += size
-            log.debug(f"PrebuiltDDSCache: Stored {tile_id} ({size} bytes, "
-                     f"total: {self._memory_used / (1024*1024):.1f}MB)")
-    
-    def remove(self, tile_id: str) -> None:
-        """Remove a tile from the cache (e.g., when tile is evicted from main cache)."""
-        with self._lock:
-            if tile_id in self._cache:
-                size = len(self._cache[tile_id])
-                del self._cache[tile_id]
-                self._memory_used -= size
-    
-    def clear(self) -> None:
-        """Clear all cached entries."""
-        with self._lock:
-            self._cache.clear()
-            self._memory_used = 0
-    
-    def contains(self, tile_id: str) -> bool:
-        """Check if tile is in cache without updating LRU."""
-        with self._lock:
-            return tile_id in self._cache
-    
-    @property
-    def stats(self) -> dict:
-        """Return cache statistics."""
-        with self._lock:
-            total = self._hits + self._misses
-            hit_rate = (self._hits / total * 100) if total > 0 else 0
-            return {
-                'entries': len(self._cache),
-                'memory_mb': self._memory_used / (1024 * 1024),
-                'max_memory_mb': self._max_memory / (1024 * 1024),
-                'hits': self._hits,
-                'misses': self._misses,
-                'hit_rate': hit_rate
-            }
-
-
-class EphemeralDDSCache:
-    """
-    Disk-based DDS cache for session overflow.
-    
-    Provides temporary disk storage for pre-built DDS textures that exceed
-    memory limits. Key properties:
-    
-    - Uses OS temp directory (auto-cleaned on reboot)
-    - Session-tagged to invalidate previous runs
-    - LRU eviction when size limit reached
-    - Automatically cleaned up on shutdown
-    
-    Unlike a persistent cache, this ephemeral cache:
-    - Does NOT persist between sessions
-    - Does NOT risk stale/corrupt textures
-    - Does NOT increase long-term disk usage
-    
-    Thread Safety:
-    - Reads and writes are protected by lock
-    """
-    
-    def __init__(self, max_size_mb: int = 4096):
-        """
-        Args:
-            max_size_mb: Maximum disk usage in MB (default 4GB)
-        """
-        import tempfile
-        self._session_id = uuid.uuid4().hex[:8]
-        self._cache_dir = os.path.join(
-            tempfile.gettempdir(),
-            'autoortho_dds_session'
-        )
-        os.makedirs(self._cache_dir, exist_ok=True)
-        self._max_size = max_size_mb * 1024 * 1024
-        self._current_size = 0
-        self._entries: OrderedDict = OrderedDict()  # tile_id -> (path, size)
-        self._lock = threading.Lock()
-        self._hits = 0
-        self._misses = 0
-        
-        # Clean stale entries from previous sessions
-        self._cleanup_stale()
-        
-        log.info(f"EphemeralDDSCache initialized: {self._cache_dir} "
-                 f"(session={self._session_id}, max={max_size_mb}MB)")
-    
-    def _cleanup_stale(self):
-        """Remove files from previous sessions."""
-        try:
-            for filename in os.listdir(self._cache_dir):
-                if not filename.startswith(self._session_id):
-                    try:
-                        os.remove(os.path.join(self._cache_dir, filename))
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-    
-    def _path_for(self, tile_id: str) -> str:
-        """Generate cache file path for a tile."""
-        # Sanitize tile_id for filename
-        safe_id = tile_id.replace('/', '_').replace('\\', '_')
-        return os.path.join(self._cache_dir, f"{self._session_id}_{safe_id}.dds")
-    
-    def get(self, tile_id: str) -> Optional[bytes]:
-        """
-        Retrieve pre-built DDS bytes from disk cache.
-        
-        Returns None on miss. Updates LRU order on hit.
-        """
-        with self._lock:
-            if tile_id not in self._entries:
-                self._misses += 1
-                return None
-            path, _ = self._entries[tile_id]
-            # Move to end (most recently used)
-            self._entries.move_to_end(tile_id)
-        
-        try:
-            data = Path(path).read_bytes()
-            with self._lock:
-                self._hits += 1
-            return data
-        except (FileNotFoundError, OSError):
-            # File was deleted externally
-            with self._lock:
-                self._entries.pop(tile_id, None)
-                self._misses += 1
-            return None
-    
-    def store(self, tile_id: str, dds_bytes: bytes) -> bool:
-        """
-        Store pre-built DDS bytes to disk cache.
-        
-        Evicts oldest entries if size limit exceeded.
-        Returns True on success.
-        """
-        if not dds_bytes:
-            return False
-        
-        size = len(dds_bytes)
-        path = self._path_for(tile_id)
-        
-        with self._lock:
-            # Remove existing entry if present
-            if tile_id in self._entries:
-                old_path, old_size = self._entries.pop(tile_id)
-                try:
-                    os.remove(old_path)
-                except OSError:
-                    pass
-                self._current_size -= old_size
-            
-            # Evict until we have room
-            while self._current_size + size > self._max_size and self._entries:
-                oldest_id, (oldest_path, oldest_size) = self._entries.popitem(last=False)
-                try:
-                    os.remove(oldest_path)
-                except OSError:
-                    pass
-                self._current_size -= oldest_size
-            
-            # Write new entry
-            try:
-                Path(path).write_bytes(dds_bytes)
-                self._entries[tile_id] = (path, size)
-                self._current_size += size
-                return True
-            except OSError as e:
-                log.debug(f"EphemeralDDSCache: Write failed for {tile_id}: {e}")
-                return False
-    
-    def path_for(self, tile_id: str) -> str:
-        """
-        Get the cache file path for a tile (public API for direct-to-disk writes).
-        
-        Used when C code needs to write directly to the cache location.
-        Call register_file() after successful write.
-        
-        Args:
-            tile_id: Tile identifier
-            
-        Returns:
-            Full path where the DDS file should be written
-        """
-        return self._path_for(tile_id)
-    
-    def register_file(self, tile_id: str, size: int) -> bool:
-        """
-        Register an externally-written file with the cache.
-        
-        CRITICAL for direct-to-disk optimization:
-        When C code writes DDS files directly (via aodds_build_from_jpegs_to_file),
-        this method registers the file with the cache without re-reading it.
-        
-        Flow for direct-to-disk:
-        1. path = cache.path_for(tile_id)
-        2. C writes DDS directly to path
-        3. cache.register_file(tile_id, bytes_written)
-        
-        Handles eviction if size limit exceeded.
-        
-        Args:
-            tile_id: Tile identifier
-            size: File size in bytes (as reported by C code)
-            
-        Returns:
-            True on success, False if file doesn't exist
-        """
-        path = self._path_for(tile_id)
-        
-        # Verify file exists (C should have written it)
-        if not os.path.exists(path):
-            log.debug(f"EphemeralDDSCache.register_file: File not found: {path}")
-            return False
-        
-        with self._lock:
-            # Remove existing entry if present
-            if tile_id in self._entries:
-                old_path, old_size = self._entries.pop(tile_id)
-                # Don't delete - the new file is at the same path
-                self._current_size -= old_size
-            
-            # Evict until we have room
-            while self._current_size + size > self._max_size and self._entries:
-                oldest_id, (oldest_path, oldest_size) = self._entries.popitem(last=False)
-                try:
-                    os.remove(oldest_path)
-                except OSError:
-                    pass
-                self._current_size -= oldest_size
-            
-            # Register the file
-            self._entries[tile_id] = (path, size)
-            self._current_size += size
-            return True
-    
-    def remove(self, tile_id: str) -> None:
-        """Remove a tile from the cache."""
-        with self._lock:
-            if tile_id in self._entries:
-                path, size = self._entries.pop(tile_id)
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-                self._current_size -= size
-    
-    def contains(self, tile_id: str) -> bool:
-        """Check if tile is in cache."""
-        with self._lock:
-            return tile_id in self._entries
-    
-    def clear(self) -> None:
-        """Clear all cached entries."""
-        with self._lock:
-            for tile_id, (path, _) in list(self._entries.items()):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            self._entries.clear()
-            self._current_size = 0
-    
-    def cleanup(self):
-        """Clean all session files on shutdown."""
-        self.clear()
-        log.info(f"EphemeralDDSCache cleaned up (session={self._session_id})")
-    
-    @property
-    def stats(self) -> dict:
-        """Return cache statistics."""
-        with self._lock:
-            total = self._hits + self._misses
-            hit_rate = (self._hits / total * 100) if total > 0 else 0
-            return {
-                'entries': len(self._entries),
-                'size_mb': self._current_size / (1024 * 1024),
-                'max_size_mb': self._max_size / (1024 * 1024),
-                'hits': self._hits,
-                'misses': self._misses,
-                'hit_rate': hit_rate,
-                'session_id': self._session_id
-            }
-
-
-class HybridDDSCache:
-    """
-    Two-tier DDS cache: fast memory + large disk overflow.
-    
-    Provides the best of both worlds:
-    - Memory tier: Fast access for hot tiles (default 512MB)
-    - Disk tier: Large capacity overflow (default 4GB)
-    
-    On store:
-    - Tries memory first
-    - Overflows to disk when memory full
-    
-    On get:
-    - Checks memory first (faster)
-    - Falls back to disk on miss
-    
-    Thread Safety:
-    - Delegates to underlying caches which are thread-safe
-    """
-    
-    def __init__(self, memory_mb: int = 512, disk_mb: int = 4096):
-        """
-        Args:
-            memory_mb: Maximum memory cache size in MB
-            disk_mb: Maximum disk cache size in MB
-        """
-        self._memory = PrebuiltDDSCache(max_memory_bytes=memory_mb * 1024 * 1024)
-        self._disk = EphemeralDDSCache(max_size_mb=disk_mb)
-        log.info(f"HybridDDSCache initialized: memory={memory_mb}MB, disk={disk_mb}MB")
-    
-    def get(self, tile_id: str) -> Optional[bytes]:
-        """
-        Retrieve DDS bytes, checking memory first then disk.
-        """
-        # Try memory first (faster)
-        result = self._memory.get(tile_id)
-        if result:
-            return result
-        
-        # Try disk
-        return self._disk.get(tile_id)
-    
-    def store(self, tile_id: str, dds_bytes: bytes) -> None:
-        """
-        Store DDS bytes, trying memory first then overflow to disk.
-        """
-        if not dds_bytes:
-            return
-        
-        # Try memory first
-        self._memory.store(tile_id, dds_bytes)
-        
-        # If memory is full and this entry wasn't stored, use disk
-        if not self._memory.contains(tile_id):
-            self._disk.store(tile_id, dds_bytes)
-    
-    def remove(self, tile_id: str) -> None:
-        """Remove from both tiers."""
-        self._memory.remove(tile_id)
-        self._disk.remove(tile_id)
-    
-    def contains(self, tile_id: str) -> bool:
-        """Check if tile is in either tier."""
-        return self._memory.contains(tile_id) or self._disk.contains(tile_id)
-    
-    def clear(self) -> None:
-        """Clear both tiers."""
-        self._memory.clear()
-        self._disk.clear()
-    
-    def cleanup(self):
-        """Cleanup disk tier on shutdown."""
-        self._disk.cleanup()
-    
-    @property
-    def stats(self) -> dict:
-        """Return combined statistics."""
-        mem_stats = self._memory.stats
-        disk_stats = self._disk.stats
-        return {
-            'memory': mem_stats,
-            'disk': disk_stats,
-            'total_entries': mem_stats['entries'] + disk_stats['entries'],
-            'total_size_mb': mem_stats['memory_mb'] + disk_stats['size_mb']
-            }
-
 
 class BackgroundDDSBuilder:
-    """
-    Builds DDS textures from fully-downloaded tiles in the background.
-    
-    Design principles:
-    1. Parallel workers: Configurable thread pool for throughput
-    2. Rate-limited submission: Prevents queue flooding
-    3. Priority queue: Build tiles in submission order (FIFO for fairness)
-    4. Interruptible: Can pause/stop cleanly during shutdown
-    """
     
     # Maximum queue depth (prevents unbounded memory growth)
     MAX_QUEUE_SIZE = 100
     
-    def __init__(self, prebuilt_cache: PrebuiltDDSCache, 
+    def __init__(self, dds_cache,
                  build_interval_sec: float = 0.5,
                  max_workers: int = 2):
         """
         Args:
-            prebuilt_cache: Cache to store completed DDS buffers
+            dds_cache: DynamicDDSCache instance for persistent DDS storage
             build_interval_sec: Minimum time between submissions (rate limiting)
             max_workers: Number of parallel build workers
         """
         self._queue = Queue(maxsize=self.MAX_QUEUE_SIZE)
-        self._prebuilt_cache = prebuilt_cache
+        self._dds_cache = dds_cache
         self._build_interval = build_interval_sec
         self._max_workers = max_workers
         
@@ -3759,10 +3301,12 @@ class BackgroundDDSBuilder:
         if tile is None:
             return False
         
-        # Skip if already in prebuilt cache
-        if self._prebuilt_cache.contains(tile.id):
-            log.debug(f"BackgroundDDSBuilder: Skipping {tile.id} - already cached")
-            return False
+        # Skip if already in DDS cache (allow through if healing needed)
+        if self._dds_cache is not None and self._dds_cache.contains(tile.id, tile.max_zoom, tile):
+            if not getattr(tile, '_dds_needs_healing', False):
+                log.debug(f"BackgroundDDSBuilder: Skipping {tile.id} - already cached")
+                return False
+            log.debug(f"BackgroundDDSBuilder: healing tile {tile.id} passed through")
         
         try:
             self._queue.put_nowait((priority, tile))
@@ -4045,14 +3589,14 @@ class BackgroundDDSBuilder:
                     else:
                         builder.mark_missing(i)
             
-            # Finalize directly to disk (optimal for prefetch cache)
-            if hasattr(self._prebuilt_cache, 'path_for'):
-                output_path = self._prebuilt_cache.path_for(tile_id)
-                success, bytes_written = builder.finalize_to_file(output_path)
+            # Finalize directly to disk via DynamicDDSCache staging path
+            if self._dds_cache is not None:
+                staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
+                success, bytes_written = builder.finalize_to_file(staging_path)
                 
                 if success and bytes_written >= 128:
-                    if hasattr(self._prebuilt_cache, 'register_file'):
-                        self._prebuilt_cache.register_file(tile_id, bytes_written)
+                    self._dds_cache.store_from_file(
+                        tile_id, tile.max_zoom, staging_path, tile)
                     
                     build_time = (time.monotonic() - build_start) * 1000
                     status = builder.get_status()
@@ -4062,8 +3606,6 @@ class BackgroundDDSBuilder:
                               f"missing={status['chunks_missing']})")
                     bump('prebuilt_dds_builds_streaming')
                     
-                    # Schedule bundle consolidation for all zoom levels
-                    # This ensures cached JPEGs are consolidated into bundles
                     consolidate_tile_if_ready(tile, "background_dds")
                     
                     return True
@@ -4169,7 +3711,11 @@ class BackgroundDDSBuilder:
 
     def _store_dds_result(self, tile, tile_id: str, dds_bytes: bytes, build_start: float) -> bool:
         """
-        Store DDS build result in prebuilt cache.
+        Store DDS build result.
+        
+        Prefers the persistent DDS cache (cross-session) when available.
+        Falls back to the ephemeral session cache only when persistent
+        storage is unavailable or fails, avoiding redundant disk writes.
         
         Args:
             tile: Tile that was built
@@ -4184,23 +3730,19 @@ class BackgroundDDSBuilder:
             return False
         
         try:
-            if hasattr(self._prebuilt_cache, 'path_for'):
-                output_path = self._prebuilt_cache.path_for(tile_id)
-                
-                # Write DDS to disk atomically
-                temp_path = output_path + f'.tmp.{os.getpid()}'
-                with open(temp_path, 'wb') as f:
-                    f.write(dds_bytes)
-                os.rename(temp_path, output_path)
-                
-                if hasattr(self._prebuilt_cache, 'register_file'):
-                    self._prebuilt_cache.register_file(tile_id, len(dds_bytes))
-                
-                build_time = (time.monotonic() - build_start) * 1000
-                self._builds_completed += 1
-                log.debug(f"BackgroundDDSBuilder: Bundle built {tile_id} in {build_time:.0f}ms")
-                bump('prebuilt_dds_builds_bundle')
-                return True
+            # Persist to Dynamic DDS Cache first (cross-session, highest value)
+            if self._dds_cache is not None:
+                try:
+                    self._dds_cache.store(
+                        tile_id, tile.max_zoom, dds_bytes, tile)
+                except Exception as e:
+                    log.debug(f"BackgroundDDSBuilder: DDS cache store failed: {e}")
+
+            build_time = (time.monotonic() - build_start) * 1000
+            self._builds_completed += 1
+            log.debug(f"BackgroundDDSBuilder: Bundle built {tile_id} in {build_time:.0f}ms")
+            bump('prebuilt_dds_builds_bundle')
+            return True
         except Exception as e:
             log.debug(f"BackgroundDDSBuilder: Failed to store DDS for {tile_id}: {e}")
         
@@ -4278,19 +3820,21 @@ class BackgroundDDSBuilder:
                 # ───────────────────────────────────────────────────────────────────
                 if pipeline_mode == PIPELINE_MODE_HYBRID:
                     chunks_for_hybrid = tile.chunks.get(tile.max_zoom, [])
+                    hybrid_mm0_missing = [i for i, c in enumerate(chunks_for_hybrid)
+                                          if not (c.data and len(c.data) > 0)]
                     if chunks_for_hybrid:
                         # ═══════════════════════════════════════════════════════════════
                         # DIRECT-TO-DISK OPTIMIZATION (Phase 1: ~65ms copy eliminated)
                         # ═══════════════════════════════════════════════════════════════
-                        # If cache supports register_file (EphemeralDDSCache), build
-                        # directly to disk file - eliminates Python memory copy entirely.
+                        # Build directly to disk file via DynamicDDSCache staging path.
+                        # Eliminates Python memory copy entirely.
                         # Flow: JPEG data → C decode → C compress → fwrite to disk
                         #
                         # This saves ~65ms per tile by avoiding:
                         # - Buffer → Python bytes copy
                         # - Python bytes → disk write
                         # ═══════════════════════════════════════════════════════════════
-                        if (hasattr(self._prebuilt_cache, 'register_file') and 
+                        if (self._dds_cache is not None and
                             hasattr(native_dds, 'build_from_jpegs_to_file')):
                             try:
                                 # Extract JPEG data from chunks
@@ -4305,27 +3849,26 @@ class BackgroundDDSBuilder:
                                         jpeg_datas.append(None)
                                 
                                 if valid_count > 0:
-                                    # Get output path from cache
-                                    output_path = self._prebuilt_cache.path_for(tile_id)
+                                    staging_path = self._dds_cache.get_staging_path(
+                                        tile_id, tile.max_zoom, tile)
                                     
-                                    # Build directly to file (zero-copy!)
                                     result = native_dds.build_from_jpegs_to_file(
                                         jpeg_datas,
-                                        output_path,
+                                        staging_path,
                                         format=dxt_format,
                                         missing_color=missing_color
                                     )
                                     
                                     if result.success and result.bytes_written >= 128:
-                                        # Register file with cache (no additional write!)
-                                        self._prebuilt_cache.register_file(tile_id, result.bytes_written)
+                                        self._dds_cache.store_from_file(
+                                            tile_id, tile.max_zoom, staging_path, tile,
+                                            mm0_missing_indices=hybrid_mm0_missing or None)
                                         build_time = (time.monotonic() - build_start) * 1000
                                         self._builds_completed += 1
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk built {tile_id} "
                                                   f"in {build_time:.0f}ms ({result.bytes_written} bytes)")
                                         bump('prebuilt_dds_builds_direct')
                                         
-                                        # Schedule bundle consolidation for all zoom levels
                                         consolidate_tile_if_ready(tile, "background_dds")
                                         
                                         return
@@ -4348,8 +3891,14 @@ class BackgroundDDSBuilder:
                             )
                             
                             if dds_bytes and len(dds_bytes) >= 128:
-                                # Hybrid build succeeded - store and return
-                                self._prebuilt_cache.store(tile_id, dds_bytes)
+                                # Hybrid build succeeded - store in DDS cache
+                                if self._dds_cache is not None:
+                                    try:
+                                        self._dds_cache.store(
+                                            tile_id, tile.max_zoom, dds_bytes, tile,
+                                            mm0_missing_indices=hybrid_mm0_missing or None)
+                                    except Exception:
+                                        pass
                                 build_time = (time.monotonic() - build_start) * 1000
                                 self._builds_completed += 1
                                 log.debug(f"BackgroundDDSBuilder: Hybrid built {tile_id} in "
@@ -4379,35 +3928,33 @@ class BackgroundDDSBuilder:
                 # - C reads cache files + decodes + compresses + writes to disk
                 # - Eliminates ~65ms Python copy overhead
                 # ═══════════════════════════════════════════════════════════════
-                if (hasattr(self._prebuilt_cache, 'register_file') and 
+                if (self._dds_cache is not None and
                     hasattr(native_dds, 'build_tile_to_file')):
                     try:
-                        # Get output path from cache
-                        output_path = self._prebuilt_cache.path_for(tile_id)
+                        staging_path = self._dds_cache.get_staging_path(
+                            tile_id, tile.max_zoom, tile)
                         
-                        # Build directly to file (zero-copy!)
                         result = native_dds.build_tile_to_file(
                             cache_dir=tile.cache_dir,
                             row=tile.row,
                             col=tile.col,
                             maptype=tile.maptype,
                             zoom=tile.max_zoom,
-                            output_path=output_path,
+                            output_path=staging_path,
                             chunks_per_side=tile.chunks_per_row,
                             format=dxt_format,
                             missing_color=missing_color
                         )
                         
                         if result.success and result.bytes_written >= 128:
-                            # Register file with cache (no additional write!)
-                            self._prebuilt_cache.register_file(tile_id, result.bytes_written)
+                            self._dds_cache.store_from_file(
+                                tile_id, tile.max_zoom, staging_path, tile)
                             build_time = (time.monotonic() - build_start) * 1000
                             self._builds_completed += 1
                             log.debug(f"BackgroundDDSBuilder: Native direct-to-disk built {tile_id} "
                                       f"in {build_time:.0f}ms ({result.bytes_written} bytes)")
                             bump('prebuilt_dds_builds_native_direct')
                             
-                            # Schedule bundle consolidation for all zoom levels
                             consolidate_tile_if_ready(tile, "background_dds")
                             
                             return
@@ -4459,9 +4006,13 @@ class BackgroundDDSBuilder:
                     )
                     
                     if result.success and result.bytes_written >= 128:
-                        # Copy from buffer and store
                         dds_bytes = result.to_bytes()
-                        self._prebuilt_cache.store(tile_id, dds_bytes)
+                        if self._dds_cache is not None:
+                            try:
+                                self._dds_cache.store(
+                                    tile_id, tile.max_zoom, dds_bytes, tile)
+                            except Exception:
+                                pass
                         build_time = (time.monotonic() - build_start) * 1000
                         self._builds_completed += 1
                         log.debug(f"BackgroundDDSBuilder: Native built {tile_id} "
@@ -4515,10 +4066,11 @@ class BackgroundDDSBuilder:
                 log.debug(f"BackgroundDDSBuilder: {tile_id} - tile.dds is None, skipping")
                 return
             
-            # Skip if already in cache (race condition check)
-            if self._prebuilt_cache.contains(tile_id):
-                log.debug(f"BackgroundDDSBuilder: {tile_id} - already in cache, skipping")
-                return
+            # Skip if already in cache (race condition check, allow healing tiles)
+            if self._dds_cache is not None and self._dds_cache.contains(tile_id, tile.max_zoom, tile):
+                if not getattr(tile, '_dds_needs_healing', False):
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - already in cache, skipping")
+                    return
             
             # Step 1: Verify chunks are ready for ALL mipmap levels
             # We need native chunks at each zoom level for proper mipmap building
@@ -4623,8 +4175,16 @@ class BackgroundDDSBuilder:
                 self._builds_failed += 1
                 return
             
-            # Step 6: Store in prebuilt cache
-            self._prebuilt_cache.store(tile_id, dds_bytes)
+            # Step 6: Store in DDS cache
+            if self._dds_cache is not None:
+                try:
+                    mm0_chunks = tile.chunks.get(tile.max_zoom, [])
+                    python_mm0_missing = [i for i, c in enumerate(mm0_chunks)
+                                          if not (c.ready.is_set() and c.data)]
+                    self._dds_cache.store(tile_id, tile.max_zoom, dds_bytes, tile,
+                                         mm0_missing_indices=python_mm0_missing or None)
+                except Exception:
+                    pass
             
             build_time = (time.monotonic() - build_start) * 1000
             self._builds_completed += 1
@@ -4673,9 +4233,12 @@ class BackgroundDDSBuilder:
 
 
 # Global instances for predictive DDS generation (initialized in start_predictive_dds)
-prebuilt_dds_cache: Optional[PrebuiltDDSCache] = None
 background_dds_builder: Optional[BackgroundDDSBuilder] = None
 tile_completion_tracker: Optional[TileCompletionTracker] = None
+
+# Persistent DDS cache (cross-session) and disk budget manager
+dynamic_dds_cache = None       # type: ignore[assignment]  # DynamicDDSCache instance
+disk_budget_manager = None     # type: ignore[assignment]  # DiskBudgetManager instance
 
 # Bundle consolidator for AOB2 format (consolidates JPEGs into bundles)
 _bundle_consolidator = None
@@ -4843,12 +4406,56 @@ def consolidate_tile_if_ready(tile, source: str = "unknown") -> bool:
         return False
 
 
+def _collect_healing_jpegs(tile, missing_indices):
+    """Collect JPEG bytes for missing chunk indices from memory or disk cache.
+
+    Returns dict mapping chunk index → JPEG bytes, or None if not all available.
+    """
+    max_zoom = getattr(tile, 'max_zoom', None)
+    if max_zoom is None:
+        return None
+    chunks = tile.chunks.get(max_zoom, [])
+    chunk_jpegs = {}
+    for idx in missing_indices:
+        if idx < len(chunks) and chunks[idx].data:
+            chunk_jpegs[idx] = chunks[idx].data
+        elif idx < len(chunks):
+            cache_data = chunks[idx].get_cache()
+            if cache_data:
+                chunk_jpegs[idx] = cache_data
+            else:
+                return None
+        else:
+            return None
+    return chunk_jpegs
+
+
+def _dispatch_healing(tile):
+    """Dispatch in-place healing for a tile with missing chunks."""
+    missing = getattr(tile, '_dds_missing_indices', [])
+    if not missing or dynamic_dds_cache is None:
+        return
+
+    chunk_jpegs = _collect_healing_jpegs(tile, missing)
+    if chunk_jpegs is None:
+        log.debug(f"Healing: not all JPEGs available for {tile.id}, deferring")
+        return
+
+    t = threading.Thread(
+        target=dynamic_dds_cache.patch_missing_chunks,
+        args=(tile.id, tile.max_zoom, tile, chunk_jpegs),
+        daemon=True)
+    t.start()
+
+
 def _on_tile_complete_callback(tile_id: str, tile) -> None:
     """
     Callback invoked when all chunks for a tile have been downloaded.
     Submits the tile to the background DDS builder and schedules bundle consolidation.
     """
-    if background_dds_builder is not None:
+    if getattr(tile, '_dds_needs_healing', False) and dynamic_dds_cache is not None:
+        _dispatch_healing(tile)
+    elif background_dds_builder is not None:
         background_dds_builder.submit(tile)
     
     # Schedule bundle consolidation for ALL zoom levels of this tile
@@ -4873,7 +4480,8 @@ def start_predictive_dds(tile_cacher=None) -> None:
     Args:
         tile_cacher: TileCacher instance (for future use)
     """
-    global prebuilt_dds_cache, background_dds_builder, tile_completion_tracker, _bundle_consolidator
+    global background_dds_builder, tile_completion_tracker, _bundle_consolidator
+    global dynamic_dds_cache, disk_budget_manager
 
     # Prevent duplicate initialization (Windows/Linux: all mounts share one process)
     if background_dds_builder is not None:
@@ -4920,13 +4528,42 @@ def start_predictive_dds(tile_cacher=None) -> None:
     except Exception as e:
         log.warning(f"Failed to initialize decoder pool: {e}")
     
-    # Initialize disk-only cache
-    # Disk reads (~1-2ms) are fast enough - no need for RAM cache overhead
-    # OS file cache naturally keeps hot files in memory
-    prebuilt_dds_cache = EphemeralDDSCache(max_size_mb=disk_cache_mb)
+    # ═══════════════════════════════════════════════════════════════════
+    # Initialize persistent Dynamic DDS Cache (cross-session)
+    # Must be created before BackgroundDDSBuilder which depends on it.
+    # ═══════════════════════════════════════════════════════════════════
+    persistent_dds_mb = int(getattr(CFG.autoortho, 'persistent_dds_cache_mb', 4096))
+    if persistent_dds_mb > 0:
+        try:
+            try:
+                from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+            except ImportError:
+                from aopipeline.dynamic_dds_cache import DynamicDDSCache
+            
+            cache_dir = str(CFG.paths.cache_dir)
+            dynamic_dds_cache = DynamicDDSCache(
+                cache_dir=cache_dir,
+                max_size_mb=persistent_dds_mb,
+                enabled=True
+            )
+            
+            # Scan existing cache entries in a background thread
+            import threading as _threading
+            _scan_thread = _threading.Thread(
+                target=dynamic_dds_cache.scan_existing,
+                daemon=True,
+                name="dds_cache_scan"
+            )
+            _scan_thread.start()
+            
+            log.info(f"Dynamic DDS cache initialized (max={persistent_dds_mb}MB)")
+        except Exception as e:
+            log.warning(f"Failed to initialize Dynamic DDS cache: {e}")
+    else:
+        log.info("Persistent DDS cache disabled (persistent_dds_cache_mb=0)")
     
     background_dds_builder = BackgroundDDSBuilder(
-        prebuilt_cache=prebuilt_dds_cache,
+        dds_cache=dynamic_dds_cache,
         build_interval_sec=build_interval_sec,
         max_workers=background_builder_workers
     )
@@ -4942,7 +4579,6 @@ def start_predictive_dds(tile_cacher=None) -> None:
     
     if bundle_consolidation_enabled:
         try:
-            # Handle imports for both frozen (PyInstaller) and direct Python execution
             try:
                 from autoortho.aopipeline.bundle_consolidator import BundleConsolidator
             except ImportError:
@@ -4951,7 +4587,7 @@ def start_predictive_dds(tile_cacher=None) -> None:
             cache_dir = CFG.paths.cache_dir
             _bundle_consolidator = BundleConsolidator(
                 cache_dir=cache_dir,
-                delete_jpegs=True,  # Remove individual JPEGs after consolidation
+                delete_jpegs=True,
                 max_workers=4,
                 enabled=True
             )
@@ -4963,6 +4599,48 @@ def start_predictive_dds(tile_cacher=None) -> None:
     else:
         log.info("Bundle consolidation disabled by config")
     
+    # ═══════════════════════════════════════════════════════════════════
+    # Initialize Disk Budget Manager
+    # ═══════════════════════════════════════════════════════════════════
+    budget_enabled = getattr(CFG.autoortho, 'disk_budget_enabled', True)
+    if isinstance(budget_enabled, str):
+        budget_enabled = budget_enabled.lower() in ('true', '1', 'yes', 'on')
+    
+    if budget_enabled:
+        try:
+            try:
+                from autoortho.aopipeline.disk_budget_manager import DiskBudgetManager
+            except ImportError:
+                from aopipeline.disk_budget_manager import DiskBudgetManager
+            
+            total_budget_gb = int(getattr(CFG.cache, 'file_cache_size', 30))
+            total_budget_mb = total_budget_gb * 1024  # GB -> MB
+            dds_pct = int(getattr(CFG.autoortho, 'dds_budget_pct', 40))
+            
+            cache_dir = str(CFG.paths.cache_dir)
+            disk_budget_manager = DiskBudgetManager(
+                cache_dir=cache_dir,
+                total_budget_mb=total_budget_mb,
+                dds_budget_pct=dds_pct,
+                dds_cache=dynamic_dds_cache
+            )
+            
+            # Run initial scan + cleanup in background thread
+            import threading as _threading
+            _budget_thread = _threading.Thread(
+                target=disk_budget_manager.initial_scan,
+                daemon=True,
+                name="disk_budget_scan"
+            )
+            _budget_thread.start()
+            
+            log.info(f"Disk budget manager initialized (total={total_budget_gb}GB, dds_pct={dds_pct}%)")
+        except Exception as e:
+            log.warning(f"Failed to initialize Disk Budget Manager: {e}")
+            disk_budget_manager = None
+    else:
+        log.info("Disk budget enforcement disabled by config")
+    
     # Start the builder thread
     background_dds_builder.start()
     
@@ -4972,7 +4650,8 @@ def start_predictive_dds(tile_cacher=None) -> None:
 
 def stop_predictive_dds() -> None:
     """Stop the predictive DDS generation system and cleanup disk cache."""
-    global background_dds_builder, tile_completion_tracker, prebuilt_dds_cache, _bundle_consolidator
+    global background_dds_builder, tile_completion_tracker, _bundle_consolidator
+    global dynamic_dds_cache, disk_budget_manager
     
     # Shutdown bundle consolidator first (let pending consolidations complete)
     if _bundle_consolidator is not None:
@@ -5018,23 +4697,30 @@ def stop_predictive_dds() -> None:
         log.info(f"BackgroundDDSBuilder: {stats['builds_completed']} tiles built, "
                 f"{stats['builds_failed']} failed")
     
-    if prebuilt_dds_cache is not None:
-        stats = prebuilt_dds_cache.stats
-        # EphemeralDDSCache uses different stat keys than PrebuiltDDSCache
-        hits = stats.get('hits', 0)
-        misses = stats.get('misses', 0)
-        hit_rate = stats.get('hit_rate', 0)
-        size_mb = stats.get('size_mb', stats.get('memory_mb', 0))
-        log.info(f"DDS disk cache: {hits} hits, {misses} misses, "
-                f"{hit_rate:.1f}% hit rate, {size_mb:.1f}MB used")
-        
-        # Clean up disk cache files
-        prebuilt_dds_cache.cleanup()
+    # Log dynamic DDS cache stats on shutdown
+    if dynamic_dds_cache is not None:
+        try:
+            stats = dynamic_dds_cache.stats
+            log.info(f"Dynamic DDS cache: {stats['hits']} hits, {stats['misses']} misses, "
+                    f"{stats['hit_rate']:.1f}% hit rate, {stats['disk_usage_mb']:.1f}MB used, "
+                    f"{stats['entries']} entries, {stats['upgrades']} ZL upgrades")
+        except Exception:
+            pass
+    
+    # Log disk budget stats on shutdown
+    if disk_budget_manager is not None:
+        try:
+            report = disk_budget_manager.usage_report
+            log.info(f"Disk budget: DDS={report['dds_usage_mb']:.0f}/{report['dds_budget_mb']:.0f}MB, "
+                    f"bundles={report['bundle_usage_mb']:.0f}/{report['bundle_budget_mb']:.0f}MB")
+        except Exception:
+            pass
     
     # Clear references
     background_dds_builder = None
     tile_completion_tracker = None
-    prebuilt_dds_cache = None
+    dynamic_dds_cache = None
+    disk_budget_manager = None
 
 
 # HTTP status codes that indicate permanent failure (no retry)
@@ -5594,6 +5280,27 @@ class Tile(object):
         self._is_live = False                           # True when X-Plane requests via FUSE
         self._live_transition_event = None              # Event to signal transition
         self._active_streaming_builder = None           # Reference for transition coordination
+        
+        # === DYNAMIC DDS CACHE UPGRADE HINT ===
+        # Set by DynamicDDSCache.load() when a lower-ZL cached DDS exists that
+        # can be upgraded via mipmap shifting instead of a full rebuild.
+        # Tuple of (old_dds_path, old_metadata) or None.
+        self._dds_upgrade_available = None
+        
+        # === DDS HEALING STATE ===
+        # Set by DynamicDDSCache.load() when a cached DDS has missing chunks.
+        self._dds_needs_healing = False
+        self._dds_missing_indices = []
+        
+        # === DDS ZL DOWNGRADE HINT ===
+        # Set by DynamicDDSCache.load() when a higher-ZL cached DDS exists.
+        self._dds_downgrade_available = None
+
+        # === DDS INCREMENTAL PERSISTENCE HINT ===
+        # Set by DynamicDDSCache.load() when loading a partially-built DDS.
+        # Contains a set of mipmap indices that have real data on disk, or
+        # None when all mipmaps are populated (v2 compat / full DDS).
+        self._dds_populated_mipmaps = None
         
         # === BATCH-TO-STREAMING DATA REUSE ===
         # When batch aopipeline collects data but fails (ratio below threshold),
@@ -6581,6 +6288,15 @@ class Tile(object):
                       f"{result.bytes_written} bytes in {build_time:.0f}ms")
             build_success = True
             
+            # Persist to Dynamic DDS Cache (cross-session, non-blocking)
+            if dynamic_dds_cache is not None:
+                try:
+                    mm0_missing = [i for i, d in enumerate(jpeg_datas) if d is None]
+                    dynamic_dds_cache.store(self.id, self.max_zoom, dds_bytes, self,
+                                           mm0_missing_indices=mm0_missing or None)
+                except Exception:
+                    pass  # Non-critical, don't block live path
+            
             # Schedule bundle consolidation for ALL zoom levels
             consolidate_tile_if_ready(self, "aopipeline")
             
@@ -6779,6 +6495,7 @@ class Tile(object):
                         break  # Budget exhausted, stop waiting
             
             # Phase 3: Process all pending chunks - batch add successful, collect failures
+            streaming_mm0_missing = []  # tracks indices marked as missing for DDM v2
             newly_ready = []
             failed_indices = []
             for i in pending_indices:
@@ -6850,15 +6567,18 @@ class Tile(object):
                         builder.add_fallback_image(idx, rgba)
                     else:
                         builder.mark_missing(idx)
+                        streaming_mm0_missing.append(idx)
                 
                 # Mark unresolved chunks as missing
                 for i in failed_indices:
                     if i not in resolved_indices:
                         builder.mark_missing(i)
+                        streaming_mm0_missing.append(i)
             elif failed_indices:
                 # Budget exhausted - mark all failed as missing
                 for i in failed_indices:
                     builder.mark_missing(i)
+                    streaming_mm0_missing.append(i)
             
             # Finalize: acquire DDS buffer and build
             pool = _get_dds_buffer_pool()
@@ -6899,6 +6619,15 @@ class Tile(object):
                                   f"(decoded={status['chunks_decoded']}, fallback={status['chunks_fallback']}, "
                                   f"missing={status['chunks_missing']})")
                         bump('streaming_builder_success')
+                        
+                        # Persist to Dynamic DDS Cache (cross-session, non-blocking)
+                        if dynamic_dds_cache is not None:
+                            try:
+                                dynamic_dds_cache.store(
+                                    self.id, self.max_zoom, dds_bytes, self,
+                                    mm0_missing_indices=streaming_mm0_missing or None)
+                            except Exception:
+                                pass  # Non-critical, don't block live path
                         
                         # Schedule bundle consolidation for ALL zoom levels
                         consolidate_tile_if_ready(self, "aopipeline")
@@ -7094,7 +6823,9 @@ class Tile(object):
             # We need to populate each mipmap's databuffer
             last_valid_mm_data = None
             last_valid_mm_idx = -1
-            
+
+            populated = getattr(self, '_dds_populated_mipmaps', None)
+
             for mm in self.dds.mipmap_list:
                 if mm.startpos >= len(prebuilt_bytes):
                     # Prebuilt data doesn't include this mipmap
@@ -7102,16 +6833,24 @@ class Tile(object):
                     # This matches pydds.gen_mipmaps() behavior for trailing mipmaps
                     if last_valid_mm_data is not None:
                         for trailing_mm in self.dds.mipmap_list[mm.idx:]:
+                            if populated is not None and trailing_mm.idx not in populated:
+                                continue
                             trailing_mm.databuffer = BytesIO(initial_bytes=last_valid_mm_data)
                             trailing_mm.retrieved = True
                     break
-                
+
+                # Skip unpopulated mipmaps (partial DDS from incremental save)
+                if populated is not None and mm.idx not in populated:
+                    continue
+
                 # Extract this mipmap's data from the prebuilt buffer
                 mm_end = min(mm.endpos, len(prebuilt_bytes))
                 if mm_end <= mm.startpos:
                     # No data for this mipmap - propagate last valid
                     if last_valid_mm_data is not None:
                         for trailing_mm in self.dds.mipmap_list[mm.idx:]:
+                            if populated is not None and trailing_mm.idx not in populated:
+                                continue
                             trailing_mm.databuffer = BytesIO(initial_bytes=last_valid_mm_data)
                             trailing_mm.retrieved = True
                     break
@@ -7126,7 +6865,9 @@ class Tile(object):
                 last_valid_mm_data = mm_data
                 last_valid_mm_idx = mm.idx
             
-            log.debug(f"Populated DDS from prebuilt cache for {self} (last_mm={last_valid_mm_idx})")
+            log.debug(f"Populated DDS from prebuilt cache for {self} "
+                      f"(last_mm={last_valid_mm_idx}, "
+                      f"populated={sorted(populated) if populated else 'all'})")
             # Mark as prepopulated so bytes_read warning doesn't trigger
             self._prepopulated = True
             return True
@@ -7156,21 +6897,20 @@ class Tile(object):
             return True
         
         # ═══════════════════════════════════════════════════════════════════
-        # PREDICTIVE DDS: Check prebuilt cache first
+        # PERSISTENT DDS CACHE: Check Dynamic DDS Cache first (disk, cross-session)
         # ═══════════════════════════════════════════════════════════════════
-        # If we have a prebuilt DDS for this tile, populate the DDS structure
-        # from it and skip all the chunk download/decode/compress work.
-        if prebuilt_dds_cache is not None:
-            prebuilt_bytes = prebuilt_dds_cache.get(self.id)
-            if prebuilt_bytes is not None:
-                if self._populate_dds_from_prebuilt(prebuilt_bytes):
-                    log.debug(f"GET_BYTES: Prebuilt cache HIT for {self.id}")
-                    bump('prebuilt_cache_hit')
+        # The persistent cache survives across sessions. On a warm start this
+        # provides ~1-2ms per tile vs ~390ms for a full rebuild.
+        if dynamic_dds_cache is not None and not self._prepopulated:
+            cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
+            if cached_bytes is not None:
+                if self._populate_dds_from_prebuilt(cached_bytes):
+                    log.debug(f"GET_BYTES: Dynamic DDS cache HIT for {self.id}")
+                    bump('dynamic_dds_cache_hit')
                     return True
                 else:
-                    # Population failed - fall through to normal path
-                    log.debug(f"GET_BYTES: Prebuilt cache hit but populate failed for {self.id}")
-                    bump('prebuilt_cache_populate_fail')
+                    log.debug(f"GET_BYTES: Dynamic DDS cache hit but populate failed for {self.id}")
+                    bump('dynamic_dds_cache_populate_fail')
         # ═══════════════════════════════════════════════════════════════════
         
         # ═══════════════════════════════════════════════════════════════════
@@ -7194,13 +6934,12 @@ class Tile(object):
             if self._live_transition_event is not None:
                 wait_time = min(transition_budget.remaining, 2.0)
                 if self._live_transition_event.wait(timeout=wait_time):
-                    # Prefetch completed - check if cache was populated
-                    if prebuilt_dds_cache is not None:
-                        prebuilt_bytes = prebuilt_dds_cache.get(self.id)
-                        if prebuilt_bytes is not None:
-                            if self._populate_dds_from_prebuilt(prebuilt_bytes):
-                                log.debug(f"GET_BYTES: Prebuilt cache HIT after transition for {self.id}")
-                                bump('prebuilt_cache_hit_after_transition')
+                    if dynamic_dds_cache is not None:
+                        cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
+                        if cached_bytes is not None:
+                            if self._populate_dds_from_prebuilt(cached_bytes):
+                                log.debug(f"GET_BYTES: DDS cache HIT after transition for {self.id}")
+                                bump('dds_cache_hit_after_transition')
                                 return True
         # ═══════════════════════════════════════════════════════════════════
 
@@ -9282,23 +9021,42 @@ class Tile(object):
             # Try to use build_all_mipmaps_native if available (best quality)
             # This builds each mipmap from its native zoom level chunks
             if hasattr(native_dds, 'build_all_mipmaps_native'):
-                # Collect JPEG data for ALL mipmap levels from current to smallest
+                # Collect JPEG data for ALL mipmap levels from current to smallest.
+                # CRITICAL: _collect_chunks_for_zoom does NOT trigger downloads,
+                # so lower zoom levels may have mostly-None data if chunks haven't
+                # been fetched yet. Passing that incomplete data to the native
+                # builder would "poison" those mipmaps with missing_color AND mark
+                # them retrieved=True, preventing later proper builds.
+                # Fix: once a zoom level falls below the availability threshold,
+                # pass empty arrays for it and all subsequent levels so the native
+                # builder derives them via reduce_half from the last good level.
                 jpeg_datas_per_zoom = []
+                chain_truncated = False
                 for mm in range(mipmap, self.dds.smallest_mm + 1):
                     mm_zoom = self.max_zoom - mm
                     if mm_zoom < self.min_zoom:
-                        # No more zoom levels available
                         jpeg_datas_per_zoom.append([])
                         continue
                     
                     if mm == mipmap:
-                        # We already collected the first mipmap's chunks above
                         jpeg_datas_per_zoom.append(jpeg_datas)
+                    elif chain_truncated:
+                        jpeg_datas_per_zoom.append([])
                     else:
-                        # Collect chunks for this zoom level
                         mm_jpeg_datas = self._collect_chunks_for_zoom(mm_zoom)
-                        jpeg_datas_per_zoom.append(mm_jpeg_datas)
-                        # Schedule consolidation for this zoom level too
+                        available = sum(1 for d in mm_jpeg_datas if d is not None) if mm_jpeg_datas else 0
+                        total = len(mm_jpeg_datas) if mm_jpeg_datas else 0
+                        if total > 0 and (available / total) >= min_ratio:
+                            jpeg_datas_per_zoom.append(mm_jpeg_datas)
+                        else:
+                            log.debug(f"_try_native_mipmap_build: ZL{mm_zoom} has "
+                                     f"{available}/{total} chunks "
+                                     f"({(available/total*100) if total else 0:.0f}% vs "
+                                     f"{min_ratio*100:.0f}% threshold), "
+                                     f"truncating chain at mm{mm}")
+                            jpeg_datas_per_zoom.append([])
+                            chain_truncated = True
+                        # Schedule consolidation for whatever data we collected
                         if mm_jpeg_datas and any(d for d in mm_jpeg_datas):
                             self._schedule_immediate_consolidation(mm_jpeg_datas, mm_zoom)
                 
@@ -9752,6 +9510,7 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════════
         # COMMIT PHASE (with lock): gen_mipmaps (if Python path), consolidation, close chunks, signal
         # ═══════════════════════════════════════════════════════════════════════
+        incremental_save_args = None
         try:
             with self._lock:
                 if not native_succeeded and new_im is not None:
@@ -9786,6 +9545,19 @@ class Tile(object):
                             tile_completion_time = total_creation_time
                         log.debug(f"GET_MIPMAP: Tile {self} COMPLETED in {tile_completion_time:.2f}s "
                                  f"(mipmap 0 done, time from first request)")
+                        
+                        # Persist progressively-built DDS to Dynamic DDS Cache.
+                        # This path is the slowest (all mipmaps built individually)
+                        # so caching the result is especially valuable.
+                        if dynamic_dds_cache is not None and not self._prepopulated:
+                            try:
+                                self.dds.seek(0)
+                                dds_bytes = self.dds.read(self.dds.total_size)
+                                if dds_bytes and len(dds_bytes) >= 128:
+                                    dynamic_dds_cache.store(
+                                        self.id, self.max_zoom, dds_bytes, self)
+                            except Exception:
+                                pass  # Non-critical
                     log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s")
 
                 mipmap_zoom = self.max_zoom - mipmap
@@ -9802,6 +9574,37 @@ class Tile(object):
                         chunk.close()
                     del self.chunks[mipmap_zoom]
 
+                # Capture mipmap data for incremental save (fast memcpy,
+                # inside lock for a consistent snapshot).
+                if (mipmap > 0 and dynamic_dds_cache is not None
+                        and not self._prepopulated
+                        and not self._completion_reported
+                        and self.dds is not None):
+                    try:
+                        mm_data = {}
+                        mm_offsets = {}
+                        for i in range(mipmap, len(self.dds.mipmap_list)):
+                            mm = self.dds.mipmap_list[i]
+                            if mm.retrieved and mm.databuffer is not None:
+                                mm.databuffer.seek(0)
+                                data = mm.databuffer.read()
+                                if data:
+                                    mm_data[i] = data
+                                    mm_offsets[i] = (mm.startpos, mm.length)
+                        if mm_data:
+                            incremental_save_args = (
+                                self.id, self.max_zoom,
+                                self.row, self.col, self.maptype,
+                                self.tilename_zoom,
+                                self.dds.header.getvalue(),
+                                self.dds.total_size,
+                                self.dds.width, self.dds.height,
+                                self.dds.mipMapCount,
+                                mm_data, mm_offsets
+                            )
+                    except Exception:
+                        pass
+
                 self._mipmap_building.pop(mipmap, None)
                 self._build_active -= 1
                 if ev is not None:
@@ -9813,6 +9616,13 @@ class Tile(object):
                 if ev is not None:
                     ev.set()
             raise
+
+        # Persist incrementally outside the tile lock (file I/O).
+        if incremental_save_args is not None:
+            try:
+                dynamic_dds_cache.store_incremental(*incremental_save_args)
+            except Exception:
+                pass
 
         log.debug("Results:")
         log.debug(self.dds.mipmap_list)
@@ -9934,6 +9744,7 @@ class Tile(object):
         self.first_request_time = None
         self._completion_reported = False
         self._is_live = False
+        self._dds_populated_mipmaps = None
         self._live_transition_event = None
         self._active_streaming_builder = None
 
