@@ -9549,7 +9549,8 @@ class Tile(object):
                         # Persist progressively-built DDS to Dynamic DDS Cache.
                         # This path is the slowest (all mipmaps built individually)
                         # so caching the result is especially valuable.
-                        if dynamic_dds_cache is not None and not self._prepopulated:
+                        _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
+                        if dynamic_dds_cache is not None and (not self._prepopulated or _partially_cached):
                             try:
                                 self.dds.seek(0)
                                 dds_bytes = self.dds.read(self.dds.total_size)
@@ -9576,8 +9577,9 @@ class Tile(object):
 
                 # Capture mipmap data for incremental save (fast memcpy,
                 # inside lock for a consistent snapshot).
+                _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
                 if (mipmap > 0 and dynamic_dds_cache is not None
-                        and not self._prepopulated
+                        and (not self._prepopulated or _partially_cached)
                         and not self._completion_reported
                         and self.dds is not None):
                     try:

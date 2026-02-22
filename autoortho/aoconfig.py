@@ -337,6 +337,15 @@ cleanup_orphan_jpegs_on_exit = True
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
+# Disk compression for cached DDS files (none or zstd)
+# zstd reduces cache disk usage by 30-60% with ~2-5ms added read latency
+# none stores raw DDS data (fastest reads, largest disk usage)
+dds_compression = zstd
+# Zstd compression level (1-19, default 3)
+# Higher = smaller files, slower writes (reads are always fast)
+# Background builds can afford higher levels since writes are async
+# Recommended: 3 (balanced), 6 (smaller files), 1 (fastest writes)
+dds_compression_level = 3
 
 [scenery]
 # Don't cleanup downloads

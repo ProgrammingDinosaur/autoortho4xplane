@@ -24,6 +24,12 @@ import time
 from collections import OrderedDict
 from typing import List, Optional, Tuple
 
+try:
+    import zstandard
+    _HAS_ZSTD = True
+except ImportError:
+    _HAS_ZSTD = False
+
 log = logging.getLogger(__name__)
 
 # Current DDM schema version. Bump when the metadata format changes
@@ -123,10 +129,16 @@ class DynamicDDSCache:
         self._evictions = 0
         self._upgrades = 0
 
+        # Disk compression settings (read once from config)
+        self._compression, self._compression_level = self._get_compression_settings()
+        if self._compression == "zstd" and not _HAS_ZSTD:
+            log.warning("zstandard not installed - DDS cache compression disabled")
+            self._compression = "none"
+
         if self._enabled:
             os.makedirs(self._dds_root, exist_ok=True)
             log.info(f"DynamicDDSCache initialized: {self._dds_root} "
-                     f"(max={max_size_mb}MB)")
+                     f"(max={max_size_mb}MB, compression={self._compression})")
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -159,7 +171,8 @@ class DynamicDDSCache:
     @staticmethod
     def _build_ddm(tile, max_zoom: int, bundle_mtime: Optional[float],
                    dds_format: str, compressor: str,
-                   mm0_missing_indices: Optional[List[int]] = None) -> dict:
+                   mm0_missing_indices: Optional[List[int]] = None,
+                   disk_compression: str = "none") -> dict:
         """Build a DDM v3 metadata dict from a tile and current config."""
         dds_ref = tile.dds
         width = dds_ref.width if dds_ref else 0
@@ -197,6 +210,7 @@ class DynamicDDSCache:
             "needs_healing": len(missing) > 0,
             "healing_chunks": len(missing),
             "missing_indices": missing,
+            "disk_compression": disk_compression,
         }
 
     @staticmethod
@@ -235,6 +249,7 @@ class DynamicDDSCache:
             "needs_healing": False,
             "healing_chunks": 0,
             "missing_indices": [],
+            "disk_compression": "none",
         }
 
     @staticmethod
@@ -299,17 +314,19 @@ class DynamicDDSCache:
             log.debug(f"DDS stale: compressor changed ({meta.get('comp')} -> {current_comp})")
             return True
 
-        # Rule 4: File size validation
-        # Only check if the cached ZL matches the requested ZL (size differs for different ZLs)
-        if meta.get("max_zl") == tile.max_zoom and tile.dds is not None:
-            expected_size = tile.dds.total_size
-            try:
-                actual_size = os.path.getsize(dds_path)
-                if actual_size != expected_size:
-                    log.debug(f"DDS stale: size mismatch ({actual_size} vs {expected_size})")
+        # Rule 4: File size validation (uncompressed files only)
+        # Compressed files have variable on-disk sizes; corruption is caught
+        # by zstd decompression failure in load() instead.
+        if meta.get("disk_compression", "none") == "none":
+            if meta.get("max_zl") == tile.max_zoom and tile.dds is not None:
+                expected_size = tile.dds.total_size
+                try:
+                    actual_size = os.path.getsize(dds_path)
+                    if actual_size != expected_size:
+                        log.debug(f"DDS stale: size mismatch ({actual_size} vs {expected_size})")
+                        return True
+                except OSError:
                     return True
-            except OSError:
-                return True
 
         # Rule 1: Bundle mtime check
         bundle_mtime = meta.get("bundle_mtime", 0.0)
@@ -398,16 +415,25 @@ class DynamicDDSCache:
                 self._misses += 1
                 return None
 
-            # Read the DDS file
+            # Read the DDS file (possibly compressed on disk)
             try:
                 with open(dds_path, "rb") as f:
-                    dds_bytes = f.read()
+                    raw_bytes = f.read()
             except (FileNotFoundError, OSError):
                 self._delete_pair(dds_path, ddm_path)
                 self._misses += 1
                 return None
 
-            # Validate size
+            # Decompress if the file was stored compressed
+            try:
+                dds_bytes = self._decompress_dds(raw_bytes, meta)
+            except Exception:
+                log.debug(f"DDS cache: decompression failed for {tile_id}, removing")
+                self._delete_pair(dds_path, ddm_path)
+                self._misses += 1
+                return None
+
+            # Validate size (against uncompressed DDS dimensions)
             if tile.dds is not None and len(dds_bytes) != tile.dds.total_size:
                 log.debug(f"DDS cache: size mismatch for {tile_id} "
                           f"({len(dds_bytes)} vs {tile.dds.total_size})")
@@ -551,6 +577,37 @@ class DynamicDDSCache:
         compressor = CFG.pydds.compressor.upper()
         return dds_format, compressor
 
+    @staticmethod
+    def _get_compression_settings():
+        """Return (compression_type, level) from config."""
+        try:
+            from autoortho.aoconfig import CFG
+        except ImportError:
+            from aoconfig import CFG  # type: ignore[no-redef]
+        comp = getattr(CFG.pydds, 'dds_compression', 'zstd').lower()
+        if comp not in ('none', 'zstd'):
+            comp = 'zstd'
+        level = int(getattr(CFG.pydds, 'dds_compression_level', 3))
+        level = max(1, min(19, level))
+        return comp, level
+
+    def _compress_dds(self, data: bytes) -> bytes:
+        """Compress raw DDS bytes with zstd. Returns original data if compression disabled."""
+        if self._compression != "zstd" or not _HAS_ZSTD:
+            return data
+        cctx = zstandard.ZstdCompressor(level=self._compression_level)
+        return cctx.compress(data)
+
+    def _decompress_dds(self, data: bytes, meta: dict) -> bytes:
+        """Decompress DDS bytes based on DDM metadata. Returns data unchanged if uncompressed."""
+        disk_comp = meta.get("disk_compression", "none")
+        if disk_comp != "zstd":
+            return data
+        if not _HAS_ZSTD:
+            raise RuntimeError("Compressed DDS but zstandard not installed")
+        dctx = zstandard.ZstdDecompressor()
+        return dctx.decompress(data)
+
     def _create_dds_skeleton(self, dds_path: str, header_bytes: bytes,
                              total_size: int) -> bool:
         """Create an empty DDS file with the correct header and total size.
@@ -620,21 +677,28 @@ class DynamicDDSCache:
 
             dds_format, compressor = self._get_format_and_compressor()
 
+            # Compress DDS data for disk storage
+            disk_bytes = self._compress_dds(dds_bytes)
+            disk_compression = self._compression if len(disk_bytes) < len(dds_bytes) else "none"
+            if disk_compression == "none":
+                disk_bytes = dds_bytes
+
             # Write DDS atomically
             tmp_dds = dds_path + f".tmp.{os.getpid()}"
             with open(tmp_dds, "wb") as f:
-                f.write(dds_bytes)
+                f.write(disk_bytes)
             os.replace(tmp_dds, dds_path)
 
             # Build and write DDM metadata atomically
             meta = self._build_ddm(tile, max_zoom, bundle_mtime,
                                    dds_format, compressor,
-                                   mm0_missing_indices=mm0_missing_indices)
+                                   mm0_missing_indices=mm0_missing_indices,
+                                   disk_compression=disk_compression)
             self._write_ddm(ddm_path, meta)
 
-            # Update LRU tracking
+            # Update LRU tracking (use on-disk size for accurate budget)
             key = self._tile_key(tile_id, max_zoom)
-            size = len(dds_bytes)
+            size = len(disk_bytes)
             with self._lock:
                 if key in self._entries:
                     old_size = self._entries[key][2]
@@ -812,50 +876,59 @@ class DynamicDDSCache:
             # Atomic placement: create at a temp name, then os.replace().
             tmp_dds = dds_path + f".tmp.{os.getpid()}"
 
-            # Try hard-link first — zero-copy, instant, works when source
-            # and destination are on the same filesystem (common case: both
-            # are under cache_dir).  The link count on the inode increases
-            # so ephemeral cleanup (os.remove) won't lose the persistent
-            # copy.
-            linked = False
-            try:
-                # Remove stale temp if it exists (previous crash)
+            if self._compression == "zstd" and _HAS_ZSTD:
+                # Read source, compress, write compressed version
+                with open(source_path, "rb") as f:
+                    raw_bytes = f.read()
+                disk_bytes = self._compress_dds(raw_bytes)
+                disk_compression = self._compression if len(disk_bytes) < len(raw_bytes) else "none"
+                if disk_compression == "none":
+                    disk_bytes = raw_bytes
+                with open(tmp_dds, "wb") as f:
+                    f.write(disk_bytes)
+                disk_size = len(disk_bytes)
+            else:
+                disk_compression = "none"
+                # Try hard-link first -- zero-copy, instant, works when source
+                # and destination are on the same filesystem.
+                linked = False
                 try:
-                    os.remove(tmp_dds)
+                    try:
+                        os.remove(tmp_dds)
+                    except OSError:
+                        pass
+                    os.link(source_path, tmp_dds)
+                    linked = True
                 except OSError:
                     pass
-                os.link(source_path, tmp_dds)
-                linked = True
-            except OSError:
-                pass
 
-            if not linked:
-                # Fallback: full copy (cross-filesystem or link unsupported)
-                import shutil
-                shutil.copy2(source_path, tmp_dds)
+                if not linked:
+                    import shutil
+                    shutil.copy2(source_path, tmp_dds)
+                disk_size = source_size
 
             os.replace(tmp_dds, dds_path)
 
             # Write DDM metadata
             dds_format, compressor = self._get_format_and_compressor()
             meta = self._build_ddm(tile, max_zoom, None, dds_format, compressor,
-                                   mm0_missing_indices=mm0_missing_indices)
+                                   mm0_missing_indices=mm0_missing_indices,
+                                   disk_compression=disk_compression)
             self._write_ddm(ddm_path, meta)
 
-            # Update LRU tracking
+            # Update LRU tracking (use on-disk size for accurate budget)
             key = self._tile_key(tile_id, max_zoom)
             with self._lock:
                 if key in self._entries:
                     old_size = self._entries[key][2]
                     self._current_size -= old_size
-                self._entries[key] = (dds_path, ddm_path, source_size, time.time())
+                self._entries[key] = (dds_path, ddm_path, disk_size, time.time())
                 self._entries.move_to_end(key)
-                self._current_size += source_size
+                self._current_size += disk_size
                 self._stores += 1
 
-            method = "link" if linked else "copy"
-            log.debug(f"DDS cache STORE (from file, {method}): {tile_id} z{max_zoom} "
-                      f"({source_size} bytes)")
+            log.debug(f"DDS cache STORE (from file): {tile_id} z{max_zoom} "
+                      f"({disk_size} bytes, compression={disk_compression})")
 
             if not mm0_missing_indices:
                 self._cleanup_jpegs_async(tile)
@@ -905,16 +978,23 @@ class DynamicDDSCache:
                 tile.tilename_zoom, old_max_zoom
             )
 
+            # Read metadata first (needed for decompression)
+            old_meta = self._read_ddm(old_ddm_path)
+            if old_meta is None:
+                return None
+
             try:
                 with open(old_dds_path, "rb") as f:
-                    old_dds_bytes = f.read()
+                    old_raw = f.read()
             except (FileNotFoundError, OSError):
                 log.debug(f"DDS upgrade: old file not found: {old_dds_path}")
                 return None
 
-            # Load old metadata
-            old_meta = self._read_ddm(old_ddm_path)
-            if old_meta is None:
+            try:
+                old_dds_bytes = self._decompress_dds(old_raw, old_meta)
+            except Exception:
+                log.debug(f"DDS upgrade: decompression failed for {old_dds_path}")
+                self._delete_pair(old_dds_path, old_ddm_path)
                 return None
 
             old_width = old_meta.get("w", 0)
@@ -1023,14 +1103,22 @@ class DynamicDDSCache:
                 tile.row, tile.col, tile.maptype,
                 tile.tilename_zoom, old_max_zoom)
 
+            # Read metadata first (needed for decompression)
+            old_meta = self._read_ddm(old_ddm_path)
+            if old_meta is None:
+                return None
+
             try:
                 with open(old_dds_path, "rb") as f:
-                    old_dds_bytes = f.read()
+                    old_raw = f.read()
             except (FileNotFoundError, OSError):
                 return None
 
-            old_meta = self._read_ddm(old_ddm_path)
-            if old_meta is None:
+            try:
+                old_dds_bytes = self._decompress_dds(old_raw, old_meta)
+            except Exception:
+                log.debug(f"DDS downgrade: decompression failed for {old_dds_path}")
+                self._delete_pair(old_dds_path, old_ddm_path)
                 return None
 
             old_width = old_meta.get("w", 0)
@@ -1316,6 +1404,9 @@ class DynamicDDSCache:
         → write strided blocks into the on-disk DDS and in-memory BytesIO buffers.
         After all chunks are patched, update the DDM sidecar to clear the
         ``needs_healing`` flag.
+
+        Compressed files are decompressed into memory, patched, then
+        recompressed and written back atomically.
         """
         from io import BytesIO
         try:
@@ -1340,8 +1431,21 @@ class DynamicDDSCache:
         mm_list = dds_ref.mipmap_list
         patched = 0
 
+        # Determine if the on-disk file is compressed
+        meta = self._read_ddm(ddm_path)
+        is_compressed = (meta or {}).get("disk_compression", "none") == "zstd"
+
         try:
-            with open(dds_path, "r+b") as f:
+            if is_compressed:
+                # Decompress the entire file into a mutable bytearray
+                with open(dds_path, "rb") as f:
+                    raw = f.read()
+                try:
+                    dds_data = bytearray(self._decompress_dds(raw, meta))
+                except Exception:
+                    log.debug(f"Healing: decompression failed for {tile_id}")
+                    return False
+
                 for idx, jpeg_data in chunk_jpegs.items():
                     cx = idx % chunks_per_row
                     cy = idx // chunks_per_row
@@ -1382,15 +1486,14 @@ class DynamicDDSCache:
                             log.debug(f"Healing: DXT compress failed for chunk {idx} mm{mm_idx}")
                             continue
 
-                        dxt_bytes = bytes(dxt_data)
+                        dxt_bytes_chunk = bytes(dxt_data)
 
                         for s in range(blocks_per_side):
                             file_offset = mm.startpos + (block_y + s) * row_stride + block_x * blocksize
-                            stripe = dxt_bytes[s * stripe_bytes:(s + 1) * stripe_bytes]
+                            stripe = dxt_bytes_chunk[s * stripe_bytes:(s + 1) * stripe_bytes]
 
-                            # Write to on-disk DDS file
-                            f.seek(file_offset)
-                            f.write(stripe)
+                            # Write to in-memory bytearray (will be recompressed below)
+                            dds_data[file_offset:file_offset + stripe_bytes] = stripe
 
                             # Write to in-memory mipmap buffer
                             if mm.databuffer is not None:
@@ -1404,7 +1507,77 @@ class DynamicDDSCache:
 
                     patched += 1
 
-                f.flush()
+                # Recompress and write back atomically
+                compressed = self._compress_dds(bytes(dds_data))
+                tmp = dds_path + f".tmp.{os.getpid()}"
+                with open(tmp, "wb") as f:
+                    f.write(compressed)
+                os.replace(tmp, dds_path)
+
+            else:
+                # Uncompressed: seek-write in place (original path)
+                with open(dds_path, "r+b") as f:
+                    for idx, jpeg_data in chunk_jpegs.items():
+                        cx = idx % chunks_per_row
+                        cy = idx // chunks_per_row
+
+                        try:
+                            rgba_img = Image.open(BytesIO(jpeg_data)).convert("RGBA")
+                        except Exception:
+                            log.debug(f"Healing: JPEG decode failed for chunk {idx}")
+                            continue
+
+                        chunk_base_size = 256
+
+                        for mm_idx, mm in enumerate(mm_list):
+                            chunk_pixels = chunk_base_size >> mm_idx
+                            if chunk_pixels < 4:
+                                break
+
+                            blocks_per_side = chunk_pixels // 4
+                            mm_width = dds_ref.width >> mm_idx
+                            if mm_width < 4:
+                                break
+                            mm_blocks_x = mm_width // 4
+                            row_stride = mm_blocks_x * blocksize
+
+                            block_x = cx * blocks_per_side
+                            block_y = cy * blocks_per_side
+                            stripe_bytes = blocks_per_side * blocksize
+
+                            if mm_idx == 0:
+                                resized = rgba_img.resize((chunk_pixels, chunk_pixels), Image.LANCZOS) \
+                                    if rgba_img.size != (chunk_pixels, chunk_pixels) else rgba_img
+                            else:
+                                resized = rgba_img.resize((chunk_pixels, chunk_pixels), Image.LANCZOS)
+
+                            dxt_data = dds_ref.compress(chunk_pixels, chunk_pixels,
+                                                        resized.tobytes())
+                            if dxt_data is None:
+                                log.debug(f"Healing: DXT compress failed for chunk {idx} mm{mm_idx}")
+                                continue
+
+                            dxt_bytes_chunk = bytes(dxt_data)
+
+                            for s in range(blocks_per_side):
+                                file_offset = mm.startpos + (block_y + s) * row_stride + block_x * blocksize
+                                stripe = dxt_bytes_chunk[s * stripe_bytes:(s + 1) * stripe_bytes]
+
+                                f.seek(file_offset)
+                                f.write(stripe)
+
+                                if mm.databuffer is not None:
+                                    mem_offset = file_offset - mm.startpos
+                                    try:
+                                        buf = mm.databuffer.getbuffer()
+                                        buf[mem_offset:mem_offset + stripe_bytes] = stripe
+                                    except Exception:
+                                        mm.databuffer.seek(mem_offset)
+                                        mm.databuffer.write(stripe)
+
+                        patched += 1
+
+                    f.flush()
 
         except (FileNotFoundError, OSError) as e:
             log.debug(f"Healing: file I/O error for {tile_id}: {e}")

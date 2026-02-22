@@ -18,6 +18,7 @@ requests = "^2.32.5"
 PySide6 = "^6.10.1"
 numpy = "^2.4.1"
 locust = "^2.43.1"
+zstandard = "^0.25.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "9.*"

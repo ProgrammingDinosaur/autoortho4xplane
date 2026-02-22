@@ -85,6 +85,8 @@ class MockCFG:
     class pydds:
         format = "BC1"
         compressor = "ISPC"
+        dds_compression = "zstd"
+        dds_compression_level = 3
     class paths:
         cache_dir = ""
     class autoortho:
@@ -110,6 +112,8 @@ def patch_cfg(monkeypatch):
     monkeypatch.setitem(sys.modules, 'autoortho.aoconfig', _mock_cfg_module)
     monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'format', 'BC1')
     monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'compressor', 'ISPC')
+    monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'zstd')
+    monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression_level', 3)
 
 
 # ============================================================================
@@ -233,22 +237,27 @@ class TestDynamicDDSCache:
         assert loaded is None
 
     def test_size_mismatch_invalidates(self, dds_cache, mock_tile, sample_dds_bytes):
-        """Test that corrupted (wrong size) DDS is detected."""
+        """Test that corrupted DDS is detected.
+
+        Truncation breaks both uncompressed (size mismatch) and compressed
+        (zstd frame corruption) files, so this test works regardless of
+        the disk_compression setting.
+        """
         tile_id = mock_tile.id
         max_zoom = mock_tile.max_zoom
         
         # Store valid data
         dds_cache.store(tile_id, max_zoom, sample_dds_bytes, mock_tile)
         
-        # Corrupt the file by appending data
+        # Corrupt the file by truncating it
         dds_path, _ = dds_cache._paths_for(
             mock_tile.row, mock_tile.col, mock_tile.maptype,
             mock_tile.tilename_zoom, max_zoom
         )
-        with open(dds_path, 'ab') as f:
-            f.write(b'\x00' * 100)
+        with open(dds_path, 'r+b') as f:
+            f.truncate(64)
         
-        # Load should miss (size mismatch)
+        # Load should miss (size mismatch or decompression failure)
         loaded = dds_cache.load(tile_id, max_zoom, mock_tile)
         assert loaded is None
 
@@ -1080,3 +1089,180 @@ class TestGetStagingPath:
         assert path is not None
         parent = os.path.dirname(path)
         assert os.path.isdir(parent)
+
+
+# ============================================================================
+# Zstd Compression Tests
+# ============================================================================
+
+class TestZstdCompression:
+    """Tests for zstd disk compression of cached DDS files."""
+
+    def test_compressed_round_trip(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test store + load round-trip returns identical bytes with compression."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        loaded = dds_cache.load(mock_tile.id, mock_tile.max_zoom, mock_tile)
+        assert loaded is not None
+        assert loaded == sample_dds_bytes
+
+    def test_compressed_file_is_smaller(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test that the on-disk file is smaller than uncompressed DDS."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+
+        dds_path, _ = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom
+        )
+        disk_size = os.path.getsize(dds_path)
+        assert disk_size < len(sample_dds_bytes)
+
+    def test_ddm_records_compression(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test that DDM metadata records disk_compression field."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom
+        )
+        with open(ddm_path, 'r') as f:
+            meta = json.load(f)
+
+        assert meta.get('disk_compression') == 'zstd'
+
+    def test_uncompressed_files_still_loadable(self, cache_dir, mock_tile, sample_dds_bytes, monkeypatch):
+        """Test backwards compat: uncompressed files load when compression is now enabled."""
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+
+        # Store with compression disabled
+        monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'none')
+        cache_none = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+        cache_none.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+
+        # Load with compression enabled (new instance reads 'zstd' from config)
+        monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'zstd')
+        cache_zstd = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+        cache_zstd.scan_existing()
+
+        loaded = cache_zstd.load(mock_tile.id, mock_tile.max_zoom, mock_tile)
+        assert loaded is not None
+        assert loaded == sample_dds_bytes
+
+    def test_no_compression_mode(self, cache_dir, mock_tile, sample_dds_bytes, monkeypatch):
+        """Test dds_compression=none stores raw DDS data."""
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+
+        monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'none')
+        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+
+        cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+
+        dds_path, ddm_path = cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom
+        )
+        assert os.path.getsize(dds_path) == len(sample_dds_bytes)
+
+        with open(ddm_path, 'r') as f:
+            meta = json.load(f)
+        assert meta.get('disk_compression') == 'none'
+
+    def test_lru_tracks_compressed_size(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test that LRU disk usage tracks compressed (on-disk) size, not uncompressed."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+
+        dds_path, _ = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom
+        )
+        disk_size = os.path.getsize(dds_path)
+
+        disk_usage = dds_cache.get_disk_usage()
+        assert disk_usage == disk_size
+
+    def test_store_from_file_compressed(self, dds_cache, mock_tile, sample_dds_bytes, cache_dir):
+        """Test store_from_file compresses the source file."""
+        source_path = os.path.join(cache_dir, "ephemeral_tile.dds")
+        with open(source_path, 'wb') as f:
+            f.write(sample_dds_bytes)
+
+        dds_cache.store_from_file(
+            mock_tile.id, mock_tile.max_zoom, source_path, mock_tile)
+
+        loaded = dds_cache.load(mock_tile.id, mock_tile.max_zoom, mock_tile)
+        assert loaded is not None
+        assert loaded == sample_dds_bytes
+
+        # Verify the cached file is compressed (smaller than source)
+        dds_path, _ = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom
+        )
+        assert os.path.getsize(dds_path) < len(sample_dds_bytes)
+
+    def test_compressed_staleness_not_false_positive(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Test that compressed files are not falsely flagged as stale."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+
+        # Load twice -- if staleness check was wrong, second load would fail
+        loaded1 = dds_cache.load(mock_tile.id, mock_tile.max_zoom, mock_tile)
+        loaded2 = dds_cache.load(mock_tile.id, mock_tile.max_zoom, mock_tile)
+        assert loaded1 is not None
+        assert loaded2 is not None
+        assert loaded1 == loaded2 == sample_dds_bytes
+
+    def test_incremental_store_uncompressed(self, dds_cache, mock_tile):
+        """Test that incremental stores remain uncompressed (seek-write compat)."""
+        mm_data = {0: b'\xAA' * 8192}
+        mm_offsets = {0: (128, 8192)}
+
+        dds_cache.store_incremental(
+            mock_tile.id, mock_tile.max_zoom,
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom,
+            b'DDS ' + b'\x00' * 124,
+            128 + 8192, 4096, 4096, 1,
+            mm_data, mm_offsets
+        )
+
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom
+        )
+        with open(ddm_path, 'r') as f:
+            meta = json.load(f)
+
+        assert meta.get('disk_compression') == 'none'
+
+    def test_upgrade_zl_with_compression(self, dds_cache, cache_dir, sample_dds_bytes):
+        """Test ZL upgrade works with compressed source files."""
+        tile_16 = MockTile(max_zoom=16, dds_width=4096, dds_height=4096)
+        tile_16.cache_dir = cache_dir
+        dds_cache.store(tile_16.id, 16, sample_dds_bytes, tile_16)
+
+        tile_17 = MockTile(max_zoom=17, dds_width=8192, dds_height=8192)
+        tile_17.cache_dir = cache_dir
+
+        new_mm0_size = tile_17.dds.mipmap_list[0].length
+        new_mm0_bytes = bytes([0xBB]) * new_mm0_size
+
+        result = dds_cache.upgrade_zl(
+            tile_17.id, old_max_zoom=16, new_max_zoom=17,
+            new_mm0_bytes=new_mm0_bytes, tile=tile_17
+        )
+        assert result is not None
+        assert len(result) == tile_17.dds.total_size
+
+    def test_downgrade_zl_with_compression(self, dds_cache, cache_dir, sample_dds_bytes):
+        """Test ZL downgrade works with compressed source files."""
+        tile_16 = MockTile(max_zoom=16, dds_width=4096, dds_height=4096)
+        tile_16.cache_dir = cache_dir
+        dds_cache.store(tile_16.id, 16, sample_dds_bytes, tile_16)
+
+        tile_15 = MockTile(max_zoom=15, dds_width=2048, dds_height=2048)
+        tile_15.cache_dir = cache_dir
+
+        result = dds_cache.downgrade_zl(
+            tile_15.id, old_max_zoom=16, new_max_zoom=15, tile=tile_15
+        )
+        assert result is not None
+        assert len(result) == tile_15.dds.total_size
