@@ -1684,7 +1684,7 @@ if get_pipeline_mode() != PIPELINE_MODE_PYTHON:
 # is sufficient. More workers would just contend on disk I/O.
 # ============================================================================
 _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4,
+    max_workers=2, 
     thread_name_prefix="cache_writer"
 )
 
@@ -1704,24 +1704,6 @@ def _async_cache_write(chunk):
         log.debug(f"Async cache write skipped for {chunk}: {e}")
     except Exception as e:
         log.debug(f"Async cache write failed for {chunk}: {e}")
-
-
-def _async_cache_write_with_data(cache_path: str, cache_dir: str, data: bytes):
-    """Write JPEG data to cache file. Data is captured at submission time.
-    
-    Used to avoid race where chunk.close() clears chunk.data before the async
-    write runs; capturing data at submit() time guarantees the write has valid bytes.
-    """
-    try:
-        if not os.path.exists(cache_dir):
-            return
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        tmp_path = cache_path + '.tmp'
-        with open(tmp_path, 'wb') as f:
-            f.write(data)
-        os.replace(tmp_path, cache_path)
-    except Exception as e:
-        log.debug(f"Async cache write failed for {cache_path}: {e}")
 
 
 def shutdown_cache_writer():
@@ -1761,7 +1743,7 @@ def flush_cache_writer(timeout=30.0):
     finally:
         # Recreate the executor for subsequent operations
         _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=4,
+            max_workers=2,
             thread_name_prefix="cache_writer"
         )
 
@@ -2968,22 +2950,16 @@ def stop_prefetcher():
 
 class _TrackedTile:
     """Internal tracking state for a tile being prefetched."""
-    __slots__ = ('tile', 'zoom', 'expected_chunks', 'completed_chunks',
-                 'start_time', 'completed_chunk_ids',
-                 'per_zoom_expected', 'per_zoom_completed', 'per_zoom_notified')
+    __slots__ = ('tile', 'zoom', 'expected_chunks', 'completed_chunks', 
+                 'start_time', 'completed_chunk_ids')
     
-    def __init__(self, tile, zoom: int, expected_chunks: int,
-                 per_zoom_expected: dict = None, per_zoom_completed: dict = None,
-                 per_zoom_notified: set = None):
+    def __init__(self, tile, zoom: int, expected_chunks: int):
         self.tile = tile
         self.zoom = zoom
         self.expected_chunks = expected_chunks
         self.completed_chunks = 0
         self.start_time = time.monotonic()
         self.completed_chunk_ids = set()  # Track which chunks reported complete
-        self.per_zoom_expected = per_zoom_expected or {}
-        self.per_zoom_completed = per_zoom_completed or {}
-        self.per_zoom_notified = per_zoom_notified or set()
 
 
 class TileCompletionTracker:
@@ -3037,7 +3013,6 @@ class TileCompletionTracker:
                 return
             
             # Calculate expected chunk count across ALL mipmap levels
-            # and per zoom level (for per-zoom bundle consolidation).
             # Each mipmap has chunks at its corresponding zoom level:
             #   mipmap 0 → max_zoom (256 chunks typically)
             #   mipmap 1 → max_zoom-1 (64 chunks)
@@ -3045,7 +3020,6 @@ class TileCompletionTracker:
             #   mipmap 3 → max_zoom-3 (4 chunks)
             #   mipmap 4 → max_zoom-4 (1 chunk)
             total_expected = 0
-            per_zoom_expected = {}
             
             for mipmap in range(tile.max_mipmap + 1):
                 mipmap_zoom = tile.max_zoom - mipmap
@@ -3056,7 +3030,7 @@ class TileCompletionTracker:
                 
                 chunks = tile.chunks.get(mipmap_zoom, [])
                 if chunks:
-                    count = len(chunks)
+                    total_expected += len(chunks)
                 else:
                     # Chunks not created yet - estimate from tile dimensions
                     # Chunk count follows 4^mipmap pattern relative to mipmap 0
@@ -3067,23 +3041,13 @@ class TileCompletionTracker:
                     else:
                         chunks_per_row = tile.width << (-zoom_diff)
                         chunks_per_col = tile.height << (-zoom_diff)
-                    count = max(1, chunks_per_row) * max(1, chunks_per_col)
-                
-                total_expected += count
-                per_zoom_expected[mipmap_zoom] = count
-            
-            per_zoom_completed = {z: 0 for z in per_zoom_expected}
+                    total_expected += max(1, chunks_per_row) * max(1, chunks_per_col)
             
             # Enforce max tracked limit (evict oldest if needed)
             if len(self._tracked_tiles) >= self._max_tracked:
                 self._evict_oldest_unlocked()
             
-            self._tracked_tiles[tile_id] = _TrackedTile(
-                tile, zoom, total_expected,
-                per_zoom_expected=per_zoom_expected,
-                per_zoom_completed=per_zoom_completed,
-                per_zoom_notified=set(),
-            )
+            self._tracked_tiles[tile_id] = _TrackedTile(tile, zoom, total_expected)
             log.debug(f"TileCompletionTracker: Started tracking {tile_id} "
                      f"(expecting {total_expected} chunks across all mipmaps)")
             
@@ -3105,7 +3069,6 @@ class TileCompletionTracker:
             return
         
         tile_to_callback = None
-        zooms_to_consolidate = []  # (tile, zoom) to schedule after releasing lock
         
         with self._lock:
             tracked = self._tracked_tiles.get(tile_id)
@@ -3122,16 +3085,6 @@ class TileCompletionTracker:
                 tracked.completed_chunk_ids.add(chunk_key)
             tracked.completed_chunks += 1
             
-            # Per-zoom completion: increment for this chunk's zoom level
-            chunk_zoom = getattr(chunk, 'zoom', None)
-            if chunk_zoom is not None and chunk_zoom in tracked.per_zoom_completed:
-                tracked.per_zoom_completed[chunk_zoom] += 1
-                # When all chunks for this zoom are ready, schedule per-zoom consolidation
-                if (tracked.per_zoom_completed[chunk_zoom] >= tracked.per_zoom_expected.get(chunk_zoom, 0)
-                        and chunk_zoom not in tracked.per_zoom_notified):
-                    tracked.per_zoom_notified.add(chunk_zoom)
-                    zooms_to_consolidate.append((tracked.tile, chunk_zoom))
-            
             log.debug(f"TileCompletionTracker: {tile_id} chunk complete "
                      f"({tracked.completed_chunks}/{tracked.expected_chunks})")
             
@@ -3141,16 +3094,6 @@ class TileCompletionTracker:
                 # Remove from tracking (build will be triggered)
                 del self._tracked_tiles[tile_id]
                 log.debug(f"TileCompletionTracker: {tile_id} COMPLETE - all chunks ready")
-        
-        # Per-zoom consolidation: run outside lock to avoid deadlocks
-        for tile, zoom in zooms_to_consolidate:
-            try:
-                zoom_chunks = tile.chunks.get(zoom, [])
-                jpeg_datas = [c.data for c in zoom_chunks if getattr(c, 'data', None)]
-                if jpeg_datas:
-                    schedule_bundle_consolidation(tile, priority=1, jpeg_datas=jpeg_datas, zoom=zoom)
-            except Exception as e:
-                log.debug(f"TileCompletionTracker: per-zoom consolidation for {tile.id} zoom {zoom}: {e}")
         
         # Call callback OUTSIDE the lock to avoid deadlocks
         if tile_to_callback is not None and self._on_tile_complete is not None:
@@ -4497,11 +4440,6 @@ class BackgroundDDSBuilder:
             #
             # By skipping locked tiles, we keep the background builder responsive
             # and avoid wasting thread time on tiles that are already being built.
-            # Also skip when a FUSE thread is in its unlocked process phase (get_img building).
-            if getattr(tile, '_build_active', 0) > 0:
-                log.debug(f"BackgroundDDSBuilder: {tile_id} - build in progress (_build_active), skipping")
-                bump('prebuilt_dds_skipped_locked')
-                return
             if hasattr(tile, '_lock'):
                 if not tile._lock.acquire(blocking=False):
                     log.debug(f"BackgroundDDSBuilder: {tile_id} - tile is locked (in-use), skipping")
@@ -5468,18 +5406,12 @@ class Chunk(object):
             pass  # Never block downloads
         
         # ASYNC CACHE WRITE: Fire-and-forget background disk write
-        # Capture data at submission time so eviction (chunk.close() clearing self.data)
-        # cannot race with the write. Otherwise with a deep queue, the write may run
-        # after eviction and save_cache() would snapshot None.
+        # The in-memory chunk.data is already captured by consumers above.
+        # Disk write is only for future session restarts (cache persistence).
+        # save_cache() snapshots self.data locally, so it's safe even if
+        # chunk.close() clears self.data before the write completes.
         try:
-            data_snapshot = self.data
-            if data_snapshot:
-                _cache_write_executor.submit(
-                    _async_cache_write_with_data,
-                    self.cache_path,
-                    self.cache_dir,
-                    data_snapshot,
-                )
+            _cache_write_executor.submit(_async_cache_write, self)
         except Exception:
             # Executor full or shutdown - fall back to sync write
             self.save_cache()
@@ -5563,13 +5495,6 @@ class Tile(object):
         # Tile-level time budget - shared across all mipmap builds for this tile
         # This ensures the budget limits the ENTIRE tile processing, not per-mipmap
         self._tile_time_budget = None
-        
-        # Per-mipmap build coordination: only one thread builds each mipmap; others wait.
-        # Maps mipmap index -> threading.Event(); builder signals when done.
-        self._mipmap_building = {}
-        # Count of threads currently in unlocked "process" phase (get_img building).
-        # BackgroundDDSBuilder skips tiles with _build_active > 0 to avoid contention.
-        self._build_active = 0
         
         # === SHARED FALLBACK CHUNK POOL ===
         # When multiple chunks fail and need the same parent chunk at a lower zoom,
@@ -5935,31 +5860,16 @@ class Tile(object):
             last_error = None
             for attempt in range(max_attempts):
                 try:
-                    zoom_missing = False
                     with AoBundle2.Bundle2Python(bundle_path) as bundle:
                         # Check if bundle has this zoom level
                         if not bundle.has_zoom(zoom):
                             log.debug(f"Bundle missing zoom {zoom} for {self.id}")
-                            zoom_missing = True
-                            break
+                            return False
                         
                         # Get all chunk data from bundle (returns copies, safe after close)
                         jpeg_datas = bundle.get_all_chunks(zoom)
                     # Bundle is now closed - file handle released
-                    if jpeg_datas is not None:
-                        break
-                    # Zoom was missing - wait for pending consolidation for this zoom if any
-                    if zoom_missing and _bundle_consolidator and _bundle_consolidator.is_pending(
-                            self.row, self.col, self.maptype, zoom=zoom):
-                        wait_timeout = 5.0
-                        if getattr(self, '_tile_time_budget', None) and self._tile_time_budget:
-                            wait_timeout = max(0.5, min(self._tile_time_budget.remaining * 0.25, 5.0))
-                        _bundle_consolidator.wait_for_pending(
-                            self.row, self.col, self.maptype, timeout=wait_timeout, zoom=zoom)
-                        # Retry: re-open bundle and check has_zoom(zoom) again
-                        continue
-                    elif zoom_missing:
-                        return False
+                    break
                 except Exception as e:
                     last_error = e
                     if attempt < max_attempts - 1:
@@ -7538,6 +7448,7 @@ class Tile(object):
         self.ready.set()
         return outfile
 
+    @locked
     def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None,
                 fallback_level_override=None):
         #
@@ -7621,6 +7532,24 @@ class Tile(object):
         log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")        
         
         log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
+        
+        # Do we already have this img?
+        if mipmap in self.imgs:
+            img_data = self.imgs[mipmap]
+            # Unpack tuple format (new) or return directly (old format, backward compat)
+            if isinstance(img_data, tuple):
+                img = img_data[0]  # Extract just the image
+                log.debug(f"GET_IMG: Found saved image: {img}")
+                return img
+            else:
+                # Old format: just the image without metadata
+                log.debug(f"GET_IMG: Found saved image (old format): {img_data}")
+                return img_data
+
+        log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
+        if mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved:
+            log.debug(f"GET_IMG: We already have mipmap {mipmap} for {self}")
+            return
 
         if startrow == 0 and endrow is None:
             complete_img = True
@@ -7629,30 +7558,26 @@ class Tile(object):
 
         startchunk = 0
         endchunk = None
-        chunks_per_row = width
+        # Determine start and end chunk based on the actual zoom level we're using
+        # Use the width/height calculated for the capped zoom level
+        chunks_per_row = width  # width already accounts for capping
         if startrow:
             startchunk = startrow * chunks_per_row
         if endrow is not None:
             endchunk = (endrow * chunks_per_row) + chunks_per_row
+            
         log.debug(f"GET_IMG: Chunk indices - start: {startchunk}, end: {endchunk}, chunks_per_row: {chunks_per_row}")
 
-        # PREPARE PHASE (with lock): early returns, create chunks, snapshot chunk list
-        with self._lock:
-            if mipmap in self.imgs:
-                img_data = self.imgs[mipmap]
-                if isinstance(img_data, tuple):
-                    img = img_data[0]
-                    log.debug(f"GET_IMG: Found saved image: {img}")
-                    return img
-                log.debug(f"GET_IMG: Found saved image (old format): {img_data}")
-                return img_data
-            log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
-            if mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved:
-                log.debug(f"GET_IMG: We already have mipmap {mipmap} for {self}")
-                return
-            self._create_chunks(zoom, min_zoom)
-            chunks = list(self.chunks[zoom][startchunk:endchunk])
-        log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(chunks)} for zoom {zoom}")
+        # Wait for any pending consolidation - done here INSIDE get_img but the wait
+        # itself doesn't hold any additional locks beyond the tile's RLock that get_img already holds.
+        # Note: get_img has @locked, so this wait is within the tile lock.
+        # TODO: For further optimization, this wait could be moved to callers of get_img.
+        # For now, the per-tile event-based wait is much faster than notify_all().
+        
+        # Create chunks for the actual zoom level we'll download from
+        self._create_chunks(zoom, min_zoom)
+        chunks = self.chunks[zoom][startchunk:endchunk]
+        log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(self.chunks[zoom])} for zoom {zoom}")
 
         log.debug(f"GET_IMG: {self} : Retrieve mipmap for ZOOM: {zoom} MIPMAP: {mipmap}")
         data_updated = False
@@ -8317,9 +8242,9 @@ class Tile(object):
         
         if should_cache:
             log.debug(f"GET_IMG: Save complete image for later...")
-            # COMMIT PHASE (with lock): store built image for fallback/upscaling
-            with self._lock:
-                self._cache_image(mipmap, (new_im, col, row, zoom))
+            # Store image with metadata (col, row, zoom) for coordinate mapping in upscaling
+            # Use _cache_image for LRU eviction to prevent unbounded memory growth
+            self._cache_image(mipmap, (new_im, col, row, zoom))
 
         # Log budget summary including fallback budget if used
         if fallback_budget is not None:
@@ -9691,129 +9616,154 @@ class Tile(object):
             return False
 
     #@profile
+    @locked
     def get_mipmap(self, mipmap=0, time_budget=None):
         """
         Build a specific mipmap level.
-        
-        Uses fine-grained locking: guard (check/register) and commit (store/signal)
-        hold the lock; the long-running build (get_img or native build) runs unlocked
-        so other mipmaps can proceed in parallel.
         
         Args:
             mipmap: Mipmap level to build (0=highest detail, 7=lowest)
             time_budget: TimeBudget for this request (created fresh in read_dds_bytes)
         """
-        if mipmap > self.max_mipmap:
-            mipmap = self.max_mipmap
-
-        # ═══════════════════════════════════════════════════════════════════════
-        # GUARD PHASE (with lock): check if already built or another thread building
-        # ═══════════════════════════════════════════════════════════════════════
-        while True:
-            with self._lock:
-                if mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved:
-                    return True
-                if mipmap in self._mipmap_building:
-                    ev = self._mipmap_building[mipmap]
-            # Wait outside lock so builder can make progress
-                else:
-                    self._mipmap_building[mipmap] = ev = threading.Event()
-                    self._build_active += 1
-                    break
-            ev.wait()
-            # Re-check after wait; another thread may have built it
-            continue
-
+        #
+        # Protect this method to avoid simultaneous threads attempting mm builds at the same time.
+        # Otherwise we risk contention such as waiting get_img call attempting to build an image as 
+        # another thread closes chunks.
+        #
+        
+        # Start timing FULL tile creation (download + compose + compress)
+        # Use monotonic() for consistent interval measurement (immune to clock adjustments)
         tile_creation_start = time.monotonic()
+
         log.debug(f"GET_MIPMAP: {self}")
 
+        if mipmap > self.max_mipmap:
+            mipmap = self.max_mipmap
+        
         # === BUDGET TIMING ===
+        # The budget is passed in from read_dds_bytes() - each read() gets its own budget.
+        #
+        # NOTE: We intentionally do NOT skip get_img/gen_mipmaps when budget is exhausted.
+        # Even if the budget is exhausted, we must still:
+        # 1. Call get_img() to create an image filled with missing_color
+        # 2. Call gen_mipmaps() to compress it into the DDS buffer
+        # This ensures X-Plane receives a valid DDS with missing_color tiles instead of
+        # black/uninitialized data. Once X-Plane reads a DDS, it's cached and won't refresh.
+        # The get_img() method handles budget exhaustion gracefully by skipping chunk downloads
+        # but still returning a valid (missing_color filled) image for compression.
+        
         if time_budget and time_budget.exhausted:
             log.debug(f"GET_MIPMAP: Budget exhausted, will build mipmap {mipmap} with missing_color (no new downloads)")
 
         # ═══════════════════════════════════════════════════════════════════════
-        # BUILD PHASE (no lock): native path or get_img + gen_mipmaps
+        # NATIVE MIPMAP BUILD: Try fast native path for mipmaps 1-4
         # ═══════════════════════════════════════════════════════════════════════
-        native_succeeded = False
-        new_im = None
+        # For mipmaps with 16-256 chunks, native aopipeline is 3-4x faster than Python.
+        # This uses build_single_mipmap() for parallel JPEG decode + DXT compress.
+        # Falls back to Python path if:
+        # - Mipmap 0 (use full aopipeline instead)
+        # - Not enough chunks ready (need fallback handling)
+        # - Native build fails for any reason
         if mipmap > 0 and self._try_native_mipmap_build(mipmap, time_budget):
+            # Native build succeeded - mipmap buffer is populated
+            # Note: Timing stats are recorded inside _try_native_mipmap_build
             log.debug(f"GET_MIPMAP: Native build succeeded for mipmap {mipmap}")
+            
             try:
                 bump_many({f"mm_count:{mipmap}": 1})
             except Exception:
                 pass
-            native_succeeded = True
-        else:
-            log.debug(f"GET_MIPMAP: Next call is get_img which may block!.............")
-            new_im = self.get_img(mipmap, maxwait=self.get_maxwait(), time_budget=time_budget)
-            if not new_im:
-                log.debug("GET_MIPMAP: No updates, so no image generated")
+            
+            return True
+        # ═══════════════════════════════════════════════════════════════════════
 
-        # ═══════════════════════════════════════════════════════════════════════
-        # COMMIT PHASE (with lock): gen_mipmaps (if Python path), consolidation, close chunks, signal
-        # ═══════════════════════════════════════════════════════════════════════
+        # We can have multiple threads wait on get_img ...
+        log.debug(f"GET_MIPMAP: Next call is get_img which may block!.............")
+        # Pass the per-request budget to get_img (each read() gets its own budget)
+        new_im = self.get_img(mipmap, maxwait=self.get_maxwait(), time_budget=time_budget)
+        if not new_im:
+            log.debug("GET_MIPMAP: No updates, so no image generated")
+            return True
+
+        self.ready.clear()
+        compress_start_time = time.monotonic()
         try:
-            with self._lock:
-                if not native_succeeded and new_im is not None:
-                    self.ready.clear()
-                    compress_start_time = time.monotonic()
-                    try:
-                        if mipmap == 0:
-                            self.dds.gen_mipmaps(new_im, mipmap, 0)
-                        else:
-                            self.dds.gen_mipmaps(new_im, mipmap)
-                    finally:
-                        if mipmap not in self.imgs:
-                            try:
-                                new_im.close()
-                            except Exception:
-                                pass
-                    compress_end_time = time.monotonic()
-                    self.ready.set()
-                    compress_time = compress_end_time - compress_start_time
-                    total_creation_time = compress_end_time - tile_creation_start
-                    mm_stats.set(mipmap, compress_time)
-                    tile_creation_stats.set(mipmap, total_creation_time)
-                    try:
-                        bump_many({f"mm_count:{mipmap}": 1})
-                    except Exception:
-                        pass
-                    if mipmap == 0 and not self._completion_reported:
-                        self._completion_reported = True
-                        if self.first_request_time is not None:
-                            tile_completion_time = time.monotonic() - self.first_request_time
-                        else:
-                            tile_completion_time = total_creation_time
-                        log.debug(f"GET_MIPMAP: Tile {self} COMPLETED in {tile_completion_time:.2f}s "
-                                 f"(mipmap 0 done, time from first request)")
-                    log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s")
+            if mipmap == 0:
+                self.dds.gen_mipmaps(new_im, mipmap, 0) 
+            else:
+                self.dds.gen_mipmaps(new_im, mipmap) 
+        finally:
+            # Close image if not cached in self.imgs to free native memory immediately
+            # If cached, it will be closed when evicted by _cache_image() or in close()
+            if mipmap not in self.imgs:
+                try:
+                    new_im.close()
+                except Exception:
+                    pass
 
-                mipmap_zoom = self.max_zoom - mipmap
-                if mipmap_zoom in self.chunks:
-                    try:
-                        zoom_chunks = self.chunks[mipmap_zoom]
-                        jpeg_datas = [chunk.data if hasattr(chunk, 'data') and chunk.data else None
-                                      for chunk in zoom_chunks]
-                        schedule_bundle_consolidation(self, priority=1, jpeg_datas=jpeg_datas, zoom=mipmap_zoom)
-                    except Exception as e:
-                        log.debug(f"GET_MIPMAP: Consolidation scheduling failed: {e}")
-                    log.debug(f"GET_MIPMAP: Closing chunks for mipmap {mipmap} (zoom {mipmap_zoom}).")
-                    for chunk in self.chunks[mipmap_zoom]:
-                        chunk.close()
-                    del self.chunks[mipmap_zoom]
+        compress_end_time = time.monotonic()
+        self.ready.set()
 
-                self._mipmap_building.pop(mipmap, None)
-                self._build_active -= 1
-                if ev is not None:
-                    ev.set()
+        # Calculate timing metrics
+        zoom = self.max_zoom - mipmap
+        compress_time = compress_end_time - compress_start_time
+        total_creation_time = compress_end_time - tile_creation_start
+        
+        # Track compression time (legacy stat)
+        mm_stats.set(mipmap, compress_time)
+        
+        # Track FULL tile creation time (new stat for tuning tile_time_budget)
+        tile_creation_stats.set(mipmap, total_creation_time)
+
+        # Record per-mipmap count via counters for aggregation
+        try:
+            bump_many({
+                f"mm_count:{mipmap}": 1,
+            })
         except Exception:
-            with self._lock:
-                self._mipmap_building.pop(mipmap, None)
-                self._build_active -= 1
-                if ev is not None:
-                    ev.set()
-            raise
+            pass
+        
+        # Log tile completion when mipmap 0 is done (full tile delivered to X-Plane)
+        if mipmap == 0 and not self._completion_reported:
+            self._completion_reported = True
+            # Calculate time from first X-Plane request to completion
+            if self.first_request_time is not None:
+                tile_completion_time = time.monotonic() - self.first_request_time
+            else:
+                # Fallback: use the mipmap creation time if first_request_time wasn't set
+                tile_completion_time = total_creation_time
+            
+            log.debug(f"GET_MIPMAP: Tile {self} COMPLETED in {tile_completion_time:.2f}s "
+                     f"(mipmap 0 done, time from first request)")
+        
+        # Log per-mipmap creation time for visibility
+        log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
+                 f"(download+compose: {total_creation_time - compress_time:.2f}s, compress: {compress_time:.2f}s)")
 
+        # Schedule bundle consolidation for this zoom level BEFORE closing chunks
+        # This uses in-memory JPEG data when available (avoids disk reads)
+        mipmap_zoom = self.max_zoom - mipmap
+        if mipmap_zoom in self.chunks:
+            try:
+                zoom_chunks = self.chunks[mipmap_zoom]
+                jpeg_datas = [chunk.data if hasattr(chunk, 'data') and chunk.data else None 
+                              for chunk in zoom_chunks]
+                schedule_bundle_consolidation(self, priority=1, jpeg_datas=jpeg_datas, zoom=mipmap_zoom)
+            except Exception as e:
+                log.debug(f"GET_MIPMAP: Consolidation scheduling failed: {e}")
+
+        # Close only chunks for THIS mipmap's zoom level (not all zooms!)
+        # FIX: Previously closing ALL chunks caused double-downloads when mipmap 0
+        # completed but mipmap 4 was still being accessed by X-Plane.
+        # Each mipmap uses a different zoom level: mipmap N uses (max_zoom - N).
+        if mipmap_zoom in self.chunks:
+            log.debug(f"GET_MIPMAP: Closing chunks for mipmap {mipmap} (zoom {mipmap_zoom}).")
+            for chunk in self.chunks[mipmap_zoom]:
+                chunk.close()
+            del self.chunks[mipmap_zoom]
+                    #del(chunk.data)
+                    #del(chunk.img)
+        #return outfile
         log.debug("Results:")
         log.debug(self.dds.mipmap_list)
         return True
@@ -9842,10 +9792,6 @@ class Tile(object):
         if self.refs > 0:
             log.warning(f"TILE: Trying to close, but has refs: {self.refs}")
             return
-
-        # Clear per-mipmap build coordination so tile can be reused or GC'd cleanly
-        self._mipmap_building.clear()
-        self._build_active = 0
 
         # Log mipmap retrieval status (safely check dds first)
         # Skip for prepopulated tiles - X-Plane may only need small mipmaps
