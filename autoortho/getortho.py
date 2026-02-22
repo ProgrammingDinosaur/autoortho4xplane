@@ -4547,10 +4547,15 @@ def start_predictive_dds(tile_cacher=None) -> None:
                 enabled=True
             )
             
-            # Scan existing cache entries in a background thread
+            # Scan existing cache entries, then migrate uncompressed files
             import threading as _threading
+
+            def _scan_and_migrate():
+                dynamic_dds_cache.scan_existing()
+                dynamic_dds_cache.migrate_uncompressed()
+
             _scan_thread = _threading.Thread(
-                target=dynamic_dds_cache.scan_existing,
+                target=_scan_and_migrate,
                 daemon=True,
                 name="dds_cache_scan"
             )

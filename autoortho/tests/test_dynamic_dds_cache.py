@@ -1210,8 +1210,9 @@ class TestZstdCompression:
         assert loaded2 is not None
         assert loaded1 == loaded2 == sample_dds_bytes
 
-    def test_incremental_store_uncompressed(self, dds_cache, mock_tile):
-        """Test that incremental stores remain uncompressed (seek-write compat)."""
+    def test_incremental_store_compressed(self, dds_cache, mock_tile):
+        """Test that incremental stores are compressed when zstd is enabled."""
+        total_size = 128 + 8192
         mm_data = {0: b'\xAA' * 8192}
         mm_offsets = {0: (128, 8192)}
 
@@ -1220,18 +1221,22 @@ class TestZstdCompression:
             mock_tile.row, mock_tile.col, mock_tile.maptype,
             mock_tile.tilename_zoom,
             b'DDS ' + b'\x00' * 124,
-            128 + 8192, 4096, 4096, 1,
+            total_size, 4096, 4096, 1,
             mm_data, mm_offsets
         )
 
-        _, ddm_path = dds_cache._paths_for(
+        dds_path, ddm_path = dds_cache._paths_for(
             mock_tile.row, mock_tile.col, mock_tile.maptype,
             mock_tile.tilename_zoom, mock_tile.max_zoom
         )
         with open(ddm_path, 'r') as f:
             meta = json.load(f)
 
-        assert meta.get('disk_compression') == 'none'
+        assert meta.get('disk_compression') == 'zstd'
+
+        # On-disk file should be smaller than the uncompressed total
+        disk_size = os.path.getsize(dds_path)
+        assert disk_size < total_size
 
     def test_upgrade_zl_with_compression(self, dds_cache, cache_dir, sample_dds_bytes):
         """Test ZL upgrade works with compressed source files."""
@@ -1266,3 +1271,75 @@ class TestZstdCompression:
         )
         assert result is not None
         assert len(result) == tile_15.dds.total_size
+
+    def test_migrate_uncompressed(self, cache_dir, mock_tile, sample_dds_bytes, monkeypatch):
+        """Test that migrate_uncompressed re-compresses old uncompressed files."""
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+
+        # Store with compression disabled
+        monkeypatch.setattr(MockCFG.pydds, 'dds_compression', 'none')
+        cache_none = DynamicDDSCache(cache_dir, max_size_mb=512, enabled=True)
+        cache_none.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+
+        dds_path, ddm_path = cache_none._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom)
+        original_size = os.path.getsize(dds_path)
+
+        # Create a new cache instance with compression enabled
+        monkeypatch.setattr(MockCFG.pydds, 'dds_compression', 'zstd')
+        cache_zstd = DynamicDDSCache(cache_dir, max_size_mb=512, enabled=True)
+        cache_zstd.scan_existing()
+
+        migrated = cache_zstd.migrate_uncompressed()
+        assert migrated == 1
+
+        # File should now be smaller
+        new_size = os.path.getsize(dds_path)
+        assert new_size < original_size
+
+        # DDM should record zstd compression
+        with open(ddm_path, 'r') as f:
+            meta = json.load(f)
+        assert meta.get('disk_compression') == 'zstd'
+
+        # Round-trip: loading should still return original data
+        loaded = cache_zstd.load(mock_tile.id, mock_tile.max_zoom, mock_tile)
+        assert loaded == sample_dds_bytes
+
+    def test_incremental_subsequent_writes_on_compressed(self, dds_cache, mock_tile):
+        """Test that subsequent incremental writes work on already-compressed files."""
+        total_size = 128 + 8192 + 2048
+        header = b'DDS ' + b'\x00' * 124
+
+        # First incremental write (mipmap 1)
+        dds_cache.store_incremental(
+            mock_tile.id, mock_tile.max_zoom,
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom,
+            header, total_size, 4096, 4096, 2,
+            {1: b'\xBB' * 2048}, {0: (128, 8192), 1: (128 + 8192, 2048)}
+        )
+
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom)
+        with open(ddm_path, 'r') as f:
+            meta1 = json.load(f)
+        assert 1 in meta1['populated_mipmaps']
+        assert 0 not in meta1['populated_mipmaps']
+
+        # Second incremental write (mipmap 0) on top of compressed file
+        dds_cache.store_incremental(
+            mock_tile.id, mock_tile.max_zoom,
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom,
+            header, total_size, 4096, 4096, 2,
+            {0: b'\xAA' * 8192}, {0: (128, 8192), 1: (128 + 8192, 2048)}
+        )
+
+        with open(ddm_path, 'r') as f:
+            meta2 = json.load(f)
+        assert 0 in meta2['populated_mipmaps']
+        assert 1 in meta2['populated_mipmaps']
+        assert meta2.get('disk_compression') == 'zstd'

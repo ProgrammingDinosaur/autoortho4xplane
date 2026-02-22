@@ -445,8 +445,7 @@ class DDS(Structure):
                     # ~We have remaining length in current mipmap~
                     #
                     if mipmap.databuffer is None:
-                        log.warning(f"PYDDS: No buffer for mipmap {mipmap.idx}! Using missing_color fallback.")
-                        # Use proper BC1/BC3 blocks with missing_color instead of garbage
+                        log.debug(f"PYDDS: No buffer for mipmap {mipmap.idx}, using fallback.")
                         data = get_fallback_bytes(length, self.blocksize)
                     else:
                         log.debug("We have a mipmap and adequated remaining length")
@@ -471,12 +470,7 @@ class DDS(Structure):
 
                     #if not mipmap.retrieved:
                     if mipmap.databuffer is None:
-                        # 
-                        # Mipmap not fully retrieved.  Mimpamp buffer may exist for partially retreived mipmap 0, but
-                        # we *must* make sure the full size is available.
-                        # 
-                        log.warning(f"PYDDS: No buffer for mipmap {mipmap.idx}! Using missing_color fallback for {remaining_mipmap_len} bytes.")
-                        # Use proper BC1/BC3 blocks with missing_color instead of garbage
+                        log.debug(f"PYDDS: No buffer for mipmap {mipmap.idx}, using fallback ({remaining_mipmap_len} bytes).")
                         data = get_fallback_bytes(remaining_mipmap_len, self.blocksize)
                     else:    
                         # Mipmap is retrieved

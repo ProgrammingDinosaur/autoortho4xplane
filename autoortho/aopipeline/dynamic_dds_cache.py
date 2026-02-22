@@ -218,7 +218,8 @@ class DynamicDDSCache:
                                tilename_zoom: int, max_zoom: int,
                                width: int, height: int, mm_count: int,
                                dds_format: str, compressor: str,
-                               populated_mipmaps: List[int]) -> dict:
+                               populated_mipmaps: List[int],
+                               disk_compression: str = "none") -> dict:
         """Build a lightweight DDM v3 dict for incremental saves.
 
         Unlike ``_build_ddm``, this does not require the tile DDS object,
@@ -249,7 +250,7 @@ class DynamicDDSCache:
             "needs_healing": False,
             "healing_chunks": 0,
             "missing_indices": [],
-            "disk_compression": "none",
+            "disk_compression": disk_compression,
         }
 
     @staticmethod
@@ -779,50 +780,101 @@ class DynamicDDSCache:
             if not new_mipmaps:
                 return True
 
-            # 3. Create skeleton if DDS file doesn't exist
-            if not os.path.isfile(dds_path):
-                self._create_dds_skeleton(dds_path, header_bytes, total_size)
+            # 3. Build the DDS content with new mipmaps, then compress
+            use_compression = self._compression == "zstd" and _HAS_ZSTD
+            merged_populated = sorted(already_populated | set(new_mipmaps.keys()))
 
-            # 4. Seek-write each mipmap's data
-            with open(dds_path, "r+b") as f:
+            if use_compression:
+                # Compressed path: work in memory, compress, write atomically.
+                # Partial DDS files (mostly zeros) compress extremely well
+                # (~43 MB skeleton → ~200 KB compressed).
+                if os.path.isfile(dds_path):
+                    with open(dds_path, "rb") as f:
+                        raw = f.read()
+                    was_compressed = (existing_meta or {}).get(
+                        "disk_compression", "none") == "zstd"
+                    if was_compressed:
+                        try:
+                            dds_data = bytearray(
+                                self._decompress_dds(raw, existing_meta))
+                        except Exception:
+                            dds_data = bytearray(total_size)
+                            dds_data[:len(header_bytes)] = header_bytes
+                    else:
+                        dds_data = bytearray(raw)
+                        # Pad if file is shorter than expected (truncated)
+                        if len(dds_data) < total_size:
+                            dds_data.extend(b'\x00' * (total_size - len(dds_data)))
+                else:
+                    dds_data = bytearray(total_size)
+                    dds_data[:len(header_bytes)] = header_bytes
+
                 for idx, data in new_mipmaps.items():
                     startpos, length = mipmap_offsets[idx]
                     if len(data) != length:
                         log.debug(f"Incremental save: mipmap {idx} size mismatch "
                                   f"({len(data)} vs {length}), skipping")
                         continue
-                    f.seek(startpos)
-                    f.write(data)
+                    dds_data[startpos:startpos + length] = data
 
-            # 5. Update DDM *after* data writes (crash-safe ordering)
-            merged_populated = sorted(already_populated | set(new_mipmaps.keys()))
+                compressed = self._compress_dds(bytes(dds_data))
+                if len(compressed) < len(dds_data):
+                    disk_compression = self._compression
+                    disk_bytes = compressed
+                else:
+                    disk_compression = "none"
+                    disk_bytes = bytes(dds_data)
 
+                tmp = dds_path + f".tmp.{os.getpid()}"
+                with open(tmp, "wb") as f:
+                    f.write(disk_bytes)
+                os.replace(tmp, dds_path)
+                disk_size = len(disk_bytes)
+            else:
+                # Uncompressed path: seek-write in place (original behavior)
+                if not os.path.isfile(dds_path):
+                    self._create_dds_skeleton(dds_path, header_bytes, total_size)
+
+                with open(dds_path, "r+b") as f:
+                    for idx, data in new_mipmaps.items():
+                        startpos, length = mipmap_offsets[idx]
+                        if len(data) != length:
+                            log.debug(f"Incremental save: mipmap {idx} size mismatch "
+                                      f"({len(data)} vs {length}), skipping")
+                            continue
+                        f.seek(startpos)
+                        f.write(data)
+
+                disk_compression = "none"
+                try:
+                    disk_size = os.path.getsize(dds_path)
+                except OSError:
+                    disk_size = total_size
+
+            # 4. Update DDM *after* data writes (crash-safe ordering)
             dds_format, compressor = self._get_format_and_compressor()
             meta = self._build_ddm_incremental(
                 row, col, maptype, tilename_zoom, max_zoom,
                 width, height, mm_count, dds_format, compressor,
-                merged_populated
+                merged_populated, disk_compression=disk_compression
             )
             self._write_ddm(ddm_path, meta)
 
-            # 6. LRU tracking
+            # 5. LRU tracking (use actual on-disk size)
             key = self._tile_key(tile_id, max_zoom)
-            try:
-                size = os.path.getsize(dds_path)
-            except OSError:
-                size = total_size
             with self._lock:
                 if key in self._entries:
                     old_size = self._entries[key][2]
                     self._current_size -= old_size
-                self._entries[key] = (dds_path, ddm_path, size, time.time())
+                self._entries[key] = (dds_path, ddm_path, disk_size, time.time())
                 self._entries.move_to_end(key)
-                self._current_size += size
+                self._current_size += disk_size
                 self._stores += 1
 
             log.debug(f"DDS cache STORE_INCR: {tile_id} z{max_zoom} "
                       f"mipmaps={sorted(new_mipmaps.keys())} "
-                      f"populated={merged_populated}")
+                      f"populated={merged_populated} "
+                      f"disk={disk_size} compression={disk_compression}")
 
             return True
 
@@ -1341,6 +1393,97 @@ class DynamicDDSCache:
                      f"({self._current_size / (1024*1024):.1f}MB)")
 
         return count
+
+    def migrate_uncompressed(self) -> int:
+        """Re-compress existing uncompressed DDS files in-place.
+
+        Walks the cache directory, reads each uncompressed DDS, compresses it
+        with the current zstd settings, and atomically replaces the file.
+        Updates DDM metadata and LRU size tracking.
+
+        Designed to run once in a background thread after ``scan_existing()``.
+
+        Returns the number of files migrated.
+        """
+        if not self._enabled or self._compression != "zstd" or not _HAS_ZSTD:
+            return 0
+
+        migrated = 0
+        saved_bytes = 0
+        start = time.monotonic()
+
+        try:
+            for dirpath, _dirnames, filenames in os.walk(self._dds_root):
+                for fname in filenames:
+                    if not fname.endswith(".ddm"):
+                        continue
+
+                    ddm_path = os.path.join(dirpath, fname)
+                    meta = self._read_ddm(ddm_path)
+                    if meta is None:
+                        continue
+                    if meta.get("disk_compression", "none") != "none":
+                        continue
+
+                    dds_path = ddm_path[:-4] + ".dds"
+                    if not os.path.isfile(dds_path):
+                        continue
+
+                    try:
+                        with open(dds_path, "rb") as f:
+                            raw = f.read()
+                        original_size = len(raw)
+
+                        compressed = self._compress_dds(raw)
+                        if len(compressed) >= original_size:
+                            continue
+
+                        tmp = dds_path + f".tmp.{os.getpid()}"
+                        with open(tmp, "wb") as f:
+                            f.write(compressed)
+                        os.replace(tmp, dds_path)
+
+                        meta["disk_compression"] = self._compression
+                        self._write_ddm(ddm_path, meta)
+
+                        # Update LRU size tracking
+                        row = meta.get("tile_row")
+                        col = meta.get("tile_col")
+                        maptype = meta.get("map", "")
+                        zl = meta.get("zl", 0)
+                        max_zl = meta.get("max_zl", 0)
+                        if row is not None and col is not None:
+                            tile_id = f"{row}_{col}_{maptype}_{zl}"
+                            key = self._tile_key(tile_id, max_zl)
+                            new_size = len(compressed)
+                            with self._lock:
+                                if key in self._entries:
+                                    old_entry = self._entries[key]
+                                    self._current_size -= old_entry[2]
+                                    self._entries[key] = (
+                                        dds_path, ddm_path, new_size, old_entry[3])
+                                    self._current_size += new_size
+
+                        saved_bytes += original_size - len(compressed)
+                        migrated += 1
+
+                    except Exception as e:
+                        log.debug(f"DDS migration error for {dds_path}: {e}")
+                        try:
+                            os.remove(dds_path + f".tmp.{os.getpid()}")
+                        except OSError:
+                            pass
+                        continue
+
+        except Exception as e:
+            log.warning(f"DDS cache migration error: {e}")
+
+        elapsed = (time.monotonic() - start) * 1000
+        if migrated > 0:
+            log.info(f"DDS cache migration: compressed {migrated} files, "
+                     f"saved {saved_bytes / (1024*1024):.1f}MB in {elapsed:.0f}ms")
+
+        return migrated
 
     def find_upgrade_candidate(self, tile_id: str, max_zoom: int,
                                tile) -> Optional[Tuple[str, dict]]:
