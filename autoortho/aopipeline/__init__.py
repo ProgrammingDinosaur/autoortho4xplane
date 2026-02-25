@@ -7,22 +7,13 @@ operations that bypass Python's GIL limitation:
 - AoCache: Parallel batch cache file I/O
 - AoDecode: Parallel JPEG decoding  
 - AoDDS: Native DDS texture building with ISPC compression
-- AoBundle: Cache bundle format for consolidated file I/O
-- AoBundle2: Multi-zoom mutable bundle format (AOB2)
 
 Optimal Usage (Hybrid Pipeline):
-    from autoortho.aopipeline import AoDDS, AoBundle, AoBundle2
+    from autoortho.aopipeline import AoDDS
     
-    # Option 1: Python reads files, native decodes
+    # Python reads files, native decodes + compresses
     jpeg_datas = [Path(p).read_bytes() for p in chunk_paths]
     dds_bytes = AoDDS.build_from_jpegs(jpeg_datas)
-    
-    # Option 2: Bundle format (single file = fastest)
-    if AoBundle.bundle_exists(cache_dir, col, row, zoom, maptype):
-        dds_bytes = AoBundle.build_dds_from_bundle(bundle_path)
-    
-    # Option 3: Multi-zoom bundle (most flexible)
-    dds_bytes = AoBundle2.build_dds(bundle_path, target_zoom=16)
 """
 
 import logging
@@ -72,7 +63,7 @@ def _get_module(name):
 
 def __getattr__(name):
     """Lazy import of submodules to avoid deadlock on concurrent imports."""
-    if name in ('AoCache', 'AoDecode', 'AoDDS', 'AoBundle', 'AoBundle2'):
+    if name in ('AoCache', 'AoDecode', 'AoDDS'):
         return _get_module(name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -107,20 +98,10 @@ def get_available_components() -> list:
             components.append('dds')
     except Exception:
         pass
-    try:
-        if _get_module('AoBundle').is_available():
-            components.append('bundle')
-    except Exception:
-        pass
-    try:
-        if _get_module('AoBundle2').is_available():
-            components.append('bundle2')
-    except Exception:
-        pass
     return components
 
 
 __all__ = [
-    'AoCache', 'AoDecode', 'AoDDS', 'AoBundle', 'AoBundle2',
+    'AoCache', 'AoDecode', 'AoDDS',
     'is_available', 'get_available_components'
 ]

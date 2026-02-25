@@ -719,13 +719,9 @@ def benchmark_bundle_format(chunks_per_side: int = 16, iterations: int = 3):
     print("  Single file open + mmap = minimal I/O overhead")
 
     cache_dir, paths = create_test_cache_dir(num_chunks, use_realistic=True)
-    bundle_path = os.path.join(cache_dir, f"test_bundle_{num_chunks}.aob")
 
     try:
         individual_avg = None
-        bundle_create_time = None
-        bundle_read_avg = None
-        bundle_dds_avg = None
 
         # 1. Measure individual file reads
         print("\n  [1] Individual file reads (256 files)...")
@@ -742,88 +738,12 @@ def benchmark_bundle_format(chunks_per_side: int = 16, iterations: int = 3):
         individual_avg = sum(individual_times) / len(individual_times) * 1000
         print(f"      Individual reads: {individual_avg:.2f}ms")
 
-        # 2. Create bundle (measure once)
-        try:
-            from autoortho.aopipeline import AoBundle
-            if AoBundle.is_available():
-                print("  [2] Creating bundle file...")
-                start = time.perf_counter()
-                AoBundle.create_bundle(
-                    cache_dir=cache_dir,
-                    tile_col=0, tile_row=0,
-                    maptype="BI", zoom=16,
-                    chunks_per_side=chunks_per_side,
-                    output_path=bundle_path
-                )
-                bundle_create_time = (time.perf_counter() - start) * 1000
-
-                bundle_size = os.path.getsize(bundle_path) if os.path.exists(bundle_path) else 0
-                print(f"      Bundle created: {bundle_create_time:.2f}ms "
-                      f"({bundle_size/1024:.1f} KB)")
-
-                # 3. Read entire bundle (compare to individual reads)
-                print("  [3] Reading bundle file...")
-                bundle_times = []
-                for i in range(iterations):
-                    start = time.perf_counter()
-                    with open(bundle_path, 'rb') as f:
-                        _ = f.read()
-                    bundle_times.append(time.perf_counter() - start)
-                bundle_read_avg = sum(bundle_times) / len(bundle_times) * 1000
-                print(f"      Bundle read:     {bundle_read_avg:.2f}ms")
-
-                # 4. Full DDS from bundle (if available)
-                print("  [4] DDS from bundle...")
-                try:
-                    # Warmup
-                    dds = AoBundle.build_dds_from_bundle(bundle_path)
-                    
-                    bundle_dds_times = []
-                    for i in range(iterations):
-                        start = time.perf_counter()
-                        dds = AoBundle.build_dds_from_bundle(bundle_path)
-                        bundle_dds_times.append(time.perf_counter() - start)
-                    bundle_dds_avg = sum(bundle_dds_times) / len(bundle_dds_times) * 1000
-                    print(f"      Bundle → DDS:    {bundle_dds_avg:.2f}ms "
-                          f"({len(dds)/1024/1024:.2f} MB)")
-                except Exception as e:
-                    print(f"      Bundle → DDS:    not available ({e})")
-            else:
-                print("      Bundle: native not available, using Python fallback")
-                start = time.perf_counter()
-                AoBundle.create_bundle_python(
-                    cache_dir=cache_dir,
-                    tile_col=0, tile_row=0,
-                    maptype="BI", zoom=16,
-                    chunks_per_side=chunks_per_side,
-                    output_path=bundle_path
-                )
-                bundle_create_time = (time.perf_counter() - start) * 1000
-                bundle_size = os.path.getsize(bundle_path) if os.path.exists(bundle_path) else 0
-                print(f"      Bundle created (Python): {bundle_create_time:.2f}ms "
-                      f"({bundle_size/1024:.1f} KB)")
-
-        except ImportError as e:
-            print(f"      Bundle: not available ({e})")
-
         # Summary
         print(f"\n  I/O Comparison:")
         if individual_avg:
             print(f"    256 individual files: {individual_avg:.2f}ms")
-        if bundle_read_avg:
-            print(f"    1 bundle file:        {bundle_read_avg:.2f}ms")
-            if individual_avg:
-                speedup = individual_avg / bundle_read_avg
-                print(f"    I/O SPEEDUP:          {speedup:.1f}x faster")
-
-        if bundle_dds_avg:
-            print(f"\n  Complete Tile Build (I/O + Decode + Compress):")
-            print(f"    Bundle → DDS:         {bundle_dds_avg:.2f}ms")
 
     finally:
-        # Clean up bundle file
-        if os.path.exists(bundle_path):
-            os.remove(bundle_path)
         cleanup_test_cache(cache_dir)
 
 

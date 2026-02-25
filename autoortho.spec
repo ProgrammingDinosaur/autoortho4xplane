@@ -224,10 +224,9 @@ hiddenimports = [
     'autoortho.aopipeline.AoCache',
     'autoortho.aopipeline.AoDecode',
     'autoortho.aopipeline.AoDDS',
-    'autoortho.aopipeline.AoBundle',
-    'autoortho.aopipeline.AoBundle2',
-    'autoortho.aopipeline.bundle_consolidator',
     'autoortho.aopipeline.fallback_resolver',
+    # Cache path utilities
+    'autoortho.utils.cache_paths',
     # 7-Zip wrapper (replaces py7zr)
     'autoortho.utils.sevenzip',
     # Async/networking stack

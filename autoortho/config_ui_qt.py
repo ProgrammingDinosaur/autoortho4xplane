@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QLabel, QLineEdit, QCheckBox, QComboBox,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QScrollArea,
-    QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox,
+    QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox, QDoubleSpinBox,
     QColorDialog, QRadioButton, QMenu, QStyle,
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem, QInputDialog,
     QHeaderView
@@ -259,6 +259,85 @@ class RestoreDefaultDsfsWorker(QThread):
             tb = traceback.format_exc()
             self.error.emit(self.region_id, str(err))
             log.error(tb)
+
+
+class AddRoughnessWorker(QThread):
+    """Worker thread for adding SUPER_ROUGHNESS to .ter files"""
+    finished = Signal(str, bool)  # region_id, success
+    error = Signal(str, str)  # region_id, error_message
+    progress = Signal(str, dict)  # region_id, progress_data
+
+    def __init__(self, scenery_name: str, scenery_path: str, roughness_value: float):
+        super().__init__()
+        self.scenery_name = scenery_name
+        self.scenery_path = scenery_path
+        self.roughness_value = roughness_value
+
+    def run(self):
+        """Run the worker thread"""
+        try:
+            try:
+                from autoortho.utils.ter_utils import ter_utils
+            except ImportError:
+                from utils.ter_utils import ter_utils
+            log.info(f"Adding SUPER_ROUGHNESS {self.roughness_value} to {self.scenery_name}")
+
+            # Notify UI that scanning is in progress before the slow scan begins
+            self.progress.emit(self.scenery_name, {"stage": "scanning"})
+
+            def progress_callback(progress_data):
+                self.progress.emit(self.scenery_name, progress_data)
+
+            success = ter_utils.patch_terrain_to_package(
+                self.scenery_name,
+                self.roughness_value,
+                progress_callback=progress_callback
+            )
+
+            log.info(f"Finished adding SUPER_ROUGHNESS to {self.scenery_name}")
+            self.progress.emit(self.scenery_name, {"stage": "finished"})
+            self.finished.emit(self.scenery_name, success)
+        except Exception as err:
+            tb = traceback.format_exc()
+            log.error(tb)
+            self.error.emit(self.scenery_name, str(err))
+
+
+class RestoreRoughnessWorker(QThread):
+    """Worker thread for removing SUPER_ROUGHNESS from .ter files"""
+    finished = Signal(str, bool)  # region_id, success
+    error = Signal(str, str)  # region_id, error_message
+    progress = Signal(str, dict)  # region_id, progress_data
+
+    def __init__(self, scenery_name: str, scenery_path: str):
+        super().__init__()
+        self.scenery_name = scenery_name
+        self.scenery_path = scenery_path
+
+    def run(self):
+        """Run the worker thread"""
+        try:
+            try:
+                from autoortho.utils.ter_utils import ter_utils
+            except ImportError:
+                from utils.ter_utils import ter_utils
+            log.info(f"Removing SUPER_ROUGHNESS from {self.scenery_name}")
+
+            def progress_callback(progress_data):
+                self.progress.emit(self.scenery_name, progress_data)
+
+            success = ter_utils.restore_ter_files(
+                self.scenery_name,
+                progress_callback=progress_callback
+            )
+
+            log.info(f"Finished removing SUPER_ROUGHNESS from {self.scenery_name}")
+            self.progress.emit(self.scenery_name, {"stage": "finished"})
+            self.finished.emit(self.scenery_name, success)
+        except Exception as err:
+            tb = traceback.format_exc()
+            log.error(tb)
+            self.error.emit(self.scenery_name, str(err))
 
 
 class SimBriefFetchWorker(QThread):
@@ -711,6 +790,283 @@ class QualityStepsDialog(QDialog):
             The DynamicZoomManager with any changes applied
         """
         return self.manager
+
+
+class RoughnessValueDialog(QDialog):
+    """
+    Dialog for selecting SUPER_ROUGHNESS value.
+    
+    Allows users to select a roughness value between 0.0 and 1.0
+    for terrain files. Higher values make terrain less reflective
+    at sunset/sunrise.
+    """
+    
+    def __init__(self, parent=None, current_value: float = 1.0, is_update: bool = False):
+        """
+        Initialize the roughness value dialog.
+        
+        Args:
+            parent: Parent widget
+            current_value: Current roughness value (0.0 to 1.0)
+            is_update: Whether this is updating an existing value
+        """
+        super().__init__(parent)
+        self.current_value = current_value
+        self.is_update = is_update
+        self.selected_value = current_value
+        
+        title = "Change SUPER_ROUGHNESS Value" if is_update else "Apply SUPER_ROUGHNESS"
+        self.setWindowTitle(title)
+        self.setMinimumSize(400, 250)
+        self._setup_ui()
+        
+    def _setup_ui(self):
+        """Set up the dialog UI."""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        
+        # Info label
+        info_text = (
+            "SUPER_ROUGHNESS controls how reflective terrain appears at low sun angles.\n\n"
+            "Without this parameter, orthophotos can look 'plastic' or overly shiny "
+            "during sunsets and sunrises.\n\n"
+            "Recommended value: 1.0 (fully matte/rough surface)\n"
+            "Lower values: More reflective/shiny appearance"
+        )
+        info = QLabel(info_text)
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #aaa; padding: 10px; background: #333; border-radius: 5px;")
+        layout.addWidget(info)
+        
+        # Slider section
+        slider_layout = QVBoxLayout()
+        
+        # Value display
+        value_layout = QHBoxLayout()
+        value_label = QLabel("SUPER_ROUGHNESS Value:")
+        value_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        self.value_display = QLabel(f"{self.current_value:.1f}")
+        self.value_display.setStyleSheet("font-weight: bold; font-size: 18px; color: #4CAF50;")
+        value_layout.addWidget(value_label)
+        value_layout.addStretch()
+        value_layout.addWidget(self.value_display)
+        slider_layout.addLayout(value_layout)
+        
+        # Slider
+        slider_row = QHBoxLayout()
+        min_label = QLabel("0.0")
+        min_label.setStyleSheet("color: #888;")
+        max_label = QLabel("1.0")
+        max_label.setStyleSheet("color: #888;")
+        
+        self.roughness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.roughness_slider.setRange(0, 10)  # 0.0 to 1.0 in 0.1 steps
+        self.roughness_slider.setValue(int(self.current_value * 10))
+        self.roughness_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.roughness_slider.setTickInterval(1)
+        self.roughness_slider.valueChanged.connect(self._on_slider_changed)
+        self.roughness_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: 1px solid #555;
+                height: 8px;
+                background: #3d3d3d;
+                margin: 2px 0;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #4CAF50;
+                border: 1px solid #388E3C;
+                width: 18px;
+                margin: -5px 0;
+                border-radius: 9px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #4CAF50;
+                border-radius: 4px;
+            }
+        """)
+        
+        slider_row.addWidget(min_label)
+        slider_row.addWidget(self.roughness_slider)
+        slider_row.addWidget(max_label)
+        slider_layout.addLayout(slider_row)
+        
+        layout.addLayout(slider_layout)
+        
+        # Preset buttons
+        preset_layout = QHBoxLayout()
+        preset_label = QLabel("Presets:")
+        preset_label.setStyleSheet("color: #888;")
+        preset_layout.addWidget(preset_label)
+        
+        for value, name in [(1.0, "Matte (1.0)"), (0.8, "Semi-Matte (0.8)"), (0.5, "Balanced (0.5)")]:
+            btn = QPushButton(name)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3d3d3d;
+                    border: 1px solid #555;
+                    padding: 5px 10px;
+                    border-radius: 3px;
+                }
+                QPushButton:hover {
+                    background-color: #4d4d4d;
+                }
+            """)
+            btn.clicked.connect(lambda checked, v=value: self._set_preset(v))
+            preset_layout.addWidget(btn)
+        
+        preset_layout.addStretch()
+        layout.addLayout(preset_layout)
+        
+        layout.addStretch()
+        
+        # Dialog buttons
+        button_text = "Update" if self.is_update else "Apply"
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | 
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(button_text)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+    def _on_slider_changed(self, value: int):
+        """Handle slider value change."""
+        self.selected_value = value / 10.0
+        self.value_display.setText(f"{self.selected_value:.1f}")
+        
+    def _set_preset(self, value: float):
+        """Set slider to a preset value."""
+        self.roughness_slider.setValue(int(value * 10))
+        
+    def get_value(self) -> float:
+        """Get the selected roughness value."""
+        return self.selected_value
+
+
+class SceneryPatchesWidget(QWidget):
+    """
+    Widget displaying status of scenery patches (Seasons and SUPER_ROUGHNESS).
+    
+    Shows a compact status section with color-coded badges for each patch type.
+    """
+    
+    def __init__(
+        self,
+        parent=None,
+        seasons_status=None,
+        roughness_status=None,
+        roughness_value=None
+    ):
+        super().__init__(parent)
+        self.seasons_status = seasons_status
+        self.roughness_status = roughness_status
+        self.roughness_value = roughness_value
+        self._setup_ui()
+    
+    def _get_status_color(self, status) -> str:
+        """Get the color for a status value."""
+        if status is None:
+            return "#2d78ba"  # Blue - not applied
+        
+        status_name = status.value if hasattr(status, 'value') else str(status)
+        if status_name == "applied":
+            return "#4CAF50"  # Green
+        elif status_name == "partially_applied":
+            return "#db7100"  # Orange
+        else:
+            return "#2d78ba"  # Blue
+    
+    def _get_status_text(self, status) -> str:
+        """Get the display text for a status value."""
+        if status is None:
+            return "Not Applied"
+        
+        status_name = status.value if hasattr(status, 'value') else str(status)
+        if status_name == "applied":
+            return "Applied"
+        elif status_name == "partially_applied":
+            return "Partial"
+        else:
+            return "Not Applied"
+    
+    def _create_status_badge(self, text: str, color: str) -> QLabel:
+        """Create a colored status badge."""
+        badge = QLabel(text)
+        badge.setStyleSheet(f"""
+            background-color: {color};
+            color: white;
+            font-size: 11px;
+            font-weight: bold;
+            padding: 3px 10px;
+            border-radius: 3px;
+        """)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setMinimumWidth(85)
+        return badge
+    
+    def _setup_ui(self):
+        """Set up the widget UI."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Container frame
+        frame = QFrame()
+        frame.setStyleSheet("""
+            QFrame {
+                background-color: #2d2d2d;
+                border: 1px solid #444;
+                border-radius: 5px;
+            }
+        """)
+        frame_layout = QVBoxLayout(frame)
+        frame_layout.setContentsMargins(10, 8, 10, 8)
+        frame_layout.setSpacing(5)
+        
+        # Title
+        title = QLabel("Scenery Patches")
+        title.setStyleSheet("font-weight: bold; font-size: 12px; color: #ccc; border: none; background: transparent;")
+        frame_layout.addWidget(title)
+        
+        label_width = 125
+        label_style = "color: #aaa; font-size: 11px; border: none; background: transparent;"
+
+        # Seasons row
+        seasons_row = QHBoxLayout()
+        seasons_row.setSpacing(8)
+        seasons_label = QLabel("Seasons")
+        seasons_label.setStyleSheet(label_style)
+        seasons_label.setFixedWidth(label_width)
+        seasons_badge = self._create_status_badge(
+            self._get_status_text(self.seasons_status),
+            self._get_status_color(self.seasons_status)
+        )
+        seasons_row.addWidget(seasons_label)
+        seasons_row.addWidget(seasons_badge)
+        seasons_row.addStretch()
+        frame_layout.addLayout(seasons_row)
+
+        # Roughness row
+        roughness_row = QHBoxLayout()
+        roughness_row.setSpacing(8)
+        roughness_text = "Roughness"
+        if self.roughness_value is not None:
+            roughness_text += f" ({self.roughness_value:.1f})"
+        roughness_label = QLabel(roughness_text)
+        roughness_label.setStyleSheet(label_style)
+        roughness_label.setFixedWidth(label_width)
+        roughness_badge = self._create_status_badge(
+            self._get_status_text(self.roughness_status),
+            self._get_status_color(self.roughness_status)
+        )
+        roughness_row.addWidget(roughness_label)
+        roughness_row.addWidget(roughness_badge)
+        roughness_row.addStretch()
+        frame_layout.addLayout(roughness_row)
+
+        layout.addWidget(frame)
 
 
 class ConfigUI(QMainWindow):
@@ -1534,6 +1890,35 @@ class ConfigUI(QMainWindow):
         )
         scenery_layout.addWidget(self.noclean_check)
 
+        # Max download workers
+        dl_workers_layout = QHBoxLayout()
+        dl_workers_label = QLabel("Parallel download workers:")
+        dl_workers_label.setToolTip(
+            "Number of files downloaded simultaneously.\n"
+            "Higher values saturate your bandwidth faster,\n"
+            "reducing total download time for multi-file packages.\n\n"
+            "Recommended: 4 (default), 2 (slow connection), 8 (fast connection)"
+        )
+        dl_workers_layout.addWidget(dl_workers_label)
+
+        self.max_download_workers_spin = ModernSpinBox()
+        self.max_download_workers_spin.setFocusPolicy(Qt.StrongFocus)
+        self.max_download_workers_spin.setRange(1, 8)
+        dl_workers_value = 4
+        try:
+            dl_workers_value = int(self.cfg.scenery.max_download_workers)
+        except (AttributeError, ValueError):
+            pass
+        self.max_download_workers_spin.setValue(dl_workers_value)
+        self.max_download_workers_spin.setObjectName('max_download_workers')
+        self.max_download_workers_spin.setToolTip(
+            "Number of files downloaded simultaneously.\n"
+            "Recommended: 4 (default), 2 (slow connection), 8 (fast connection)"
+        )
+        dl_workers_layout.addWidget(self.max_download_workers_spin)
+        dl_workers_layout.addStretch()
+        scenery_layout.addLayout(dl_workers_layout)
+
         layout.addWidget(scenery_group)
 
         # Scenery Tab Seasons Settings group
@@ -1834,9 +2219,9 @@ class ConfigUI(QMainWindow):
         self.clean_jpegs_btn = StyledButton("Clean JPEG Files")
         self.clean_jpegs_btn.clicked.connect(self.on_clean_jpegs)
         self.clean_jpegs_btn.setToolTip(
-            "Delete only legacy JPEG files from the cache.\n"
-            "Bundle files (.aob2) are not affected.\n"
-            "Use this to free up space from old cache format."
+            "Delete only JPEG files from the cache.\n"
+            "DDS cache files are not affected.\n"
+            "Use this to free up space from source images."
         )
         cache_buttons_layout.addWidget(self.clean_jpegs_btn)
         self.delete_cache_btn = StyledButton("Delete Cache")
@@ -3095,15 +3480,16 @@ class ConfigUI(QMainWindow):
 
         self.settings_layout.addWidget(flightdata_group)
 
-        # Time Exclusion Settings group
-        time_exclusion_group = QGroupBox("Time Exclusion Settings")
+        # Night Exclusion Settings group (sun-position based)
+        time_exclusion_group = QGroupBox("Night Exclusion (Sun Position)")
         time_exclusion_layout = QVBoxLayout()
         time_exclusion_group.setLayout(time_exclusion_layout)
 
         # Info label
         time_exclusion_info = QLabel(
-            "Configure a time range during which AutoOrtho scenery will be disabled.\n"
-            "X-Plane will use default scenery during this time (e.g., for night flying)."
+            "Automatically disable orthophoto scenery at night based on the sun's\n"
+            "position. X-Plane will use default scenery with night lighting instead.\n"
+            "Works accurately across seasons, latitudes, and with time acceleration."
         )
         time_exclusion_info.setStyleSheet("color: #888; font-size: 11px;")
         time_exclusion_info.setWordWrap(True)
@@ -3112,81 +3498,92 @@ class ConfigUI(QMainWindow):
         time_exclusion_layout.addSpacing(5)
 
         # Enable checkbox
-        self.time_exclusion_enabled_check = QCheckBox("Enable time-based exclusion")
+        self.time_exclusion_enabled_check = QCheckBox("Enable night exclusion")
         time_exclusion_enabled = getattr(self.cfg.time_exclusion, 'enabled', False)
         self.time_exclusion_enabled_check.setChecked(time_exclusion_enabled)
         self.time_exclusion_enabled_check.setObjectName('time_exclusion_enabled')
         self.time_exclusion_enabled_check.setToolTip(
-            "When enabled, AutoOrtho scenery will be hidden from X-Plane\n"
-            "during the specified time range (based on simulator local time).\n"
-            "X-Plane will fall back to default scenery during this period.\n"
-            "Useful for night flying when satellite imagery is less useful."
+            "When enabled, AutoOrtho scenery will be automatically disabled at night\n"
+            "based on the sun's elevation angle (sun_pitch_degrees dataref).\n"
+            "X-Plane will fall back to default scenery with night lighting.\n"
+            "Hysteresis prevents rapid toggling during twilight transitions."
         )
         self.time_exclusion_enabled_check.toggled.connect(self._on_time_exclusion_toggled)
         time_exclusion_layout.addWidget(self.time_exclusion_enabled_check)
 
-        # Time range inputs
-        time_range_layout = QHBoxLayout()
-        
-        # Start time
-        start_time_label = QLabel("Start time:")
-        start_time_label.setToolTip("Start of exclusion period (24-hour format HH:MM)")
-        time_range_layout.addWidget(start_time_label)
-        
-        self.time_exclusion_start_edit = QLineEdit(
-            str(getattr(self.cfg.time_exclusion, 'start_time', '22:00'))
-        )
-        self.time_exclusion_start_edit.setObjectName('time_exclusion_start_time')
-        self.time_exclusion_start_edit.setMaximumWidth(80)
-        self.time_exclusion_start_edit.setPlaceholderText("HH:MM")
-        self.time_exclusion_start_edit.setToolTip(
-            "Start time for exclusion in 24-hour format (e.g., 22:00 for 10 PM)"
-        )
-        time_range_layout.addWidget(self.time_exclusion_start_edit)
-        
-        time_range_layout.addSpacing(20)
-        
-        # End time
-        end_time_label = QLabel("End time:")
-        end_time_label.setToolTip("End of exclusion period (24-hour format HH:MM)")
-        time_range_layout.addWidget(end_time_label)
-        
-        self.time_exclusion_end_edit = QLineEdit(
-            str(getattr(self.cfg.time_exclusion, 'end_time', '06:00'))
-        )
-        self.time_exclusion_end_edit.setObjectName('time_exclusion_end_time')
-        self.time_exclusion_end_edit.setMaximumWidth(80)
-        self.time_exclusion_end_edit.setPlaceholderText("HH:MM")
-        self.time_exclusion_end_edit.setToolTip(
-            "End time for exclusion in 24-hour format (e.g., 06:00 for 6 AM)"
-        )
-        time_range_layout.addWidget(self.time_exclusion_end_edit)
-        
-        time_range_layout.addStretch()
-        time_exclusion_layout.addLayout(time_range_layout)
-
-        # Example label
-        time_example_label = QLabel(
-            "Example: 22:00 to 06:00 hides AutoOrtho during night hours"
-        )
-        time_example_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
-        time_exclusion_layout.addWidget(time_example_label)
-
         time_exclusion_layout.addSpacing(5)
 
         # Default to exclusion checkbox
-        self.time_exclusion_default_check = QCheckBox("Start Flight with AutoOrtho Exclusion")
+        self.time_exclusion_default_check = QCheckBox("Start flight with exclusion active")
         default_to_exclusion = getattr(self.cfg.time_exclusion, 'default_to_exclusion', False)
         self.time_exclusion_default_check.setChecked(default_to_exclusion)
         self.time_exclusion_default_check.setObjectName('time_exclusion_default')
         self.time_exclusion_default_check.setToolTip(
             "When enabled, AutoOrtho will start with exclusion active until X-Plane starts\n"
-            "sending sim time data. This ensures night flights start with default scenery from the very beginning. Useful for night flights.\n\n"
-            "When disabled, AutoOrtho will start with normal operation until X-Plane starts sending sim time data."
+            "sending sun position data. This ensures night flights start with default scenery.\n\n"
+            "When disabled, AutoOrtho works normally until sun data confirms exclusion."
         )
         time_exclusion_layout.addWidget(self.time_exclusion_default_check)
 
-        # Set initial enabled state for time inputs
+        time_exclusion_layout.addSpacing(5)
+
+        # Sun threshold inputs
+        sun_threshold_widget = QWidget()
+        sun_threshold_layout = QHBoxLayout(sun_threshold_widget)
+        sun_threshold_layout.setContentsMargins(0, 0, 0, 0)
+
+        night_threshold_label = QLabel("Night threshold:")
+        sun_threshold_layout.addWidget(night_threshold_label)
+
+        self.sun_night_threshold_spin = QDoubleSpinBox()
+        self.sun_night_threshold_spin.setRange(-18.0, 0.0)
+        self.sun_night_threshold_spin.setSingleStep(1.0)
+        self.sun_night_threshold_spin.setSuffix("°")
+        self.sun_night_threshold_spin.setValue(
+            getattr(self.cfg.time_exclusion, 'sun_night_threshold', -12.0)
+        )
+        self.sun_night_threshold_spin.setObjectName('time_exclusion_sun_night')
+        self.sun_night_threshold_spin.setToolTip(
+            "Sun elevation angle to switch to night mode (exclusion active).\n"
+            "-6° = civil twilight, -12° = nautical twilight, -18° = astronomical twilight"
+        )
+        self.sun_night_threshold_spin.setMaximumWidth(80)
+        sun_threshold_layout.addWidget(self.sun_night_threshold_spin)
+
+        sun_threshold_layout.addSpacing(20)
+
+        day_threshold_label = QLabel("Day threshold:")
+        sun_threshold_layout.addWidget(day_threshold_label)
+
+        self.sun_day_threshold_spin = QDoubleSpinBox()
+        self.sun_day_threshold_spin.setRange(-18.0, 0.0)
+        self.sun_day_threshold_spin.setSingleStep(1.0)
+        self.sun_day_threshold_spin.setSuffix("°")
+        self.sun_day_threshold_spin.setValue(
+            getattr(self.cfg.time_exclusion, 'sun_day_threshold', -10.0)
+        )
+        self.sun_day_threshold_spin.setObjectName('time_exclusion_sun_day')
+        self.sun_day_threshold_spin.setToolTip(
+            "Sun elevation angle to switch to day mode (ortho enabled).\n"
+            "Should be higher than night threshold to provide hysteresis\n"
+            "and prevent rapid toggling during twilight."
+        )
+        self.sun_day_threshold_spin.setMaximumWidth(80)
+        sun_threshold_layout.addWidget(self.sun_day_threshold_spin)
+
+        sun_threshold_layout.addStretch()
+        time_exclusion_layout.addWidget(sun_threshold_widget)
+
+        # Sun position info label
+        sun_info_label = QLabel(
+            "Nautical twilight (-12°) is when artificial lights dominate the landscape.\n"
+            "The 2° gap between thresholds provides hysteresis to prevent flickering."
+        )
+        sun_info_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+        sun_info_label.setWordWrap(True)
+        time_exclusion_layout.addWidget(sun_info_label)
+
+        # Set initial enabled state for controls
         self._set_time_exclusion_controls_enabled(time_exclusion_enabled)
 
         self.settings_layout.addWidget(time_exclusion_group)
@@ -3273,7 +3670,7 @@ class ConfigUI(QMainWindow):
             pass
 
     def _on_time_exclusion_toggled(self):
-        """Handle time exclusion checkbox toggle."""
+        """Handle night exclusion checkbox toggle."""
         try:
             enabled = self.time_exclusion_enabled_check.isChecked()
             self._set_time_exclusion_controls_enabled(enabled)
@@ -3281,14 +3678,14 @@ class ConfigUI(QMainWindow):
             pass
 
     def _set_time_exclusion_controls_enabled(self, enabled):
-        """Enable/disable time exclusion time input fields."""
+        """Enable/disable night exclusion controls."""
         try:
-            if hasattr(self, 'time_exclusion_start_edit'):
-                self.time_exclusion_start_edit.setEnabled(enabled)
-            if hasattr(self, 'time_exclusion_end_edit'):
-                self.time_exclusion_end_edit.setEnabled(enabled)
             if hasattr(self, 'time_exclusion_default_check'):
                 self.time_exclusion_default_check.setEnabled(enabled)
+            if hasattr(self, 'sun_night_threshold_spin'):
+                self.sun_night_threshold_spin.setEnabled(enabled)
+            if hasattr(self, 'sun_day_threshold_spin'):
+                self.sun_day_threshold_spin.setEnabled(enabled)
         except Exception:
             pass
 
@@ -3409,84 +3806,63 @@ class ConfigUI(QMainWindow):
                     )
                 )
                 seasons_apply_status = latest.seasons_apply_status
-                if seasons_apply_status == downloader.SeasonsApplyStatus.NOT_APPLIED:
-                    status_btn_text = "Add Native Seasons"
-                    status_btn_color = "#2d78ba"
-                elif seasons_apply_status == downloader.SeasonsApplyStatus.PARTIALLY_APPLIED:
-                    status_btn_text = "Partially Added Seasons"
-                    status_btn_color = "#db7100"
-                elif seasons_apply_status == downloader.SeasonsApplyStatus.APPLIED:
-                    status_btn_text = "Seasons Added"
-                    status_btn_color = "#4CAF50"
-                else:
-                    status_btn_text = "Add Native Seasons"
-                    status_btn_color = "#2d78ba"
+                roughness_apply_status = getattr(latest, 'roughness_apply_status', downloader.RoughnessApplyStatus.NOT_APPLIED)
+                roughness_value = getattr(latest, 'roughness_value', None)
 
                 package_name = os.path.basename(latest.subfolder_dir)
                 if package_name not in self.installed_package_names:
                     self.installed_package_names.append(package_name)
 
-                # Status button (clickable when seasons not yet applied)
-                seasons_status_btn = StyledButton(status_btn_text, primary=False)
-                seasons_status_btn.setFixedSize(200,35)
-                seasons_status_btn.setStyleSheet(
-                    f"""
-                    background-color: {status_btn_color};
-                    font-size: 16px;
+                # Create the scenery patches status widget
+                patches_widget = SceneryPatchesWidget(
+                    parent=self,
+                    seasons_status=seasons_apply_status,
+                    roughness_status=roughness_apply_status,
+                    roughness_value=roughness_value
+                )
+                patches_widget.setObjectName(f"patches-widget-{package_name}")
+
+                # Scenery Options button - unified menu for all patch options
+                scenery_options_btn = StyledButton("Scenery Options", primary=False)
+                scenery_options_btn.setFixedSize(150, 35)
+                scenery_options_btn.setStyleSheet(
+                    """
+                    background-color: #2d78ba;
+                    font-size: 14px;
                     font-weight: bold;
                     text-align: center;
                     line-height: 30px;
                     """
                 )
-                if seasons_apply_status == downloader.SeasonsApplyStatus.NOT_APPLIED:
-                    seasons_status_btn.setEnabled(True)
-                    seasons_status_btn.setObjectName(f"seasons-options-{package_name}")
-                    seasons_status_btn.clicked.connect(
-                        lambda checked, rid=package_name, st=seasons_apply_status: (
-                            self.on_add_seasons(rid, st)
-                        )
+                scenery_options_btn.setObjectName(f"scenery-options-{package_name}")
+                scenery_options_btn.clicked.connect(
+                    lambda checked, rid=package_name, ss=seasons_apply_status, rs=roughness_apply_status, rv=roughness_value: (
+                        self.on_scenery_options_clicked(rid, ss, rs, rv)
                     )
-                else:
-                    seasons_status_btn.setEnabled(False)
-                    seasons_status_btn.setObjectName(f"seasons-status-{package_name}")
+                )
 
-                # Seasons Options button (menu) - only when seasons are partially or fully added
-                seasons_options_btn = None
-                if seasons_apply_status in (
-                    downloader.SeasonsApplyStatus.PARTIALLY_APPLIED,
-                    downloader.SeasonsApplyStatus.APPLIED,
-                ):
-                    seasons_options_btn = StyledButton("Seasons Options", primary=False)
-                    seasons_options_btn.setFixedSize(200,35)
-                    seasons_options_btn.setStyleSheet(
-                        """
-                        background-color: #2d78ba;
-                        font-size: 16px;
-                        font-weight: bold;
-                        text-align: center;
-                        line-height: 30px;
-                        """
-                    )
-                    seasons_options_btn.setObjectName(f"seasons-options-{package_name}")
-                    seasons_options_btn.clicked.connect(
-                        lambda checked, rid=package_name: (
-                            self.on_seasons_options_clicked(rid)
-                        )
-                    )
                 h_layout = QHBoxLayout()
-                h_layout.addWidget(seasons_status_btn)
-                if seasons_options_btn:
-                    h_layout.addWidget(seasons_options_btn)
-                h_layout.addWidget(delete_btn)
+                h_layout.setSpacing(10)
+                h_layout.addWidget(patches_widget, 1)
+                buttons_col = QVBoxLayout()
+                buttons_col.addStretch()
+                buttons_row = QHBoxLayout()
+                buttons_row.setSpacing(10)
+                buttons_row.addWidget(scenery_options_btn)
+                buttons_row.addWidget(delete_btn)
+                buttons_col.addLayout(buttons_row)
+                buttons_col.addStretch()
+                h_layout.addLayout(buttons_col)
 
-                dsf_progress_bar = QProgressBar()
-                dsf_progress_bar.setVisible(False)
-                dsf_progress_bar.setObjectName(f"dsf-progress-bar-{package_name}")
-                dsf_progress_bar.setToolTip("Progress of adding seasons to DSFs")
-                dsf_progress_bar.setRange(0, 100)
+                # Progress bar for patching operations (shared between seasons and roughness)
+                patch_progress_bar = QProgressBar()
+                patch_progress_bar.setVisible(False)
+                patch_progress_bar.setObjectName(f"dsf-progress-bar-{package_name}")
+                patch_progress_bar.setToolTip("Progress of patching operations")
+                patch_progress_bar.setRange(0, 100)
 
                 item_layout.addLayout(h_layout)
-                item_layout.addWidget(dsf_progress_bar)
+                item_layout.addWidget(patch_progress_bar)
 
 
             self.scenery_layout.addWidget(item_frame)
@@ -3495,8 +3871,8 @@ class ConfigUI(QMainWindow):
 
     def on_restore_default_dsfs(self, region_id):
         """Handle restoring default DSFs"""
-        # Button now is seasons-options, disable it while working
-        button = self.findChild(QPushButton, f"seasons-options-{region_id}")
+        # Button now is scenery-options, disable it while working
+        button = self.findChild(QPushButton, f"scenery-options-{region_id}")
         if button:
             button.setEnabled(False)
             button.setText("Working...")
@@ -3522,10 +3898,10 @@ class ConfigUI(QMainWindow):
 
     def on_restore_default_dsfs_finished(self, region_id, success):
         """Handle restore default DSFs completion"""
-        button = self.findChild(QPushButton, f"seasons-options-{region_id}")
+        button = self.findChild(QPushButton, f"scenery-options-{region_id}")
         if button:
             button.setEnabled(True)
-            button.setText("Seasons Options")
+            button.setText("Scenery Options")
         dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if dsf_progress_bar:
             dsf_progress_bar.setVisible(False)
@@ -3545,8 +3921,282 @@ class ConfigUI(QMainWindow):
         if dsf_progress_bar:
             dsf_progress_bar.setValue(progress_data["pcnt_done"])
 
+    def on_scenery_options_clicked(self, region_id, seasons_status, roughness_status, roughness_value):
+        """Show unified Scenery Options menu with Seasons and SUPER_ROUGHNESS options"""
+        if getattr(self, 'running', False):
+            QMessageBox.warning(
+                self,
+                "Operation Not Allowed While Running",
+                "Cannot modify scenery patches while AutoOrtho is running. Please stop AutoOrtho first."
+            )
+            return
+
+        # Build a styled, informative menu
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            """
+            QMenu {
+                background-color: #2A2A2A;
+                border: 1px solid #3A3A3A;
+                padding: 6px;
+            }
+            QMenu::item {
+                color: #E0E0E0;
+                padding: 8px 14px;
+                background-color: transparent;
+            }
+            QMenu::icon {
+                padding-left: 6px;
+            }
+            QMenu::item:selected {
+                background-color: #3A3A3A;
+                color: #ffffff;
+            }
+            QMenu::item:disabled {
+                color: #666;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #3A3A3A;
+                margin: 6px 8px;
+            }
+            """
+        )
+
+        # Use standard icons
+        style = self.style()
+        icon_add = style.standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+        icon_repair = style.standardIcon(QStyle.StandardPixmap.SP_DialogResetButton)
+        icon_reapply = style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
+        icon_restore = style.standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
+        icon_edit = style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView)
+
+        # === SEASONS SECTION ===
+        seasons_header = menu.addAction("SEASONS")
+        seasons_header.setEnabled(False)
+        seasons_header_font = seasons_header.font()
+        seasons_header_font.setBold(True)
+        seasons_header.setFont(seasons_header_font)
+
+        # Add Seasons - only if not applied
+        add_seasons_action = None
+        if seasons_status == downloader.SeasonsApplyStatus.NOT_APPLIED:
+            add_seasons_action = menu.addAction(icon_add, "Add Native Seasons")
+
+        # Repair - only if partially applied
+        repair_seasons_action = None
+        if seasons_status == downloader.SeasonsApplyStatus.PARTIALLY_APPLIED:
+            repair_seasons_action = menu.addAction(icon_repair, "Repair Seasons")
+
+        # Reapply and Restore - only if applied or partially applied
+        reapply_seasons_action = None
+        restore_seasons_action = None
+        if seasons_status in (downloader.SeasonsApplyStatus.PARTIALLY_APPLIED, downloader.SeasonsApplyStatus.APPLIED):
+            reapply_seasons_action = menu.addAction(icon_reapply, "Reapply Seasons")
+            restore_seasons_action = menu.addAction(icon_restore, "Restore Default DSFs")
+
+        menu.addSeparator()
+
+        # === SUPER_ROUGHNESS SECTION ===
+        roughness_header = menu.addAction("TERRAIN (SUPER_ROUGHNESS)")
+        roughness_header.setEnabled(False)
+        roughness_header_font = roughness_header.font()
+        roughness_header_font.setBold(True)
+        roughness_header.setFont(roughness_header_font)
+
+        # Apply SUPER_ROUGHNESS - only if not applied
+        apply_roughness_action = None
+        if roughness_status == downloader.RoughnessApplyStatus.NOT_APPLIED:
+            apply_roughness_action = menu.addAction(icon_add, "Apply SUPER_ROUGHNESS...")
+
+        # Change Value - only if applied or partially applied
+        change_roughness_action = None
+        remove_roughness_action = None
+        if roughness_status in (downloader.RoughnessApplyStatus.PARTIALLY_APPLIED, downloader.RoughnessApplyStatus.APPLIED):
+            current_val_text = f" (current: {roughness_value:.1f})" if roughness_value is not None else ""
+            change_roughness_action = menu.addAction(icon_edit, f"Change SUPER_ROUGHNESS Value{current_val_text}")
+            remove_roughness_action = menu.addAction(icon_restore, "Remove SUPER_ROUGHNESS")
+
+        # Repair roughness - only if partially applied
+        repair_roughness_action = None
+        if roughness_status == downloader.RoughnessApplyStatus.PARTIALLY_APPLIED:
+            repair_roughness_action = menu.addAction(icon_repair, "Repair SUPER_ROUGHNESS")
+
+        # Position menu anchored to the triggering button, falling back to cursor
+        btn = self.findChild(QPushButton, f"scenery-options-{region_id}")
+        global_pos = QCursor.pos() if btn is None else btn.mapToGlobal(QPoint(0, btn.height()))
+        chosen = menu.exec(global_pos)
+        if not chosen:
+            return
+
+        # Handle chosen action
+        if chosen == add_seasons_action:
+            self.on_add_seasons(region_id, seasons_status)
+        elif chosen == repair_seasons_action:
+            self._start_add_seasons_job(region_id)
+        elif chosen == reapply_seasons_action:
+            msg = (
+                "Reapply will first restore all DSFs to defaults (removing seasons), "
+                "and then re-apply Native Seasons.\n\nProceed?"
+            )
+            reply = QMessageBox.question(
+                self, "Confirm Reapply", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.reapply_after_restore.add(region_id)
+                self.on_restore_default_dsfs(region_id)
+        elif chosen == restore_seasons_action:
+            msg = "Restore will revert all DSFs to their original state and remove Native Seasons.\n\nProceed?"
+            reply = QMessageBox.question(
+                self, "Confirm Restore", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.on_restore_default_dsfs(region_id)
+        elif chosen == apply_roughness_action:
+            self._show_roughness_dialog(region_id, is_update=False, current_value=1.0)
+        elif chosen == change_roughness_action:
+            current = roughness_value if roughness_value is not None else 1.0
+            self._show_roughness_dialog(region_id, is_update=True, current_value=current)
+        elif chosen == remove_roughness_action:
+            msg = "This will remove SUPER_ROUGHNESS from all .ter files.\n\nProceed?"
+            reply = QMessageBox.question(
+                self, "Confirm Remove", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._start_remove_roughness_job(region_id)
+        elif chosen == repair_roughness_action:
+            # Re-apply with same value to fix partial application
+            current = roughness_value if roughness_value is not None else 1.0
+            self._start_add_roughness_job(region_id, current)
+
+    def _show_roughness_dialog(self, region_id, is_update=False, current_value=1.0):
+        """Show the SUPER_ROUGHNESS value selection dialog."""
+        dialog = RoughnessValueDialog(self, current_value=current_value, is_update=is_update)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            value = dialog.get_value()
+            self._start_add_roughness_job(region_id, value)
+
+    def _start_add_roughness_job(self, region_id, roughness_value):
+        """Start the SUPER_ROUGHNESS patching job."""
+        button = self.findChild(QPushButton, f"scenery-options-{region_id}")
+        if button:
+            button.setEnabled(False)
+            button.setText("Scanning...")
+
+        progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if progress_bar:
+            progress_bar.setVisible(True)
+            progress_bar.setRange(0, 0)  # indeterminate while scanning
+            progress_bar.setFormat("Scanning for .ter files...")
+
+        # Create worker thread
+        worker = AddRoughnessWorker(region_id, self.cfg.paths.scenery_path, roughness_value)
+        worker.progress.connect(self.on_add_roughness_progress)
+        worker.finished.connect(self.on_add_roughness_finished)
+        worker.error.connect(self.on_add_roughness_error)
+        worker.setParent(self)
+        
+        # Store worker reference
+        if not hasattr(self, 'add_roughness_workers'):
+            self.add_roughness_workers = {}
+        self.add_roughness_workers[region_id] = worker
+        worker.start()
+        self._update_run_button_for_seasons_state()
+
+    def _start_remove_roughness_job(self, region_id):
+        """Start the SUPER_ROUGHNESS removal job."""
+        button = self.findChild(QPushButton, f"scenery-options-{region_id}")
+        if button:
+            button.setEnabled(False)
+            button.setText("Removing...")
+
+        progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if progress_bar:
+            progress_bar.setVisible(True)
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(0)
+
+        # Create worker thread
+        worker = RestoreRoughnessWorker(region_id, self.cfg.paths.scenery_path)
+        worker.progress.connect(self.on_add_roughness_progress)
+        worker.finished.connect(self.on_add_roughness_finished)
+        worker.error.connect(self.on_add_roughness_error)
+        worker.setParent(self)
+        
+        # Store worker reference
+        if not hasattr(self, 'restore_roughness_workers'):
+            self.restore_roughness_workers = {}
+        self.restore_roughness_workers[region_id] = worker
+        worker.start()
+        self._update_run_button_for_seasons_state()
+
+    def on_add_roughness_progress(self, region_id, progress_data):
+        """Update SUPER_ROUGHNESS patching progress."""
+        progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if not progress_bar:
+            return
+
+        stage = progress_data.get("stage")
+        if stage == "scanning":
+            # Show indeterminate progress while scanning for .ter files
+            progress_bar.setVisible(True)
+            progress_bar.setRange(0, 0)  # indeterminate / "busy" animation
+            progress_bar.setFormat("Scanning for .ter files...")
+            return
+
+        if "pcnt_done" in progress_data:
+            # Switch back to determinate mode once patching starts
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(progress_data["pcnt_done"])
+            files_done = progress_data.get('files_done')
+            files_total = progress_data.get('files_total')
+            if files_done is not None and files_total:
+                progress_bar.setFormat(f"{files_done}/{files_total}")
+            else:
+                progress_bar.setFormat("%p%")
+            # Update button text from "Scanning..." to "Patching..."
+            button = self.findChild(QPushButton, f"scenery-options-{region_id}")
+            if button and button.text() == "Scanning...":
+                button.setText("Patching...")
+
+    def on_add_roughness_finished(self, region_id, success):
+        """Handle SUPER_ROUGHNESS patching completion."""
+        button = self.findChild(QPushButton, f"scenery-options-{region_id}")
+        if button:
+            button.setEnabled(True)
+            button.setText("Scenery Options")
+
+        progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
+        if progress_bar:
+            progress_bar.setVisible(False)
+
+        # Clean up worker references
+        if hasattr(self, 'add_roughness_workers') and region_id in self.add_roughness_workers:
+            del self.add_roughness_workers[region_id]
+        if hasattr(self, 'restore_roughness_workers') and region_id in self.restore_roughness_workers:
+            del self.restore_roughness_workers[region_id]
+
+        self._update_run_button_for_seasons_state()
+        self.refresh_scenery_list()
+
+        if success:
+            log.info(f"SUPER_ROUGHNESS operation completed for {region_id}")
+        else:
+            log.error(f"SUPER_ROUGHNESS operation failed for {region_id}")
+
+    def on_add_roughness_error(self, region_id, error_msg):
+        """Handle SUPER_ROUGHNESS patching error."""
+        self.show_error.emit(f"Failed SUPER_ROUGHNESS operation on {region_id}:\n{error_msg}")
+        self.on_add_roughness_finished(region_id, False)
+
     def on_seasons_options_clicked(self, region_id):
-        """Show Seasons Options menu with Repair, Reapply, Restore"""
+        """Show Seasons Options menu with Repair, Reapply, Restore (legacy - kept for compatibility)"""
         if getattr(self, 'running', False):
             QMessageBox.warning(
                 self,
@@ -4366,7 +5016,7 @@ class ConfigUI(QMainWindow):
         # Disable Add Seasons buttons while running
         try:
             for rid in self.installed_packages:
-                btn = self.findChild(QPushButton, f"seasons-options-{rid}")
+                btn = self.findChild(QPushButton, f"scenery-options-{rid}")
                 if btn:
                     btn.setEnabled(False)
                     btn.setToolTip("Disabled while AutoOrtho is running")
@@ -4588,8 +5238,8 @@ class ConfigUI(QMainWindow):
             )
             return
 
-        # Button no longer exists directly; use seasons-options for state changes
-        button = self.findChild(QPushButton, f"seasons-options-{region_id}")
+        # Button no longer exists directly; use scenery-options for state changes
+        button = self.findChild(QPushButton, f"scenery-options-{region_id}")
         if button is None:
             return
 
@@ -4621,17 +5271,17 @@ class ConfigUI(QMainWindow):
 
     def on_add_seasons_finished(self, region_id, success):
         """Handle add seasons completion"""
-        button = self.findChild(QPushButton, f"seasons-options-{region_id}")
+        button = self.findChild(QPushButton, f"scenery-options-{region_id}")
         if button:
             button.setEnabled(not self.running)
             button.setText("Seasons Options")
 
         if success:
             self.update_status_bar(f"Successfully added seasons to {region_id}")
-            button.setText("Native Seasons Added")
+            button.setText("Scenery Options")
         else:
             self.update_status_bar(f"Failed to add seasons to {region_id}")
-            button.setText("Add Native Seasons")
+            button.setText("Scenery Options")
 
         dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if dsf_progress_bar:
@@ -4659,16 +5309,17 @@ class ConfigUI(QMainWindow):
             return False
 
     def _update_run_button_for_seasons_state(self):
-        """Disable Run while seasons jobs are active; re-enable otherwise when not running"""
+        """Disable Run while seasons/roughness jobs are active; re-enable otherwise when not running"""
         try:
-            if self._has_active_seasons_jobs():
+            has_active_jobs = self._has_active_seasons_jobs() or self._has_active_roughness_jobs()
+            if has_active_jobs:
                 if hasattr(self, 'run_button'):
                     self.run_button.setEnabled(False)
-                    self.run_button.setToolTip("Disabled: Native Seasons are being added")
-                # Also disable Seasons Options buttons
+                    self.run_button.setToolTip("Disabled: Scenery patches are being applied")
+                # Also disable Scenery Options buttons
                 try:
                     for rid in getattr(self, 'installed_package_names', []):
-                        btn = self.findChild(QPushButton, f"seasons-options-{rid}")
+                        btn = self.findChild(QPushButton, f"scenery-options-{rid}")
                         if btn:
                             btn.setEnabled(False)
                 except Exception:
@@ -4681,10 +5332,10 @@ class ConfigUI(QMainWindow):
                         self.run_button.setText("Run")
                     except Exception:
                         pass
-                # Re-enable Seasons Options buttons when idle
+                # Re-enable Scenery Options buttons when idle
                 try:
                     for rid in getattr(self, 'installed_package_names', []):
-                        btn = self.findChild(QPushButton, f"seasons-options-{rid}")
+                        btn = self.findChild(QPushButton, f"scenery-options-{rid}")
                         if btn:
                             btn.setEnabled(True)
                 except Exception:
@@ -4692,10 +5343,21 @@ class ConfigUI(QMainWindow):
         except Exception:
             pass
 
+    def _has_active_roughness_jobs(self):
+        """Check if there are any active roughness patching jobs."""
+        try:
+            if hasattr(self, 'add_roughness_workers') and self.add_roughness_workers:
+                return True
+            if hasattr(self, 'restore_roughness_workers') and self.restore_roughness_workers:
+                return True
+        except Exception:
+            pass
+        return False
+
     def _start_add_seasons_job(self, region_id):
         """Internal helper to begin processing a single add-seasons job for region_id."""
         try:
-            button = self.findChild(QPushButton, f"seasons-options-{region_id}")
+            button = self.findChild(QPushButton, f"scenery-options-{region_id}")
             if button:
                 button.setEnabled(False)
                 button.setText("Adding seasons...")
@@ -4728,10 +5390,10 @@ class ConfigUI(QMainWindow):
                 # Start next job and update its button
                 self._start_add_seasons_job(next_region_id)
             else:
-                # If nothing pending, re-enable all seasons options buttons
+                # If nothing pending, re-enable all scenery options buttons
                 if not self._has_active_seasons_jobs():
                     for rid in self.installed_packages:
-                        btn = self.findChild(QPushButton, f"seasons-options-{rid}")
+                        btn = self.findChild(QPushButton, f"scenery-options-{rid}")
                         if btn:
                             btn.setEnabled(True)
         except Exception:
@@ -4766,12 +5428,12 @@ class ConfigUI(QMainWindow):
                 for rid in self.installed_packages:
                     if rid == self.add_seasons_current:
                         continue
-                    btn = self.findChild(QPushButton, f"seasons-options-{rid}")
+                    btn = self.findChild(QPushButton, f"scenery-options-{rid}")
                     if not btn:
                         continue
                     if rid in self.add_seasons_queue:
                         btn.setEnabled(False)
-                        btn.setText("Queued for seasons…")
+                        btn.setText("Queued for seasons...")
                     else:
                         # If not queued and not current, ensure enabled state only if nothing running
                         if not self._has_active_seasons_jobs():
@@ -5048,6 +5710,7 @@ class ConfigUI(QMainWindow):
             # Scenery settings
             self.cfg.scenery.noclean = self.noclean_check.isChecked()
             self.dl.noclean = self.cfg.scenery.noclean
+            self.cfg.scenery.max_download_workers = self.max_download_workers_spin.value()
 
             # FUSE settings
             self.cfg.fuse.threading = self.threading_check.isChecked()
@@ -5069,15 +5732,15 @@ class ConfigUI(QMainWindow):
             self.cfg.seasons.fal_saturation = str(self.fal_sat_slider.value())
             self.cfg.seasons.win_saturation = str(self.win_sat_slider.value())
 
-            # Time exclusion settings
+            # Night exclusion settings (sun-position based)
             if hasattr(self, 'time_exclusion_enabled_check'):
                 self.cfg.time_exclusion.enabled = self.time_exclusion_enabled_check.isChecked()
-            if hasattr(self, 'time_exclusion_start_edit'):
-                self.cfg.time_exclusion.start_time = self.time_exclusion_start_edit.text()
-            if hasattr(self, 'time_exclusion_end_edit'):
-                self.cfg.time_exclusion.end_time = self.time_exclusion_end_edit.text()
             if hasattr(self, 'time_exclusion_default_check'):
                 self.cfg.time_exclusion.default_to_exclusion = self.time_exclusion_default_check.isChecked()
+            if hasattr(self, 'sun_night_threshold_spin'):
+                self.cfg.time_exclusion.sun_night_threshold = self.sun_night_threshold_spin.value()
+            if hasattr(self, 'sun_day_threshold_spin'):
+                self.cfg.time_exclusion.sun_day_threshold = self.sun_day_threshold_spin.value()
 
         # SimBrief settings
         if hasattr(self.cfg, 'simbrief'):
@@ -5384,86 +6047,58 @@ class ConfigUI(QMainWindow):
             sys.exit(1)
 
     def clean_cache(self, cache_dir, size_gb):
-        """Clean cache directory
-        
-        Steps:
-        1. Delete all JPEGs from cache folder (legacy files)
-        2. Apply size-based cleanup to bundles in their new locations
+        """Clean cache with 2-phase deletion order:
+        1. JPEGs (always delete all)
+        2. Dynamic DDS (LRU eviction if still over budget)
         """
         self.status_update.emit(
             f"Cleaning up cache_dir {cache_dir}. Please wait..."
         )
 
         try:
-            # Step 1: Always delete all legacy JPEGs from cache_dir root
+            target_bytes = size_gb * (1024 ** 3)
+
+            # --- Phase 1: JPEGs ---
             jpeg_count = 0
             for entry in os.scandir(cache_dir):
                 if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg')):
-                    os.remove(entry.path)
-                    jpeg_count += 1
-            if jpeg_count > 0:
-                self.status_update.emit(f"Deleted {jpeg_count} legacy JPEG files.")
+                    try:
+                        os.remove(entry.path)
+                        jpeg_count += 1
+                    except OSError:
+                        pass
+            self.status_update.emit(f"Phase 1: Deleted {jpeg_count} JPEG files.")
 
-            # Step 2: Handle bundles
-            bundles_dir = os.path.join(cache_dir, "bundles")
-
+            # --- Phase 2: DDS cache (LRU, only if still over target) ---
+            dds_root = os.path.join(cache_dir, "dds_cache")
             if size_gb == 0:
-                # Delete all bundles
-                if os.path.isdir(bundles_dir):
-                    shutil.rmtree(bundles_dir, ignore_errors=True)
-                    self.status_update.emit("Deleted all bundle files.")
+                if os.path.isdir(dds_root):
+                    shutil.rmtree(dds_root, ignore_errors=True)
+                    self.status_update.emit("Phase 2: Deleted all DDS cache files.")
             else:
-                # Size-based cleanup for bundles
-                target_bytes = pow(2, 30) * size_gb
-
-                # Find all bundle files
-                bundle_files = sorted(
-                    pathlib.Path(bundles_dir).glob('**/*.aob2'),
-                    key=os.path.getmtime
-                ) if os.path.isdir(bundles_dir) else []
-
-                if not bundle_files:
-                    self.status_update.emit("No bundles to clean.")
-                    self.status_update.emit("Cache cleanup done.")
-                    return
-
-                cache_bytes = sum(f.stat().st_size for f in bundle_files)
-                bundle_count = len(bundle_files)
-                avg_size = cache_bytes / bundle_count if bundle_count > 0 else 0
-
-                self.status_update.emit(
-                    f"Cache has {bundle_count} bundles. "
-                    f"Total size approx {cache_bytes // 1048576} MB."
-                )
-
-                # Remove empty bundles
-                empty_bundles = [f for f in bundle_files if f.stat().st_size == 0]
-                for f in empty_bundles:
-                    if f.exists():
-                        os.remove(f)
-                if empty_bundles:
-                    self.status_update.emit(f"Removed {len(empty_bundles)} empty bundles.")
-
-                if target_bytes >= cache_bytes:
-                    self.status_update.emit("Cache within size limits.")
-                    self.status_update.emit("Cache cleanup done.")
-                    return
-
-                to_delete = int((cache_bytes - target_bytes) // avg_size)
-                self.status_update.emit(
-                    f"Over cache size limit, will remove {to_delete} bundles."
-                )
-
-                for f in bundle_files[:to_delete]:
-                    if f.is_file():
-                        os.remove(f)
+                try:
+                    from autoortho.getortho import dynamic_dds_cache
+                except ImportError:
+                    dynamic_dds_cache = None
+                if dynamic_dds_cache is not None:
+                    usage = dynamic_dds_cache.get_disk_usage()
+                    remaining_budget = target_bytes
+                    if usage > remaining_budget:
+                        excess = usage - int(remaining_budget * 0.9)
+                        freed = dynamic_dds_cache.evict_lru(excess)
+                        self.status_update.emit(
+                            f"Phase 2: Evicted {freed // (1024*1024)} MB from DDS cache.")
+                    else:
+                        self.status_update.emit("Phase 2: DDS cache within budget.")
+                else:
+                    self.status_update.emit("Phase 2: DDS cache not initialized, skipping.")
 
             self.status_update.emit("Cache cleanup done.")
         except Exception as e:
             self.status_update.emit(f"Cache cleanup error: {str(e)}")
 
     def clean_jpegs_only(self, cache_dir):
-        """Clean only JPEG files from cache directory, leaving bundles untouched"""
+        """Clean only JPEG files from cache directory, leaving DDS cache untouched."""
         self.status_update.emit(
             f"Cleaning JPEG files from {cache_dir}. Please wait..."
         )

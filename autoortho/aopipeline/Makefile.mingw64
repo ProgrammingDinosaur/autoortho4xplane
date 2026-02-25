@@ -25,7 +25,7 @@ LDFLAGS     := -shared -static-libgcc -fopenmp
 LIBS        := -L$(JPGT)/lib -lturbojpeg
 
 # Source files (no HTTP - uses Python requests instead)
-SOURCES     := aocache.c aodecode.c aodds.c aobundle.c aobundle2.c aopipeline.c
+SOURCES     := aocache.c aodecode.c aodds.c aopipeline.c
 OBJECTS     := $(SOURCES:.c=.o)
 
 .PHONY: all clean phase1 phase2 phase3 libjpeg-turbo-gcc64
@@ -60,13 +60,7 @@ aodecode.o: aodecode.c aodecode.h aocache.h internal.h libjpeg-turbo-gcc64
 aodds.o: aodds.c aodds.h aodecode.h internal.h
 	$(CC) $(CFLAGS_DLL) -c aodds.c -o $@
 
-aobundle.o: aobundle.c aobundle.h aodds.h internal.h
-	$(CC) $(CFLAGS_DLL) -c aobundle.c -o $@
-
-aobundle2.o: aobundle2.c aobundle2.h aodds.h internal.h
-	$(CC) $(CFLAGS_DLL) -c aobundle2.c -o $@
-
-aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h aobundle.h aobundle2.h internal.h
+aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h internal.h
 	$(CC) $(CFLAGS_DLL) -c aopipeline.c -o $@
 
 # Full library

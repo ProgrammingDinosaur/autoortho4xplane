@@ -375,176 +375,6 @@ def get_pipeline_mode() -> str:
     return _pipeline_mode
 
 
-# ============================================================================
-# BUNDLE DDS BUILDING (Mode Dispatcher)
-# ============================================================================
-# Builds DDS from AOB2 bundle files using the appropriate pipeline mode.
-# ============================================================================
-
-def _build_tile_dds_from_bundle(
-    tile,
-    bundle_path: str,
-    target_zoom: int,
-    dxt_format: str = "BC1",
-    missing_color: Tuple[int, int, int] = (66, 77, 55),
-    chunks_per_side: int = 16
-) -> Optional[bytes]:
-    """
-    Build DDS from an AOB2 bundle file using the appropriate pipeline mode.
-    
-    This is the mode dispatcher that routes to native, hybrid, or pure Python
-    implementations based on current pipeline mode and availability.
-    
-    Args:
-        tile: Tile object (for metadata)
-        bundle_path: Path to AOB2 bundle file
-        target_zoom: Target zoom level
-        dxt_format: "BC1" or "BC3"
-        missing_color: RGB tuple for missing chunks
-        chunks_per_side: Chunks per side (typically 16)
-    
-    Returns:
-        DDS bytes if successful, None on failure
-    """
-    mode = get_pipeline_mode()
-    
-    # Try native mode (C reads bundle + builds DDS)
-    if mode == PIPELINE_MODE_NATIVE:
-        result = _build_dds_native_from_bundle(bundle_path, target_zoom, dxt_format, missing_color, chunks_per_side)
-        if result is not None:
-            return result
-        # Fall through to hybrid
-    
-    # Try hybrid mode (Python reads bundle, C decodes + compresses)
-    if mode in (PIPELINE_MODE_NATIVE, PIPELINE_MODE_HYBRID):
-        result = _build_dds_hybrid_from_bundle(bundle_path, target_zoom, dxt_format, missing_color, chunks_per_side)
-        if result is not None:
-            return result
-        # Fall through to pure Python
-    
-    # Pure Python mode
-    return _build_dds_python_from_bundle(bundle_path, target_zoom, dxt_format, missing_color, chunks_per_side)
-
-
-def _build_dds_native_from_bundle(
-    bundle_path: str,
-    target_zoom: int,
-    dxt_format: str,
-    missing_color: Tuple[int, int, int],
-    chunks_per_side: int
-) -> Optional[bytes]:
-    """Build DDS using native C code for bundle I/O and DDS building."""
-    try:
-        try:
-            from autoortho.aopipeline import AoBundle2
-        except ImportError:
-            from aopipeline import AoBundle2
-        
-        if not AoBundle2.is_available():
-            return None
-        
-        return AoBundle2.build_dds(
-            bundle_path=bundle_path,
-            target_zoom=target_zoom,
-            format=dxt_format,
-            missing_color=missing_color,
-            chunks_per_side=chunks_per_side
-        )
-    except Exception as e:
-        log.debug(f"Native bundle DDS build failed: {e}")
-        return None
-
-
-def _build_dds_hybrid_from_bundle(
-    bundle_path: str,
-    target_zoom: int,
-    dxt_format: str,
-    missing_color: Tuple[int, int, int],
-    chunks_per_side: int
-) -> Optional[bytes]:
-    """Build DDS: Python reads bundle, C decodes and compresses."""
-    try:
-        try:
-            from autoortho.aopipeline import AoBundle2, AoDDS
-        except ImportError:
-            from aopipeline import AoBundle2, AoDDS
-        
-        # Python reads bundle - use context manager to release file immediately
-        # Critical: On Windows, mmap holds file open and blocks consolidation updates
-        with AoBundle2.Bundle2Python(bundle_path) as bundle:
-            jpeg_datas = bundle.get_all_chunks(target_zoom)
-        # Bundle is now closed - file handle released
-        
-        if not jpeg_datas:
-            return None
-        
-        # Check if native DDS is available
-        native = _get_native_dds()
-        if native is None or not hasattr(native, 'build_from_jpegs'):
-            return None
-        
-        # C builds DDS from JPEG array
-        return native.build_from_jpegs(
-            jpeg_datas=jpeg_datas,
-            format=dxt_format,
-            missing_color=missing_color
-        )
-    except Exception as e:
-        log.debug(f"Hybrid bundle DDS build failed: {e}")
-        return None
-
-
-def _build_dds_python_from_bundle(
-    bundle_path: str,
-    target_zoom: int,
-    dxt_format: str,
-    missing_color: Tuple[int, int, int],
-    chunks_per_side: int
-) -> Optional[bytes]:
-    """Build DDS using pure Python (no native dependencies)."""
-    try:
-        try:
-            from autoortho.aopipeline import AoBundle2
-        except ImportError:
-            from aopipeline import AoBundle2
-        
-        # Read bundle with Python - use context manager to release file immediately
-        # Critical: On Windows, mmap holds file open and blocks consolidation updates
-        with AoBundle2.Bundle2Python(bundle_path) as bundle:
-            jpeg_datas = bundle.get_all_chunks(target_zoom)
-        # Bundle is now closed - file handle released
-        
-        if not jpeg_datas:
-            return None
-        
-        # Compose image using AoImage
-        tile_size = chunks_per_side * 256
-        chunk_size = 256
-        
-        base_img = AoImage.new("RGBA", (tile_size, tile_size), missing_color + (255,))
-        
-        for i, jpeg_data in enumerate(jpeg_datas):
-            if jpeg_data is not None:
-                try:
-                    chunk_img = AoImage.load_from_memory(jpeg_data)
-                    if chunk_img:
-                        x = (i % chunks_per_side) * chunk_size
-                        y = (i // chunks_per_side) * chunk_size
-                        base_img.paste(chunk_img, x, y)
-                except Exception:
-                    pass  # Use missing color for failed decodes
-        
-        # Build DDS using pydds
-        dds_format = 0 if dxt_format == "BC1" else 1  # BC1=0, BC3=1
-        dds = pydds.DDS(tile_size, tile_size, dxt_format=dds_format)
-        dds.gen_mipmaps(base_img)
-        return dds.read(dds.total_size)
-        
-    except Exception as e:
-        log.debug(f"Python bundle DDS build failed: {e}")
-        return None
-
-
 # Global buffer pool for zero-copy DDS building (unified for live + prefetch)
 # Uses priority queue: live tiles (PRIORITY_LIVE=0) are served first,
 # prefetch tiles (PRIORITY_PREFETCH=100) are served when idle.
@@ -2866,8 +2696,6 @@ class SpatialPrefetcher:
                 if mipmap_zoom < tile.min_zoom:
                     break
                 
-                # Wait for any pending consolidation OUTSIDE lock
-                tile._wait_for_pending_consolidation_if_needed()
                 
                 # Create chunks for this zoom level if they don't exist
                 tile._create_chunks(mipmap_zoom)
@@ -2944,7 +2772,7 @@ def stop_prefetcher():
 #
 # Components:
 # 1. TileCompletionTracker - Monitors chunk downloads, detects when all ready
-# 2. PrebuiltDDSCache - Stores pre-built DDS for instant serving
+# 2. DynamicDDSCache - Stores pre-built DDS for instant serving
 # 3. BackgroundDDSBuilder - Builds DDS from completed tiles in background
 # ============================================================================
 
@@ -3147,481 +2975,23 @@ class TileCompletionTracker:
             return len(self._tracked_tiles)
 
 
-class PrebuiltDDSCache:
-    """
-    Cache for pre-built DDS byte buffers.
-    
-    Stores completed DDS textures built by BackgroundDDSBuilder.
-    These are served directly to X-Plane on cache hit, avoiding
-    the decode+compress overhead.
-    
-    Memory Management:
-    - Has its own memory limit (separate from tile cache)
-    - Uses LRU eviction when limit is reached
-    - Prebuilt tiles are evicted BEFORE active tiles
-    
-    Thread Safety:
-    - Reads and writes are protected by RLock
-    - Multiple FUSE threads may read concurrently
-    - Single builder thread writes
-    """
-    
-    def __init__(self, max_memory_bytes: int = 512 * 1024 * 1024):
-        """
-        Args:
-            max_memory_bytes: Maximum memory for prebuilt DDS (default 512MB)
-        """
-        self._lock = threading.RLock()
-        self._cache: OrderedDict = OrderedDict()
-        self._memory_used = 0
-        self._max_memory = max_memory_bytes
-        self._hits = 0
-        self._misses = 0
-    
-    def get(self, tile_id: str) -> Optional[bytes]:
-        """
-        Retrieve pre-built DDS bytes for a tile.
-        
-        Returns None if not in cache (cache miss).
-        Updates LRU order on hit.
-        
-        Thread-safe: may be called from multiple FUSE threads.
-        """
-        with self._lock:
-            if tile_id not in self._cache:
-                self._misses += 1
-                return None
-            
-            # Move to end (most recently used)
-            self._cache.move_to_end(tile_id)
-            self._hits += 1
-            return self._cache[tile_id]
-    
-    def store(self, tile_id: str, dds_bytes: bytes) -> None:
-        """
-        Store pre-built DDS bytes.
-        
-        Evicts oldest entries if memory limit exceeded.
-        
-        Thread-safe: called from builder thread.
-        """
-        if not dds_bytes:
-            return
-        
-        size = len(dds_bytes)
-        
-        with self._lock:
-            # Remove existing entry if present
-            if tile_id in self._cache:
-                old_size = len(self._cache[tile_id])
-                del self._cache[tile_id]
-                self._memory_used -= old_size
-            
-            # Evict until we have room
-            while self._memory_used + size > self._max_memory and self._cache:
-                oldest_id, oldest_bytes = self._cache.popitem(last=False)
-                self._memory_used -= len(oldest_bytes)
-                log.debug(f"PrebuiltDDSCache: Evicted {oldest_id} to make room")
-            
-            # Store new entry
-            self._cache[tile_id] = dds_bytes
-            self._memory_used += size
-            log.debug(f"PrebuiltDDSCache: Stored {tile_id} ({size} bytes, "
-                     f"total: {self._memory_used / (1024*1024):.1f}MB)")
-    
-    def remove(self, tile_id: str) -> None:
-        """Remove a tile from the cache (e.g., when tile is evicted from main cache)."""
-        with self._lock:
-            if tile_id in self._cache:
-                size = len(self._cache[tile_id])
-                del self._cache[tile_id]
-                self._memory_used -= size
-    
-    def clear(self) -> None:
-        """Clear all cached entries."""
-        with self._lock:
-            self._cache.clear()
-            self._memory_used = 0
-    
-    def contains(self, tile_id: str) -> bool:
-        """Check if tile is in cache without updating LRU."""
-        with self._lock:
-            return tile_id in self._cache
-    
-    @property
-    def stats(self) -> dict:
-        """Return cache statistics."""
-        with self._lock:
-            total = self._hits + self._misses
-            hit_rate = (self._hits / total * 100) if total > 0 else 0
-            return {
-                'entries': len(self._cache),
-                'memory_mb': self._memory_used / (1024 * 1024),
-                'max_memory_mb': self._max_memory / (1024 * 1024),
-                'hits': self._hits,
-                'misses': self._misses,
-                'hit_rate': hit_rate
-            }
-
-
-class EphemeralDDSCache:
-    """
-    Disk-based DDS cache for session overflow.
-    
-    Provides temporary disk storage for pre-built DDS textures that exceed
-    memory limits. Key properties:
-    
-    - Uses OS temp directory (auto-cleaned on reboot)
-    - Session-tagged to invalidate previous runs
-    - LRU eviction when size limit reached
-    - Automatically cleaned up on shutdown
-    
-    Unlike a persistent cache, this ephemeral cache:
-    - Does NOT persist between sessions
-    - Does NOT risk stale/corrupt textures
-    - Does NOT increase long-term disk usage
-    
-    Thread Safety:
-    - Reads and writes are protected by lock
-    """
-    
-    def __init__(self, max_size_mb: int = 4096):
-        """
-        Args:
-            max_size_mb: Maximum disk usage in MB (default 4GB)
-        """
-        import tempfile
-        self._session_id = uuid.uuid4().hex[:8]
-        self._cache_dir = os.path.join(
-            tempfile.gettempdir(),
-            'autoortho_dds_session'
-        )
-        os.makedirs(self._cache_dir, exist_ok=True)
-        self._max_size = max_size_mb * 1024 * 1024
-        self._current_size = 0
-        self._entries: OrderedDict = OrderedDict()  # tile_id -> (path, size)
-        self._lock = threading.Lock()
-        self._hits = 0
-        self._misses = 0
-        
-        # Clean stale entries from previous sessions
-        self._cleanup_stale()
-        
-        log.info(f"EphemeralDDSCache initialized: {self._cache_dir} "
-                 f"(session={self._session_id}, max={max_size_mb}MB)")
-    
-    def _cleanup_stale(self):
-        """Remove files from previous sessions."""
-        try:
-            for filename in os.listdir(self._cache_dir):
-                if not filename.startswith(self._session_id):
-                    try:
-                        os.remove(os.path.join(self._cache_dir, filename))
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-    
-    def _path_for(self, tile_id: str) -> str:
-        """Generate cache file path for a tile."""
-        # Sanitize tile_id for filename
-        safe_id = tile_id.replace('/', '_').replace('\\', '_')
-        return os.path.join(self._cache_dir, f"{self._session_id}_{safe_id}.dds")
-    
-    def get(self, tile_id: str) -> Optional[bytes]:
-        """
-        Retrieve pre-built DDS bytes from disk cache.
-        
-        Returns None on miss. Updates LRU order on hit.
-        """
-        with self._lock:
-            if tile_id not in self._entries:
-                self._misses += 1
-                return None
-            path, _ = self._entries[tile_id]
-            # Move to end (most recently used)
-            self._entries.move_to_end(tile_id)
-        
-        try:
-            data = Path(path).read_bytes()
-            with self._lock:
-                self._hits += 1
-            return data
-        except (FileNotFoundError, OSError):
-            # File was deleted externally
-            with self._lock:
-                self._entries.pop(tile_id, None)
-                self._misses += 1
-            return None
-    
-    def store(self, tile_id: str, dds_bytes: bytes) -> bool:
-        """
-        Store pre-built DDS bytes to disk cache.
-        
-        Evicts oldest entries if size limit exceeded.
-        Returns True on success.
-        """
-        if not dds_bytes:
-            return False
-        
-        size = len(dds_bytes)
-        path = self._path_for(tile_id)
-        
-        with self._lock:
-            # Remove existing entry if present
-            if tile_id in self._entries:
-                old_path, old_size = self._entries.pop(tile_id)
-                try:
-                    os.remove(old_path)
-                except OSError:
-                    pass
-                self._current_size -= old_size
-            
-            # Evict until we have room
-            while self._current_size + size > self._max_size and self._entries:
-                oldest_id, (oldest_path, oldest_size) = self._entries.popitem(last=False)
-                try:
-                    os.remove(oldest_path)
-                except OSError:
-                    pass
-                self._current_size -= oldest_size
-            
-            # Write new entry
-            try:
-                Path(path).write_bytes(dds_bytes)
-                self._entries[tile_id] = (path, size)
-                self._current_size += size
-                return True
-            except OSError as e:
-                log.debug(f"EphemeralDDSCache: Write failed for {tile_id}: {e}")
-                return False
-    
-    def path_for(self, tile_id: str) -> str:
-        """
-        Get the cache file path for a tile (public API for direct-to-disk writes).
-        
-        Used when C code needs to write directly to the cache location.
-        Call register_file() after successful write.
-        
-        Args:
-            tile_id: Tile identifier
-            
-        Returns:
-            Full path where the DDS file should be written
-        """
-        return self._path_for(tile_id)
-    
-    def register_file(self, tile_id: str, size: int) -> bool:
-        """
-        Register an externally-written file with the cache.
-        
-        CRITICAL for direct-to-disk optimization:
-        When C code writes DDS files directly (via aodds_build_from_jpegs_to_file),
-        this method registers the file with the cache without re-reading it.
-        
-        Flow for direct-to-disk:
-        1. path = cache.path_for(tile_id)
-        2. C writes DDS directly to path
-        3. cache.register_file(tile_id, bytes_written)
-        
-        Handles eviction if size limit exceeded.
-        
-        Args:
-            tile_id: Tile identifier
-            size: File size in bytes (as reported by C code)
-            
-        Returns:
-            True on success, False if file doesn't exist
-        """
-        path = self._path_for(tile_id)
-        
-        # Verify file exists (C should have written it)
-        if not os.path.exists(path):
-            log.debug(f"EphemeralDDSCache.register_file: File not found: {path}")
-            return False
-        
-        with self._lock:
-            # Remove existing entry if present
-            if tile_id in self._entries:
-                old_path, old_size = self._entries.pop(tile_id)
-                # Don't delete - the new file is at the same path
-                self._current_size -= old_size
-            
-            # Evict until we have room
-            while self._current_size + size > self._max_size and self._entries:
-                oldest_id, (oldest_path, oldest_size) = self._entries.popitem(last=False)
-                try:
-                    os.remove(oldest_path)
-                except OSError:
-                    pass
-                self._current_size -= oldest_size
-            
-            # Register the file
-            self._entries[tile_id] = (path, size)
-            self._current_size += size
-            return True
-    
-    def remove(self, tile_id: str) -> None:
-        """Remove a tile from the cache."""
-        with self._lock:
-            if tile_id in self._entries:
-                path, size = self._entries.pop(tile_id)
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-                self._current_size -= size
-    
-    def contains(self, tile_id: str) -> bool:
-        """Check if tile is in cache."""
-        with self._lock:
-            return tile_id in self._entries
-    
-    def clear(self) -> None:
-        """Clear all cached entries."""
-        with self._lock:
-            for tile_id, (path, _) in list(self._entries.items()):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            self._entries.clear()
-            self._current_size = 0
-    
-    def cleanup(self):
-        """Clean all session files on shutdown."""
-        self.clear()
-        log.info(f"EphemeralDDSCache cleaned up (session={self._session_id})")
-    
-    @property
-    def stats(self) -> dict:
-        """Return cache statistics."""
-        with self._lock:
-            total = self._hits + self._misses
-            hit_rate = (self._hits / total * 100) if total > 0 else 0
-            return {
-                'entries': len(self._entries),
-                'size_mb': self._current_size / (1024 * 1024),
-                'max_size_mb': self._max_size / (1024 * 1024),
-                'hits': self._hits,
-                'misses': self._misses,
-                'hit_rate': hit_rate,
-                'session_id': self._session_id
-            }
-
-
-class HybridDDSCache:
-    """
-    Two-tier DDS cache: fast memory + large disk overflow.
-    
-    Provides the best of both worlds:
-    - Memory tier: Fast access for hot tiles (default 512MB)
-    - Disk tier: Large capacity overflow (default 4GB)
-    
-    On store:
-    - Tries memory first
-    - Overflows to disk when memory full
-    
-    On get:
-    - Checks memory first (faster)
-    - Falls back to disk on miss
-    
-    Thread Safety:
-    - Delegates to underlying caches which are thread-safe
-    """
-    
-    def __init__(self, memory_mb: int = 512, disk_mb: int = 4096):
-        """
-        Args:
-            memory_mb: Maximum memory cache size in MB
-            disk_mb: Maximum disk cache size in MB
-        """
-        self._memory = PrebuiltDDSCache(max_memory_bytes=memory_mb * 1024 * 1024)
-        self._disk = EphemeralDDSCache(max_size_mb=disk_mb)
-        log.info(f"HybridDDSCache initialized: memory={memory_mb}MB, disk={disk_mb}MB")
-    
-    def get(self, tile_id: str) -> Optional[bytes]:
-        """
-        Retrieve DDS bytes, checking memory first then disk.
-        """
-        # Try memory first (faster)
-        result = self._memory.get(tile_id)
-        if result:
-            return result
-        
-        # Try disk
-        return self._disk.get(tile_id)
-    
-    def store(self, tile_id: str, dds_bytes: bytes) -> None:
-        """
-        Store DDS bytes, trying memory first then overflow to disk.
-        """
-        if not dds_bytes:
-            return
-        
-        # Try memory first
-        self._memory.store(tile_id, dds_bytes)
-        
-        # If memory is full and this entry wasn't stored, use disk
-        if not self._memory.contains(tile_id):
-            self._disk.store(tile_id, dds_bytes)
-    
-    def remove(self, tile_id: str) -> None:
-        """Remove from both tiers."""
-        self._memory.remove(tile_id)
-        self._disk.remove(tile_id)
-    
-    def contains(self, tile_id: str) -> bool:
-        """Check if tile is in either tier."""
-        return self._memory.contains(tile_id) or self._disk.contains(tile_id)
-    
-    def clear(self) -> None:
-        """Clear both tiers."""
-        self._memory.clear()
-        self._disk.clear()
-    
-    def cleanup(self):
-        """Cleanup disk tier on shutdown."""
-        self._disk.cleanup()
-    
-    @property
-    def stats(self) -> dict:
-        """Return combined statistics."""
-        mem_stats = self._memory.stats
-        disk_stats = self._disk.stats
-        return {
-            'memory': mem_stats,
-            'disk': disk_stats,
-            'total_entries': mem_stats['entries'] + disk_stats['entries'],
-            'total_size_mb': mem_stats['memory_mb'] + disk_stats['size_mb']
-            }
-
 
 class BackgroundDDSBuilder:
-    """
-    Builds DDS textures from fully-downloaded tiles in the background.
-    
-    Design principles:
-    1. Parallel workers: Configurable thread pool for throughput
-    2. Rate-limited submission: Prevents queue flooding
-    3. Priority queue: Build tiles in submission order (FIFO for fairness)
-    4. Interruptible: Can pause/stop cleanly during shutdown
-    """
     
     # Maximum queue depth (prevents unbounded memory growth)
     MAX_QUEUE_SIZE = 100
     
-    def __init__(self, prebuilt_cache: PrebuiltDDSCache, 
+    def __init__(self, dds_cache,
                  build_interval_sec: float = 0.5,
                  max_workers: int = 2):
         """
         Args:
-            prebuilt_cache: Cache to store completed DDS buffers
+            dds_cache: DynamicDDSCache instance for persistent DDS storage
             build_interval_sec: Minimum time between submissions (rate limiting)
             max_workers: Number of parallel build workers
         """
         self._queue = Queue(maxsize=self.MAX_QUEUE_SIZE)
-        self._prebuilt_cache = prebuilt_cache
+        self._dds_cache = dds_cache
         self._build_interval = build_interval_sec
         self._max_workers = max_workers
         
@@ -3702,10 +3072,12 @@ class BackgroundDDSBuilder:
         if tile is None:
             return False
         
-        # Skip if already in prebuilt cache
-        if self._prebuilt_cache.contains(tile.id):
-            log.debug(f"BackgroundDDSBuilder: Skipping {tile.id} - already cached")
-            return False
+        # Skip if already in DDS cache (allow through if healing needed)
+        if self._dds_cache is not None and self._dds_cache.contains(tile.id, tile.max_zoom, tile):
+            if not getattr(tile, '_dds_needs_healing', False):
+                log.debug(f"BackgroundDDSBuilder: Skipping {tile.id} - already cached")
+                return False
+            log.debug(f"BackgroundDDSBuilder: healing tile {tile.id} passed through")
         
         try:
             self._queue.put_nowait((priority, tile))
@@ -3811,8 +3183,6 @@ class BackgroundDDSBuilder:
         Key difference from live: NO TIME BUDGET.
         Takes as long as needed to apply all fallbacks for quality.
         
-        Priority: Bundle build (fastest) > Streaming build (with fallbacks)
-        
         Args:
             tile: Tile to build
             tile_id: Tile ID string
@@ -3821,17 +3191,6 @@ class BackgroundDDSBuilder:
         Returns:
             True if build succeeded, False to fall back to other methods
         """
-        # Try bundle-first path (much faster than streaming build)
-        try:
-            dds_bytes = self._try_build_from_bundle(tile, tile_id)
-            if dds_bytes is not None:
-                elapsed = (time.monotonic() - build_start) * 1000
-                log.debug(f"BackgroundDDSBuilder: Built {tile_id} from bundle in {elapsed:.0f}ms")
-                return self._store_dds_result(tile, tile_id, dds_bytes, build_start)
-        except Exception as e:
-            log.debug(f"BackgroundDDSBuilder: Bundle build failed for {tile_id}: {e}")
-        
-        # Fall through to streaming build
         try:
             from autoortho.aopipeline.AoDDS import get_default_builder_pool
             from autoortho.aopipeline.fallback_resolver import FallbackResolver
@@ -3913,6 +3272,8 @@ class BackgroundDDSBuilder:
             # Phase 1: Batch add all ready chunks at once
             ready_chunks = []
             pending_indices = []
+            prefetch_mm0_missing = []
+            prefetch_mm0_fallback = []
             for i, chunk in enumerate(chunks):
                 if chunk.ready.is_set() and chunk.data:
                     ready_chunks.append((i, chunk.data))
@@ -3934,8 +3295,8 @@ class BackgroundDDSBuilder:
                 time_budget = tile._tile_time_budget if tile._is_live else None
                 
                 if tile._is_live and time_budget and time_budget.exhausted:
-                    # Budget exhausted - mark remaining as missing
                     builder.mark_missing(i)
+                    prefetch_mm0_missing.append(i)
                     continue
                 
                 # Wait for chunk - but check for live transition periodically
@@ -3970,8 +3331,10 @@ class BackgroundDDSBuilder:
                         
                         if fallback_rgba:
                             builder.add_fallback_image(i, fallback_rgba)
+                            prefetch_mm0_fallback.append(i)
                         else:
                             builder.mark_missing(i)
+                            prefetch_mm0_missing.append(i)
                 else:
                     # Chunk failed to download - apply full fallback chain
                     chunk_col = tile.col + (i % tile.chunks_per_row)
@@ -3985,17 +3348,21 @@ class BackgroundDDSBuilder:
                     
                     if fallback_rgba:
                         builder.add_fallback_image(i, fallback_rgba)
+                        prefetch_mm0_fallback.append(i)
                     else:
                         builder.mark_missing(i)
+                        prefetch_mm0_missing.append(i)
             
-            # Finalize directly to disk (optimal for prefetch cache)
-            if hasattr(self._prebuilt_cache, 'path_for'):
-                output_path = self._prebuilt_cache.path_for(tile_id)
-                success, bytes_written = builder.finalize_to_file(output_path)
+            # Finalize directly to disk via DynamicDDSCache staging path
+            if self._dds_cache is not None:
+                staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
+                success, bytes_written = builder.finalize_to_file(staging_path)
                 
                 if success and bytes_written >= 128:
-                    if hasattr(self._prebuilt_cache, 'register_file'):
-                        self._prebuilt_cache.register_file(tile_id, bytes_written)
+                    self._dds_cache.store_from_file(
+                        tile_id, tile.max_zoom, staging_path, tile,
+                        mm0_missing_indices=prefetch_mm0_missing or None,
+                        mm0_fallback_indices=prefetch_mm0_fallback or None)
                     
                     build_time = (time.monotonic() - build_start) * 1000
                     status = builder.get_status()
@@ -4004,10 +3371,6 @@ class BackgroundDDSBuilder:
                               f"(decoded={status['chunks_decoded']}, fallback={status['chunks_fallback']}, "
                               f"missing={status['chunks_missing']})")
                     bump('prebuilt_dds_builds_streaming')
-                    
-                    # Schedule bundle consolidation for all zoom levels
-                    # This ensures cached JPEGs are consolidated into bundles
-                    consolidate_tile_if_ready(tile, "background_dds")
                     
                     return True
             
@@ -4025,129 +3388,6 @@ class BackgroundDDSBuilder:
             tile._active_streaming_builder = None
             tile._live_transition_event = None
             builder.release()
-
-    def _try_build_from_bundle(self, tile, tile_id: str) -> Optional[bytes]:
-        """
-        Try to build DDS directly from an AOB2 bundle file.
-        
-        This is the fastest path when a bundle exists:
-        - Single file read instead of 256+
-        - Memory-mapped for zero-copy access
-        - Native parallel JPEG decode + DXT compress
-        
-        Args:
-            tile: Tile to build
-            tile_id: Tile ID string
-        
-        Returns:
-            DDS bytes if successful, None if bundle not available
-        """
-        try:
-            # Handle imports for both frozen (PyInstaller) and direct Python execution
-            try:
-                from autoortho.utils.bundle_paths import get_bundle2_path
-                from autoortho.aopipeline import AoBundle2
-            except ImportError:
-                from utils.bundle_paths import get_bundle2_path
-                from aopipeline import AoBundle2
-            
-            # CRITICAL: Use TILE ID coordinates (tile.row, tile.col at tilename_zoom) for bundle path!
-            # Bundles are named after the tile ID, NOT the scaled chunk coordinates.
-            bundle_path = get_bundle2_path(tile.cache_dir, tile.row, tile.col, tile.maptype, tile.tilename_zoom)
-            
-            if not os.path.exists(bundle_path):
-                # Bundle doesn't exist - check if consolidation is pending or recently completed
-                # CRITICAL: Pass max_zoom to is_pending() - only wait for OUR zoom!
-                global _bundle_consolidator
-                if _bundle_consolidator is not None:
-                    bump('jpeg_to_bundle_fallback_entered')
-                    waited_for_consolidation = False
-                    if _bundle_consolidator.is_pending(tile.row, tile.col, tile.maptype, tile.max_zoom):
-                        log.debug(f"Waiting for consolidation (zoom {tile.max_zoom}): {tile_id}")
-                        # Use 60s timeout - consolidation will complete, waiting is better than failing
-                        # Pass zoom to wait for THIS specific zoom level's consolidation
-                        wait_result = _bundle_consolidator.wait_for_pending(tile.row, tile.col, tile.maptype, timeout=60.0, zoom=tile.max_zoom)
-                        waited_for_consolidation = True
-                    
-                    # ALWAYS re-check bundle - even if is_pending was False
-                    # Consolidation may have JUST completed between os.path.exists() and is_pending()
-                    if os.path.exists(bundle_path):
-                        bump('jpeg_to_bundle_fallback_bundle_exists')
-                        if waited_for_consolidation:
-                            log.debug(f"Bundle appeared after consolidation wait: {tile_id}")
-                        else:
-                            log.debug(f"Bundle appeared (consolidation completed between checks): {tile_id}")
-                            bump('jpeg_to_bundle_fallback_not_pending')
-                    else:
-                        # Still no bundle after all checks
-                        return None
-                else:
-                    return None
-            
-            # Get chunk grid dimensions for max_zoom (used for DDS building)
-            _, _, width, height, effective_zoom, _ = tile._get_quick_zoom(tile.max_zoom)
-            
-            # Get configuration
-            dxt_format = CFG.pydds.format.upper()
-            if dxt_format in ("DXT1", "BC1"):
-                dxt_format = "BC1"
-            else:
-                dxt_format = "BC3"
-            
-            missing_color = tuple(CFG.autoortho.missing_color[:3]) if hasattr(CFG.autoortho, 'missing_color') else (66, 77, 55)
-            
-            # Build DDS from bundle using mode dispatcher
-            return _build_tile_dds_from_bundle(
-                tile=tile,
-                bundle_path=bundle_path,
-                target_zoom=effective_zoom,
-                dxt_format=dxt_format,
-                missing_color=missing_color,
-                chunks_per_side=width  # Use scaled width (chunks_per_side for this zoom level)
-            )
-            
-        except Exception as e:
-            log.debug(f"BackgroundDDSBuilder: Bundle build failed: {e}")
-            return None
-
-    def _store_dds_result(self, tile, tile_id: str, dds_bytes: bytes, build_start: float) -> bool:
-        """
-        Store DDS build result in prebuilt cache.
-        
-        Args:
-            tile: Tile that was built
-            tile_id: Tile ID string
-            dds_bytes: DDS data
-            build_start: Build start time for metrics
-        
-        Returns:
-            True if stored successfully
-        """
-        if not dds_bytes or len(dds_bytes) < 128:
-            return False
-        
-        try:
-            if hasattr(self._prebuilt_cache, 'path_for'):
-                output_path = self._prebuilt_cache.path_for(tile_id)
-                
-                # Write DDS to disk atomically
-                temp_path = output_path + f'.tmp.{os.getpid()}'
-                with open(temp_path, 'wb') as f:
-                    f.write(dds_bytes)
-                os.rename(temp_path, output_path)
-                
-                if hasattr(self._prebuilt_cache, 'register_file'):
-                    self._prebuilt_cache.register_file(tile_id, len(dds_bytes))
-                
-                build_time = (time.monotonic() - build_start) * 1000
-                self._builds_completed += 1
-                log.debug(f"BackgroundDDSBuilder: Bundle built {tile_id} in {build_time:.0f}ms")
-                bump('prebuilt_dds_builds_bundle')
-                return True
-        except Exception as e:
-            log.debug(f"BackgroundDDSBuilder: Failed to store DDS for {tile_id}: {e}")
-        
-        return False
 
     def _build_tile_dds(self, tile) -> None:
         """
@@ -4221,19 +3461,21 @@ class BackgroundDDSBuilder:
                 # ───────────────────────────────────────────────────────────────────
                 if pipeline_mode == PIPELINE_MODE_HYBRID:
                     chunks_for_hybrid = tile.chunks.get(tile.max_zoom, [])
+                    hybrid_mm0_missing = [i for i, c in enumerate(chunks_for_hybrid)
+                                          if not (c.data and len(c.data) > 0)]
                     if chunks_for_hybrid:
                         # ═══════════════════════════════════════════════════════════════
                         # DIRECT-TO-DISK OPTIMIZATION (Phase 1: ~65ms copy eliminated)
                         # ═══════════════════════════════════════════════════════════════
-                        # If cache supports register_file (EphemeralDDSCache), build
-                        # directly to disk file - eliminates Python memory copy entirely.
+                        # Build directly to disk file via DynamicDDSCache staging path.
+                        # Eliminates Python memory copy entirely.
                         # Flow: JPEG data → C decode → C compress → fwrite to disk
                         #
                         # This saves ~65ms per tile by avoiding:
                         # - Buffer → Python bytes copy
                         # - Python bytes → disk write
                         # ═══════════════════════════════════════════════════════════════
-                        if (hasattr(self._prebuilt_cache, 'register_file') and 
+                        if (self._dds_cache is not None and
                             hasattr(native_dds, 'build_from_jpegs_to_file')):
                             try:
                                 # Extract JPEG data from chunks
@@ -4248,28 +3490,25 @@ class BackgroundDDSBuilder:
                                         jpeg_datas.append(None)
                                 
                                 if valid_count > 0:
-                                    # Get output path from cache
-                                    output_path = self._prebuilt_cache.path_for(tile_id)
+                                    staging_path = self._dds_cache.get_staging_path(
+                                        tile_id, tile.max_zoom, tile)
                                     
-                                    # Build directly to file (zero-copy!)
                                     result = native_dds.build_from_jpegs_to_file(
                                         jpeg_datas,
-                                        output_path,
+                                        staging_path,
                                         format=dxt_format,
                                         missing_color=missing_color
                                     )
                                     
                                     if result.success and result.bytes_written >= 128:
-                                        # Register file with cache (no additional write!)
-                                        self._prebuilt_cache.register_file(tile_id, result.bytes_written)
+                                        self._dds_cache.store_from_file(
+                                            tile_id, tile.max_zoom, staging_path, tile,
+                                            mm0_missing_indices=hybrid_mm0_missing or None)
                                         build_time = (time.monotonic() - build_start) * 1000
                                         self._builds_completed += 1
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk built {tile_id} "
                                                   f"in {build_time:.0f}ms ({result.bytes_written} bytes)")
                                         bump('prebuilt_dds_builds_direct')
-                                        
-                                        # Schedule bundle consolidation for all zoom levels
-                                        consolidate_tile_if_ready(tile, "background_dds")
                                         
                                         return
                                     else:
@@ -4291,16 +3530,19 @@ class BackgroundDDSBuilder:
                             )
                             
                             if dds_bytes and len(dds_bytes) >= 128:
-                                # Hybrid build succeeded - store and return
-                                self._prebuilt_cache.store(tile_id, dds_bytes)
+                                # Hybrid build succeeded - store in DDS cache
+                                if self._dds_cache is not None:
+                                    try:
+                                        self._dds_cache.store(
+                                            tile_id, tile.max_zoom, dds_bytes, tile,
+                                            mm0_missing_indices=hybrid_mm0_missing or None)
+                                    except Exception:
+                                        pass
                                 build_time = (time.monotonic() - build_start) * 1000
                                 self._builds_completed += 1
                                 log.debug(f"BackgroundDDSBuilder: Hybrid built {tile_id} in "
                                           f"{build_time:.0f}ms ({len(dds_bytes)} bytes)")
                                 bump('prebuilt_dds_builds_hybrid')
-                                
-                                # Schedule bundle consolidation for all zoom levels
-                                consolidate_tile_if_ready(tile, "background_dds")
                                 
                                 return
                             else:
@@ -4322,36 +3564,32 @@ class BackgroundDDSBuilder:
                 # - C reads cache files + decodes + compresses + writes to disk
                 # - Eliminates ~65ms Python copy overhead
                 # ═══════════════════════════════════════════════════════════════
-                if (hasattr(self._prebuilt_cache, 'register_file') and 
+                if (self._dds_cache is not None and
                     hasattr(native_dds, 'build_tile_to_file')):
                     try:
-                        # Get output path from cache
-                        output_path = self._prebuilt_cache.path_for(tile_id)
+                        staging_path = self._dds_cache.get_staging_path(
+                            tile_id, tile.max_zoom, tile)
                         
-                        # Build directly to file (zero-copy!)
                         result = native_dds.build_tile_to_file(
                             cache_dir=tile.cache_dir,
                             row=tile.row,
                             col=tile.col,
                             maptype=tile.maptype,
                             zoom=tile.max_zoom,
-                            output_path=output_path,
+                            output_path=staging_path,
                             chunks_per_side=tile.chunks_per_row,
                             format=dxt_format,
                             missing_color=missing_color
                         )
                         
                         if result.success and result.bytes_written >= 128:
-                            # Register file with cache (no additional write!)
-                            self._prebuilt_cache.register_file(tile_id, result.bytes_written)
+                            self._dds_cache.store_from_file(
+                                tile_id, tile.max_zoom, staging_path, tile)
                             build_time = (time.monotonic() - build_start) * 1000
                             self._builds_completed += 1
                             log.debug(f"BackgroundDDSBuilder: Native direct-to-disk built {tile_id} "
                                       f"in {build_time:.0f}ms ({result.bytes_written} bytes)")
                             bump('prebuilt_dds_builds_native_direct')
-                            
-                            # Schedule bundle consolidation for all zoom levels
-                            consolidate_tile_if_ready(tile, "background_dds")
                             
                             return
                         else:
@@ -4402,17 +3640,18 @@ class BackgroundDDSBuilder:
                     )
                     
                     if result.success and result.bytes_written >= 128:
-                        # Copy from buffer and store
                         dds_bytes = result.to_bytes()
-                        self._prebuilt_cache.store(tile_id, dds_bytes)
+                        if self._dds_cache is not None:
+                            try:
+                                self._dds_cache.store(
+                                    tile_id, tile.max_zoom, dds_bytes, tile)
+                            except Exception:
+                                pass
                         build_time = (time.monotonic() - build_start) * 1000
                         self._builds_completed += 1
                         log.debug(f"BackgroundDDSBuilder: Native built {tile_id} "
                                   f"in {build_time:.0f}ms ({len(dds_bytes)} bytes)")
                         bump('prebuilt_dds_builds_native_buffered')
-                        
-                        # Schedule bundle consolidation for all zoom levels
-                        consolidate_tile_if_ready(tile, "background_dds")
                         
                         return
                     else:
@@ -4453,10 +3692,11 @@ class BackgroundDDSBuilder:
                 log.debug(f"BackgroundDDSBuilder: {tile_id} - tile.dds is None, skipping")
                 return
             
-            # Skip if already in cache (race condition check)
-            if self._prebuilt_cache.contains(tile_id):
-                log.debug(f"BackgroundDDSBuilder: {tile_id} - already in cache, skipping")
-                return
+            # Skip if already in cache (race condition check, allow healing tiles)
+            if self._dds_cache is not None and self._dds_cache.contains(tile_id, tile.max_zoom, tile):
+                if not getattr(tile, '_dds_needs_healing', False):
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} - already in cache, skipping")
+                    return
             
             # Step 1: Verify chunks are ready for ALL mipmap levels
             # We need native chunks at each zoom level for proper mipmap building
@@ -4561,8 +3801,16 @@ class BackgroundDDSBuilder:
                 self._builds_failed += 1
                 return
             
-            # Step 6: Store in prebuilt cache
-            self._prebuilt_cache.store(tile_id, dds_bytes)
+            # Step 6: Store in DDS cache
+            if self._dds_cache is not None:
+                try:
+                    mm0_chunks = tile.chunks.get(tile.max_zoom, [])
+                    python_mm0_missing = [i for i, c in enumerate(mm0_chunks)
+                                          if not (c.ready.is_set() and c.data)]
+                    self._dds_cache.store(tile_id, tile.max_zoom, dds_bytes, tile,
+                                         mm0_missing_indices=python_mm0_missing or None)
+                except Exception:
+                    pass
             
             build_time = (time.monotonic() - build_start) * 1000
             self._builds_completed += 1
@@ -4570,9 +3818,6 @@ class BackgroundDDSBuilder:
             log.debug(f"BackgroundDDSBuilder: Built {tile_id} in {build_time:.0f}ms "
                      f"({len(dds_bytes)} bytes, {len(mipmap_images)} native mipmaps)")
             bump('prebuilt_dds_builds')
-            
-            # Schedule bundle consolidation for all zoom levels
-            consolidate_tile_if_ready(tile, "background_dds")
             
         except Exception as e:
             log.warning(f"BackgroundDDSBuilder: Failed to build {tile_id}: {e}")
@@ -4611,186 +3856,86 @@ class BackgroundDDSBuilder:
 
 
 # Global instances for predictive DDS generation (initialized in start_predictive_dds)
-prebuilt_dds_cache: Optional[PrebuiltDDSCache] = None
 background_dds_builder: Optional[BackgroundDDSBuilder] = None
 tile_completion_tracker: Optional[TileCompletionTracker] = None
 
-# Bundle consolidator for AOB2 format (consolidates JPEGs into bundles)
-_bundle_consolidator = None
-_consolidation_schedule_count = 0
+# Persistent DDS cache (cross-session) and disk budget manager
+dynamic_dds_cache = None       # type: ignore[assignment]  # DynamicDDSCache instance
+disk_budget_manager = None     # type: ignore[assignment]  # DiskBudgetManager instance
 
 
-def schedule_bundle_consolidation(tile, priority: int = 0, jpeg_datas: list = None, zoom: int = None) -> bool:
+def _collect_healing_jpegs(tile, missing_indices):
+    """Collect JPEG bytes for missing chunk indices from memory or disk cache.
+
+    Returns dict mapping chunk index → JPEG bytes, or None if not all available.
     """
-    Schedule bundle consolidation for a tile after successful build.
-    
-    This is called from ALL tile build paths (live, streaming, prefetch) to
-    ensure JPEGs are consolidated into bundles for faster future access.
-    
-    CRITICAL: Bundle paths are based on TILE ID coordinates (tile.row, tile.col at tilename_zoom),
-    NOT the scaled chunk coordinates! This ensures bundles can be found when looking up by tile ID.
-    
-    The bundle stores chunks at their respective zoom levels internally.
-    
-    PERFORMANCE OPTIMIZATION:
-    When jpeg_datas is provided, the consolidator uses in-memory data directly,
-    avoiding disk reads per tile.
-    
-    Args:
-        tile: The tile that was successfully built
-        priority: Consolidation priority (0=HIGH for live, 1=NORMAL for prefetch)
-        jpeg_datas: Optional list of JPEG bytes for each chunk. If provided,
-                    consolidator uses this data directly instead of reading from disk.
-        zoom: Specific zoom level to consolidate. If None, consolidates max_zoom only.
-    
-    Returns:
-        True if scheduled successfully, False otherwise
-    """
-    if _bundle_consolidator is None or tile is None:
-        return False
-    
-    try:
-        # Determine which zoom level to consolidate
-        if zoom is None:
-            target_zoom = tile.max_zoom
+    max_zoom = getattr(tile, 'max_zoom', None)
+    if max_zoom is None:
+        return None
+    chunks = tile.chunks.get(max_zoom, [])
+    chunk_jpegs = {}
+    for idx in missing_indices:
+        if idx < len(chunks) and chunks[idx].data:
+            chunk_jpegs[idx] = chunks[idx].data
+        elif idx < len(chunks):
+            cache_data = chunks[idx].get_cache()
+            if cache_data:
+                chunk_jpegs[idx] = cache_data
+            else:
+                return None
         else:
-            target_zoom = zoom
-        
-        # Get chunk grid dimensions for the target zoom level
-        # This gives us the scaled coordinates where chunks are stored
-        chunk_col, chunk_row, width, height, effective_zoom, _ = tile._get_quick_zoom(target_zoom)
-        
-        # Calculate chunks_per_side from scaled dimensions
-        chunks_per_side = width  # Assuming square tiles (width == height)
-        
-        # CRITICAL: Bundle path uses TILE ID coordinates (tile.row, tile.col at tilename_zoom)
-        # NOT the scaled chunk coordinates! This ensures we can find the bundle when looking up by tile ID.
-        # The consolidator needs:
-        # - tile_row, tile_col: for bundle path (at tilename_zoom)
-        # - tilename_zoom: for bundle path directory structure
-        # - chunk_row, chunk_col: where chunks are stored (at effective_zoom)
-        # - effective_zoom: the actual zoom level of the chunks
-        _bundle_consolidator.schedule(
-            row=chunk_row,  # Chunk grid origin row
-            col=chunk_col,  # Chunk grid origin col
-            maptype=tile.maptype,
-            zoom=effective_zoom,
-            priority=priority,
-            chunks_per_side=chunks_per_side,
-            jpeg_datas=jpeg_datas,
-            # NEW: Pass tile ID coordinates for bundle path
-            tile_row=tile.row,
-            tile_col=tile.col,
-            tile_zoom=tile.tilename_zoom
-        )
-        # Sync consolidator queue stats to global stats periodically
-        # (every 10 schedules to avoid overhead)
-        global _consolidation_schedule_count
-        _consolidation_schedule_count = _consolidation_schedule_count + 1
-        if _consolidation_schedule_count % 10 == 0:
-            try:
-                cstats = _bundle_consolidator.get_stats()
-                STATS['consolidator_queue_current'] = cstats.get('queue_size_current', 0)
-                STATS['consolidator_queue_max'] = cstats.get('queue_size_max', 0)
-                STATS['consolidator_time_max_ms'] = int(cstats.get('tile_consolidation_max_ms', 0))
-            except Exception:
-                pass
-        
-        return True
-    except Exception as e:
-        log.debug(f"Failed to schedule bundle consolidation for tile {tile.row},{tile.col} at zoom {zoom}: {e}")
-        return False
+            return None
+    return chunk_jpegs
 
 
-def schedule_bundle_consolidation_all_zooms(tile, priority: int = 0) -> int:
+def _dispatch_healing(tile):
+    """Dispatch in-place healing for a tile with missing or fallback chunks.
+
+    Missing chunks (showing missing_color) are collected first so they are
+    patched even when fallback-chunk JPEGs are not yet available.
     """
-    Schedule bundle consolidation for ALL zoom levels of a tile.
-    
-    A DDS tile uses chunks at multiple zoom levels for different mipmaps:
-    - Mipmap 0: max_zoom (e.g., ZL17) - 16×16 chunks
-    - Mipmap 1: max_zoom-1 (e.g., ZL16) - 8×8 chunks
-    - Mipmap 2: max_zoom-2 (e.g., ZL15) - 4×4 chunks
-    - etc., down to min_zoom
-    
-    This function schedules consolidation for each zoom level that has cached chunks.
-    
-    Args:
-        tile: The tile to consolidate
-        priority: Consolidation priority
-    
-    Returns:
-        Number of zoom levels scheduled for consolidation
-    """
-    if _bundle_consolidator is None or tile is None:
-        return 0
-    
-    scheduled = 0
-    
-    # Consolidate all zoom levels from max_zoom down to min_zoom
-    for mipmap in range(tile.max_mipmap + 1):
-        zoom = tile.max_zoom - mipmap
-        if zoom < tile.min_zoom:
-            break
-        
-        # Get chunks for this zoom level if they exist
-        zoom_chunks = tile.chunks.get(zoom, [])
-        if zoom_chunks:
-            # Collect JPEG data from in-memory chunks if available
-            jpeg_datas = [chunk.data if hasattr(chunk, 'data') and chunk.data else None 
-                          for chunk in zoom_chunks]
-            
-            if schedule_bundle_consolidation(tile, priority=priority, jpeg_datas=jpeg_datas, zoom=zoom):
-                scheduled += 1
-                log.debug(f"CONSOLIDATE_ALL: Scheduled ZL{zoom} for tile {tile.id}")
+    missing = getattr(tile, '_dds_missing_indices', [])
+    fallback = getattr(tile, '_dds_fallback_indices', [])
+    if (not missing and not fallback) or dynamic_dds_cache is None:
+        return
+
+    chunk_jpegs = {}
+
+    # Phase 1: missing chunks (high priority -- these show missing_color)
+    if missing:
+        missing_jpegs = _collect_healing_jpegs(tile, missing)
+        if missing_jpegs is not None:
+            chunk_jpegs.update(missing_jpegs)
         else:
-            log.debug(f"CONSOLIDATE_ALL: No chunks at ZL{zoom} for tile {tile.id}")
-    
-    if scheduled > 0:
-        log.debug(f"Scheduled {scheduled} zoom levels for consolidation: {tile.id}")
-    
-    return scheduled
+            log.debug(f"Healing: not all missing-chunk JPEGs available for {tile.id}, deferring missing")
 
+    # Phase 2: fallback chunks (lower priority -- these have low-res data)
+    if fallback:
+        fallback_jpegs = _collect_healing_jpegs(tile, fallback)
+        if fallback_jpegs is not None:
+            chunk_jpegs.update(fallback_jpegs)
+        else:
+            log.debug(f"Healing: not all fallback-chunk JPEGs available for {tile.id}, skipping fallback healing")
 
-def consolidate_tile_if_ready(tile, source: str = "unknown") -> bool:
-    """
-    Single entry point for tile consolidation.
-    
-    Call this after any successful tile build to consolidate all zoom levels.
-    The function handles deduplication internally.
-    
-    Args:
-        tile: The tile to consolidate
-        source: Debug identifier for logging (e.g., "background_dds", "aopipeline")
-    
-    Returns:
-        True if consolidation was scheduled, False otherwise
-    """
-    if tile is None or _bundle_consolidator is None:
-        return False
-    
-    # Priority: background builds use lower priority (1), live uses high (0)
-    priority = 1 if source in ("background_dds", "prefetch") else 0
-    
-    try:
-        scheduled = schedule_bundle_consolidation_all_zooms(tile, priority=priority)
-        if scheduled > 0:
-            log.debug(f"Consolidation scheduled ({source}): {scheduled} zooms for tile {tile.id}")
-        return scheduled > 0
-    except Exception as e:
-        log.debug(f"Consolidation scheduling failed ({source}): {e}")
-        return False
+    if not chunk_jpegs:
+        return
+
+    t = threading.Thread(
+        target=dynamic_dds_cache.patch_missing_chunks,
+        args=(tile.id, tile.max_zoom, tile, chunk_jpegs),
+        daemon=True)
+    t.start()
 
 
 def _on_tile_complete_callback(tile_id: str, tile) -> None:
     """
     Callback invoked when all chunks for a tile have been downloaded.
-    Submits the tile to the background DDS builder and schedules bundle consolidation.
+    Submits the tile to the background DDS builder.
     """
-    if background_dds_builder is not None:
+    if getattr(tile, '_dds_needs_healing', False) and dynamic_dds_cache is not None:
+        _dispatch_healing(tile)
+    elif background_dds_builder is not None:
         background_dds_builder.submit(tile)
-    
-    # Schedule bundle consolidation for ALL zoom levels of this tile
-    consolidate_tile_if_ready(tile, "prefetch")
 
 
 def start_predictive_dds(tile_cacher=None) -> None:
@@ -4811,7 +3956,8 @@ def start_predictive_dds(tile_cacher=None) -> None:
     Args:
         tile_cacher: TileCacher instance (for future use)
     """
-    global prebuilt_dds_cache, background_dds_builder, tile_completion_tracker, _bundle_consolidator
+    global background_dds_builder, tile_completion_tracker
+    global dynamic_dds_cache, disk_budget_manager
 
     # Prevent duplicate initialization (Windows/Linux: all mounts share one process)
     if background_dds_builder is not None:
@@ -4858,13 +4004,47 @@ def start_predictive_dds(tile_cacher=None) -> None:
     except Exception as e:
         log.warning(f"Failed to initialize decoder pool: {e}")
     
-    # Initialize disk-only cache
-    # Disk reads (~1-2ms) are fast enough - no need for RAM cache overhead
-    # OS file cache naturally keeps hot files in memory
-    prebuilt_dds_cache = EphemeralDDSCache(max_size_mb=disk_cache_mb)
+    # ═══════════════════════════════════════════════════════════════════
+    # Initialize persistent Dynamic DDS Cache (cross-session)
+    # Must be created before BackgroundDDSBuilder which depends on it.
+    # ═══════════════════════════════════════════════════════════════════
+    persistent_dds_mb = int(getattr(CFG.autoortho, 'persistent_dds_cache_mb', 4096))
+    if persistent_dds_mb > 0:
+        try:
+            try:
+                from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+            except ImportError:
+                from aopipeline.dynamic_dds_cache import DynamicDDSCache
+            
+            cache_dir = str(CFG.paths.cache_dir)
+            dynamic_dds_cache = DynamicDDSCache(
+                cache_dir=cache_dir,
+                max_size_mb=persistent_dds_mb,
+                enabled=True
+            )
+            
+            # Scan existing cache entries, then migrate uncompressed files
+            import threading as _threading
+
+            def _scan_and_migrate():
+                dynamic_dds_cache.scan_existing()
+                dynamic_dds_cache.migrate_uncompressed()
+
+            _scan_thread = _threading.Thread(
+                target=_scan_and_migrate,
+                daemon=True,
+                name="dds_cache_scan"
+            )
+            _scan_thread.start()
+            
+            log.info(f"Dynamic DDS cache initialized (max={persistent_dds_mb}MB)")
+        except Exception as e:
+            log.warning(f"Failed to initialize Dynamic DDS cache: {e}")
+    else:
+        log.info("Persistent DDS cache disabled (persistent_dds_cache_mb=0)")
     
     background_dds_builder = BackgroundDDSBuilder(
-        prebuilt_cache=prebuilt_dds_cache,
+        dds_cache=dynamic_dds_cache,
         build_interval_sec=build_interval_sec,
         max_workers=background_builder_workers
     )
@@ -4873,33 +4053,47 @@ def start_predictive_dds(tile_cacher=None) -> None:
         on_tile_complete=_on_tile_complete_callback
     )
     
-    # Initialize bundle consolidator for AOB2 format
-    bundle_consolidation_enabled = getattr(CFG.autoortho, 'bundle_consolidation_enabled', True)
-    if isinstance(bundle_consolidation_enabled, str):
-        bundle_consolidation_enabled = bundle_consolidation_enabled.lower() in ('true', '1', 'yes', 'on')
+    # ═══════════════════════════════════════════════════════════════════
+    # Initialize Disk Budget Manager
+    # ═══════════════════════════════════════════════════════════════════
+    budget_enabled = getattr(CFG.autoortho, 'disk_budget_enabled', True)
+    if isinstance(budget_enabled, str):
+        budget_enabled = budget_enabled.lower() in ('true', '1', 'yes', 'on')
     
-    if bundle_consolidation_enabled:
+    if budget_enabled:
         try:
-            # Handle imports for both frozen (PyInstaller) and direct Python execution
             try:
-                from autoortho.aopipeline.bundle_consolidator import BundleConsolidator
+                from autoortho.aopipeline.disk_budget_manager import DiskBudgetManager
             except ImportError:
-                from aopipeline.bundle_consolidator import BundleConsolidator
+                from aopipeline.disk_budget_manager import DiskBudgetManager
             
-            cache_dir = CFG.paths.cache_dir
-            _bundle_consolidator = BundleConsolidator(
+            total_budget_gb = int(getattr(CFG.cache, 'file_cache_size', 30))
+            total_budget_mb = total_budget_gb * 1024  # GB -> MB
+            dds_pct = int(getattr(CFG.autoortho, 'dds_budget_pct', 40))
+            
+            cache_dir = str(CFG.paths.cache_dir)
+            disk_budget_manager = DiskBudgetManager(
                 cache_dir=cache_dir,
-                delete_jpegs=True,  # Remove individual JPEGs after consolidation
-                max_workers=4,
-                enabled=True
+                total_budget_mb=total_budget_mb,
+                dds_budget_pct=dds_pct,
+                dds_cache=dynamic_dds_cache
             )
-            log.info(f"Bundle consolidation enabled (AOB2 format) - bundles saved to {cache_dir}/bundles/")
-        except ImportError as e:
-            log.info(f"Bundle consolidator not available (import failed): {e}")
+            
+            # Run initial scan + cleanup in background thread
+            import threading as _threading
+            _budget_thread = _threading.Thread(
+                target=disk_budget_manager.initial_scan,
+                daemon=True,
+                name="disk_budget_scan"
+            )
+            _budget_thread.start()
+            
+            log.info(f"Disk budget manager initialized (total={total_budget_gb}GB, dds_pct={dds_pct}%)")
         except Exception as e:
-            log.warning(f"Failed to initialize bundle consolidator: {e}")
+            log.warning(f"Failed to initialize Disk Budget Manager: {e}")
+            disk_budget_manager = None
     else:
-        log.info("Bundle consolidation disabled by config")
+        log.info("Disk budget enforcement disabled by config")
     
     # Start the builder thread
     background_dds_builder.start()
@@ -4910,45 +4104,8 @@ def start_predictive_dds(tile_cacher=None) -> None:
 
 def stop_predictive_dds() -> None:
     """Stop the predictive DDS generation system and cleanup disk cache."""
-    global background_dds_builder, tile_completion_tracker, prebuilt_dds_cache, _bundle_consolidator
-    
-    # Shutdown bundle consolidator first (let pending consolidations complete)
-    if _bundle_consolidator is not None:
-        try:
-            stats = _bundle_consolidator.get_stats()
-            _bundle_consolidator.shutdown(wait=True)
-            log.info(f"Bundle consolidator: {stats['bundles_created']} bundles created, "
-                    f"{stats['jpegs_consolidated']} JPEGs consolidated")
-            # TEMP STATS: Log queue and timing info for timeout tuning
-            log.info(f"Bundle consolidator timing: "
-                    f"avg={stats.get('tile_consolidation_avg_ms', 0):.1f}ms, "
-                    f"max={stats.get('tile_consolidation_max_ms', 0):.1f}ms, "
-                    f"min={stats.get('tile_consolidation_min_ms', 0):.1f}ms")
-            log.info(f"Bundle consolidator queue: "
-                    f"max_seen={stats.get('queue_size_max', 0)}, "
-                    f"avg={stats.get('queue_size_avg', 0):.1f}")
-            
-            # Orphan JPEG cleanup (if enabled)
-            cleanup_orphans = getattr(CFG.autoortho, 'cleanup_orphan_jpegs_on_exit', True)
-            if isinstance(cleanup_orphans, str):
-                cleanup_orphans = cleanup_orphans.lower() in ('true', '1', 'yes', 'on')
-            
-            if cleanup_orphans:
-                try:
-                    try:
-                        from autoortho.aopipeline.bundle_consolidator import cleanup_orphan_jpegs
-                    except ImportError:
-                        from aopipeline.bundle_consolidator import cleanup_orphan_jpegs
-                    
-                    cache_dir = str(CFG.paths.cache_dir)
-                    deleted, scanned = cleanup_orphan_jpegs(cache_dir)
-                    if deleted > 0:
-                        log.info(f"Orphan cleanup: deleted {deleted}/{scanned} JPEGs (data safe in bundles)")
-                except Exception as e:
-                    log.debug(f"Orphan cleanup failed: {e}")
-        except Exception as e:
-            log.warning(f"Error shutting down bundle consolidator: {e}")
-        _bundle_consolidator = None
+    global background_dds_builder, tile_completion_tracker
+    global dynamic_dds_cache, disk_budget_manager
     
     if background_dds_builder is not None:
         stats = background_dds_builder.stats
@@ -4956,23 +4113,30 @@ def stop_predictive_dds() -> None:
         log.info(f"BackgroundDDSBuilder: {stats['builds_completed']} tiles built, "
                 f"{stats['builds_failed']} failed")
     
-    if prebuilt_dds_cache is not None:
-        stats = prebuilt_dds_cache.stats
-        # EphemeralDDSCache uses different stat keys than PrebuiltDDSCache
-        hits = stats.get('hits', 0)
-        misses = stats.get('misses', 0)
-        hit_rate = stats.get('hit_rate', 0)
-        size_mb = stats.get('size_mb', stats.get('memory_mb', 0))
-        log.info(f"DDS disk cache: {hits} hits, {misses} misses, "
-                f"{hit_rate:.1f}% hit rate, {size_mb:.1f}MB used")
-        
-        # Clean up disk cache files
-        prebuilt_dds_cache.cleanup()
+    # Log dynamic DDS cache stats on shutdown
+    if dynamic_dds_cache is not None:
+        try:
+            stats = dynamic_dds_cache.stats
+            log.info(f"Dynamic DDS cache: {stats['hits']} hits, {stats['misses']} misses, "
+                    f"{stats['hit_rate']:.1f}% hit rate, {stats['disk_usage_mb']:.1f}MB used, "
+                    f"{stats['entries']} entries, {stats['upgrades']} ZL upgrades")
+        except Exception:
+            pass
+    
+    # Log disk budget stats on shutdown
+    if disk_budget_manager is not None:
+        try:
+            report = disk_budget_manager.usage_report
+            log.info(f"Disk budget: DDS={report['dds_usage_mb']:.0f}/{report['dds_budget_mb']:.0f}MB, "
+                    f"JPEGs={report['jpeg_usage_mb']:.0f}/{report['jpeg_budget_mb']:.0f}MB")
+        except Exception:
+            pass
     
     # Clear references
     background_dds_builder = None
     tile_completion_tracker = None
-    prebuilt_dds_cache = None
+    dynamic_dds_cache = None
+    disk_budget_manager = None
 
 
 # HTTP status codes that indicate permanent failure (no retry)
@@ -5252,10 +4416,10 @@ class Chunk(object):
         # Hack override maptype
         #maptype = "ARC"
 
-        MAPID = "s2cloudless-2023_3857"
+        MAPID = "s2cloudless-2024_3857"
         MATRIXSET = "g"
         MAPTYPES = {
-            "EOX": f"https://{server}.tiles.maps.eox.at/wmts/?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
+            "EOX": f"https://s2maps-tiles.eu/wmts?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
             "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
             "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
             "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
@@ -5357,7 +4521,7 @@ class Chunk(object):
                         log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
                         # Enhanced circuit breaker: reduce wait times on severe error rates
                         if error_rate >= 0.25:
-                            log.warning("Severe error rate (≥25%) detected, consider checking configuration")
+                            log.warning("Severe error rate (>=25%%) detected, consider checking configuration")
                 return False
 
             data = resp.content
@@ -5383,7 +4547,6 @@ class Chunk(object):
         self.fetchtime = time.monotonic() - self.starttime
 
         # Signal ready IMMEDIATELY - data is in memory for consumers
-        # Tile composition and bundle consolidation use chunk.data directly
         self.ready.set()
         
         # Track slow downloads for visibility in stats
@@ -5398,7 +4561,6 @@ class Chunk(object):
         
         # Notify tile completion tracker (for predictive DDS generation)
         # MUST happen before async cache write to ensure in-memory data capture
-        # by bundle consolidation (which uses chunk.data directly)
         try:
             if tile_completion_tracker is not None and self.tile_id:
                 tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
@@ -5519,6 +4681,28 @@ class Tile(object):
         self._is_live = False                           # True when X-Plane requests via FUSE
         self._live_transition_event = None              # Event to signal transition
         self._active_streaming_builder = None           # Reference for transition coordination
+        
+        # === DYNAMIC DDS CACHE UPGRADE HINT ===
+        # Set by DynamicDDSCache.load() when a lower-ZL cached DDS exists that
+        # can be upgraded via mipmap shifting instead of a full rebuild.
+        # Tuple of (old_dds_path, old_metadata) or None.
+        self._dds_upgrade_available = None
+        
+        # === DDS HEALING STATE ===
+        # Set by DynamicDDSCache.load() when a cached DDS has missing or fallback chunks.
+        self._dds_needs_healing = False
+        self._dds_missing_indices = []
+        self._dds_fallback_indices = []
+        
+        # === DDS ZL DOWNGRADE HINT ===
+        # Set by DynamicDDSCache.load() when a higher-ZL cached DDS exists.
+        self._dds_downgrade_available = None
+
+        # === DDS INCREMENTAL PERSISTENCE HINT ===
+        # Set by DynamicDDSCache.load() when loading a partially-built DDS.
+        # Contains a set of mipmap indices that have real data on disk, or
+        # None when all mipmaps are populated (v2 compat / full DDS).
+        self._dds_populated_mipmaps = None
         
         # === BATCH-TO-STREAMING DATA REUSE ===
         # When batch aopipeline collects data but fails (ratio below threshold),
@@ -5653,81 +4837,6 @@ class Tile(object):
         self.imgs[mipmap] = img_data
         self._imgs_order.append(mipmap)
 
-    def _wait_for_pending_consolidation_if_needed(self, timeout: float = 5.0) -> bool:
-        """
-        Wait for pending consolidation OUTSIDE any locks.
-        
-        Must be called BEFORE _create_chunks() to avoid blocking other threads
-        while waiting for consolidation. This prevents the scenario where thread A
-        holds the tile lock for 30 seconds waiting for consolidation while thread B
-        (wanting the same tile) is blocked.
-        
-        Args:
-            timeout: Maximum time to wait in seconds (default 30s)
-            
-        Returns:
-            True if consolidation completed (or wasn't pending)
-            False if still pending after timeout
-        """
-        global _bundle_consolidator
-        if _bundle_consolidator is None:
-            return True
-        
-        if not _bundle_consolidator.is_pending(self.row, self.col, self.maptype):
-            return True
-        
-        # Determine timeout based on time budget (if live request)
-        if hasattr(self, '_tile_time_budget') and self._tile_time_budget is not None:
-            wait_timeout = max(0.5, min(self._tile_time_budget.remaining, timeout))
-        else:
-            wait_timeout = timeout
-        
-        log.debug(f"Waiting for consolidation outside lock: {self.id}")
-        
-        if _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=wait_timeout):
-            return True
-        
-        bump('bundle_wait_timeout')
-        return False
-
-    def _schedule_immediate_consolidation(self, jpeg_datas: list, zoom: int) -> bool:
-        """
-        Schedule consolidation immediately while JPEG data is in memory.
-        
-        This ensures that zoom levels are consolidated as soon as their data
-        is collected, before chunks can be garbage collected or evicted.
-        Critical for ensuring lower zoom levels (mipmaps) are consolidated
-        into the bundle, not just max_zoom.
-        
-        Args:
-            jpeg_datas: List of JPEG bytes (None for missing chunks)
-            zoom: Zoom level of the data
-            
-        Returns:
-            True if scheduling succeeded, False otherwise
-        """
-        try:
-            valid_count = sum(1 for d in jpeg_datas if d is not None)
-            if valid_count == 0:
-                return False
-            
-            # Use the existing schedule_bundle_consolidation function
-            result = schedule_bundle_consolidation(
-                self, 
-                priority=1,  # Normal priority (not urgent)
-                jpeg_datas=jpeg_datas, 
-                zoom=zoom
-            )
-            
-            if result:
-                log.debug(f"Scheduled immediate consolidation for {self.id} ZL{zoom} "
-                         f"({valid_count}/{len(jpeg_datas)} chunks)")
-            
-            return result
-        except Exception as e:
-            log.debug(f"_schedule_immediate_consolidation failed: {e}")
-            return False
-
     @locked
     def _create_chunks(self, quick_zoom=0, min_zoom=None):
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom, min_zoom)
@@ -5735,19 +4844,6 @@ class Tile(object):
         if not self.chunks.get(zoom):
             self.chunks[zoom] = []
             log.debug(f"CREATE_CHUNKS: Tile {self.id} creating chunks for zoom {zoom}: {width}x{height} grid starting at ({col},{row})")
-            
-            # Try bundle-first read (AOB2 format - much faster than individual files)
-            bundle_loaded = False
-            try:
-                bundle_loaded = self._try_load_from_bundle(col, row, width, height, zoom)
-            except Exception as e:
-                log.warning(f"Bundle read error for {self.id}: {e}")
-            
-            if bundle_loaded:
-                return
-            else:
-                # Track bundle misses - will fall through to individual file loading
-                bump('bundle_cache_miss')
 
             # Check if native batch cache reading is available
             native_cache = _get_native_cache()
@@ -5773,259 +4869,8 @@ class Tile(object):
                             hits += 1
                     if hits > 0:
                         log.debug(f"Native batch cache read: {hits}/{len(paths)} hits for zoom {zoom}")
-                
-                # SIMPLIFIED BUNDLE RECOVERY
-                # If batch read missed files, try bundle once (no waiting)
-                missing_count = len(paths) - len(cached_data)
-                if missing_count > 0:
-                    try:
-                        try:
-                            from autoortho.utils.bundle_paths import get_bundle2_path
-                            from autoortho.aopipeline import AoBundle2
-                        except ImportError:
-                            from utils.bundle_paths import get_bundle2_path
-                            from aopipeline import AoBundle2
-                        
-                        bundle_path = get_bundle2_path(
-                            self.cache_dir, self.row, self.col, 
-                            self.maptype, self.tilename_zoom
-                        )
-                        
-                        if os.path.exists(bundle_path):
-                            with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                                if bundle.has_zoom(zoom):
-                                    jpeg_datas = bundle.get_all_chunks(zoom)
-                                    if jpeg_datas:
-                                        recovered = 0
-                                        for i, chunk in enumerate(self.chunks[zoom]):
-                                            if chunk.cache_path not in cached_data and i < len(jpeg_datas):
-                                                if jpeg_datas[i]:
-                                                    chunk.set_cached_data(jpeg_datas[i])
-                                                    recovered += 1
-                                        if recovered > 0:
-                                            bump('bundle_fallback_success')
-                                            log.debug(f"Bundle fallback: recovered {recovered}/{missing_count} chunks")
-                    except Exception as e:
-                        log.debug(f"Bundle fallback failed: {e}")
         else:
             log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
-
-    def _try_load_from_bundle(self, col: int, row: int, width: int, height: int, zoom: int) -> bool:
-        """
-        Try to load chunks from an AOB2 bundle file.
-        
-        Bundle loading is much faster than individual file reads because:
-        - Single file open instead of 256+ opens
-        - Sequential read for optimal disk I/O
-        - Memory-mappable for zero-copy access
-        
-        If the bundle doesn't exist but consolidation is pending, waits briefly
-        for the consolidation to complete before falling back to individual files.
-        
-        Args:
-            col, row: Starting chunk coordinates (SCALED for the target zoom level)
-            width, height: Chunk grid dimensions
-            zoom: Zoom level
-        
-        Returns:
-            True if bundle was loaded successfully, False otherwise
-        """
-        global _bundle_consolidator
-        
-        try:
-            # Handle imports for both frozen (PyInstaller) and direct Python execution
-            try:
-                from autoortho.utils.bundle_paths import get_bundle2_path, bundle_exists
-                from autoortho.aopipeline import AoBundle2
-            except ImportError:
-                from utils.bundle_paths import get_bundle2_path, bundle_exists
-                from aopipeline import AoBundle2
-            
-            # CRITICAL: Use TILE ID coordinates (self.row, self.col at tilename_zoom) for bundle path!
-            # Bundles are named after the tile ID, NOT the scaled chunk coordinates.
-            # The bundle stores chunks at their respective zoom levels internally.
-            bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
-            
-            if not os.path.exists(bundle_path):
-                # Bundle doesn't exist - consolidation wait is now done OUTSIDE the lock
-                # via _wait_for_pending_consolidation_if_needed() called before _create_chunks()
-                # If bundle still doesn't exist here, fall back to individual files
-                return False
-            
-            # Open bundle and read chunks - use context manager to release file immediately
-            # Critical: On Windows, mmap holds file open and blocks consolidation updates
-            max_attempts = 3
-            retry_delay = 0.2
-            jpeg_datas = None
-            last_error = None
-            for attempt in range(max_attempts):
-                try:
-                    with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                        # Check if bundle has this zoom level
-                        if not bundle.has_zoom(zoom):
-                            log.debug(f"Bundle missing zoom {zoom} for {self.id}")
-                            return False
-                        
-                        # Get all chunk data from bundle (returns copies, safe after close)
-                        jpeg_datas = bundle.get_all_chunks(zoom)
-                    # Bundle is now closed - file handle released
-                    break
-                except Exception as e:
-                    last_error = e
-                    if attempt < max_attempts - 1:
-                        time.sleep(retry_delay * (attempt + 1))
-                        continue
-                    log.warning(f"Failed to load bundle for {self.id} after {max_attempts} attempts: {e}")
-                    return False
-
-            if jpeg_datas is None:
-                log.debug(f"Bundle read returned no data for {self.id}: {last_error}")
-                return False
-            
-            expected_count = width * height
-            
-            if len(jpeg_datas) != expected_count:
-                log.warning(f"Bundle chunk count mismatch: {len(jpeg_datas)} vs {expected_count} for {self.id}")
-                return False
-            
-            # Count valid chunks
-            valid_count = sum(1 for d in jpeg_datas if d is not None)
-            
-            # Create chunks with data from bundle
-            chunk_idx = 0
-            for r in range(row, row + height):
-                for c in range(col, col + width):
-                    chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir,
-                                  tile_id=self.id, skip_cache_check=True)
-                    
-                    # Set cached data if available
-                    jpeg_data = jpeg_datas[chunk_idx]
-                    if jpeg_data is not None:
-                        chunk.set_cached_data(jpeg_data)
-                    
-                    self.chunks[zoom].append(chunk)
-                    chunk_idx += 1
-            
-            bump('bundle_cache_hit')
-            return True
-            
-        except ImportError:
-            log.debug("Bundle modules not available")
-            return False
-        except Exception as e:
-            log.warning(f"Failed to load bundle for {self.id}: {e}")
-            return False
-
-    def _try_build_dds_from_bundle(self, zoom: int, dxt_format: str = "BC1",
-                                    missing_color: Tuple[int, int, int] = (66, 77, 55)) -> Optional[bytes]:
-        """
-        Try to build complete DDS from bundle using native C code.
-        
-        This is the fastest path when a bundle exists with all required chunks.
-        Uses native aobundle2_build_dds which:
-        - Reads bundle (single file open)
-        - Decodes all JPEGs in parallel (OpenMP)
-        - Builds DDS in one pass
-        
-        Args:
-            zoom: Zoom level to build DDS for
-            dxt_format: DXT compression format ("BC1" or "BC3")
-            missing_color: RGB tuple for missing chunk fill color
-            
-        Returns:
-            Complete DDS file as bytes, or None if bundle doesn't exist/have zoom level
-            
-        Thread Safety:
-            - Uses context manager for Bundle2Python (releases mmap immediately)
-            - Native build_dds opens/closes file internally
-        """
-        try:
-            # Handle imports for both frozen (PyInstaller) and direct Python execution
-            try:
-                from autoortho.utils.bundle_paths import get_bundle2_path
-                from autoortho.aopipeline import AoBundle2
-            except ImportError:
-                from utils.bundle_paths import get_bundle2_path
-                from aopipeline import AoBundle2
-            
-            # Get bundle path for this tile
-            bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
-            
-            if not os.path.exists(bundle_path):
-                return None
-            
-            # Check if bundle has this zoom level - use context manager to release file
-            # immediately so native build_dds can open it
-            with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                has_zoom = bundle.has_zoom(zoom)
-            # Bundle is now closed - file handle released
-            
-            if not has_zoom:
-                return None
-            
-            # Native DDS build (parallel JPEG decode + DXT compress)
-            # This is ~3-4x faster than sequential Python processing
-            try:
-                dds_bytes = AoBundle2.build_dds(bundle_path, zoom, dxt_format, missing_color)
-                bump('bundle_dds_build_success')
-                return dds_bytes
-            except Exception as e:
-                log.debug(f"Native bundle DDS build failed: {e}")
-                return None
-                
-        except ImportError:
-            log.debug("Bundle modules not available for DDS build")
-            return None
-        except Exception as e:
-            log.debug(f"_try_build_dds_from_bundle failed: {e}")
-            return None
-
-    def _try_get_chunks_from_bundle(self, zoom: int) -> Optional[List[Optional[bytes]]]:
-        """
-        Try to get all chunk JPEG data from bundle for a specific zoom level.
-        
-        This provides bulk access to chunk data from a bundle, which is faster
-        than reading individual cache files when the bundle exists.
-        
-        Args:
-            zoom: Zoom level to get chunks for
-            
-        Returns:
-            List of JPEG bytes (None for missing chunks), or None if bundle unavailable
-            
-        Thread Safety:
-            - Uses context manager for Bundle2Python (releases mmap immediately)
-        """
-        try:
-            # Handle imports for both frozen (PyInstaller) and direct Python execution
-            try:
-                from autoortho.utils.bundle_paths import get_bundle2_path
-                from autoortho.aopipeline import AoBundle2
-            except ImportError:
-                from utils.bundle_paths import get_bundle2_path
-                from aopipeline import AoBundle2
-            
-            # Get bundle path for this tile
-            bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
-            
-            if not os.path.exists(bundle_path):
-                return None
-            
-            # Read all chunks at once - use context manager to release file immediately
-            with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                if not bundle.has_zoom(zoom):
-                    return None
-                jpeg_datas = bundle.get_all_chunks(zoom)
-            # Bundle is now closed - file handle released
-            
-            return jpeg_datas
-            
-        except ImportError:
-            log.debug("Bundle modules not available for chunk read")
-            return None
-        except Exception as e:
-            log.debug(f"_try_get_chunks_from_bundle failed: {e}")
-            return None
 
     def _collect_chunk_jpegs(self, zoom: int, time_budget=None,
                               min_available_ratio: float = 0.9,
@@ -6057,9 +4902,6 @@ class Tile(object):
             - chunk_getter.submit() is thread-safe
             - No locks held during wait (allows concurrent operations)
         """
-        # Wait for any pending consolidation OUTSIDE lock to avoid blocking other threads
-        self._wait_for_pending_consolidation_if_needed()
-        
         # Ensure chunks exist for this zoom level
         self._create_chunks(zoom)
         chunks = self.chunks.get(zoom, [])
@@ -6114,96 +4956,6 @@ class Tile(object):
                 
                 log.debug(f"_collect_chunk_jpegs: Batch cache read - "
                          f"{len(cached_data)}/{len(cache_paths)} hits")
-                
-                # ═══════════════════════════════════════════════════════════
-                # JPEG-TO-BUNDLE FALLBACK: Handle race condition with consolidator
-                # ═══════════════════════════════════════════════════════════
-                # If batch read missed files, consolidator may have deleted them
-                # while creating a bundle. Check if bundle now exists, or wait
-                # for pending consolidation to avoid re-downloading.
-                still_missing = [i for i in need_cache_read_indices 
-                                if jpeg_datas[i] is None]
-                if still_missing:
-                    try:
-                        try:
-                            from autoortho.utils.bundle_paths import get_bundle2_path
-                            from autoortho.aopipeline import AoBundle2
-                        except ImportError:
-                            from utils.bundle_paths import get_bundle2_path
-                            from aopipeline import AoBundle2
-                        
-                        bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
-                        bundle_datas = None
-                        bundle_has_data = False
-                        
-                        # SMART FALLBACK: Only attempt if bundle exists
-                        bundle_exists = os.path.exists(bundle_path)
-                        if not bundle_exists:
-                            bump('jpeg_to_bundle_fallback_skipped')
-                        
-                        # First check: bundle exists?
-                        if bundle_exists:
-                            with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                                if bundle.has_zoom(zoom):
-                                    bundle_datas = bundle.get_all_chunks(zoom)
-                                    bundle_has_data = True
-                        
-                        # Second check: consolidation pending or recently completed?
-                        # CRITICAL: Pass zoom to is_pending() - only wait for OUR zoom!
-                        if not bundle_has_data and _bundle_consolidator is not None:
-                            bump('jpeg_to_bundle_fallback_entered')
-                            waited_for_consolidation = False
-                            if _bundle_consolidator.is_pending(self.row, self.col, self.maptype, zoom):
-                                log.debug(f"_collect_chunk_jpegs: waiting for pending consolidation (zoom {zoom})")
-                                bump('jpeg_to_bundle_wait_started')
-                                wait_start = time.monotonic()
-                                # Pass zoom to wait for THIS specific zoom level's consolidation
-                                wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0, zoom=zoom)
-                                wait_time = time.monotonic() - wait_start
-                                waited_for_consolidation = True
-                                
-                                if wait_result:
-                                    bump('jpeg_to_bundle_wait_success')
-                                    if wait_time > 5.0:
-                                        bump('jpeg_to_bundle_wait_long')
-                                        log.debug(f"_collect_chunk_jpegs: waited {wait_time:.1f}s for consolidation")
-                                elif wait_time > 30.0:
-                                    bump('jpeg_to_bundle_wait_timeout')
-                                    log.warning(f"_collect_chunk_jpegs: consolidation wait TIMEOUT after {wait_time:.1f}s - "
-                                               f"tile {self.row}_{self.col}_{self.maptype} may have stuck consolidation")
-                                else:
-                                    bump('jpeg_to_bundle_wait_already_done')
-                            
-                            # ALWAYS try bundle - even if is_pending was False
-                            # Consolidation may have completed between first check and now
-                            if not bundle_has_data and os.path.exists(bundle_path):
-                                bump('jpeg_to_bundle_fallback_bundle_exists')
-                                with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                                    if bundle.has_zoom(zoom):
-                                        bump('jpeg_to_bundle_fallback_has_zoom')
-                                        bundle_datas = bundle.get_all_chunks(zoom)
-                                        bundle_has_data = True
-                                        if not waited_for_consolidation:
-                                            bump('jpeg_to_bundle_fallback_not_pending')
-                                    else:
-                                        bump('jpeg_to_bundle_fallback_no_zoom')
-                        
-                        # Apply recovered data
-                        if bundle_has_data and bundle_datas:
-                            fallback_hits = 0
-                            for i in still_missing:
-                                if i < len(bundle_datas) and bundle_datas[i]:
-                                    chunks[i].set_cached_data(bundle_datas[i])
-                                    jpeg_datas[i] = bundle_datas[i]
-                                    available_count += 1
-                                    fallback_hits += 1
-                            if fallback_hits > 0:
-                                log.debug(f"_collect_chunk_jpegs: JPEG-to-bundle fallback - "
-                                         f"recovered {fallback_hits}/{len(still_missing)} chunks")
-                                bump('jpeg_to_bundle_fallback')
-                    except Exception as e:
-                        log.debug(f"_collect_chunk_jpegs: JPEG-to-bundle fallback failed: {e}")
-                # ═══════════════════════════════════════════════════════════
             else:
                 # Batch read failed or unavailable - fall back to individual reads
                 for i in need_cache_read_indices:
@@ -6219,9 +4971,6 @@ class Tile(object):
         if ratio >= min_available_ratio:
             log.debug(f"_collect_chunk_jpegs: Phase 1 sufficient - "
                       f"{available_count}/{total_chunks} chunks ({ratio*100:.0f}%)")
-            # Schedule consolidation immediately while data is in memory
-            # This ensures the zoom level gets consolidated before chunks are GC'd
-            self._schedule_immediate_consolidation(jpeg_datas, zoom)
             return jpeg_datas
         
         log.debug(f"_collect_chunk_jpegs: Phase 1 - {available_count}/{total_chunks} "
@@ -6295,8 +5044,6 @@ class Tile(object):
         if ratio >= min_available_ratio:
             log.debug(f"_collect_chunk_jpegs: Phase 2 final success - "
                       f"{available_count}/{total_chunks} ({ratio*100:.0f}%)")
-            # Schedule consolidation immediately while data is in memory
-            self._schedule_immediate_consolidation(jpeg_datas, zoom)
             return jpeg_datas
         
         log.debug(f"_collect_chunk_jpegs: Threshold not met - "
@@ -6308,11 +5055,6 @@ class Tile(object):
         self._last_collected_jpegs = jpeg_datas
         self._last_collected_ratio = ratio
         self._last_collected_missing = [i for i, d in enumerate(jpeg_datas) if d is None]
-        
-        # Schedule consolidation for partial data too - merge logic will fill in
-        # missing chunks later when they're downloaded
-        if available_count > 0:
-            self._schedule_immediate_consolidation(jpeg_datas, zoom)
         
         # If return_partial requested, return what we collected (for build-as-is mode)
         if return_partial:
@@ -6491,8 +5233,14 @@ class Tile(object):
                       f"{result.bytes_written} bytes in {build_time:.0f}ms")
             build_success = True
             
-            # Schedule bundle consolidation for ALL zoom levels
-            consolidate_tile_if_ready(self, "aopipeline")
+            # Persist to Dynamic DDS Cache (cross-session, non-blocking)
+            if dynamic_dds_cache is not None:
+                try:
+                    mm0_missing = [i for i, d in enumerate(jpeg_datas) if d is None]
+                    dynamic_dds_cache.store(self.id, self.max_zoom, dds_bytes, self,
+                                           mm0_missing_indices=mm0_missing or None)
+                except Exception:
+                    pass  # Non-critical, don't block live path
             
         except Exception as e:
             log.debug(f"_try_aopipeline_build: Exception for {self.id}: {e}")
@@ -6616,8 +5364,6 @@ class Tile(object):
         jpeg_refs_for_nocopy = []
         
         try:
-            # Wait for any pending consolidation OUTSIDE lock
-            self._wait_for_pending_consolidation_if_needed()
             
             # Ensure chunks are created for target zoom
             self._create_chunks(self.max_zoom)
@@ -6689,6 +5435,8 @@ class Tile(object):
                         break  # Budget exhausted, stop waiting
             
             # Phase 3: Process all pending chunks - batch add successful, collect failures
+            streaming_mm0_missing = []
+            streaming_mm0_fallback = []
             newly_ready = []
             failed_indices = []
             for i in pending_indices:
@@ -6704,21 +5452,37 @@ class Tile(object):
                 builder.add_chunks_batch_nocopy(newly_ready, jpeg_refs_for_nocopy)
             
             # Phase 4: Resolve fallbacks for failed chunks
-            # Use ThreadPoolExecutor for parallel disk I/O and image operations
-            if failed_indices and not (time_budget and time_budget.exhausted):
+            # Use ThreadPoolExecutor for parallel disk I/O and image operations.
+            # Always attempt fallback resolution even if the main time budget is
+            # exhausted: the resolver only does disk cache lookups and mipmap
+            # scaling (downloader=None) which are fast, sub-second operations.
+            # Skipping this phase when the budget exhausted was the root cause of
+            # permanent missing-color patches on first load, because the DDS was
+            # built with missing_color baked in and marked retrieved=True,
+            # preventing any later retry.
+            if failed_indices:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
+                
+                # When main budget is exhausted, give fallback resolution a
+                # fresh budget for disk-only operations (no network), using the
+                # user-configured fallback_timeout.
+                fallback_resolve_budget = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
                 
                 def resolve_fallback(idx):
                     """Resolve fallback for a single chunk - can run in parallel."""
                     chunk_col = self.col + (idx % self.chunks_per_row)
                     chunk_row = self.row + (idx // self.chunks_per_row)
                     
-                    # Create fallback time budget if main budget provided
+                    # Create fallback time budget:
+                    # - If main budget has time remaining, use that
+                    # - Otherwise use a fresh small budget for disk-only fallbacks
                     fb_budget = None
                     if time_budget:
                         fb_remaining = time_budget.remaining
                         if fb_remaining > 0:
                             fb_budget = FBTimeBudget(fb_remaining)
+                        else:
+                            fb_budget = FBTimeBudget(fallback_resolve_budget)
                     
                     rgba = resolver.resolve(
                         chunk_col, chunk_row, self.max_zoom,
@@ -6731,12 +5495,15 @@ class Tile(object):
                 max_workers = min(8, len(failed_indices))
                 fallback_results = []
                 
+                # Use remaining budget or a fresh small budget for collection
+                resolve_deadline_secs = max(1.0, max_wait) if not (time_budget and time_budget.exhausted) else fallback_resolve_budget
+                
                 try:
                     with ThreadPoolExecutor(max_workers=max_workers) as executor:
                         futures = {executor.submit(resolve_fallback, i): i for i in failed_indices}
                         
                         # Collect results with timeout
-                        deadline = time.monotonic() + max(1.0, max_wait)
+                        deadline = time.monotonic() + resolve_deadline_secs
                         for future in as_completed(futures, timeout=max(0.1, deadline - time.monotonic())):
                             try:
                                 idx, rgba = future.result(timeout=0.1)
@@ -6745,9 +5512,6 @@ class Tile(object):
                                 # Fallback failed, will be marked missing
                                 idx = futures[future]
                                 fallback_results.append((idx, None))
-                            
-                            if time_budget and time_budget.exhausted:
-                                break
                 except Exception:
                     # Timeout or other error - mark remaining as missing
                     pass
@@ -6758,17 +5522,16 @@ class Tile(object):
                     resolved_indices.add(idx)
                     if rgba:
                         builder.add_fallback_image(idx, rgba)
+                        streaming_mm0_fallback.append(idx)
                     else:
                         builder.mark_missing(idx)
+                        streaming_mm0_missing.append(idx)
                 
                 # Mark unresolved chunks as missing
                 for i in failed_indices:
                     if i not in resolved_indices:
                         builder.mark_missing(i)
-            elif failed_indices:
-                # Budget exhausted - mark all failed as missing
-                for i in failed_indices:
-                    builder.mark_missing(i)
+                        streaming_mm0_missing.append(i)
             
             # Finalize: acquire DDS buffer and build
             pool = _get_dds_buffer_pool()
@@ -6810,8 +5573,16 @@ class Tile(object):
                                   f"missing={status['chunks_missing']})")
                         bump('streaming_builder_success')
                         
-                        # Schedule bundle consolidation for ALL zoom levels
-                        consolidate_tile_if_ready(self, "aopipeline")
+                        # Persist to Dynamic DDS Cache (cross-session, non-blocking)
+                        if dynamic_dds_cache is not None:
+                            try:
+                                dynamic_dds_cache.store(
+                                    self.id, self.max_zoom, dds_bytes, self,
+                                    mm0_missing_indices=streaming_mm0_missing or None,
+                                    mm0_fallback_indices=streaming_mm0_fallback or None)
+                            except Exception:
+                                pass  # Non-critical, don't block live path
+                        
                         return True
                 
                 log.debug(f"_try_streaming_aopipeline_build: Finalize failed for {self.id}")
@@ -6958,8 +5729,6 @@ class Tile(object):
 
 
     def fetch(self, quick_zoom=0, background=False):
-        # Wait for any pending consolidation OUTSIDE lock
-        self._wait_for_pending_consolidation_if_needed()
         
         self._create_chunks(quick_zoom)
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom)
@@ -7004,7 +5773,9 @@ class Tile(object):
             # We need to populate each mipmap's databuffer
             last_valid_mm_data = None
             last_valid_mm_idx = -1
-            
+
+            populated = getattr(self, '_dds_populated_mipmaps', None)
+
             for mm in self.dds.mipmap_list:
                 if mm.startpos >= len(prebuilt_bytes):
                     # Prebuilt data doesn't include this mipmap
@@ -7012,16 +5783,24 @@ class Tile(object):
                     # This matches pydds.gen_mipmaps() behavior for trailing mipmaps
                     if last_valid_mm_data is not None:
                         for trailing_mm in self.dds.mipmap_list[mm.idx:]:
+                            if populated is not None and trailing_mm.idx not in populated:
+                                continue
                             trailing_mm.databuffer = BytesIO(initial_bytes=last_valid_mm_data)
                             trailing_mm.retrieved = True
                     break
-                
+
+                # Skip unpopulated mipmaps (partial DDS from incremental save)
+                if populated is not None and mm.idx not in populated:
+                    continue
+
                 # Extract this mipmap's data from the prebuilt buffer
                 mm_end = min(mm.endpos, len(prebuilt_bytes))
                 if mm_end <= mm.startpos:
                     # No data for this mipmap - propagate last valid
                     if last_valid_mm_data is not None:
                         for trailing_mm in self.dds.mipmap_list[mm.idx:]:
+                            if populated is not None and trailing_mm.idx not in populated:
+                                continue
                             trailing_mm.databuffer = BytesIO(initial_bytes=last_valid_mm_data)
                             trailing_mm.retrieved = True
                     break
@@ -7036,7 +5815,9 @@ class Tile(object):
                 last_valid_mm_data = mm_data
                 last_valid_mm_idx = mm.idx
             
-            log.debug(f"Populated DDS from prebuilt cache for {self} (last_mm={last_valid_mm_idx})")
+            log.debug(f"Populated DDS from prebuilt cache for {self} "
+                      f"(last_mm={last_valid_mm_idx}, "
+                      f"populated={sorted(populated) if populated else 'all'})")
             # Mark as prepopulated so bytes_read warning doesn't trigger
             self._prepopulated = True
             return True
@@ -7066,21 +5847,20 @@ class Tile(object):
             return True
         
         # ═══════════════════════════════════════════════════════════════════
-        # PREDICTIVE DDS: Check prebuilt cache first
+        # PERSISTENT DDS CACHE: Check Dynamic DDS Cache first (disk, cross-session)
         # ═══════════════════════════════════════════════════════════════════
-        # If we have a prebuilt DDS for this tile, populate the DDS structure
-        # from it and skip all the chunk download/decode/compress work.
-        if prebuilt_dds_cache is not None:
-            prebuilt_bytes = prebuilt_dds_cache.get(self.id)
-            if prebuilt_bytes is not None:
-                if self._populate_dds_from_prebuilt(prebuilt_bytes):
-                    log.debug(f"GET_BYTES: Prebuilt cache HIT for {self.id}")
-                    bump('prebuilt_cache_hit')
+        # The persistent cache survives across sessions. On a warm start this
+        # provides ~1-2ms per tile vs ~390ms for a full rebuild.
+        if dynamic_dds_cache is not None and not self._prepopulated:
+            cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
+            if cached_bytes is not None:
+                if self._populate_dds_from_prebuilt(cached_bytes):
+                    log.debug(f"GET_BYTES: Dynamic DDS cache HIT for {self.id}")
+                    bump('dynamic_dds_cache_hit')
                     return True
                 else:
-                    # Population failed - fall through to normal path
-                    log.debug(f"GET_BYTES: Prebuilt cache hit but populate failed for {self.id}")
-                    bump('prebuilt_cache_populate_fail')
+                    log.debug(f"GET_BYTES: Dynamic DDS cache hit but populate failed for {self.id}")
+                    bump('dynamic_dds_cache_populate_fail')
         # ═══════════════════════════════════════════════════════════════════
         
         # ═══════════════════════════════════════════════════════════════════
@@ -7104,13 +5884,12 @@ class Tile(object):
             if self._live_transition_event is not None:
                 wait_time = min(transition_budget.remaining, 2.0)
                 if self._live_transition_event.wait(timeout=wait_time):
-                    # Prefetch completed - check if cache was populated
-                    if prebuilt_dds_cache is not None:
-                        prebuilt_bytes = prebuilt_dds_cache.get(self.id)
-                        if prebuilt_bytes is not None:
-                            if self._populate_dds_from_prebuilt(prebuilt_bytes):
-                                log.debug(f"GET_BYTES: Prebuilt cache HIT after transition for {self.id}")
-                                bump('prebuilt_cache_hit_after_transition')
+                    if dynamic_dds_cache is not None:
+                        cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
+                        if cached_bytes is not None:
+                            if self._populate_dds_from_prebuilt(cached_bytes):
+                                log.debug(f"GET_BYTES: DDS cache HIT after transition for {self.id}")
+                                bump('dds_cache_hit_after_transition')
                                 return True
         # ═══════════════════════════════════════════════════════════════════
 
@@ -7568,9 +6347,7 @@ class Tile(object):
             
         log.debug(f"GET_IMG: Chunk indices - start: {startchunk}, end: {endchunk}, chunks_per_row: {chunks_per_row}")
 
-        # Wait for any pending consolidation - done here INSIDE get_img but the wait
-        # itself doesn't hold any additional locks beyond the tile's RLock that get_img already holds.
-        # Note: get_img has @locked, so this wait is within the tile lock.
+
         # TODO: For further optimization, this wait could be moved to callers of get_img.
         # For now, the per-tile event-based wait is much faster than notify_all().
         
@@ -7746,13 +6523,18 @@ class Tile(object):
                 return (chunk, None, 0, 0)
             
             # === TIME BUDGET CHECK ===
-            # Early exit if the time budget is exhausted. This is the key improvement:
-            # instead of each chunk waiting maxwait seconds, we check the shared budget.
-            if time_budget.exhausted:
-                log.debug(f"Time budget exhausted (elapsed={time_budget.elapsed:.2f}s), skipping chunk {chunk}")
-                time_budget.record_chunk_skipped()
-                bump('chunk_budget_skipped')
-                return (chunk, None, start_x, start_y)
+            # When the budget is exhausted we no longer wait for downloads
+            # (wait_with_budget returns immediately), but we still fall through
+            # to attempt local fallbacks (Fallback 1: disk cache, Fallback 2:
+            # mipmap scaling).  These are fast, sub-millisecond operations that
+            # can eliminate missing-color patches at virtually no cost.
+            # Fallback 3 (network) has its own internal budget gates and will
+            # not fire when the budget is exhausted.
+            budget_exhausted_at_entry = time_budget.exhausted
+            if budget_exhausted_at_entry:
+                log.debug(f"Time budget exhausted (elapsed={time_budget.elapsed:.2f}s), "
+                         f"attempting local fallbacks for chunk {chunk}")
+                bump('chunk_budget_exhausted_local_fallback')
             
             # Track if this chunk permanently failed
             is_permanent_failure = chunk.permanent_failure
@@ -7949,10 +6731,10 @@ class Tile(object):
                 
             return (chunk, chunk_img, start_x, start_y)
         
-        # OPTIMIZATION: Non-blocking chunk processing with bundle pre-check
+        # OPTIMIZATION: Non-blocking chunk processing
         # 
         # Architecture:
-        # 1. EARLY BUNDLE CHECK: Try to get all chunks from bundle first (fastest path)
+        # 1. IMMEDIATE READY PROCESSING: Process ready chunks without executor overhead
         # 2. IMMEDIATE READY PROCESSING: Process ready chunks without waiting
         # 3. EXECUTOR FOR WAITING: Use executor only for chunks that need download wait
         # 4. ROUND-ROBIN RETRY: Poll non-ready chunks periodically instead of blocking all workers
@@ -7969,39 +6751,6 @@ class Tile(object):
         chunks_with_images = set()  # Track which chunks have images for fallback sweep
         
         try:
-            # === PHASE 0: EARLY BUNDLE CHECK ===
-            # If bundle exists with this zoom level, populate chunk data immediately
-            # This avoids submitting chunks to executor when data is already available
-            bundle_preload_count = 0
-            bundle_chunks = self._try_get_chunks_from_bundle(zoom)
-            
-            if bundle_chunks:
-                # Calculate tile origin for this zoom level
-                zoom_diff = self.max_zoom - zoom
-                tile_col_at_zoom = self.col >> zoom_diff
-                tile_row_at_zoom = self.row >> zoom_diff
-                chunks_per_side = int(round((2 ** self.max_zoom) / (2 ** zoom)))
-                
-                for chunk in chunks:
-                    if chunk.ready.is_set():
-                        continue  # Already ready
-                    
-                    # Calculate chunk's index in the bundle
-                    chunk_col_offset = chunk.col - tile_col_at_zoom
-                    chunk_row_offset = chunk.row - tile_row_at_zoom
-                    
-                    if 0 <= chunk_col_offset < chunks_per_side and 0 <= chunk_row_offset < chunks_per_side:
-                        bundle_idx = chunk_row_offset * chunks_per_side + chunk_col_offset
-                        
-                        if bundle_idx < len(bundle_chunks) and bundle_chunks[bundle_idx] is not None:
-                            # Preload chunk data from bundle
-                            chunk.set_cached_data(bundle_chunks[bundle_idx])
-                            bundle_preload_count += 1
-                
-                if bundle_preload_count > 0:
-                    log.debug(f"GET_IMG: Bundle preload populated {bundle_preload_count}/{len(chunks)} chunks")
-                    bump('bundle_preload_chunks', bundle_preload_count)
-            
             # === PHASE 1: IMMEDIATE READY PROCESSING ===
             # Process chunks that are already ready without submitting to executor
             # This is faster than executor overhead for chunks that don't need waiting
@@ -8116,64 +6865,7 @@ class Tile(object):
                         log.info(f"GET_IMG: Fallback sweep for {len(missing_chunks)} missing chunks "
                                 f"(remaining={fallback_budget.remaining:.2f}s)")
                     
-                    # === OPTIMIZATION: Try bundle-based bulk read FIRST ===
-                    # This is MUCH faster than sequential chunk processing because:
-                    # - Single file open instead of 256+ opens
-                    # - All data read in one pass
-                    # - Parallel JPEG decoding via OpenMP
-                    bundle_recovery_attempted = False
-                    bundle_jpegs = self._try_get_chunks_from_bundle(zoom)
-                    
-                    if bundle_jpegs:
-                        bundle_recovery_attempted = True
-                        bundle_recovered = 0
-                        
-                        # Build a mapping from (col, row) to bundle index
-                        # Bundle stores chunks in row-major order starting from tile origin
-                        # Calculate the tile origin for this zoom level
-                        zoom_diff = self.max_zoom - zoom
-                        tile_col_at_zoom = self.col >> zoom_diff
-                        tile_row_at_zoom = self.row >> zoom_diff
-                        chunks_per_side = int(round((2 ** self.max_zoom) / (2 ** zoom)))
-                        
-                        for chunk in missing_chunks:
-                            # Calculate chunk's index in the bundle
-                            chunk_col_offset = chunk.col - tile_col_at_zoom
-                            chunk_row_offset = chunk.row - tile_row_at_zoom
-                            
-                            # Validate offsets are within bounds
-                            if 0 <= chunk_col_offset < chunks_per_side and 0 <= chunk_row_offset < chunks_per_side:
-                                bundle_idx = chunk_row_offset * chunks_per_side + chunk_col_offset
-                                
-                                if bundle_idx < len(bundle_jpegs) and bundle_jpegs[bundle_idx] is not None:
-                                    jpeg_data = bundle_jpegs[bundle_idx]
-                                    
-                                    # Decode JPEG and paste into image
-                                    try:
-                                        with _decode_sem:
-                                            chunk_img = AoImage.load_from_memory(jpeg_data)
-                                        
-                                        if chunk_img:
-                                            start_x = int(chunk.width * (chunk.col - col))
-                                            start_y = int(chunk.height * (chunk.row - row))
-                                            _safe_paste(new_im, chunk_img, start_x, start_y)
-                                            chunks_with_images.add(id(chunk))
-                                            bundle_recovered += 1
-                                            
-                                            # Also update chunk state for future use
-                                            chunk.set_cached_data(jpeg_data)
-                                    except Exception as e:
-                                        log.debug(f"Bundle chunk decode failed: {e}")
-                        
-                        if bundle_recovered > 0:
-                            log.info(f"GET_IMG: Bundle sweep recovered {bundle_recovered}/{len(missing_chunks)} chunks")
-                            bump('fallback_bundle_sweep_recovered', bundle_recovered)
-                            
-                            # Update missing chunks list for sequential fallback
-                            missing_chunks = [c for c in missing_chunks if id(c) not in chunks_with_images]
-                    
                     # === SEQUENTIAL FALLBACK: Process remaining missing chunks ===
-                    # Only runs if bundle didn't recover all chunks
                     sweep_recovered = 0
                     for chunk in missing_chunks:
                         if fallback_budget.exhausted:
@@ -8226,9 +6918,8 @@ class Tile(object):
             if missing_after_lazy and len(self.imgs) > 0:
                 log.debug(f"GET_IMG: Re-processing {len(missing_after_lazy)} chunks after lazy build")
                 for chunk in missing_after_lazy:
-                    if time_budget.exhausted:
-                        break
-                    # Try Fallback 2 now that we have built lower mipmaps
+                    # get_downscaled_from_higher_mipmap is pure in-memory
+                    # scaling -- always worth attempting regardless of budget.
                     chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
                     if chunk_img:
                         start_x = int(chunk.width * (chunk.col - col))
@@ -8911,9 +7602,8 @@ class Tile(object):
         Returns raw DXT bytes that are written directly to DDS mipmap buffer.
         
         Optimized data loading:
-        1. Try bundle (AOB2) loading first - fastest path
-        2. Batch cache read with _batch_read_cache_files() - parallel I/O
-        3. Download missing chunks if below threshold - respects time budget
+        1. Batch cache read with _batch_read_cache_files() - parallel I/O
+        2. Download missing chunks if below threshold - respects time budget
         
         Args:
             mipmap: Mipmap level to build (1-4 typically, 0 uses full aopipeline)
@@ -8959,14 +7649,10 @@ class Tile(object):
         min_ratio = max(0.0, min(1.0, min_ratio))  # Clamp to valid range
         
         # ═══════════════════════════════════════════════════════════════════════
-        # PHASE 1: Create chunks and try bundle loading (fastest path)
+        # PHASE 1: Create chunks and collect data from cache
         # ═══════════════════════════════════════════════════════════════════════
         
-        # Wait for any pending consolidation OUTSIDE lock
-        self._wait_for_pending_consolidation_if_needed()
-        
         # Ensure chunks exist for this zoom level
-        # Note: _create_chunks already tries bundle loading internally
         self._create_chunks(zoom)
         chunks = self.chunks.get(zoom, [])
         
@@ -8992,9 +7678,8 @@ class Tile(object):
             else:
                 need_cache_read.append(i)
         
-        # Check if bundle loaded everything
         if ready_count == total_chunks:
-            log.debug(f"_try_native_mipmap_build: All {total_chunks} chunks from bundle/memory")
+            log.debug(f"_try_native_mipmap_build: All {total_chunks} chunks from memory")
         
         # ═══════════════════════════════════════════════════════════════════════
         # PHASE 3: Batch cache read for missing chunks (parallel I/O)
@@ -9019,96 +7704,6 @@ class Tile(object):
             
             # Update need list for potential download phase
             need_cache_read = [i for i in need_cache_read if jpeg_datas[i] is None]
-            
-            # ═══════════════════════════════════════════════════════════════
-            # JPEG-TO-BUNDLE FALLBACK: Handle race condition with consolidator
-            # ═══════════════════════════════════════════════════════════════
-            # If batch read missed files, consolidator may have deleted them
-            # while creating a bundle. Check if bundle now exists, or wait
-            # for pending consolidation to avoid re-downloading.
-            if need_cache_read:
-                try:
-                    try:
-                        from autoortho.utils.bundle_paths import get_bundle2_path
-                        from autoortho.aopipeline import AoBundle2
-                    except ImportError:
-                        from utils.bundle_paths import get_bundle2_path
-                        from aopipeline import AoBundle2
-                    
-                    bundle_path = get_bundle2_path(self.cache_dir, self.row, self.col, self.maptype, self.tilename_zoom)
-                    bundle_datas = None
-                    bundle_has_data = False
-                    
-                    # SMART FALLBACK: Only attempt if bundle exists
-                    bundle_exists = os.path.exists(bundle_path)
-                    if not bundle_exists:
-                        bump('jpeg_to_bundle_fallback_skipped')
-                    
-                    # First check: bundle exists?
-                    if bundle_exists:
-                        with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                            if bundle.has_zoom(zoom):
-                                bundle_datas = bundle.get_all_chunks(zoom)
-                                bundle_has_data = True
-                    
-                    # Second check: consolidation pending or recently completed?
-                    # CRITICAL: Pass zoom to is_pending() - only wait for OUR zoom!
-                    if not bundle_has_data and _bundle_consolidator is not None:
-                        bump('jpeg_to_bundle_fallback_entered')
-                        waited_for_consolidation = False
-                        if _bundle_consolidator.is_pending(self.row, self.col, self.maptype, zoom):
-                            log.debug(f"_try_native_mipmap_build: waiting for pending consolidation (zoom {zoom})")
-                            bump('jpeg_to_bundle_wait_started')
-                            wait_start = time.monotonic()
-                            # Pass zoom to wait for THIS specific zoom level's consolidation
-                            wait_result = _bundle_consolidator.wait_for_pending(self.row, self.col, self.maptype, timeout=60.0, zoom=zoom)
-                            wait_time = time.monotonic() - wait_start
-                            waited_for_consolidation = True
-                            
-                            if wait_result:
-                                bump('jpeg_to_bundle_wait_success')
-                                if wait_time > 5.0:
-                                    bump('jpeg_to_bundle_wait_long')
-                                    log.debug(f"_try_native_mipmap_build: waited {wait_time:.1f}s for consolidation")
-                            elif wait_time > 30.0:
-                                bump('jpeg_to_bundle_wait_timeout')
-                                log.warning(f"_try_native_mipmap_build: consolidation wait TIMEOUT after {wait_time:.1f}s - "
-                                           f"tile {self.row}_{self.col}_{self.maptype} may have stuck consolidation")
-                            else:
-                                bump('jpeg_to_bundle_wait_already_done')
-                        
-                        # ALWAYS try bundle - even if is_pending was False
-                        # Consolidation may have completed between first check and now
-                        if not bundle_has_data and os.path.exists(bundle_path):
-                            bump('jpeg_to_bundle_fallback_bundle_exists')
-                            with AoBundle2.Bundle2Python(bundle_path) as bundle:
-                                if bundle.has_zoom(zoom):
-                                    bump('jpeg_to_bundle_fallback_has_zoom')
-                                    bundle_datas = bundle.get_all_chunks(zoom)
-                                    bundle_has_data = True
-                                    if not waited_for_consolidation:
-                                        bump('jpeg_to_bundle_fallback_not_pending')
-                                else:
-                                    bump('jpeg_to_bundle_fallback_no_zoom')
-                    
-                    # Apply recovered data
-                    if bundle_has_data and bundle_datas:
-                        fallback_hits = 0
-                        for i in need_cache_read:
-                            if i < len(bundle_datas) and bundle_datas[i]:
-                                chunks[i].set_cached_data(bundle_datas[i])
-                                jpeg_datas[i] = bundle_datas[i]
-                                ready_count += 1
-                                fallback_hits += 1
-                        if fallback_hits > 0:
-                            log.debug(f"_try_native_mipmap_build: JPEG-to-bundle fallback - "
-                                     f"recovered {fallback_hits}/{len(need_cache_read)} for mipmap {mipmap}")
-                            bump('jpeg_to_bundle_fallback')
-                        # Update need list
-                        need_cache_read = [i for i in need_cache_read if jpeg_datas[i] is None]
-                except Exception as e:
-                    log.debug(f"_try_native_mipmap_build: JPEG-to-bundle fallback failed: {e}")
-            # ═══════════════════════════════════════════════════════════════
         
         # ═══════════════════════════════════════════════════════════════════════
         # PHASE 4: Download missing chunks (same as aopipeline)
@@ -9164,18 +7759,7 @@ class Tile(object):
                      f"for mipmap {mipmap} ({ready_count/total_chunks*100:.0f}%), "
                      f"threshold {min_ratio*100:.0f}%, falling back to Python")
             bump('native_mipmap_threshold_miss')
-            # Still schedule consolidation for partial data - merge will fill in later
-            if ready_count > 0:
-                self._schedule_immediate_consolidation(jpeg_datas, zoom)
             return False
-        
-        # ═══════════════════════════════════════════════════════════════════════
-        # SCHEDULE CONSOLIDATION IMMEDIATELY (before build)
-        # ═══════════════════════════════════════════════════════════════════════
-        # Schedule consolidation NOW while we have the JPEG data in memory.
-        # This ensures lower zoom levels get consolidated into the bundle, not
-        # just max_zoom. The merge logic will combine with any existing data.
-        self._schedule_immediate_consolidation(jpeg_datas, zoom)
         
         # ═══════════════════════════════════════════════════════════════════════
         # BUILD MIPMAPS WITH NATIVE CHUNKS (QUALITY OPTIMIZED)
@@ -9207,25 +7791,41 @@ class Tile(object):
             # Try to use build_all_mipmaps_native if available (best quality)
             # This builds each mipmap from its native zoom level chunks
             if hasattr(native_dds, 'build_all_mipmaps_native'):
-                # Collect JPEG data for ALL mipmap levels from current to smallest
+                # Collect JPEG data for ALL mipmap levels from current to smallest.
+                # CRITICAL: _collect_chunks_for_zoom does NOT trigger downloads,
+                # so lower zoom levels may have mostly-None data if chunks haven't
+                # been fetched yet. Passing that incomplete data to the native
+                # builder would "poison" those mipmaps with missing_color AND mark
+                # them retrieved=True, preventing later proper builds.
+                # Fix: once a zoom level falls below the availability threshold,
+                # pass empty arrays for it and all subsequent levels so the native
+                # builder derives them via reduce_half from the last good level.
                 jpeg_datas_per_zoom = []
+                chain_truncated = False
                 for mm in range(mipmap, self.dds.smallest_mm + 1):
                     mm_zoom = self.max_zoom - mm
                     if mm_zoom < self.min_zoom:
-                        # No more zoom levels available
                         jpeg_datas_per_zoom.append([])
                         continue
                     
                     if mm == mipmap:
-                        # We already collected the first mipmap's chunks above
                         jpeg_datas_per_zoom.append(jpeg_datas)
+                    elif chain_truncated:
+                        jpeg_datas_per_zoom.append([])
                     else:
-                        # Collect chunks for this zoom level
                         mm_jpeg_datas = self._collect_chunks_for_zoom(mm_zoom)
-                        jpeg_datas_per_zoom.append(mm_jpeg_datas)
-                        # Schedule consolidation for this zoom level too
-                        if mm_jpeg_datas and any(d for d in mm_jpeg_datas):
-                            self._schedule_immediate_consolidation(mm_jpeg_datas, mm_zoom)
+                        available = sum(1 for d in mm_jpeg_datas if d is not None) if mm_jpeg_datas else 0
+                        total = len(mm_jpeg_datas) if mm_jpeg_datas else 0
+                        if total > 0 and (available / total) >= min_ratio:
+                            jpeg_datas_per_zoom.append(mm_jpeg_datas)
+                        else:
+                            log.debug(f"_try_native_mipmap_build: ZL{mm_zoom} has "
+                                     f"{available}/{total} chunks "
+                                     f"({(available/total*100) if total else 0:.0f}% vs "
+                                     f"{min_ratio*100:.0f}% threshold), "
+                                     f"truncating chain at mm{mm}")
+                            jpeg_datas_per_zoom.append([])
+                            chain_truncated = True
                 
                 result = native_dds.build_all_mipmaps_native(
                     jpeg_datas_per_zoom,
@@ -9301,9 +7901,6 @@ class Tile(object):
                      f"{len(result.data)} bytes ({mipmaps_built} mipmaps) in {total_time*1000:.0f}ms "
                      f"(native: {native_time*1000:.0f}ms, {ready_count}/{total_chunks} chunks)")
             
-            # Consolidation was already scheduled before the build
-            # (see SCHEDULE CONSOLIDATION IMMEDIATELY section above)
-            
             return True
             
         except Exception as e:
@@ -9329,7 +7926,6 @@ class Tile(object):
             List of JPEG bytes (None for missing chunks)
         """
         # Ensure chunks exist for this zoom level
-        self._wait_for_pending_consolidation_if_needed()
         self._create_chunks(zoom)
         chunks = self.chunks.get(zoom, [])
         
@@ -9393,9 +7989,6 @@ class Tile(object):
             - chunk.ready.wait() is thread-safe
             - chunk.data access uses GIL-protected reference copy
         """
-        # Wait for any pending consolidation OUTSIDE lock
-        self._wait_for_pending_consolidation_if_needed()
-        
         # Ensure chunks exist for this zoom level
         self._create_chunks(zoom)
         
@@ -9589,25 +8182,9 @@ class Tile(object):
                      f"({result.bytes_written} bytes at offset {row_offset}, "
                      f"{result.elapsed_ms:.1f}ms native, {build_time*1000:.1f}ms total)")
             
-            # Schedule bundle consolidation for this zoom level
+            
             # Track which zoom levels we've scheduled to avoid duplicate scheduling
-            # (partial builds happen row-by-row, we only need to schedule once)
-            if not hasattr(self, '_partial_build_consolidation_scheduled'):
-                self._partial_build_consolidation_scheduled = set()
-            
-            if zoom not in self._partial_build_consolidation_scheduled:
-                self._partial_build_consolidation_scheduled.add(zoom)
-                try:
-                    # Get ALL chunks for this zoom (not just partial rows) for consolidation
-                    all_chunks = self.chunks.get(zoom, [])
-                    if all_chunks:
-                        all_jpeg_datas = [chunk.data if hasattr(chunk, 'data') and chunk.data else None 
-                                          for chunk in all_chunks]
-                        schedule_bundle_consolidation(self, priority=1, jpeg_datas=all_jpeg_datas, zoom=zoom)
-                        log.debug(f"_try_native_partial_mipmap_build: Scheduled consolidation for ZL{zoom}")
-                except Exception as e:
-                    log.debug(f"_try_native_partial_mipmap_build: Consolidation scheduling failed: {e}")
-            
+
             return True
             
         except Exception as e:
@@ -9689,12 +8266,10 @@ class Tile(object):
         compress_start_time = time.monotonic()
         try:
             if mipmap == 0:
-                self.dds.gen_mipmaps(new_im, mipmap, 0) 
+                self.dds.gen_mipmaps(new_im, mipmap, 0)
             else:
-                self.dds.gen_mipmaps(new_im, mipmap) 
+                self.dds.gen_mipmaps(new_im, mipmap)
         finally:
-            # Close image if not cached in self.imgs to free native memory immediately
-            # If cached, it will be closed when evicted by _cache_image() or in close()
             if mipmap not in self.imgs:
                 try:
                     new_im.close()
@@ -9705,17 +8280,12 @@ class Tile(object):
         self.ready.set()
 
         # Calculate timing metrics
-        zoom = self.max_zoom - mipmap
         compress_time = compress_end_time - compress_start_time
         total_creation_time = compress_end_time - tile_creation_start
-        
-        # Track compression time (legacy stat)
+
         mm_stats.set(mipmap, compress_time)
-        
-        # Track FULL tile creation time (new stat for tuning tile_time_budget)
         tile_creation_stats.set(mipmap, total_creation_time)
 
-        # Record per-mipmap count via counters for aggregation
         try:
             bump_many({
                 f"mm_count:{mipmap}": 1,
@@ -9735,35 +8305,63 @@ class Tile(object):
             
             log.debug(f"GET_MIPMAP: Tile {self} COMPLETED in {tile_completion_time:.2f}s "
                      f"(mipmap 0 done, time from first request)")
+
+            # Persist progressively-built DDS to Dynamic DDS Cache.
+            # This path is the slowest (all mipmaps built individually)
+            # so caching the result is especially valuable.
+            _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
+            if dynamic_dds_cache is not None and (not self._prepopulated or _partially_cached):
+                try:
+                    self.dds.seek(0)
+                    dds_bytes = self.dds.read(self.dds.total_size)
+                    if dds_bytes and len(dds_bytes) >= 128:
+                        dynamic_dds_cache.store(
+                            self.id, self.max_zoom, dds_bytes, self)
+                except Exception:
+                    pass
         
         # Log per-mipmap creation time for visibility
         log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
                  f"(download+compose: {total_creation_time - compress_time:.2f}s, compress: {compress_time:.2f}s)")
 
-        # Schedule bundle consolidation for this zoom level BEFORE closing chunks
-        # This uses in-memory JPEG data when available (avoids disk reads)
-        mipmap_zoom = self.max_zoom - mipmap
-        if mipmap_zoom in self.chunks:
+        # Persist intermediate mipmaps (1+) incrementally to DDS cache
+        _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
+        if (mipmap > 0 and dynamic_dds_cache is not None
+                and (not self._prepopulated or _partially_cached)
+                and not self._completion_reported
+                and self.dds is not None):
             try:
-                zoom_chunks = self.chunks[mipmap_zoom]
-                jpeg_datas = [chunk.data if hasattr(chunk, 'data') and chunk.data else None 
-                              for chunk in zoom_chunks]
-                schedule_bundle_consolidation(self, priority=1, jpeg_datas=jpeg_datas, zoom=mipmap_zoom)
-            except Exception as e:
-                log.debug(f"GET_MIPMAP: Consolidation scheduling failed: {e}")
+                mm_data = {}
+                mm_offsets = {}
+                for i in range(mipmap, len(self.dds.mipmap_list)):
+                    mm = self.dds.mipmap_list[i]
+                    if mm.retrieved and mm.databuffer is not None:
+                        mm.databuffer.seek(0)
+                        data = mm.databuffer.read()
+                        if data:
+                            mm_data[i] = data
+                            mm_offsets[i] = (mm.startpos, mm.length)
+                if mm_data:
+                    dynamic_dds_cache.store_incremental(
+                        self.id, self.max_zoom,
+                        self.row, self.col, self.maptype,
+                        self.tilename_zoom,
+                        self.dds.header.getvalue(),
+                        self.dds.total_size,
+                        self.dds.width, self.dds.height,
+                        self.dds.mipMapCount,
+                        mm_data, mm_offsets
+                    )
+            except Exception:
+                pass
 
         # Close only chunks for THIS mipmap's zoom level (not all zooms!)
-        # FIX: Previously closing ALL chunks caused double-downloads when mipmap 0
-        # completed but mipmap 4 was still being accessed by X-Plane.
-        # Each mipmap uses a different zoom level: mipmap N uses (max_zoom - N).
+        mipmap_zoom = self.max_zoom - mipmap
         if mipmap_zoom in self.chunks:
             log.debug(f"GET_MIPMAP: Closing chunks for mipmap {mipmap} (zoom {mipmap_zoom}).")
             for chunk in self.chunks[mipmap_zoom]:
                 chunk.close()
             del self.chunks[mipmap_zoom]
-                    #del(chunk.data)
-                    #del(chunk.img)
-        #return outfile
         log.debug("Results:")
         log.debug(self.dds.mipmap_list)
         return True
@@ -9880,6 +8478,7 @@ class Tile(object):
         self.first_request_time = None
         self._completion_reported = False
         self._is_live = False
+        self._dds_populated_mipmaps = None
         self._live_transition_event = None
         self._active_streaming_builder = None
 
@@ -10727,7 +9326,7 @@ def shutdown():
     
     Shutdown order:
     1. Spatial prefetcher (stop new prefetch requests)
-    2. Predictive DDS (bundle consolidator, DDS builder, cache)
+    2. Predictive DDS (DDS builder, cache)
     3. ChunkGetter (background download threads)
     4. Cache writer executor
     5. Terrain indices
@@ -10744,7 +9343,7 @@ def shutdown():
     except Exception as _err:
         log.debug(f"Prefetcher stop error: {_err}")
 
-    # 2. Stop predictive DDS (includes bundle consolidator, DDS builder)
+    # 2. Stop predictive DDS (DDS builder, cache)
     try:
         stop_predictive_dds()
         log.debug("Predictive DDS stopped")

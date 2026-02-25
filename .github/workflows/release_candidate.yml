@@ -44,11 +44,14 @@ jobs:
 
       - name: Capture PR body
         id: body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          echo 'releasebody<<EOF' >> "$GITHUB_OUTPUT"
-          printf "%s" "${{ github.event.pull_request.body }}" >> "$GITHUB_OUTPUT"
-          echo '' >> "$GITHUB_OUTPUT"
-          echo 'EOF' >> "$GITHUB_OUTPUT"
+          {
+            echo 'releasebody<<EOF'
+            printf '%s\n' "$PR_BODY" | tr -d '\r'
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare-rc

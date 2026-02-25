@@ -12,9 +12,10 @@ import hashlib
 import zipfile
 import argparse
 import platform
+import threading
 import subprocess
-from urllib.request import urlopen, Request, urlretrieve, urlcleanup
-from urllib.error import URLError, HTTPError
+import requests
+import requests.adapters
 from datetime import datetime, timezone, timedelta
 from packaging import version
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,17 +34,44 @@ log = logging.getLogger(__name__)
 TESTMODE=os.environ.get('AO_TESTMODE', False)
 
 
-def do_url(url, headers={}, ):
-    req = Request(url, headers=headers)
-    resp = urlopen(req, timeout=15)
-    if resp.status != 200:
-        raise Exception
-    return resp.read()
+_download_session = None
+_session_lock = threading.Lock()
+
+def _get_download_session(pool_size=10):
+    """Return a module-level requests.Session with connection pooling."""
+    global _download_session
+    if _download_session is None:
+        with _session_lock:
+            if _download_session is None:
+                session = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=pool_size,
+                    pool_maxsize=pool_size,
+                    max_retries=0,
+                    pool_block=True,
+                )
+                session.mount('https://', adapter)
+                session.mount('http://', adapter)
+                _download_session = session
+    return _download_session
+
+
+def do_url(url, headers={}):
+    session = _get_download_session()
+    resp = session.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.content
 
 
 cur_activity = {}
 
 class SeasonsApplyStatus(Enum):
+    NOT_APPLIED = "not_applied"
+    PARTIALLY_APPLIED = "partially_applied"
+    APPLIED = "applied"
+
+
+class RoughnessApplyStatus(Enum):
     NOT_APPLIED = "not_applied"
     PARTIALLY_APPLIED = "partially_applied"
     APPLIED = "applied"
@@ -55,12 +83,13 @@ class Zip(object):
     zf = None
     hashfile = '' 
     assembled = False
+    computed_hash = None
 
     def __init__(self, path):
         self.path = path
         self.files = []
 
-    def check(self):
+    def check(self, precomputed_hash=None):
 
         if not os.path.exists(self.path):
             log.info(f"File does not exist. {self.path}")
@@ -68,25 +97,36 @@ class Zip(object):
 
         if self.hashfile:
             log.info(f"Found hashfile {self.hashfile} verifying ...")
+            with open(self.hashfile, "r") as h:
+                data = h.read()
+            m = re.match(r'(^[0-9A-Fa-f]+)\s+(\S.*)$', data)
+            if not m:
+                log.error(f"Could not parse hashfile {self.hashfile}")
+                return False
+
+            expected_hash = m.group(1)
+
+            # Use pre-computed hash if available (from download or assembly)
+            if precomputed_hash:
+                if precomputed_hash == expected_hash:
+                    log.info(f"Hash verified (pre-computed) for {self.path}")
+                    return True
+                log.error(f"Hash check failed for {self.path} : {expected_hash} != {precomputed_hash}")
+                return False
+
             with open(self.path, "rb") as h:
-                #python3.11 ziphash = hashlib.file_digest(h, "sha256")
                 sha256 = hashlib.sha256()
                 while True:
                     data = h.read(131072)
                     if not data:
                         break
-                    else:
-                        sha256.update(data)
+                    sha256.update(data)
                 ziphash = sha256.hexdigest()
 
-            with open(self.hashfile, "r") as h:
-                data = h.read()
-            m = re.match(r'(^[0-9A-Fa-f]+)\s+(\S.*)$', data)
-            if m:
-                if m.group(1) == ziphash:
-                    return True
+            if expected_hash == ziphash:
+                return True
 
-            log.error(f"Hash check failed for {self.path} : {m.group(1)} != {ziphash}")
+            log.error(f"Hash check failed for {self.path} : {expected_hash} != {ziphash}")
             return False
 
         try:
@@ -109,17 +149,23 @@ class Zip(object):
             log.info(f"No assembly required for {self.path}")
             return
 
-
         self.files.sort()
         log.info(f"Will assemble {self.path} from parts: {self.files}")
+        sha256 = hashlib.sha256()
         with open(self.path, 'wb') as out_h:
             for f in self.files:
-                if os.path.exists(os.path.join(self.path,f)):
+                if os.path.exists(f):
                     with open(f, 'rb') as in_h:
-                        out_h.write(in_h.read())
+                        while True:
+                            buf = in_h.read(1048576)
+                            if not buf:
+                                break
+                            out_h.write(buf)
+                            sha256.update(buf)
                     log.info(f"Removing {f}")
                     os.remove(f)
 
+        self.computed_hash = sha256.hexdigest()
         self.assembled = True
 
     def extract(self, dest):
@@ -220,6 +266,10 @@ class Zip(object):
             if os.path.exists(f):
                 log.info(f"Removing {f}")
                 os.remove(f)
+            partpath = f + '.part'
+            if os.path.exists(partpath):
+                log.info(f"Removing {partpath}")
+                os.remove(partpath)
 
         if os.path.exists(self.hashfile):
             log.info(f"Removing {self.hashfile}")
@@ -227,6 +277,7 @@ class Zip(object):
 
         self.files = []
         self.assembled = False
+        self.computed_hash = None
 
 
 class Package(object):
@@ -266,8 +317,8 @@ class Package(object):
         #return(str(self.__dict__))
 
 
-    def download(self, progress_callback=None, progress_state=None):
-        retries = 0
+    def download(self, progress_callback=None, progress_state=None,
+                 session=None, progress_lock=None):
         if self.downloaded:
             log.info(f"Already downloaded.")
             return
@@ -275,9 +326,12 @@ class Package(object):
         if not os.path.exists(self.download_dir):
             os.makedirs(self.download_dir)
 
-        # Store progress callback for use in _show_progress
+        if session is None:
+            session = _get_download_session()
+
         self.progress_callback = progress_callback
         self.progress_state = progress_state
+        self._progress_lock = progress_lock
         self._last_progress_emit_ts = 0
         self._last_progress_emit_pcnt = -1
 
@@ -298,123 +352,165 @@ class Package(object):
             possible_destpath = ""
             filename = os.path.basename(url)
             destpath = os.path.join(self.download_dir, filename)
+            partpath = destpath + '.part'
             log.info(f"Considering downloading {filename}")
             match = re.match(self.regex_for_assembled_files, filename)
-            if (match):
+            if match:
                 possible_destpath = os.path.join(self.download_dir, match.group(1))
                 log.info(f"{filename} is a possible part of the multi-part file {match.group(1)}")
 
-            # If the file is already present, count it as done for overall progress
             if os.path.isfile(destpath) or os.path.isfile(possible_destpath):
-                # If the assembled multipart file already exists, add it to the list only once
-                # and consider the current partial file (destpath) already downloaded.
+                # If the assembled multipart file already exists, add it only once
                 if os.path.isfile(possible_destpath):
                     log.info(f"{possible_destpath} already exists.  Skipping {destpath}.")
                     if possible_destpath not in self.zf.files:
                         self.zf.files.append(possible_destpath)
                 else:
                     log.info(f"{destpath} already exists.  Skip.")
-                    self.zf.files.append(destpath)
-                #print(f"{self.zf.path} already exists.  Skip.")
-                #self.zf.assembled = True
-                #self.downloaded = True
-                #return
-                #continue
-                if isinstance(self.progress_state, dict):
-                    self.progress_state['files_done'] = self.progress_state.get('files_done', 0) + 1
-                    if self.progress_callback:
-                        files_total = self.progress_state.get('files_total', 0)
-                        files_done = self.progress_state.get('files_done', 0)
-                        overall_pcnt = 0
-                        if files_total:
-                            overall_pcnt = round((files_done / files_total) * 100, 2)
-                        self.progress_callback({
-                            'status': f"Downloaded {files_done}/{files_total}",
-                            'pcnt_done': 100,
-                            'MBps': 0,
-                            'overall_pcnt': overall_pcnt,
-                            'files_done': files_done,
-                            'files_total': files_total,
-                        })
+                    if destpath.endswith('sha256'):
+                        self.zf.hashfile = destpath
+                    else:
+                        self.zf.files.append(destpath)
+                self._increment_files_done()
                 continue
-            else:
-                while retries < self.max_retries:
-                    try:
-                        log.info(f"Download {url}")
-                        self.dl_start_time = time.time()
-                        self.dl_url = url
-                        urlcleanup()
-                        local_file, headers = urlretrieve(
-                            url,
-                            destpath,
-                            self._show_progress
-                        )
-                        log.info(f"DONE downloading {url}")
-                        # Update overall file progress after each file completes
-                        if isinstance(self.progress_state, dict):
-                            self.progress_state['files_done'] = self.progress_state.get('files_done', 0) + 1
-                            if self.progress_callback:
-                                files_total = self.progress_state.get('files_total', 0)
-                                files_done = self.progress_state.get('files_done', 0)
-                                overall_pcnt = 0
-                                if files_total:
-                                    overall_pcnt = round((files_done / files_total) * 100, 2)
-                                self.progress_callback({
-                                    'status': f"Downloaded {files_done}/{files_total}",
-                                    'pcnt_done': 100,
-                                    'MBps': 0,
-                                    'overall_pcnt': overall_pcnt,
-                                    'files_done': files_done,
-                                    'files_total': files_total,
-                                })
-                        break
 
-                    except (HTTPError, URLError) as e:
-                        retries += 1
-                        log.error(f"Failed to download {url}, attempt {retries} of {self.max_retries}. Error: {e}")
-                        time.sleep(2**retries)  # Exponencial backoff
-                    finally:
-                        self.dl_start_time = None
-                        self.dl_url = None
-                        urlcleanup()
+            # file:// URLs (used in tests) bypass the requests session
+            if url.startswith('file://'):
+                from urllib.parse import urlparse
+                from urllib.request import url2pathname
+                local_path = url2pathname(urlparse(url).path)
+                shutil.copy2(local_path, destpath)
+                log.info(f"Copied local file {local_path} -> {destpath}")
+                self._increment_files_done()
+                if destpath.endswith('sha256'):
+                    self.zf.hashfile = destpath
+                else:
+                    self.zf.files.append(destpath)
+                continue
 
-                if retries == self.max_retries:
-                    log.error(f"Max retries reached. Failed to download {url}")
+            retries = 0
+            while retries < self.max_retries:
+                try:
+                    log.info(f"Download {url}")
+                    dl_start_time = time.time()
 
+                    resume_pos = 0
+                    req_headers = {}
+                    if os.path.isfile(partpath):
+                        resume_pos = os.path.getsize(partpath)
+                        if resume_pos > 0:
+                            req_headers['Range'] = f'bytes={resume_pos}-'
+                            log.info(f"Resuming download from byte {resume_pos}")
+
+                    resp = session.get(url, headers=req_headers, stream=True, timeout=30)
+                    resp.raise_for_status()
+
+                    content_length = int(resp.headers.get('content-length', 0))
+
+                    if resume_pos > 0 and resp.status_code == 206:
+                        total_size = resume_pos + content_length
+                        file_mode = 'ab'
+                        fetched = resume_pos
+                    else:
+                        total_size = content_length
+                        file_mode = 'wb'
+                        fetched = 0
+                        resume_pos = 0
+
+                    sha256 = hashlib.sha256()
+
+                    # When resuming, hash the existing partial content first
+                    if file_mode == 'ab' and resume_pos > 0:
+                        with open(partpath, 'rb') as h:
+                            while True:
+                                chunk = h.read(131072)
+                                if not chunk:
+                                    break
+                                sha256.update(chunk)
+
+                    with open(partpath, file_mode) as f:
+                        for chunk in resp.iter_content(chunk_size=1048576):
+                            f.write(chunk)
+                            sha256.update(chunk)
+                            fetched += len(chunk)
+                            self._emit_progress(url, fetched, total_size, dl_start_time)
+
+                    os.replace(partpath, destpath)
+
+                    # For single-file zips, store hash for later verification
+                    if destpath.endswith('.zip'):
+                        self.zf.computed_hash = sha256.hexdigest()
+
+                    log.info(f"DONE downloading {url}")
+                    self._increment_files_done()
+                    break
+
+                except requests.RequestException as e:
+                    retries += 1
+                    log.error(f"Failed to download {url}, attempt {retries} of {self.max_retries}. Error: {e}")
+                    time.sleep(2**retries)
+
+            if retries == self.max_retries:
+                log.error(f"Max retries reached. Failed to download {url}")
 
             if destpath.endswith('sha256'):
                 self.zf.hashfile = destpath
             else:
-            #elif not self.zf.assembled:
                 self.zf.files.append(destpath)
 
         self.downloaded = True
         self.zf.assemble()
 
-    def _show_progress(self, block_num, block_size, total_size):
-        total_fetched = block_num * block_size
-        pcnt_done = round(total_fetched / total_size * 100, 2)
-        elapsed = time.time() - self.dl_start_time
+    def _increment_files_done(self):
+        """Thread-safe increment of files_done and emit completion progress."""
+        if not isinstance(self.progress_state, dict):
+            return
+
+        if self._progress_lock:
+            with self._progress_lock:
+                self.progress_state['files_done'] = self.progress_state.get('files_done', 0) + 1
+        else:
+            self.progress_state['files_done'] = self.progress_state.get('files_done', 0) + 1
+
+        if self.progress_callback:
+            files_total = self.progress_state.get('files_total', 0)
+            files_done = self.progress_state.get('files_done', 0)
+            overall_pcnt = round((files_done / files_total) * 100, 2) if files_total else 0
+            self.progress_callback({
+                'status': f"Downloaded {files_done}/{files_total}",
+                'pcnt_done': 100,
+                'MBps': 0,
+                'overall_pcnt': overall_pcnt,
+                'files_done': files_done,
+                'files_total': files_total,
+            })
+
+    def _emit_progress(self, url, fetched, total_size, start_time):
+        """Emit download progress with throttling."""
+        if total_size <= 0:
+            return
+
+        pcnt_done = round(fetched / total_size * 100, 2)
+        elapsed = time.time() - start_time
         if not elapsed:
             return
-        MBps = (total_fetched/1048576) / elapsed
-        
+        MBps = (fetched / 1048576) / elapsed
+
         progress_data = {
             'pcnt_done': pcnt_done,
             'MBps': MBps,
-            'status': f"Downloading {self.dl_url}\n{pcnt_done:.2f}%   {MBps:.2f} MBps",
+            'status': f"Downloading {url}\n{pcnt_done:.2f}%   {MBps:.2f} MBps",
         }
 
-        # Compute overall progress across all files if progress_state is present
         if isinstance(self.progress_state, dict) and total_size > 0:
             files_total = self.progress_state.get('files_total', 0)
             files_done = self.progress_state.get('files_done', 0)
             if files_total:
-                overall = ((files_done + (total_fetched / total_size)) / files_total) * 100
+                overall = ((files_done + (fetched / total_size)) / files_total) * 100
                 progress_data['overall_pcnt'] = round(overall, 2)
                 progress_data['files_done'] = files_done
                 progress_data['files_total'] = files_total
-        
+
         should_emit = False
         now = time.time()
         if self._last_progress_emit_ts == 0:
@@ -430,21 +526,23 @@ class Package(object):
             if hasattr(self, 'progress_callback') and self.progress_callback:
                 self.progress_callback(progress_data)
             else:
-                # Fallback to global cur_activity for backward compatibility
                 cur_activity.update(progress_data)
-            
-        # Avoid spamming stdout when a UI progress callback is present
+
         if not getattr(self, 'progress_callback', None):
-            if block_num % 1000 == 0:
+            if int(fetched / 1048576) % 10 == 0:
                 print(f"\r{pcnt_done:.2f}%   {MBps:.2f} MBps", end='')
 
     def check(self):
         log.info(f"Checking {self.name}")
-        if not self.zf.check():
+        precomputed = getattr(self.zf, 'computed_hash', None)
+        try:
+            result = self.zf.check(precomputed_hash=precomputed) if precomputed else self.zf.check()
+        except TypeError:
+            result = self.zf.check()
+        if not result:
             log.warning(f"{self.name} is bad.  Cleaning up.")
             self.cleanup()
             self.downloaded = False
-            #self.zf.assembled = False
             return False
         log.info(f"{self.name} is good.")
         return True
@@ -461,7 +559,6 @@ class Package(object):
         self.installed = True
 
     def uninstall(self):
-        #print(f"Install dir {self.install_dir}")
         if os.path.exists(self.install_dir):
             log.info(f"Dir exists.  Uninstalling {self.install_dir}")
             shutil.rmtree(self.install_dir)
@@ -483,6 +580,7 @@ class Release(object):
     ver = "0.0.0"
     url = ""
     seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
+    roughness_apply_status = RoughnessApplyStatus.NOT_APPLIED
     install_name = ""
 
     installed = False
@@ -517,6 +615,11 @@ class Release(object):
         self.processed_dsf_seasons = {}
         self.total_dsfs = 0
         self.missing_xp_tiles = {}
+        # SUPER_ROUGHNESS patching tracking
+        self.ter_files = {}
+        self.processed_ter_roughness = {}
+        self.total_ters = 0
+        self.roughness_value = None
 
         #if os.path.exists(self.info_path):
         #    self.load(self.info_path)
@@ -568,6 +671,34 @@ class Release(object):
             self.seasons_apply_status = SeasonsApplyStatus.APPLIED
         else:
             self.seasons_apply_status = SeasonsApplyStatus.PARTIALLY_APPLIED
+
+        # Determine SUPER_ROUGHNESS status
+        ter_files = getattr(self, 'ter_files', {})
+        processed_ter_roughness = getattr(self, 'processed_ter_roughness', {})
+        total_ters = getattr(self, 'total_ters', 0)
+        self.roughness_value = getattr(self, 'roughness_value', None)
+
+        # Count total processed ter files
+        total_processed_ters = 0
+        for subfolder, files_dict in processed_ter_roughness.items():
+            if isinstance(files_dict, dict):
+                total_processed_ters += len(files_dict)
+            else:
+                total_processed_ters += len(files_dict) if files_dict else 0
+
+        # Count total expected ter files
+        total_expected_ters = 0
+        for subfolder, files in ter_files.items():
+            total_expected_ters += len(files) if files else 0
+
+        if not ter_files and not processed_ter_roughness:
+            self.roughness_apply_status = RoughnessApplyStatus.NOT_APPLIED
+        elif total_processed_ters >= total_expected_ters and total_expected_ters > 0:
+            self.roughness_apply_status = RoughnessApplyStatus.APPLIED
+        elif total_processed_ters > 0:
+            self.roughness_apply_status = RoughnessApplyStatus.PARTIALLY_APPLIED
+        else:
+            self.roughness_apply_status = RoughnessApplyStatus.NOT_APPLIED
 
         detected_info_ver = info.get('info_ver')
         if self.ortho_dirs and detected_info_ver is None:
@@ -676,25 +807,59 @@ class Release(object):
         self.cleaned = False
         self.parse()
 
-        # Calculate total files to download across all packages
         total_files = 0
         for pkg in self.packages.values():
             total_files += len(pkg.remote_urls)
         progress_state = {'files_total': total_files, 'files_done': 0}
+        progress_lock = threading.Lock()
 
-        for k, v in self.packages.items():
-            log.info(f"Downloading {k}")
-            #if v.check():
-            #    log.info(f"Local file exists and is valid.")
-            #    continue 
+        session = _get_download_session()
 
-            v.download(progress_callback, progress_state)
-            if not v.check():
-                log.warning(f"{k} failed checks.  Retrying ...")
-                v.download(progress_callback, progress_state)
-                if not v.check():
-                    log.error(f"{k} failed again.  Exiting!")
+        try:
+            max_workers = int(CFG.scenery.max_download_workers)
+        except (AttributeError, ValueError):
+            max_workers = 4
+        max_workers = max(1, min(max_workers, len(self.packages)))
+
+        def _download_package(pkg_name, pkg):
+            log.info(f"Downloading {pkg_name}")
+            pkg.download(
+                progress_callback=progress_callback,
+                progress_state=progress_state,
+                session=session,
+                progress_lock=progress_lock,
+            )
+            if not pkg.check():
+                log.warning(f"{pkg_name} failed checks.  Retrying ...")
+                pkg.cleanup()
+                pkg.download(
+                    progress_callback=progress_callback,
+                    progress_state=progress_state,
+                    session=session,
+                    progress_lock=progress_lock,
+                )
+                if not pkg.check():
+                    log.error(f"{pkg_name} failed again.  Exiting!")
                     return False
+            return True
+
+        success = True
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_download_package, k, v): k
+                for k, v in self.packages.items()
+            }
+            for future in as_completed(futures):
+                pkg_name = futures[future]
+                try:
+                    if not future.result():
+                        success = False
+                except Exception as err:
+                    log.error(f"Download error for {pkg_name}: {err}")
+                    success = False
+
+        if not success:
+            return False
 
         self.downloaded = True
         return True
@@ -761,6 +926,7 @@ class Release(object):
                 return True
             except Exception as err:
                 log.error(f"Install error for {pkg.name}: {err}")
+                pkg.cleanup()
                 return False
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -787,6 +953,142 @@ class Release(object):
                     })
 
         return success
+
+    def download_and_install(self, progress_callback=None, noclean=False):
+        """Download and install packages in a pipelined fashion.
+
+        Packages are submitted for extraction as soon as their download
+        and hash verification complete, overlapping network I/O with
+        decompression and disk writes.
+        """
+        if self.installed:
+            log.info(f"Already installed {self.name}")
+            return True
+
+        self.cleaned = False
+        self.parse()
+
+        if not self.packages:
+            self.downloaded = True
+            self.installed = True
+            self.save()
+            return True
+
+        # Remove previous z-type install dirs before any extraction begins
+        for k, v in self.packages.items():
+            if v.pkgtype == "z":
+                log.debug(f"Cleaning up ortho type package: {v.name}.")
+                v.uninstall()
+
+        total_files = 0
+        for pkg in self.packages.values():
+            total_files += len(pkg.remote_urls)
+        progress_state = {'files_total': total_files, 'files_done': 0}
+        progress_lock = threading.Lock()
+
+        session = _get_download_session()
+
+        try:
+            max_workers = int(CFG.scenery.max_download_workers)
+        except (AttributeError, ValueError):
+            max_workers = 4
+        max_workers = max(1, min(max_workers, len(self.packages)))
+        extract_workers = max(1, max_workers // 2)
+
+        extract_total = len(self.packages)
+        extract_done = [0]
+        extract_lock = threading.Lock()
+        extract_futures = []
+
+        def _install_package(pkg):
+            try:
+                pkg.install()
+            except Exception as err:
+                log.error(f"Install error for {pkg.name}: {err}")
+                pkg.cleanup()
+                raise
+            with extract_lock:
+                extract_done[0] += 1
+
+        def _download_then_submit(pkg_name, pkg, extract_exec):
+            log.info(f"Downloading {pkg_name}")
+            pkg.download(
+                progress_callback=progress_callback,
+                progress_state=progress_state,
+                session=session,
+                progress_lock=progress_lock,
+            )
+            if not pkg.check():
+                log.warning(f"{pkg_name} failed checks. Retrying ...")
+                pkg.cleanup()
+                pkg.download(
+                    progress_callback=progress_callback,
+                    progress_state=progress_state,
+                    session=session,
+                    progress_lock=progress_lock,
+                )
+                if not pkg.check():
+                    log.error(f"{pkg_name} failed again. Exiting!")
+                    return False
+
+            future = extract_exec.submit(_install_package, pkg)
+            with extract_lock:
+                extract_futures.append(future)
+            return True
+
+        success = True
+        extract_executor = ThreadPoolExecutor(max_workers=extract_workers)
+
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as dl_executor:
+                dl_futures = {
+                    dl_executor.submit(
+                        _download_then_submit, k, v, extract_executor
+                    ): k
+                    for k, v in self.packages.items()
+                }
+                for future in as_completed(dl_futures):
+                    pkg_name = dl_futures[future]
+                    try:
+                        if not future.result():
+                            success = False
+                    except Exception as err:
+                        log.error(f"Download error for {pkg_name}: {err}")
+                        success = False
+
+            # All downloads finished; wait for any extractions still running.
+            if success:
+                has_pending = any(not f.done() for f in extract_futures)
+
+                for future in as_completed(list(extract_futures)):
+                    try:
+                        future.result()
+                    except Exception as err:
+                        log.error(f"Extract error: {err}")
+                        success = False
+
+                    if has_pending and progress_callback:
+                        pcnt = int((extract_done[0] / extract_total) * 100)
+                        progress_callback({
+                            'stage': 'verify',
+                            'verify_done': extract_done[0],
+                            'verify_total': extract_total,
+                            'verify_pcnt': pcnt,
+                            'status': f'Installed {extract_done[0]}/{extract_total}',
+                        })
+        finally:
+            extract_executor.shutdown(wait=True)
+
+        if not success:
+            self.downloaded = False
+            return False
+
+        self.downloaded = True
+        self.installed = True
+        self.save()
+        if not noclean:
+            self.cleanup()
+        return True
 
     def cleanup(self):
         if self.cleaned:
@@ -890,12 +1192,10 @@ class Region(object):
             self.releases.pop(self.local_rel.ver)
             self.local_rel = None
 
-        if not rel.download(progress_callback):
-            log.error(f"Failed to download release {rel}")
-            return False
-
-        if not rel.install(progress_callback=progress_callback, noclean=noclean):
-            log.error(f"Failed to install release {rel}")
+        if not rel.download_and_install(
+            progress_callback=progress_callback, noclean=noclean
+        ):
+            log.error(f"Failed to download and install release {rel}")
             return False
 
         return True
