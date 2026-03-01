@@ -481,14 +481,32 @@ class DynamicDDSCache:
             return None
 
     def contains(self, tile_id: str, max_zoom: int, tile) -> bool:
-        """Check if a tile exists in the cache (stat-only, no data load)."""
+        """Check if a COMPLETE tile exists in the cache.
+
+        Returns False for partial DDS entries (from store_incremental) where
+        mipmap 0 is not populated.  This allows BackgroundDDSBuilder to build
+        the complete DDS instead of skipping tiles that only have mm4-12.
+        Without this check, store_incremental() creates partial entries that
+        permanently block the builder, causing the 2.1.0 pixelation regression.
+        """
         if not self._enabled:
             return False
         try:
-            dds_path, _ = self._paths_for(
+            dds_path, ddm_path = self._paths_for(
                 tile.row, tile.col, tile.maptype,
                 tile.tilename_zoom, max_zoom)
-            return os.path.exists(dds_path)
+            if not os.path.exists(dds_path):
+                return False
+
+            # Read DDM sidecar to check if mm0 is populated.
+            # If no DDM exists, assume complete (v2 compat / pre-DDM entries).
+            meta = self._read_ddm(ddm_path)
+            if meta is not None:
+                populated = meta.get("populated_mipmaps")
+                if populated is not None and 0 not in populated:
+                    return False  # Partial DDS — mm0 missing
+
+            return True
         except Exception:
             return False
 

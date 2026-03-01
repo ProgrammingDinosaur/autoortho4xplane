@@ -2706,7 +2706,7 @@ class ConfigUI(QMainWindow):
             "Maximum number of chunks to submit per prefetch cycle.\n"
             "Higher = more aggressive prefetching, more bandwidth\n"
             "Lower = gentler prefetching, less bandwidth\n\n"
-            "Recommended: 32 (balanced), 64-128 (fast internet), 16 (slow internet)\n"
+            "Recommended: 48 (balanced), 64-128 (fast internet), 16-32 (slow internet)\n"
             "Values above 128 are for very fast connections only."
         )
         max_chunks_layout.addWidget(self.prefetch_max_chunks_label)
@@ -2714,7 +2714,7 @@ class ConfigUI(QMainWindow):
         self.prefetch_max_chunks_slider = ModernSlider(Qt.Orientation.Horizontal)
         self.prefetch_max_chunks_slider.setRange(8, 512)
         self.prefetch_max_chunks_slider.setValue(
-            int(getattr(self.cfg.autoortho, 'prefetch_max_chunks', 32))
+            int(getattr(self.cfg.autoortho, 'prefetch_max_chunks', 48))
         )
         self.prefetch_max_chunks_slider.setObjectName('prefetch_max_chunks')
         self.prefetch_max_chunks_value = QLabel(
@@ -2843,9 +2843,9 @@ class ConfigUI(QMainWindow):
             "Higher values = faster prefetch, more CPU usage\n"
             "Lower values = slower prefetch, less CPU impact\n\n"
             "Recommended:\n"
-            "  • 1 - Low-end CPU or battery saving\n"
-            "  • 2 - Balanced (default)\n"
-            "  • 4-8 - Fast CPU, maximize prefetch speed"
+            "  • 1-2 - Low-end CPU or battery saving\n"
+            "  • 4 - Balanced (default)\n"
+            "  • 6-8 - Fast CPU, maximize prefetch speed"
         )
         prefetch_layout.addWidget(self.prefetch_workers_label)
         
@@ -2855,7 +2855,7 @@ class ConfigUI(QMainWindow):
         self.background_workers_slider.setPageStep(1)
         self.background_workers_slider.setTickInterval(1)
         self.background_workers_slider.setValue(
-            int(getattr(self.cfg.autoortho, 'background_builder_workers', 2))
+            int(getattr(self.cfg.autoortho, 'background_builder_workers', 4))
         )
         self.background_workers_slider.setObjectName('background_builder_workers')
         self.prefetch_workers_value = QLabel(
@@ -3007,7 +3007,7 @@ class ConfigUI(QMainWindow):
         
         self.buffer_pool_slider = ModernSlider(Qt.Orientation.Horizontal)
         # Calculate optimal pool size from worker counts (will be updated dynamically)
-        prefetch = int(getattr(self.cfg.autoortho, 'background_builder_workers', 2))
+        prefetch = int(getattr(self.cfg.autoortho, 'background_builder_workers', 4))
         live = int(getattr(self.cfg.autoortho, 'live_builder_concurrency', 8))
         optimal_pool_size = prefetch + live
         self.buffer_pool_slider.setRange(2, optimal_pool_size)
@@ -3043,7 +3043,7 @@ class ConfigUI(QMainWindow):
         
         self.min_chunk_ratio_slider = ModernSlider(Qt.Orientation.Horizontal)
         self.min_chunk_ratio_slider.setRange(50, 100)  # 50% to 100%
-        current_ratio = float(getattr(self.cfg.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
+        current_ratio = float(getattr(self.cfg.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
         current_ratio_pct = int(current_ratio * 100)
         current_ratio_pct = max(50, min(100, current_ratio_pct))
         self.min_chunk_ratio_slider.setValue(current_ratio_pct)
@@ -3147,25 +3147,21 @@ class ConfigUI(QMainWindow):
         seasons_layout = QVBoxLayout()
         seasons_group.setLayout(seasons_layout)
 
-        # Enable/Disable controls
+        # Enable control
         seasons_toggle_layout = QHBoxLayout()
-        # TEMP pyside6 / Python 3.14 QRadioButton workaround
-        # self.seasons_enabled_radio = QRadioButton("Enabled")
-        # self.seasons_disabled_radio = QRadioButton("Disabled")
-        self.seasons_enabled_radio = QCheckBox("Enabled")
-        self.seasons_disabled_radio = QCheckBox("Disabled")
+        self.seasons_enabled_check = QCheckBox(
+            "Enable Seasons Saturation Adjustments"
+        )
+        self.seasons_enabled_check.setToolTip(
+            "Activates desaturation of base ortho texture to enhance the application of seasons effects.\n"
+            "NOTE: This does not turn seasons on/off.\n"
+            "Activate seasons by adding Seasons data in the Scenery tab."
+        )
 
         seasons_enabled = bool(self.cfg.seasons.enabled)
-        self.seasons_enabled_radio.setChecked(seasons_enabled)
-        self.seasons_disabled_radio.setChecked(not seasons_enabled)
-        # TEMP pyside6 / Python 3.14 QRadioButton workaround
-        # self.seasons_enabled_radio.toggled.connect(self.on_seasons_enabled_toggled)
-        # self.seasons_disabled_radio.toggled.connect(self.on_seasons_enabled_toggled)
-        self.seasons_enabled_radio.clicked.connect(self.on_seasons_enabled_checked)
-        self.seasons_disabled_radio.clicked.connect(self.on_seasons_disabled_checked)
-
-        seasons_toggle_layout.addWidget(self.seasons_enabled_radio)
-        seasons_toggle_layout.addWidget(self.seasons_disabled_radio)
+        self.seasons_enabled_check.setChecked(seasons_enabled)
+        self.seasons_enabled_check.toggled.connect(self.on_seasons_enabled_toggled)
+        seasons_toggle_layout.addWidget(self.seasons_enabled_check)
         seasons_toggle_layout.addStretch()
         seasons_layout.addLayout(seasons_toggle_layout)
 
@@ -3631,26 +3627,8 @@ class ConfigUI(QMainWindow):
 
     def on_seasons_enabled_toggled(self):
         try:
-            enabled = self.seasons_enabled_radio.isChecked()
+            enabled = self.seasons_enabled_check.isChecked()
             self._set_seasons_controls_enabled(enabled)
-        except Exception:
-            pass
-
-    # TEMP pyside6 / Python 3.14 QRadioButton workaround
-    def on_seasons_enabled_checked(self):
-        try:
-            self.seasons_enabled_radio.setChecked(True)
-            self.seasons_disabled_radio.setChecked(False)
-            self._set_seasons_controls_enabled(True)
-        except Exception:
-            pass
-
-    # TEMP pyside6 / Python 3.14 QRadioButton workaround
-    def on_seasons_disabled_checked(self):
-        try:
-            self.seasons_enabled_radio.setChecked(False)
-            self.seasons_disabled_radio.setChecked(True)
-            self._set_seasons_controls_enabled(False)
         except Exception:
             pass
 
@@ -5488,7 +5466,12 @@ class ConfigUI(QMainWindow):
             del self.restore_default_dsfs_workers[region_id]
 
     def on_download_progress(self, region_id, progress_data):
-        """Update download progress"""
+        """Update download progress.
+
+        Handles both aggregated progress (from ProgressAggregator, with
+        'aggregate_MBps' / 'active_downloads' keys) and legacy per-file
+        progress (with 'pcnt_done' / 'MBps' keys).
+        """
         # Throttle UI updates to avoid freezing
         if not hasattr(self, '_last_ui_progress'):
             self._last_ui_progress = {}
@@ -5503,23 +5486,34 @@ class ConfigUI(QMainWindow):
 
         stage = progress_data.get('stage')
         if stage == 'verify':
-            # Switch to verification mode: show a single bar (overall), hide current
             if progress_current:
                 progress_current.setVisible(False)
             if progress_overall:
                 progress_overall.setVisible(True)
                 progress_overall.setValue(int(progress_data.get('verify_pcnt', 0)))
-            # Also change button text while verifying
             button = self.findChild(QPushButton, f"scenery-{region_id}")
             if button:
-                button.setText("Installing...")  # We're actually installing
-            # Update status with verification state
-            status = progress_data.get('status', 'Verifying...')
+                button.setText("Installing...")
+            status = progress_data.get('status', 'Installing...')
             self.update_status_bar(f"{region_id}: {status}")
             return
+
+        is_aggregate = 'aggregate_MBps' in progress_data
+        overall_pcnt = progress_data.get('overall_pcnt', 0) or 0
+
+        if is_aggregate:
+            # Aggregated progress: hide the per-file bar, show only overall
+            if progress_current:
+                progress_current.setVisible(False)
+            if progress_overall:
+                progress_overall.setVisible(True)
+                progress_overall.setValue(int(overall_pcnt))
+
+            status = progress_data.get('status', 'Downloading...')
+            self.update_status_bar(f"{region_id}: {status}")
         else:
+            # Legacy per-file progress (single-threaded fallback)
             pcnt_done = progress_data.get('pcnt_done', 0)
-            overall_pcnt = progress_data.get('overall_pcnt')
             files_done = progress_data.get('files_done')
             files_total = progress_data.get('files_total')
 
@@ -5528,28 +5522,22 @@ class ConfigUI(QMainWindow):
                 progress_current.setValue(int(pcnt_done))
 
             if progress_overall is not None:
-                if overall_pcnt is None and files_done is not None and files_total:
+                if overall_pcnt == 0 and files_done is not None and files_total:
                     try:
                         overall_pcnt = (float(files_done) / float(files_total)) * 100.0
                     except Exception:
                         overall_pcnt = 0
-                if overall_pcnt is None:
-                    overall_pcnt = 0
                 progress_overall.setVisible(True)
                 progress_overall.setValue(int(overall_pcnt))
 
-        status = progress_data.get('status', 'Downloading...')
-        MBps = progress_data.get('MBps', 0)
-        try:
+            MBps = progress_data.get('MBps', 0)
+            status = progress_data.get('status', 'Downloading...')
             if pcnt_done > 0:
                 self.update_status_bar(
                     f"{region_id}: {pcnt_done:.1f}% ({MBps:.1f} MB/s)"
                 )
             else:
                 self.update_status_bar(f"{region_id}: {status}")
-        except UnboundLocalError:
-            # If pcnt_done wasn't defined (e.g., stage mismatch), fall back to status
-            self.update_status_bar(f"{region_id}: {status}")
 
     def on_download_finished(self, region_id, success):
         """Handle download completion"""
@@ -5724,7 +5712,7 @@ class ConfigUI(QMainWindow):
             )
 
             # Seasons settings
-            self.cfg.seasons.enabled = self.seasons_enabled_radio.isChecked()
+            self.cfg.seasons.enabled = self.seasons_enabled_check.isChecked()
             self.cfg.seasons.compress_dsf = self.compress_dsf_check.isChecked()
             self.cfg.seasons.seasons_convert_workers = str(self.seasons_convert_workers_slider.value())
             self.cfg.seasons.spr_saturation = str(self.spr_sat_slider.value())

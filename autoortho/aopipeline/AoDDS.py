@@ -688,7 +688,7 @@ class StreamingBuilder:
         
         return bool(self._lib.aodds_builder_is_complete(self._handle))
     
-    def finalize(self, buffer: np.ndarray) -> StreamingBuilderResult:
+    def finalize(self, buffer: np.ndarray, max_threads: int = 0) -> StreamingBuilderResult:
         """
         Finalize and write DDS to buffer.
         
@@ -719,7 +719,8 @@ class StreamingBuilder:
             self._handle,
             buffer_ptr,
             c_uint32(len(buffer)),
-            byref(bytes_written)
+            byref(bytes_written),
+            c_int32(max_threads)
         )
         
         self._finalized = True
@@ -736,7 +737,7 @@ class StreamingBuilder:
                 error="Failed to finalize DDS"
             )
     
-    def finalize_to_file(self, output_path: str) -> Tuple[bool, int]:
+    def finalize_to_file(self, output_path: str, max_threads: int = 0) -> Tuple[bool, int]:
         """
         Finalize and write DDS directly to file.
         
@@ -761,7 +762,8 @@ class StreamingBuilder:
         result = self._lib.aodds_builder_finalize_to_file(
             self._handle,
             output_path_bytes,
-            byref(bytes_written)
+            byref(bytes_written),
+            c_int32(max_threads)
         )
         
         self._finalized = True
@@ -910,12 +912,12 @@ class StreamingBuilderPool:
             self._lib.aodds_builder_is_complete.restype = c_int32
             
             self._lib.aodds_builder_finalize.argtypes = [
-                c_void_p, POINTER(c_uint8), c_uint32, POINTER(c_uint32)
+                c_void_p, POINTER(c_uint8), c_uint32, POINTER(c_uint32), c_int32
             ]
             self._lib.aodds_builder_finalize.restype = c_int32
-            
+
             self._lib.aodds_builder_finalize_to_file.argtypes = [
-                c_void_p, c_char_p, POINTER(c_uint32)
+                c_void_p, c_char_p, POINTER(c_uint32), c_int32
             ]
             self._lib.aodds_builder_finalize_to_file.restype = c_int32
             
@@ -1208,8 +1210,8 @@ def _calculate_builder_pool_size() -> int:
         except ImportError:
             from aoconfig import CFG
         
-        prefetch_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 2))
-        live_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 4))
+        prefetch_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 4))
+        live_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 8))
     except Exception:
         # Config not available yet - use defaults
         pass
@@ -2008,24 +2010,25 @@ def get_decoder_pool_stats() -> DecoderPoolStats:
 def calculate_decoder_pool_size(max_builders: int, cpu_threads: int = 0) -> int:
     """
     Calculate the recommended decoder pool size based on configuration.
-    
-    Formula: max_builders * cpu_threads
-    
+
+    With thread budget coordination, total concurrent OpenMP threads across
+    all builds is approximately cpu_threads. We add 50% headroom for
+    transient spikes when builds start/finish.
+
     Args:
         max_builders: Maximum number of parallel DDS builders (background_builder_workers)
         cpu_threads: Number of CPU threads (0 = auto-detect from os.cpu_count())
-        
+
     Returns:
-        Recommended pool size (minimum 1, no upper limit)
+        Recommended pool size (at least max_builders)
     """
     import os
     if cpu_threads <= 0:
         cpu_threads = os.cpu_count() or 1
-    
-    pool_size = max_builders * cpu_threads
-    
-    # Minimum of 1
-    return max(1, pool_size)
+
+    pool_size = int(cpu_threads * 1.5)
+
+    return max(max_builders, pool_size)
 
 
 def _check_compressor_warning():
@@ -2158,11 +2161,12 @@ def build_from_jpegs(
             POINTER(c_uint8),           # dds_output
             c_uint32,                   # output_size
             POINTER(c_uint32),          # bytes_written
-            c_void_p                    # pool
+            c_void_p,                   # pool
+            c_int32                     # max_threads
         ]
         lib.aodds_build_from_jpegs.restype = c_int32
         lib._hybrid_setup_done = True
-    
+
     # Call native function
     success = lib.aodds_build_from_jpegs(
         jpeg_ptrs,
@@ -2175,7 +2179,8 @@ def build_from_jpegs(
         cast(buffer, POINTER(c_uint8)),
         dds_size,
         byref(bytes_written),
-        pool_handle
+        pool_handle,
+        c_int32(0)
     )
     
     if not success:
@@ -2189,7 +2194,8 @@ def build_from_jpegs_to_buffer(
     jpeg_datas: list,
     format: str = "BC1",
     missing_color: Tuple[int, int, int] = (66, 77, 55),
-    decode_pool: Optional[c_void_p] = None
+    decode_pool: Optional[c_void_p] = None,
+    max_threads: int = 0
 ) -> BufferBuildResult:
     """
     Build DDS from pre-read JPEG data into a pre-allocated buffer (ZERO-COPY).
@@ -2296,11 +2302,12 @@ def build_from_jpegs_to_buffer(
             POINTER(c_uint8),           # dds_output
             c_uint32,                   # output_size
             POINTER(c_uint32),          # bytes_written
-            c_void_p                    # pool
+            c_void_p,                   # pool
+            c_int32                     # max_threads
         ]
         lib.aodds_build_from_jpegs.restype = c_int32
         lib._hybrid_setup_done = True
-    
+
     # Call native function with numpy buffer
     success = lib.aodds_build_from_jpegs(
         jpeg_ptrs,
@@ -2313,7 +2320,8 @@ def build_from_jpegs_to_buffer(
         buffer.ctypes.data_as(POINTER(c_uint8)),
         len(buffer),
         byref(bytes_written),
-        pool_handle
+        pool_handle,
+        c_int32(max_threads)
     )
     
     return BufferBuildResult(
@@ -2369,7 +2377,8 @@ def build_single_mipmap(
     jpeg_datas: List[Optional[bytes]],
     format: str = "BC1",
     missing_color: Tuple[int, int, int] = (66, 77, 55),
-    pool: Optional[c_void_p] = None
+    pool: Optional[c_void_p] = None,
+    max_threads: int = 0
 ) -> SingleMipmapResult:
     """
     Build a single mipmap level from JPEG data.
@@ -2463,7 +2472,8 @@ def build_single_mipmap(
             POINTER(c_uint8),           # output
             c_uint32,                   # output_size
             POINTER(c_uint32),          # bytes_written
-            c_void_p                    # pool
+            c_void_p,                   # pool
+            c_int32                     # max_threads
         ]
         lib.aodds_build_single_mipmap.restype = c_int32
         
@@ -2484,7 +2494,8 @@ def build_single_mipmap(
         output_buffer.ctypes.data_as(POINTER(c_uint8)),
         output_size,
         byref(bytes_written),
-        pool_handle
+        pool_handle,
+        c_int32(max_threads)
     )
     
     elapsed_ms = (time.monotonic() - start_time) * 1000
@@ -3180,7 +3191,8 @@ def build_from_jpegs_to_file(
     output_path: str,
     format: str = "BC1",
     missing_color: Tuple[int, int, int] = (66, 77, 55),
-    decode_pool: Optional[c_void_p] = None
+    decode_pool: Optional[c_void_p] = None,
+    max_threads: int = 0
 ) -> FileBuildResult:
     """
     Build DDS from pre-read JPEG data and write directly to disk (ZERO-COPY).
@@ -3274,15 +3286,16 @@ def build_from_jpegs_to_file(
             c_uint8, c_uint8, c_uint8,  # missing color
             c_char_p,                   # output_path
             POINTER(c_uint32),          # bytes_written
-            c_void_p                    # pool
+            c_void_p,                   # pool
+            c_int32                     # max_threads
         ]
         lib.aodds_build_from_jpegs_to_file.restype = c_int32
         lib._file_output_setup_done = True
-    
+
     # Encode path for cross-platform compatibility
     # On Windows, use UTF-8 which works with most file systems
     path_bytes = output_path.encode('utf-8')
-    
+
     # Call native function
     success = lib.aodds_build_from_jpegs_to_file(
         jpeg_ptrs,
@@ -3294,7 +3307,8 @@ def build_from_jpegs_to_file(
         missing_color[2],
         path_bytes,
         byref(bytes_written),
-        pool_handle
+        pool_handle,
+        c_int32(max_threads)
     )
     
     return FileBuildResult(

@@ -65,6 +65,111 @@ def do_url(url, headers={}):
 
 cur_activity = {}
 
+
+class ProgressAggregator:
+    """Collects per-download progress from multiple threads and emits a single
+    unified progress update to the UI callback at a controlled interval.
+
+    This avoids the "jumpy progress bar" problem where parallel download
+    threads independently overwrite each other's progress snapshots.
+    """
+
+    def __init__(self, callback, total_files, emit_interval=0.25):
+        self._callback = callback
+        self._total_files = total_files
+        self._lock = threading.Lock()
+        self._active = {}
+        self._files_done = 0
+        self._last_emit = 0
+        self._emit_interval = emit_interval
+        self._extracts_done = 0
+        self._extracts_total = 0
+
+    def update(self, key, fetched, total_size, start_time):
+        """Called by a download thread to report its current byte position."""
+        now = time.time()
+        with self._lock:
+            self._active[key] = {
+                'fetched': fetched,
+                'total_size': total_size,
+                'start_time': start_time,
+                'last_update': now,
+            }
+            self._maybe_emit(now)
+
+    def complete_file(self, key):
+        """Mark a download as finished."""
+        now = time.time()
+        with self._lock:
+            self._active.pop(key, None)
+            self._files_done += 1
+            self._maybe_emit(now, force=True)
+
+    def update_extract(self, done, total):
+        """Report extraction/install progress alongside downloads."""
+        now = time.time()
+        with self._lock:
+            self._extracts_done = done
+            self._extracts_total = total
+            self._maybe_emit(now, force=True)
+
+    def _maybe_emit(self, now, force=False):
+        """Emit an aggregate progress dict if enough time has elapsed.
+        Must be called while holding self._lock.
+        """
+        if not self._callback:
+            return
+        if not force and (now - self._last_emit) < self._emit_interval:
+            return
+        self._last_emit = now
+
+        active_fractions = 0.0
+        aggregate_MBps = 0.0
+        active_count = 0
+
+        for info in self._active.values():
+            ts = info['total_size']
+            if ts > 0:
+                active_fractions += info['fetched'] / ts
+                elapsed = now - info['start_time']
+                if elapsed > 0:
+                    aggregate_MBps += (info['fetched'] / 1048576) / elapsed
+            active_count += 1
+
+        overall_pcnt = 0.0
+        if self._total_files > 0:
+            overall_pcnt = round(
+                ((self._files_done + active_fractions) / self._total_files) * 100, 2
+            )
+            overall_pcnt = min(overall_pcnt, 100.0)
+
+        status_parts = []
+        if active_count > 0 or self._files_done < self._total_files:
+            status_parts.append(
+                f"Downloading {self._files_done}/{self._total_files} files "
+                f"({aggregate_MBps:.1f} MB/s)"
+            )
+        if self._extracts_total > 0:
+            status_parts.append(
+                f"Installing {self._extracts_done}/{self._extracts_total} packages"
+            )
+
+        progress_data = {
+            'overall_pcnt': overall_pcnt,
+            'aggregate_MBps': aggregate_MBps,
+            'files_done': self._files_done,
+            'files_total': self._total_files,
+            'active_downloads': active_count,
+            'status': ' | '.join(status_parts) if status_parts else 'Finishing...',
+        }
+
+        if self._extracts_total > 0:
+            progress_data['extracts_done'] = self._extracts_done
+            progress_data['extracts_total'] = self._extracts_total
+
+        self._callback(progress_data)
+
+
 class SeasonsApplyStatus(Enum):
     NOT_APPLIED = "not_applied"
     PARTIALLY_APPLIED = "partially_applied"
@@ -172,90 +277,49 @@ class Zip(object):
         with zipfile.ZipFile(self.path) as zf:
             zf.extractall(dest)
 
-    # This approach is faster than extract, copytree, rmtree
-    def extractScenery_y(self, destpath):
-        with zipfile.ZipFile(self.path) as zf:
-            destpath = os.path.join(destpath, "Earth nav data")
-            os.makedirs(destpath, exist_ok=True)
-            zip_path = zipfile.Path(zf)  # This is the path to and within the zip file
+    def extract_scenery(self, destpath, pkgtype):
+        """Extract scenery zip to *destpath*, flattening the internal structure.
 
-            children = []
-            for entry in zip_path.iterdir():
-                if (zip_path / entry.name).is_dir():
-                    children.append(entry.name)
-            if not len(children) == 1:
+        Single O(N) pass over infolist() with ZipInfo.filename rewriting so
+        files are written directly to their final location.
+        """
+        with zipfile.ZipFile(self.path) as zf:
+            top_dirs = {n.split('/')[0] for n in zf.namelist() if '/' in n}
+            if len(top_dirs) != 1:
                 log.error(
-                    f"Unexpected directory structure in {zf}, too many top-level children."
+                    f"Unexpected directory structure in {self.path}, "
+                    f"expected 1 top-level dir, found {len(top_dirs)}: {top_dirs}"
                 )
                 return
 
-            zip_path = zip_path / children[0] / "yOrtho4XP_Overlays" / "Earth nav data"
-            if not zip_path.is_dir():
-                log.error(f"'yOrtho4XP_Overlays/Earth nav data' not found in {zf}")
+            top_dir = next(iter(top_dirs))
+
+            if pkgtype == 'z':
+                prefix = f"{top_dir}/"
+            elif pkgtype == 'y':
+                prefix = f"{top_dir}/yOrtho4XP_Overlays/"
+            else:
+                log.error(f"Unknown pkgtype '{pkgtype}' for {self.path}")
                 return
 
-            for dir in zip_path.iterdir():
-                # Some zip files have a directory with this name.  Invalid and unexpected!
-                if dir.name == "*":
+            found_any = False
+            for info in zf.infolist():
+                if not info.filename.startswith(prefix):
                     continue
-                os.makedirs(os.path.join(destpath, dir.name), exist_ok=True)
-                for entry in (zip_path / dir.name).iterdir():
-                    with (
-                        entry.open(mode="rb") as source,
-                        open(
-                            os.path.join(destpath, dir.name, entry.name),
-                            "wb",
-                        ) as dest,
-                    ):
-                        shutil.copyfileobj(source, dest)
+                relative = info.filename[len(prefix):]
+                if not relative:
+                    continue
+                # Skip entries under the invalid "*" directory
+                if relative.startswith('*/'):
+                    continue
+                found_any = True
+                info.filename = relative
+                zf.extract(info, destpath)
 
-    # This approach is faster than extract, copytree, rmtree
-    def extractScenery_z(self, destpath):
-        with zipfile.ZipFile(self.path) as zf:
-            os.makedirs(destpath, exist_ok=True)
-            zip_path = zipfile.Path(zf)  # This is the path to and within the zip file
-
-            children = []
-            for entry in zip_path.iterdir():
-                if (zip_path / entry.name).is_dir():
-                    children.append(entry.name)
-            if not len(children) == 1:
+            if not found_any:
                 log.error(
-                    f"Unexpected directory structure in {zf}, too many top-level children."
+                    f"No files found under prefix '{prefix}' in {self.path}"
                 )
-                return
-
-            zip_path = zip_path / children[0]
-
-            for dir in zip_path.iterdir():
-                os.makedirs(os.path.join(destpath, dir.name), exist_ok=True)
-                if dir.name == "textures" or dir.name == "terrain":
-                    for entry in (zip_path / dir.name).iterdir():
-                        with (
-                            entry.open(mode="rb") as source,
-                            open(
-                                os.path.join(destpath, dir.name, entry.name), "wb"
-                            ) as dest,
-                        ):
-                            shutil.copyfileobj(source, dest)
-                elif dir.name == "Earth nav data":
-                    earth_path = zip_path / dir.name
-                    for earth_dir in earth_path.iterdir():
-                        os.makedirs(
-                            os.path.join(destpath, dir.name, earth_dir.name),
-                            exist_ok=True,
-                        )
-                        for entry in (earth_path / earth_dir.name).iterdir():
-                            with (
-                                entry.open(mode="rb") as source,
-                                open(
-                                    os.path.join(
-                                        destpath, dir.name, earth_dir.name, entry.name
-                                    ),
-                                    "wb",
-                                ) as dest,
-                            ):
-                                shutil.copyfileobj(source, dest)
 
     def clean(self):
         if os.path.exists(self.path):
@@ -318,7 +382,8 @@ class Package(object):
 
 
     def download(self, progress_callback=None, progress_state=None,
-                 session=None, progress_lock=None):
+                 session=None, progress_lock=None,
+                 progress_aggregator=None):
         if self.downloaded:
             log.info(f"Already downloaded.")
             return
@@ -332,11 +397,14 @@ class Package(object):
         self.progress_callback = progress_callback
         self.progress_state = progress_state
         self._progress_lock = progress_lock
+        self._progress_aggregator = progress_aggregator
         self._last_progress_emit_ts = 0
         self._last_progress_emit_pcnt = -1
 
         for url in self.remote_urls:
-            if progress_callback:
+            if progress_aggregator:
+                pass  # aggregator handles all progress emission
+            elif progress_callback:
                 init_progress = {
                     'status': f"Downloading and/or verifying {url}",
                     'pcnt_done': 0,
@@ -371,7 +439,7 @@ class Package(object):
                         self.zf.hashfile = destpath
                     else:
                         self.zf.files.append(destpath)
-                self._increment_files_done()
+                self._increment_files_done(url)
                 continue
 
             # file:// URLs (used in tests) bypass the requests session
@@ -381,7 +449,7 @@ class Package(object):
                 local_path = url2pathname(urlparse(url).path)
                 shutil.copy2(local_path, destpath)
                 log.info(f"Copied local file {local_path} -> {destpath}")
-                self._increment_files_done()
+                self._increment_files_done(url)
                 if destpath.endswith('sha256'):
                     self.zf.hashfile = destpath
                 else:
@@ -442,7 +510,7 @@ class Package(object):
                         self.zf.computed_hash = sha256.hexdigest()
 
                     log.info(f"DONE downloading {url}")
-                    self._increment_files_done()
+                    self._increment_files_done(url)
                     break
 
                 except requests.RequestException as e:
@@ -461,8 +529,14 @@ class Package(object):
         self.downloaded = True
         self.zf.assemble()
 
-    def _increment_files_done(self):
+    def _increment_files_done(self, url=None):
         """Thread-safe increment of files_done and emit completion progress."""
+        aggregator = getattr(self, '_progress_aggregator', None)
+        if aggregator:
+            key = url or self.name
+            aggregator.complete_file(key)
+            return
+
         if not isinstance(self.progress_state, dict):
             return
 
@@ -488,6 +562,11 @@ class Package(object):
     def _emit_progress(self, url, fetched, total_size, start_time):
         """Emit download progress with throttling."""
         if total_size <= 0:
+            return
+
+        aggregator = getattr(self, '_progress_aggregator', None)
+        if aggregator:
+            aggregator.update(url, fetched, total_size, start_time)
             return
 
         pcnt_done = round(fetched / total_size * 100, 2)
@@ -551,11 +630,7 @@ class Package(object):
         if self.installed:
             return
 
-        if self.pkgtype == 'y':
-            self.zf.extractScenery_y(self.install_dir)
-        if self.pkgtype == 'z':
-            self.zf.extractScenery_z(self.install_dir)
-
+        self.zf.extract_scenery(self.install_dir, self.pkgtype)
         self.installed = True
 
     def uninstall(self):
@@ -810,8 +885,9 @@ class Release(object):
         total_files = 0
         for pkg in self.packages.values():
             total_files += len(pkg.remote_urls)
-        progress_state = {'files_total': total_files, 'files_done': 0}
-        progress_lock = threading.Lock()
+
+        aggregator = ProgressAggregator(progress_callback, total_files) \
+            if progress_callback else None
 
         session = _get_download_session()
 
@@ -824,19 +900,15 @@ class Release(object):
         def _download_package(pkg_name, pkg):
             log.info(f"Downloading {pkg_name}")
             pkg.download(
-                progress_callback=progress_callback,
-                progress_state=progress_state,
                 session=session,
-                progress_lock=progress_lock,
+                progress_aggregator=aggregator,
             )
             if not pkg.check():
                 log.warning(f"{pkg_name} failed checks.  Retrying ...")
                 pkg.cleanup()
                 pkg.download(
-                    progress_callback=progress_callback,
-                    progress_state=progress_state,
                     session=session,
-                    progress_lock=progress_lock,
+                    progress_aggregator=aggregator,
                 )
                 if not pkg.check():
                     log.error(f"{pkg_name} failed again.  Exiting!")
@@ -983,8 +1055,9 @@ class Release(object):
         total_files = 0
         for pkg in self.packages.values():
             total_files += len(pkg.remote_urls)
-        progress_state = {'files_total': total_files, 'files_done': 0}
-        progress_lock = threading.Lock()
+
+        aggregator = ProgressAggregator(progress_callback, total_files) \
+            if progress_callback else None
 
         session = _get_download_session()
 
@@ -1009,23 +1082,21 @@ class Release(object):
                 raise
             with extract_lock:
                 extract_done[0] += 1
+            if aggregator:
+                aggregator.update_extract(extract_done[0], extract_total)
 
         def _download_then_submit(pkg_name, pkg, extract_exec):
             log.info(f"Downloading {pkg_name}")
             pkg.download(
-                progress_callback=progress_callback,
-                progress_state=progress_state,
                 session=session,
-                progress_lock=progress_lock,
+                progress_aggregator=aggregator,
             )
             if not pkg.check():
                 log.warning(f"{pkg_name} failed checks. Retrying ...")
                 pkg.cleanup()
                 pkg.download(
-                    progress_callback=progress_callback,
-                    progress_state=progress_state,
                     session=session,
-                    progress_lock=progress_lock,
+                    progress_aggregator=aggregator,
                 )
                 if not pkg.check():
                     log.error(f"{pkg_name} failed again. Exiting!")
@@ -1058,8 +1129,6 @@ class Release(object):
 
             # All downloads finished; wait for any extractions still running.
             if success:
-                has_pending = any(not f.done() for f in extract_futures)
-
                 for future in as_completed(list(extract_futures)):
                     try:
                         future.result()
@@ -1067,7 +1136,7 @@ class Release(object):
                         log.error(f"Extract error: {err}")
                         success = False
 
-                    if has_pending and progress_callback:
+                    if progress_callback:
                         pcnt = int((extract_done[0] / extract_total) * 100)
                         progress_callback({
                             'stage': 'verify',

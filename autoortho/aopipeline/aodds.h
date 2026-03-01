@@ -294,7 +294,8 @@ AODDS_API int32_t aodds_build_from_jpegs(
     uint8_t* dds_output,
     uint32_t output_size,
     uint32_t* bytes_written,
-    aodecode_pool_t* pool
+    aodecode_pool_t* pool,
+    int32_t max_threads          /**< 0 = auto (default), >0 = limit OpenMP threads */
 );
 
 /**
@@ -353,7 +354,8 @@ AODDS_API int32_t aodds_build_single_mipmap(
     uint8_t* output,
     uint32_t output_size,
     uint32_t* bytes_written,
-    aodecode_pool_t* pool
+    aodecode_pool_t* pool,
+    int32_t max_threads
 );
 
 /**
@@ -526,7 +528,8 @@ AODDS_API int32_t aodds_build_from_jpegs_to_file(
     uint8_t missing_b,
     const char* output_path,
     uint32_t* bytes_written,
-    aodecode_pool_t* pool
+    aodecode_pool_t* pool,
+    int32_t max_threads          /**< 0 = auto (default), >0 = limit OpenMP threads */
 );
 
 /**
@@ -888,7 +891,8 @@ AODDS_API int32_t aodds_builder_finalize(
     aodds_builder_t* builder,
     uint8_t* dds_output,
     uint32_t output_size,
-    uint32_t* bytes_written
+    uint32_t* bytes_written,
+    int32_t max_threads          /**< 0 = auto (default), >0 = limit OpenMP threads */
 );
 
 /**
@@ -908,7 +912,8 @@ AODDS_API int32_t aodds_builder_finalize(
 AODDS_API int32_t aodds_builder_finalize_to_file(
     aodds_builder_t* builder,
     const char* output_path,
-    uint32_t* bytes_written
+    uint32_t* bytes_written,
+    int32_t max_threads          /**< 0 = auto (default), >0 = limit OpenMP threads */
 );
 
 /* ========== DECODER POOL CONFIGURATION ========== */

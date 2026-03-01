@@ -38,6 +38,14 @@ questions.
 * Latest release: (https://github.com/ProgrammingDinosaur/autoortho4xplane/releases)
 
 ---
+## Donation
+---
+Donations are not necessary. All of the work I do is me doing my contribution for the awesome X-Plane community and without an economic purpose in mind. 
+That being said if you find AutoOrtho useful and would like to support its development, you can donate via PayPal. Your support is very much appreciated and inspires me to continue improving the project.
+
+[![Donate with PayPal](https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif)](https://www.paypal.com/donate/?hosted_button_id=4Z8774JVYPQHG)
+
+---
 Found a bug? Open an issue here and report it. I'll take a look at it.
 ---
 *Important!* _Before submitting a bug or report make sure to search existing issues as it may already be reported._

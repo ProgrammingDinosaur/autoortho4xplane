@@ -557,7 +557,7 @@ def _get_dds_buffer_pool():
             # Maximum concurrent builds = prefetch_workers + live_builder_concurrency
             # More buffers than this would never be used simultaneously
             try:
-                prefetch_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 2))
+                prefetch_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 4))
                 live_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 8))
             except (ValueError, TypeError):
                 prefetch_workers = 2
@@ -683,13 +683,15 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
             return None
         
         try:
-            result = native.build_from_jpegs_to_buffer(
-                buffer,
-                jpeg_datas,
-                format=dxt_format,
-                missing_color=missing_color
-            )
-            
+            with _native_build_context():
+                result = native.build_from_jpegs_to_buffer(
+                    buffer,
+                    jpeg_datas,
+                    format=dxt_format,
+                    missing_color=missing_color,
+                    max_threads=_compute_thread_budget()
+                )
+
             if result.success and result.bytes_written >= 128:
                 dds_bytes = result.to_bytes()
                 log.debug(f"Hybrid DDS build: {valid_count}/{len(chunks)} chunks, "
@@ -788,6 +790,62 @@ def create_http_session(pool_size=10):
 # Each decode uses ~256KB RAM, so even 64 concurrent = only ~16MB
 _MAX_DECODE = min(CURRENT_CPU_COUNT * 4, 64)
 _decode_sem = threading.Semaphore(_MAX_DECODE)
+
+# Persistent thread pool for progressive tile building (avoids per-tile executor overhead)
+_progressive_executor = None
+_progressive_executor_lock = threading.Lock()
+
+# Track concurrent native builds for OpenMP thread budget coordination.
+# Shared across background builder, live builder, and streaming builder.
+_active_native_builds = 0
+_active_native_builds_lock = threading.Lock()
+
+
+def _compute_thread_budget() -> int:
+    """Compute per-build OpenMP thread count to avoid oversubscription.
+
+    Divides CPU cores across active concurrent builds so total threads ~ cpu_count.
+    Returns at least 2 to ensure each build makes progress.
+    If native_pipeline_threads config is > 0, uses that as a fixed override.
+    """
+    try:
+        explicit = int(getattr(CFG.autoortho, 'native_pipeline_threads', 0))
+        if explicit > 0:
+            return explicit
+    except (ValueError, TypeError, AttributeError):
+        pass
+
+    with _active_native_builds_lock:
+        active = max(1, _active_native_builds)
+    return max(2, CURRENT_CPU_COUNT // active)
+
+
+class _native_build_context:
+    """Track entry/exit of native DDS builds for thread budget coordination."""
+    def __enter__(self):
+        global _active_native_builds
+        with _active_native_builds_lock:
+            _active_native_builds += 1
+        return self
+
+    def __exit__(self, *exc):
+        global _active_native_builds
+        with _active_native_builds_lock:
+            _active_native_builds -= 1
+        return False
+
+
+def _get_progressive_executor(max_workers):
+    """Get or create the shared progressive tile executor."""
+    global _progressive_executor
+    if _progressive_executor is None:
+        with _progressive_executor_lock:
+            if _progressive_executor is None:
+                _progressive_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="ao-progressive"
+                )
+    return _progressive_executor
 
 
 # Track average fetch times
@@ -1472,7 +1530,13 @@ log.info(f"chunk_getter: {chunk_getter}")
 # ============================================================================
 
 def _warmup_native_pipeline():
-    """Pre-warm native pipeline for optimal first-tile performance."""
+    """Pre-warm native pipeline for optimal first-tile performance.
+
+    Early init: creates persistent decoder handles and warms the OpenMP
+    thread pool.  If a real buffer pool is available later (via
+    ``start_predictive_dds``), ``warmup_full`` is called again with it
+    to pre-fault the pool's memory pages.
+    """
     try:
         try:
             from autoortho.aopipeline import AoDecode
@@ -1481,20 +1545,33 @@ def _warmup_native_pipeline():
                 from aopipeline import AoDecode
             except ImportError:
                 return  # Native not available
-        
+
         if not AoDecode.is_available():
             return
-        
-        # Create a temporary pool for warmup (will be destroyed after warmup)
-        pool = AoDecode.create_pool(64)
-        if pool:
-            try:
-                AoDecode.warmup_full(pool)
-                log.info("Native decode pipeline pre-warmed")
-            finally:
-                pool.destroy()
+
+        # Initialize persistent decoders (one per OpenMP thread) and warm
+        # the OpenMP thread pool.  No buffer pool needed at this stage.
+        AoDecode.init_persistent_decoders()
+        AoDecode.warmup_full()  # pool=None — just warms decoders + OpenMP
+        log.info("Native decode pipeline pre-warmed (decoders + OpenMP)")
     except Exception as e:
-        log.debug(f"Native warmup failed: {e}")
+        log.debug(f"Native decode warmup failed: {e}")
+
+    # Also warm the native cache I/O thread pool
+    try:
+        try:
+            from autoortho.aopipeline import AoCache
+        except ImportError:
+            try:
+                from aopipeline import AoCache
+            except ImportError:
+                return
+
+        if AoCache.is_available():
+            AoCache.warmup_threads()
+            log.info("Native cache I/O thread pool pre-warmed")
+    except Exception as e:
+        log.debug(f"Native cache warmup failed: {e}")
 
 # Call warmup during module init if native pipeline is being used
 if get_pipeline_mode() != PIPELINE_MODE_PYTHON:
@@ -1514,7 +1591,7 @@ if get_pipeline_mode() != PIPELINE_MODE_PYTHON:
 # is sufficient. More workers would just contend on disk I/O.
 # ============================================================================
 _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=2, 
+    max_workers=4,
     thread_name_prefix="cache_writer"
 )
 
@@ -1573,7 +1650,7 @@ def flush_cache_writer(timeout=30.0):
     finally:
         # Recreate the executor for subsequent operations
         _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=2,
+            max_workers=4,
             thread_name_prefix="cache_writer"
         )
 
@@ -1965,7 +2042,7 @@ class SpatialPrefetcher:
             self.lookahead_sec = max(60, min(3600, self.lookahead_sec))
         
         self.interval_sec = float(getattr(CFG.autoortho, 'prefetch_interval', 2.0))
-        self.max_chunks = int(getattr(CFG.autoortho, 'prefetch_max_chunks', 24))
+        self.max_chunks = int(getattr(CFG.autoortho, 'prefetch_max_chunks', 48))
         
         # Unified prefetch radius (used by both velocity and SimBrief methods)
         # This replaces the old simbrief-specific route_prefetch_radius_nm
@@ -2717,8 +2794,10 @@ class SpatialPrefetcher:
                     # Lower priority number = more urgent
                     chunk.priority = self.PREFETCH_PRIORITY_OFFSET + mipmap
                     
-                    # Submit to chunk getter
-                    chunk_getter.submit(chunk)
+                    # Submit to chunk getter with shorter prefetch timeouts
+                    # Prefetch chunks should fail fast to keep the pipeline flowing;
+                    # the healing system handles any permanently failed chunks later
+                    chunk_getter.submit(chunk, timeout=(5, 10), max_attempts=8)
                     submitted += 1
                     
                     # Limit chunks per tile to avoid flooding queue with one tile
@@ -2778,9 +2857,9 @@ def stop_prefetcher():
 
 class _TrackedTile:
     """Internal tracking state for a tile being prefetched."""
-    __slots__ = ('tile', 'zoom', 'expected_chunks', 'completed_chunks', 
-                 'start_time', 'completed_chunk_ids')
-    
+    __slots__ = ('tile', 'zoom', 'expected_chunks', 'completed_chunks',
+                 'start_time', 'completed_chunk_ids', 'build_triggered')
+
     def __init__(self, tile, zoom: int, expected_chunks: int):
         self.tile = tile
         self.zoom = zoom
@@ -2788,6 +2867,7 @@ class _TrackedTile:
         self.completed_chunks = 0
         self.start_time = time.monotonic()
         self.completed_chunk_ids = set()  # Track which chunks reported complete
+        self.build_triggered = False  # True once threshold build was fired
 
 
 class TileCompletionTracker:
@@ -2804,17 +2884,24 @@ class TileCompletionTracker:
     def __init__(self, on_tile_complete=None):
         """
         Args:
-            on_tile_complete: Callback when all chunks are ready.
-                             Called with (tile_id, tile) from notification thread.
+            on_tile_complete: Callback when chunks are ready.
+                             Called with (tile_id, tile, partial, healing).
+                             partial=True means threshold reached but not 100%.
+                             healing=True means remaining chunks arrived after partial build.
                              If None, no callback is made.
         """
         self._lock = threading.Lock()
         self._tracked_tiles: Dict[str, _TrackedTile] = {}
         self._on_tile_complete = on_tile_complete
-        self._max_tracked = 200  # Limit memory usage
+        self._max_tracked = 400  # Limit memory usage
         self._timeout_sec = 600  # Stop tracking after 10 minutes
         self._last_cleanup = time.monotonic()
         self._cleanup_interval = 60  # Cleanup every 60 seconds
+        # Build threshold: trigger DDS build when this fraction of chunks is ready.
+        # build_from_jpegs handles None entries for missing chunks; healing fills gaps later.
+        self._build_threshold = float(getattr(
+            CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0
+        )) if hasattr(CFG, 'autoortho') else 0.9
     
     def start_tracking(self, tile, zoom: int) -> None:
         """
@@ -2897,36 +2984,54 @@ class TileCompletionTracker:
             return
         
         tile_to_callback = None
-        
+        callback_partial = False
+        callback_healing = False
+
         with self._lock:
             tracked = self._tracked_tiles.get(tile_id)
             if tracked is None:
                 # Not tracking this tile (not prefetched, or already completed)
                 return
-            
+
             # Avoid double-counting the same chunk
             chunk_key = chunk.chunk_id if chunk else None
             if chunk_key and chunk_key in tracked.completed_chunk_ids:
                 return
-            
+
             if chunk_key:
                 tracked.completed_chunk_ids.add(chunk_key)
             tracked.completed_chunks += 1
-            
+
             log.debug(f"TileCompletionTracker: {tile_id} chunk complete "
                      f"({tracked.completed_chunks}/{tracked.expected_chunks})")
-            
-            # Check if tile is complete
+
+            # Threshold-based triggering: fire early build at _build_threshold,
+            # then fire healing when remaining chunks arrive.
+            ratio = tracked.completed_chunks / tracked.expected_chunks if tracked.expected_chunks > 0 else 0
             if tracked.completed_chunks >= tracked.expected_chunks:
+                # 100% complete
                 tile_to_callback = tracked.tile
-                # Remove from tracking (build will be triggered)
                 del self._tracked_tiles[tile_id]
-                log.debug(f"TileCompletionTracker: {tile_id} COMPLETE - all chunks ready")
-        
+                if tracked.build_triggered:
+                    # Already built at threshold — remaining chunks trigger healing
+                    callback_healing = True
+                    log.debug(f"TileCompletionTracker: {tile_id} COMPLETE - healing pass")
+                else:
+                    log.debug(f"TileCompletionTracker: {tile_id} COMPLETE - all chunks ready")
+            elif ratio >= self._build_threshold and not tracked.build_triggered:
+                # Threshold reached — trigger early build
+                tracked.build_triggered = True
+                tile_to_callback = tracked.tile
+                callback_partial = True
+                log.debug(f"TileCompletionTracker: {tile_id} THRESHOLD ({ratio:.0%}) - early build")
+                # Keep tracking for healing when remaining chunks arrive
+
         # Call callback OUTSIDE the lock to avoid deadlocks
         if tile_to_callback is not None and self._on_tile_complete is not None:
             try:
-                self._on_tile_complete(tile_id, tile_to_callback)
+                self._on_tile_complete(tile_id, tile_to_callback,
+                                       partial=callback_partial,
+                                       healing=callback_healing)
             except Exception as e:
                 log.warning(f"TileCompletionTracker: Callback error for {tile_id}: {e}")
     
@@ -3000,12 +3105,14 @@ class BackgroundDDSBuilder:
         self._coordinator_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         
+        # Event to wake coordinator when work is available or a slot frees up
+        self._work_event = threading.Event()
+
         # Stats (thread-safe via atomic operations)
         self._builds_completed = 0
         self._builds_failed = 0
         self._active_builds = 0
         self._active_lock = threading.Lock()
-        self._last_build_time = 0.0
     
     def start(self) -> None:
         """Start the background builder."""
@@ -3033,14 +3140,15 @@ class BackgroundDDSBuilder:
     def stop(self) -> None:
         """Stop the background builder gracefully."""
         self._stop_event.set()
-        
+        self._work_event.set()  # Wake coordinator so it sees stop_event
+
         # Drain queue
         try:
             while True:
                 self._queue.get_nowait()
         except Empty:
             pass
-        
+
         # Stop coordinator
         if self._coordinator_thread is not None:
             try:
@@ -3081,6 +3189,7 @@ class BackgroundDDSBuilder:
         
         try:
             self._queue.put_nowait((priority, tile))
+            self._work_event.set()  # Wake coordinator immediately
             log.debug(f"BackgroundDDSBuilder: Queued {tile.id} "
                      f"(queue size: {self._queue.qsize()})")
             return True
@@ -3090,43 +3199,48 @@ class BackgroundDDSBuilder:
     
     def _coordinator_loop(self) -> None:
         """
-        Coordinator loop - dispatches tiles to worker pool in batches.
-        
-        Submits multiple tiles per interval to better utilize worker pool.
-        With 8 workers but only 1 submission/second, workers were underutilized.
-        Now submits up to half the workers per interval to leave capacity.
+        Event-driven coordinator loop - dispatches tiles to worker pool.
+
+        Wakes immediately when:
+        - A tile is submitted to the queue (submit() signals _work_event)
+        - A worker finishes and frees a slot (_build_tile_wrapper signals _work_event)
+
+        Fills ALL available worker slots each cycle instead of rate-limiting
+        to half the workers, maximizing CPU utilization for background builds.
         """
         while not self._stop_event.is_set():
-            # Rate limiting: wait for interval before batch submission
-            elapsed = time.monotonic() - self._last_build_time
-            if elapsed < self._build_interval:
-                sleep_time = self._build_interval - elapsed
-                if self._stop_event.wait(timeout=sleep_time):
-                    continue  # Stop requested during sleep
-            
-            # Submit batch of tiles to utilize all workers
-            # Limit to half of workers to leave capacity for newly arriving tiles
-            max_batch = max(1, self._max_workers // 2)
+            # Wait for work signal or timeout as fallback
+            self._work_event.wait(timeout=self._build_interval)
+            self._work_event.clear()
+
+            if self._stop_event.is_set():
+                break
+
+            # Fill all available worker slots
+            with self._active_lock:
+                available = self._max_workers - self._active_builds
+            if available <= 0:
+                continue
+
             batch_submitted = 0
-            
-            while batch_submitted < max_batch:
+            while batch_submitted < available:
                 try:
                     item = self._queue.get_nowait()
                 except Empty:
                     break  # Queue exhausted
-                
+
                 # Sentinel value signals shutdown
                 if item is None:
                     continue
-                
+
                 priority, tile = item
-                
+
                 # Drop evicted tiles early to avoid holding
                 # references longer than necessary
                 if getattr(tile, '_closed', False):
                     bump('prebuilt_dds_skip_closed')
                     continue
-                
+
                 if self._executor is not None:
                     with self._active_lock:
                         self._active_builds += 1
@@ -3134,31 +3248,6 @@ class BackgroundDDSBuilder:
                         self._build_tile_wrapper, tile
                     )
                     batch_submitted += 1
-            
-            if batch_submitted > 0:
-                self._last_build_time = time.monotonic()
-            else:
-                # Queue was empty - wait for new items
-                # with blocking get
-                try:
-                    item = self._queue.get(timeout=1.0)
-                    if item is not None:
-                        priority, tile = item
-                        # Drop evicted tiles early
-                        if getattr(tile, '_closed', False):
-                            bump('prebuilt_dds_skip_closed')
-                        elif self._executor is not None:
-                            with self._active_lock:
-                                self._active_builds += 1
-                            self._executor.submit(
-                                self._build_tile_wrapper,
-                                tile
-                            )
-                            self._last_build_time = (
-                                time.monotonic()
-                            )
-                except Empty:
-                    continue
     
     def _build_tile_wrapper(self, tile) -> None:
         """Wrapper for _build_tile_dds that handles exceptions and stats."""
@@ -3175,6 +3264,7 @@ class BackgroundDDSBuilder:
         finally:
             with self._active_lock:
                 self._active_builds -= 1
+            self._work_event.set()  # Signal coordinator a slot freed up
     
     def _try_streaming_prefetch_build(self, tile, tile_id: str, build_start: float) -> bool:
         """
@@ -3191,12 +3281,17 @@ class BackgroundDDSBuilder:
         Returns:
             True if build succeeded, False to fall back to other methods
         """
+        # Handle imports for both frozen (PyInstaller) and direct Python execution
         try:
             from autoortho.aopipeline.AoDDS import get_default_builder_pool
             from autoortho.aopipeline.fallback_resolver import FallbackResolver
-        except ImportError as e:
-            log.debug(f"BackgroundDDSBuilder: Streaming builder imports failed: {e}")
-            return False
+        except ImportError:
+            try:
+                from aopipeline.AoDDS import get_default_builder_pool
+                from aopipeline.fallback_resolver import FallbackResolver
+            except ImportError as e:
+                log.debug(f"BackgroundDDSBuilder: Streaming builder imports failed: {e}")
+                return False
         
         builder_pool = get_default_builder_pool()
         if builder_pool is None:
@@ -3267,7 +3362,11 @@ class BackgroundDDSBuilder:
                 return False
             
             # Import fallback TimeBudget for use during transition
-            from autoortho.aopipeline.fallback_resolver import TimeBudget as FBTimeBudget
+            # Handle imports for both frozen (PyInstaller) and direct Python execution
+            try:
+                from autoortho.aopipeline.fallback_resolver import TimeBudget as FBTimeBudget
+            except ImportError:
+                from aopipeline.fallback_resolver import TimeBudget as FBTimeBudget
             
             # Phase 1: Batch add all ready chunks at once
             ready_chunks = []
@@ -3356,7 +3455,10 @@ class BackgroundDDSBuilder:
             # Finalize directly to disk via DynamicDDSCache staging path
             if self._dds_cache is not None:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
-                success, bytes_written = builder.finalize_to_file(staging_path)
+                with _native_build_context():
+                    success, bytes_written = builder.finalize_to_file(
+                        staging_path, max_threads=_compute_thread_budget()
+                    )
                 
                 if success and bytes_written >= 128:
                     self._dds_cache.store_from_file(
@@ -3493,13 +3595,15 @@ class BackgroundDDSBuilder:
                                     staging_path = self._dds_cache.get_staging_path(
                                         tile_id, tile.max_zoom, tile)
                                     
-                                    result = native_dds.build_from_jpegs_to_file(
-                                        jpeg_datas,
-                                        staging_path,
-                                        format=dxt_format,
-                                        missing_color=missing_color
-                                    )
-                                    
+                                    with _native_build_context():
+                                        result = native_dds.build_from_jpegs_to_file(
+                                            jpeg_datas,
+                                            staging_path,
+                                            format=dxt_format,
+                                            missing_color=missing_color,
+                                            max_threads=_compute_thread_budget()
+                                        )
+
                                     if result.success and result.bytes_written >= 128:
                                         self._dds_cache.store_from_file(
                                             tile_id, tile.max_zoom, staging_path, tile,
@@ -3927,12 +4031,22 @@ def _dispatch_healing(tile):
     t.start()
 
 
-def _on_tile_complete_callback(tile_id: str, tile) -> None:
+def _on_tile_complete_callback(tile_id: str, tile,
+                               partial: bool = False,
+                               healing: bool = False) -> None:
     """
-    Callback invoked when all chunks for a tile have been downloaded.
-    Submits the tile to the background DDS builder.
+    Callback invoked when chunks reach the build threshold or all complete.
+
+    Args:
+        tile_id: Tile identifier
+        tile: Tile object
+        partial: True when threshold reached but not 100% — build with available chunks
+        healing: True when remaining chunks arrived after a partial build — patch the DDS
     """
-    if getattr(tile, '_dds_needs_healing', False) and dynamic_dds_cache is not None:
+    if healing:
+        # Remaining chunks arrived after partial build — dispatch healing
+        _dispatch_healing(tile)
+    elif getattr(tile, '_dds_needs_healing', False) and dynamic_dds_cache is not None:
         _dispatch_healing(tile)
     elif background_dds_builder is not None:
         background_dds_builder.submit(tile)
@@ -3981,22 +4095,22 @@ def start_predictive_dds(tile_cacher=None) -> None:
     build_interval_ms = max(100, min(2000, build_interval_ms))
     build_interval_sec = build_interval_ms / 1000.0
     
-    background_builder_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 2))
+    background_builder_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 4))
     background_builder_workers = max(1, min(8, background_builder_workers))  # 1-8 workers
     
-    live_builder_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 4))
+    live_builder_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 8))
     live_builder_concurrency = max(1, min(32, live_builder_concurrency))  # 1-32 workers
     
     total_builders = background_builder_workers + live_builder_concurrency
     
-    # Initialize decoder pool with size based on total_builders × CPU threads
-    # This allows parallel JPEG decoding across all concurrent tile builds
+    # Initialize decoder pool sized for coordinated thread budget
+    # With dynamic thread coordination, total OpenMP threads ~ cpu_count
     try:
         from autoortho.aopipeline import AoDDS
         decoder_pool_size = AoDDS.calculate_decoder_pool_size(total_builders)
         if AoDDS.init_decoder_pool(decoder_pool_size):
             log.info(f"Decoder pool initialized: {decoder_pool_size} decoders "
-                    f"({total_builders} builders × {CURRENT_CPU_COUNT} threads)")
+                    f"(cpu×1.5={CURRENT_CPU_COUNT}×1.5, min={total_builders} builders)")
         else:
             log.debug("Decoder pool already initialized (using existing size)")
     except ImportError:
@@ -4378,9 +4492,9 @@ class Chunk(object):
                 log.warning(f"Failed to save cache for {self}: {e}")
                 return
 
-    def get(self, idx=0, session=requests):
+    def get(self, idx=0, session=requests, timeout=None, max_attempts=None):
         log.debug(f"Getting {self}")
-        
+
         # Signal that download has started (not waiting in queue anymore)
         self.download_started.set()
 
@@ -4388,11 +4502,13 @@ class Chunk(object):
             self.ready.set()
             return True
 
+        _max_attempts = max_attempts or MAX_TOTAL_ATTEMPTS
+
         # === TOTAL ATTEMPT LIMIT ===
         # Prevent infinite retries for persistent failures (network issues,
         # invalid responses, etc.) that don't return specific HTTP codes
-        if self.attempt >= MAX_TOTAL_ATTEMPTS:
-            log.warning(f"Chunk {self} exceeded {MAX_TOTAL_ATTEMPTS} total attempts, marking as permanently failed")
+        if self.attempt >= _max_attempts:
+            log.warning(f"Chunk {self} exceeded {_max_attempts} total attempts, marking as permanently failed")
             self.permanent_failure = True
             self.failure_reason = "max_total_attempts"
             self.data = b''
@@ -4447,12 +4563,14 @@ class Chunk(object):
         time.sleep(backoff_sleep)
         self.attempt += 1
 
+        _http_timeout = timeout or (5, 20)
+
         log.debug(f"Requesting {self.url} ..")
-        
+
         resp = None
         try:
 
-            resp = session.get(self.url, headers=header, timeout=(5, 20))
+            resp = session.get(self.url, headers=header, timeout=_http_timeout)
             status_code = resp.status_code
 
             if self.maptype.upper() == "APPLE" and status_code in (403, 410):
@@ -4462,7 +4580,7 @@ class Chunk(object):
                 self.url = MAPTYPES[self.maptype.upper()]
                 if resp is not None:
                     resp.close()
-                resp = session.get(self.url, headers=header, timeout=(5, 20))
+                resp = session.get(self.url, headers=header, timeout=_http_timeout)
                 status_code = resp.status_code
 
             if status_code != 200:
@@ -4537,6 +4655,14 @@ class Chunk(object):
 
             bump('bytes_dl', len(self.data))
                 
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as err:
+            self.attempt += 1
+            backoff = min(10.0, 0.5 * (2 ** min(self.attempt, 5)))
+            log.warning(f"{self} connection/timeout error (attempt {self.attempt}), "
+                        f"backoff {backoff:.1f}s: {err}")
+            time.sleep(backoff)
+            return False
         except Exception as err:
             log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
             return False
@@ -5010,34 +5136,47 @@ class Tile(object):
                 chunk.priority = 0  # Highest priority for live requests
                 chunk_getter.submit(chunk)
         
-        # Wait for downloads with polling (allows early exit)
+        # Wait for downloads using chunk.ready events (avoids busy-wait polling).
+        # Each chunk's ready Event is set when its download completes, so we
+        # wake immediately instead of wasting up to 20ms per poll cycle.
         deadline = time.monotonic() + wait_time
-        poll_interval = 0.02  # 20ms polling for responsiveness
-        
-        while time.monotonic() < deadline:
-            # Check newly ready chunks
-            newly_available = 0
-            for i in missing_indices:
+
+        # Build list of still-pending chunk indices for event-driven wait
+        still_pending = [i for i in missing_indices if jpeg_datas[i] is None]
+
+        while still_pending and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            # Wait on the first pending chunk's ready event (wakes on any completion)
+            # Use short timeout so we can cycle through and check all chunks
+            wait_timeout = min(0.1, remaining)
+            chunks[still_pending[0]].ready.wait(timeout=wait_timeout)
+
+            # Check all pending chunks for newly available data
+            new_pending = []
+            for i in still_pending:
                 if jpeg_datas[i] is not None:
                     continue  # Already collected
-                
+
                 chunk = chunks[i]
                 chunk_data = chunk.data  # TOCTOU-safe capture
-                
+
                 if chunk.ready.is_set() and chunk_data:
                     jpeg_datas[i] = chunk_data
                     available_count += 1
-                    newly_available += 1
-            
+                else:
+                    new_pending.append(i)
+
+            still_pending = new_pending
+
             # Check if we have enough now
             ratio = available_count / total_chunks
             if ratio >= min_available_ratio:
                 log.debug(f"_collect_chunk_jpegs: Phase 2 success - "
                           f"{available_count}/{total_chunks} ({ratio*100:.0f}%)")
                 return jpeg_datas
-            
-            # Brief sleep to avoid busy-wait
-            time.sleep(poll_interval)
         
         # Final check after deadline
         ratio = available_count / total_chunks
@@ -5137,8 +5276,8 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════════
         # Uses the entire remaining time_budget to maximize chunk collection.
         # If force_build_partial is True, we'll build with whatever we get.
-        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
-        
+        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
+
         jpeg_datas = self._collect_chunk_jpegs(
             self.max_zoom,
             time_budget=time_budget,
@@ -5198,13 +5337,15 @@ class Tile(object):
             # ═══════════════════════════════════════════════════════════════
             # STEP 4: Build DDS with native aopipeline
             # ═══════════════════════════════════════════════════════════════
-            result = native_dds.build_from_jpegs_to_buffer(
-                buffer,
-                jpeg_datas,
-                format=dxt_format,
-                missing_color=missing_color
-            )
-            
+            with _native_build_context():
+                result = native_dds.build_from_jpegs_to_buffer(
+                    buffer,
+                    jpeg_datas,
+                    format=dxt_format,
+                    missing_color=missing_color,
+                    max_threads=_compute_thread_budget()
+                )
+
             if not result.success:
                 log.debug(f"_try_aopipeline_build: Native build failed for {self.id}: {result.error}")
                 bump('live_aopipeline_build_failed')
@@ -5283,12 +5424,17 @@ class Tile(object):
             return False
         
         # Check if native DDS module is available
+        # Handle imports for both frozen (PyInstaller) and direct Python execution
         try:
             from autoortho.aopipeline.AoDDS import get_default_builder_pool, get_default_pool
             from autoortho.aopipeline.fallback_resolver import FallbackResolver, TimeBudget as FBTimeBudget
-        except ImportError as e:
-            log.debug(f"_try_streaming_aopipeline_build: Imports not available: {e}")
-            return False
+        except ImportError:
+            try:
+                from aopipeline.AoDDS import get_default_builder_pool, get_default_pool
+                from aopipeline.fallback_resolver import FallbackResolver, TimeBudget as FBTimeBudget
+            except ImportError as e:
+                log.debug(f"_try_streaming_aopipeline_build: Imports not available: {e}")
+                return False
         
         builder_pool = get_default_builder_pool()
         if builder_pool is None:
@@ -5561,7 +5707,8 @@ class Tile(object):
                 return False
             
             try:
-                result = builder.finalize(buffer)
+                with _native_build_context():
+                    result = builder.finalize(buffer, max_threads=_compute_thread_budget())
                 if result.success and result.bytes_written >= 128:
                     dds_bytes = bytes(buffer[:result.bytes_written])
                     if self._populate_dds_from_prebuilt(dds_bytes):
@@ -5855,9 +6002,21 @@ class Tile(object):
             cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
             if cached_bytes is not None:
                 if self._populate_dds_from_prebuilt(cached_bytes):
-                    log.debug(f"GET_BYTES: Dynamic DDS cache HIT for {self.id}")
-                    bump('dynamic_dds_cache_hit')
-                    return True
+                    # FIX: Only return early if mm0 was actually populated.
+                    # Partial DDS entries (from store_incremental) contain mm4-12 but
+                    # NOT mm0. Returning True here would serve empty mm0 data to X-Plane
+                    # and set _prepopulated=True, permanently blocking the complete DDS
+                    # from being loaded later. This is the root cause of the 2.1.0
+                    # pixelation regression: partial cache hit → empty mm0 served →
+                    # complete DDS from BackgroundDDSBuilder never loaded.
+                    if self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
+                        log.debug(f"GET_BYTES: Dynamic DDS cache HIT (complete) for {self.id}")
+                        bump('dynamic_dds_cache_hit')
+                        return True
+                    else:
+                        log.debug(f"GET_BYTES: Dynamic DDS cache HIT (partial, mm0 missing) for {self.id} "
+                                  f"— falling through to build paths")
+                        bump('dynamic_dds_cache_hit_partial')
                 else:
                     log.debug(f"GET_BYTES: Dynamic DDS cache hit but populate failed for {self.id}")
                     bump('dynamic_dds_cache_populate_fail')
@@ -5888,9 +6047,11 @@ class Tile(object):
                         cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
                         if cached_bytes is not None:
                             if self._populate_dds_from_prebuilt(cached_bytes):
-                                log.debug(f"GET_BYTES: DDS cache HIT after transition for {self.id}")
-                                bump('dds_cache_hit_after_transition')
-                                return True
+                                # Only return if mm0 was populated (same guard as primary cache path)
+                                if self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
+                                    log.debug(f"GET_BYTES: DDS cache HIT after transition for {self.id}")
+                                    bump('dds_cache_hit_after_transition')
+                                    return True
         # ═══════════════════════════════════════════════════════════════════
 
         mipmap = self.find_mipmap_pos(offset)
@@ -5998,6 +6159,16 @@ class Tile(object):
                     # Both failed - continue to progressive path
                     log.debug(f"GET_BYTES: aopipeline build failed, using progressive path for {self.id}")
                     bump('live_aopipeline_fallback')
+
+                    # BUDGET PROTECTION: Give progressive path a minimum budget.
+                    # Batch collection may have consumed the entire original budget,
+                    # leaving 0 seconds for progressive. Without this, the progressive
+                    # path can't download any chunks and fills mm0 with missing_color.
+                    min_progressive_budget = float(getattr(CFG.autoortho, 'progressive_min_budget', 15.0))
+                    if time_budget is not None and time_budget.remaining < min_progressive_budget:
+                        log.debug(f"GET_BYTES: Budget exhausted ({time_budget.remaining:.1f}s remaining), "
+                                  f"granting progressive minimum budget of {min_progressive_budget}s")
+                        time_budget = TimeBudget(min_progressive_budget)
                     
                 else:
                     # FALLBACKS DISABLED: Build with whatever batch collects
@@ -6437,17 +6608,28 @@ class Tile(object):
                 if source_img is None or getattr(source_img, '_freed', False):
                     continue
                 
-                # Calculate scale factor: mipmap 1->0 = 2x, mipmap 2->0 = 4x, etc.
-                scale_factor = 1 << source_mm  # 2^source_mm
-                
-                # Verify source image dimensions match expected size
-                expected_source_width = img_width >> source_mm
-                expected_source_height = img_height >> source_mm
-                
+                # Calculate expected dimensions using _get_quick_zoom which
+                # correctly accounts for min_zoom capping. Without this, the
+                # bit-shift calculation (img_width >> source_mm) gives wrong
+                # expected sizes when min_zoom > max_zoom - source_mm.
+                source_zoom = self.max_zoom - source_mm
+                _, _, sw_chunks, sh_chunks, _, _ = self._get_quick_zoom(source_zoom, self.min_zoom)
+                expected_source_width = 256 * sw_chunks
+                expected_source_height = 256 * sh_chunks
+
                 if source_img._width != expected_source_width or source_img._height != expected_source_height:
                     log.debug(f"GET_IMG: Prefill skipping mipmap {source_mm} - size mismatch: "
                              f"got {source_img._width}x{source_img._height}, expected {expected_source_width}x{expected_source_height}")
                     continue
+
+                # Calculate scale factor from actual dimensions
+                scale_factor_w = img_width // expected_source_width
+                scale_factor_h = img_height // expected_source_height
+                if scale_factor_w != scale_factor_h or scale_factor_w < 1:
+                    log.debug(f"GET_IMG: Prefill skipping mipmap {source_mm} - non-uniform scale: "
+                              f"{scale_factor_w}x{scale_factor_h}")
+                    continue
+                scale_factor = scale_factor_w
                 
                 # Upscale to mipmap 0 size
                 log.debug(f"GET_IMG: Pre-initializing mipmap 0 base from mipmap {source_mm} "
@@ -6743,10 +6925,10 @@ class Tile(object):
         # when downloads are slow, leaving no workers to process chunks that become ready.
         
         max_pool_workers = min(CURRENT_CPU_COUNT, len(chunks), _MAX_DECODE)
-        
+
         total_chunks = len(chunks)
         completed = 0
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_pool_workers)
+        executor = _get_progressive_executor(max_pool_workers)
         active_futures = {}
         chunks_with_images = set()  # Track which chunks have images for fallback sweep
         
@@ -6898,10 +7080,11 @@ class Tile(object):
                     if still_missing > 0:
                         bump('chunk_missing_count', still_missing)
         finally:
-            # Use wait=False to avoid blocking on cancelled/timed-out futures
-            # The futures will complete in the background but we won't wait for them
-            # Since process_chunk checks time_budget.exhausted, they should exit quickly
-            executor.shutdown(wait=False, cancel_futures=True)
+            # Cancel any remaining futures from the shared pool (don't shut it down)
+            for future in list(active_futures.keys()):
+                if not future.done():
+                    future.cancel()
+            active_futures.clear()
         
         # === DEFERRED LAZY BUILD ===
         # If any executor thread signaled that lazy build is needed, do it now.
@@ -7588,6 +7771,40 @@ class Tile(object):
         else:
             return False  # Default: respect budget
 
+    def _try_incremental_dds_store(self, mipmap):
+        """Persist intermediate mipmaps (1+) incrementally to DDS cache."""
+        if mipmap == 0 or dynamic_dds_cache is None or self.dds is None:
+            return
+        _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
+        if self._prepopulated and not _partially_cached:
+            return
+        if self._completion_reported:
+            return
+        try:
+            mm_data = {}
+            mm_offsets = {}
+            for i in range(mipmap, len(self.dds.mipmap_list)):
+                mm = self.dds.mipmap_list[i]
+                if mm.retrieved and mm.databuffer is not None:
+                    mm.databuffer.seek(0)
+                    data = mm.databuffer.read()
+                    if data:
+                        mm_data[i] = data
+                        mm_offsets[i] = (mm.startpos, mm.length)
+            if mm_data:
+                dynamic_dds_cache.store_incremental(
+                    self.id, self.max_zoom,
+                    self.row, self.col, self.maptype,
+                    self.tilename_zoom,
+                    self.dds.header.getvalue(),
+                    self.dds.total_size,
+                    self.dds.width, self.dds.height,
+                    self.dds.mipMapCount,
+                    mm_data, mm_offsets
+                )
+        except Exception as e:
+            log.warning(f"Incremental DDS cache store failed for {self.id} mm{mipmap}: {e}")
+
     def _try_native_mipmap_build(self, mipmap: int, time_budget=None) -> bool:
         """
         Try to build a single mipmap level using native aopipeline.
@@ -7645,7 +7862,7 @@ class Tile(object):
         # Get threshold config with validation
         # UNIFIED: Use the same threshold as live_aopipeline for consistency
         # This removes the separate native_mipmap_min_ratio config
-        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
+        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
         min_ratio = max(0.0, min(1.0, min_ratio))  # Clamp to valid range
         
         # ═══════════════════════════════════════════════════════════════════════
@@ -8114,8 +8331,8 @@ class Tile(object):
             log.debug(f"_try_native_partial_mipmap_build: No chunks for rows {startrow}-{endrow}")
             return False
         
-        # Check threshold - need 90% of chunks
-        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 0.9))
+        # Check threshold - need configured % of chunks
+        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
         valid_count = sum(1 for d in jpeg_datas if d is not None)
         
         if valid_count < chunk_count * min_ratio:
@@ -8251,6 +8468,7 @@ class Tile(object):
             except Exception:
                 pass
             
+            self._try_incremental_dds_store(mipmap)
             return True
         # ═══════════════════════════════════════════════════════════════════════
 
@@ -8324,36 +8542,7 @@ class Tile(object):
         log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
                  f"(download+compose: {total_creation_time - compress_time:.2f}s, compress: {compress_time:.2f}s)")
 
-        # Persist intermediate mipmaps (1+) incrementally to DDS cache
-        _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
-        if (mipmap > 0 and dynamic_dds_cache is not None
-                and (not self._prepopulated or _partially_cached)
-                and not self._completion_reported
-                and self.dds is not None):
-            try:
-                mm_data = {}
-                mm_offsets = {}
-                for i in range(mipmap, len(self.dds.mipmap_list)):
-                    mm = self.dds.mipmap_list[i]
-                    if mm.retrieved and mm.databuffer is not None:
-                        mm.databuffer.seek(0)
-                        data = mm.databuffer.read()
-                        if data:
-                            mm_data[i] = data
-                            mm_offsets[i] = (mm.startpos, mm.length)
-                if mm_data:
-                    dynamic_dds_cache.store_incremental(
-                        self.id, self.max_zoom,
-                        self.row, self.col, self.maptype,
-                        self.tilename_zoom,
-                        self.dds.header.getvalue(),
-                        self.dds.total_size,
-                        self.dds.width, self.dds.height,
-                        self.dds.mipMapCount,
-                        mm_data, mm_offsets
-                    )
-            except Exception:
-                pass
+        self._try_incremental_dds_store(mipmap)
 
         # Close only chunks for THIS mipmap's zoom level (not all zooms!)
         mipmap_zoom = self.max_zoom - mipmap
@@ -8985,7 +9174,15 @@ class TileCacher(object):
                 finally:
                     t = None
                 evicted += 1
-        
+
+        # Prompt garbage collection after large eviction batches.
+        # DDS buffers are multi-MB objects; Python's generational GC may
+        # not collect them promptly without a hint after bulk deletion.
+        if evicted > 50:
+            gc.collect()
+        elif evicted > 10:
+            gc.collect(generation=1)  # Partial collection — fast
+
         return evicted
 
     def clean(self):
@@ -9365,6 +9562,16 @@ def shutdown():
         log.debug("Cache writer shutdown")
     except Exception as _err:
         log.debug(f"Cache writer shutdown error: {_err}")
+
+    # 4b. Shutdown persistent progressive executor
+    global _progressive_executor
+    try:
+        if _progressive_executor is not None:
+            _progressive_executor.shutdown(wait=False)
+            _progressive_executor = None
+            log.debug("Progressive executor shutdown")
+    except Exception as _err:
+        log.debug(f"Progressive executor shutdown error: {_err}")
 
     # 5. Clear terrain indices
     try:

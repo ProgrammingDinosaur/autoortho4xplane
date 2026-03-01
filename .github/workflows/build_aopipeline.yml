@@ -1,0 +1,120 @@
+name: Build aopipeline libraries
+
+# Triggered by any PR to develop that touches aopipeline C/H sources.
+# Builds the shared library for Linux, macOS (arm64), and Windows (MinGW
+# cross-compile on Linux), then commits the updated binaries back to the PR branch.
+
+on:
+  pull_request:
+    branches: [develop]
+    paths:
+      - 'autoortho/aopipeline/*.c'
+      - 'autoortho/aopipeline/*.h'
+
+jobs:
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc make libturbojpeg-dev
+
+      - name: Build libaopipeline.so
+        run: |
+          cd autoortho/aopipeline
+          make -f Makefile.linux phase3
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-lib
+          path: autoortho/aopipeline/libaopipeline.so
+
+
+  build-macos:
+    runs-on: macos-latest   # arm64 runner, matches Makefile.macos ARCH=arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install libomp jpeg-turbo || true
+
+      - name: Build libaopipeline.dylib
+        run: |
+          cd autoortho/aopipeline
+          make -f Makefile.macos phase3
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-lib
+          path: autoortho/aopipeline/libaopipeline.dylib
+
+
+  build-windows:
+    # Cross-compile for Windows using MinGW on Linux (same approach as local dev)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 make
+
+      - name: Build aopipeline.dll
+        # The Makefile handles libjpeg-turbo extraction automatically
+        run: |
+          cd autoortho/aopipeline
+          make -f Makefile.mingw64 phase3
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-lib
+          path: autoortho/aopipeline/aopipeline.dll
+
+
+  commit-libs:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+
+    # Skip for fork PRs: GITHUB_TOKEN cannot push to a fork branch
+    if: github.event.pull_request.head.repo.full_name == github.repository
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Linux lib
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-lib
+          path: autoortho/aopipeline/lib/linux/
+
+      - name: Download macOS lib
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-lib
+          path: autoortho/aopipeline/lib/macos/
+
+      - name: Download Windows lib
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-lib
+          path: autoortho/aopipeline/lib/windows/
+
+      - name: Commit and push rebuilt libraries
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add autoortho/aopipeline/lib/linux/libaopipeline.so
+          git add autoortho/aopipeline/lib/macos/libaopipeline.dylib
+          git add autoortho/aopipeline/lib/windows/aopipeline.dll
+          git diff --staged --quiet && echo "No library changes to commit." || \
+            git commit -m "chore: rebuild aopipeline libraries [skip ci]" && git push
