@@ -282,10 +282,14 @@ buffer_pool_size = 10
 # when sufficient chunks are available. Falls back to progressive path on failure.
 # Recommended: True (enables fast path when chunks are cached/prefetched)
 live_aopipeline_enabled = True
-# Minimum ratio of chunks that must be available for aopipeline build (0.0-1.0)
-# 1.0 = 100%%, waits for all chunks then builds (best quality, fallbacks resolve missing)
-# Lower values build earlier with missing chunks filled by missing_color (faster but visual artifacts)
-# Recommended: 1.0 (quality, uses fallbacks), 0.9 (balanced), 0.8 (faster)
+# Threshold ratio of chunks that triggers an early DDS build (0.5-1.0)
+# Controls a two-phase build strategy:
+#   1. Early build: fires when this ratio is reached, missing chunks filled with missing_color
+#   2. Healing pass: fires automatically when the remaining chunks arrive, replacing placeholders
+# 1.0 = wait for all chunks before building (single pass, no healing needed)
+# 0.9 = build at 90%%, heal remaining 10%% when they arrive (faster first texture, then corrected)
+# 0.5 = build at 50%% (fastest first texture, more healing work)
+# Recommended: 1.0 (quality, no artifacts), 0.9 (balanced), 0.8 (faster)
 live_aopipeline_min_chunk_ratio = 1.0
 # === STREAMING BUILDER SETTINGS ===
 # Enable streaming builder for incremental DDS generation (True/False)

@@ -3029,15 +3029,17 @@ class ConfigUI(QMainWindow):
         min_chunk_layout = QHBoxLayout()
         self.min_chunk_ratio_label = QLabel("Min chunk ratio:")
         self.min_chunk_ratio_label.setToolTip(
-            "Minimum ratio of chunks that must be available before\n"
-            "falling back to lower zoom levels or missing color.\n\n"
-            "Lower values = faster (allows more missing chunks)\n"
-            "Higher values = better quality (waits for more data)\n\n"
-            "• 80% - Fast: Allows up to 20% missing chunks\n"
-            "• 90% - Balanced (default): Up to 10% missing\n"
-            "• 95% - Quality: Only 5% missing allowed\n\n"
-            "Missing chunks are filled with fallback images\n"
-            "or the missing color if no fallback is available."
+            "Threshold ratio of chunks that triggers the first DDS build.\n"
+            "Uses a two-phase strategy:\n\n"
+            "1. Early build: fires when this threshold is reached.\n"
+            "   Missing chunks are filled with the missing color.\n"
+            "2. Healing pass: fires automatically when remaining\n"
+            "   chunks arrive, replacing placeholder areas.\n\n"
+            "• 100% - Quality (default): single build, no placeholders\n"
+            "• 90%  - Balanced: texture appears ~10% sooner, healed after\n"
+            "• 80%  - Fast: texture appears earlier, more healing work\n\n"
+            "Lower values show textures sooner at the cost of a\n"
+            "brief placeholder until the healing pass completes."
         )
         min_chunk_layout.addWidget(self.min_chunk_ratio_label)
         
@@ -3048,7 +3050,7 @@ class ConfigUI(QMainWindow):
         current_ratio_pct = max(50, min(100, current_ratio_pct))
         self.min_chunk_ratio_slider.setValue(current_ratio_pct)
         self.min_chunk_ratio_slider.setObjectName('live_aopipeline_min_chunk_ratio')
-        self.min_chunk_ratio_slider.setToolTip("Minimum chunk availability ratio (50-100%)")
+        self.min_chunk_ratio_slider.setToolTip("Early-build threshold: tile builds at this chunk ratio, healed when remaining chunks arrive (50-100%)")
         
         self.min_chunk_ratio_value_label = QLabel(f"{current_ratio_pct}%")
         self.min_chunk_ratio_slider.valueChanged.connect(
@@ -4548,7 +4550,7 @@ class ConfigUI(QMainWindow):
             )
             if hasattr(self, 'min_chunk_ratio_label'):
                 self.min_chunk_ratio_label.setToolTip(
-                    "Min chunk ratio is only used in Native and Hybrid modes.\n"
+                    "Early-build threshold is only active in Native and Hybrid modes.\n"
                     "Select a different pipeline mode to configure this setting."
                 )
 

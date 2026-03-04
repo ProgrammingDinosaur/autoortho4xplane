@@ -866,10 +866,14 @@ All steps happen in native C threads, completely bypassing the Python GIL.
 
 ```ini
 [autoortho]
-# Maximum threads for native pipeline (0 = auto from CPU cores)
-# Controls parallelism for cache I/O, JPEG decoding, and DDS compression
+# Maximum threads per native build (0 = auto, divided across concurrent builds)
 # Set to 1 for single-threaded mode (lowest CPU, slowest builds)
 native_pipeline_threads = 0
+
+# Early-build threshold: start DDS build when this fraction of chunks are ready (0.5-1.0)
+# 1.0 = wait for all chunks (single build, no placeholders)
+# 0.9 = build at 90%, automatically rebuild when remaining 10% arrive
+live_aopipeline_min_chunk_ratio = 1.0
 
 # Disk-based DDS cache size in MB (0 = disabled)
 # Uses temp directory, auto-cleaned on session end
@@ -880,9 +884,25 @@ ephemeral_dds_cache_mb = 4096
 
 | Value | Behavior |
 |-------|----------|
-| **0** (default) | Auto-detect CPU cores, use all available |
+| **0** (default) | Auto: divides CPU cores across concurrent builds to avoid oversubscription |
 | **1** | Single-threaded (useful for debugging or very low-end CPUs) |
-| **N** | Limit to N threads (balance performance vs other applications) |
+| **N** | Fixed N threads per build (regardless of concurrent build count) |
+
+#### Early-Build Threshold (`live_aopipeline_min_chunk_ratio`)
+
+Controls a **two-phase build strategy** that trades brief placeholder artifacts for faster first texture appearance:
+
+**Phase 1 — Early build**: fires as soon as this ratio of chunks is available. Any missing chunks are filled with the missing color.
+
+**Phase 2 — Healing pass**: fires automatically when the remaining chunks arrive, replacing placeholder areas with real imagery.
+
+| Value | Behavior |
+|-------|----------|
+| **1.0** (default) | Wait for all chunks — single build, no placeholders, no healing needed |
+| **0.9** | Build at 90% — texture appears ~10% sooner, healed silently after |
+| **0.8** | Build at 80% — texture appears earlier, more placeholder area to heal |
+
+At `1.0` there is no behavioral difference from before — the tile only builds once all chunks are present. Values below `1.0` are useful on slow connections where waiting for the last few chunks causes noticeable delay before a tile becomes visible.
 
 ### Ephemeral DDS Cache
 

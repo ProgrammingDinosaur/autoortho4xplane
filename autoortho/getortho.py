@@ -3687,8 +3687,17 @@ class BackgroundDDSBuilder:
                         )
                         
                         if result.success and result.bytes_written >= 128:
+                            # Check which chunks were missing from cache (filled with missing_color by native build)
+                            native_mm0_missing = None
+                            if hasattr(tile, 'chunks') and tile.max_zoom in tile.chunks:
+                                mm0_chunks = tile.chunks[tile.max_zoom]
+                                missing = [i for i, c in enumerate(mm0_chunks)
+                                           if not (c.ready.is_set() and c.data)]
+                                if missing:
+                                    native_mm0_missing = missing
                             self._dds_cache.store_from_file(
-                                tile_id, tile.max_zoom, staging_path, tile)
+                                tile_id, tile.max_zoom, staging_path, tile,
+                                mm0_missing_indices=native_mm0_missing)
                             build_time = (time.monotonic() - build_start) * 1000
                             self._builds_completed += 1
                             log.debug(f"BackgroundDDSBuilder: Native direct-to-disk built {tile_id} "
@@ -3747,8 +3756,16 @@ class BackgroundDDSBuilder:
                         dds_bytes = result.to_bytes()
                         if self._dds_cache is not None:
                             try:
+                                native_mm0_missing = None
+                                if hasattr(tile, 'chunks') and tile.max_zoom in tile.chunks:
+                                    mm0_chunks = tile.chunks[tile.max_zoom]
+                                    missing = [i for i, c in enumerate(mm0_chunks)
+                                               if not (c.ready.is_set() and c.data)]
+                                    if missing:
+                                        native_mm0_missing = missing
                                 self._dds_cache.store(
-                                    tile_id, tile.max_zoom, dds_bytes, tile)
+                                    tile_id, tile.max_zoom, dds_bytes, tile,
+                                    mm0_missing_indices=native_mm0_missing)
                             except Exception:
                                 pass
                         build_time = (time.monotonic() - build_start) * 1000
@@ -8533,8 +8550,21 @@ class Tile(object):
                     self.dds.seek(0)
                     dds_bytes = self.dds.read(self.dds.total_size)
                     if dds_bytes and len(dds_bytes) >= 128:
+                        # Identify chunks that were missing during progressive build.
+                        # Without this, DDS with missing_color patches gets cached as
+                        # "complete" and healing is never triggered on subsequent loads.
+                        mm0_missing = None
+                        if self.max_zoom in self.chunks:
+                            mm0_chunks = self.chunks[self.max_zoom]
+                            missing = [i for i, c in enumerate(mm0_chunks)
+                                       if not (c.ready.is_set() and c.data)]
+                            if missing:
+                                mm0_missing = missing
+                                log.debug(f"GET_MIPMAP: Progressive store for {self.id} "
+                                          f"recording {len(missing)} missing chunks for healing")
                         dynamic_dds_cache.store(
-                            self.id, self.max_zoom, dds_bytes, self)
+                            self.id, self.max_zoom, dds_bytes, self,
+                            mm0_missing_indices=mm0_missing)
                 except Exception:
                     pass
         

@@ -432,6 +432,30 @@ class DynamicDDSCache:
                           f"{len(fallback_indices)} fallback chunks need healing)")
                 self._try_heal_from_disk_cache(tile_id, max_zoom, tile)
 
+            # Quality gate: if cached DDS is below current min_chunk_ratio,
+            # serve it (preserving valid data) but trigger healing for the gap.
+            # This ensures raising min_chunk_ratio heals existing tiles instead
+            # of permanently serving stale quality.
+            mipmaps_meta = meta.get("mipmaps", [])
+            if mipmaps_meta and len(mipmaps_meta) > 0:
+                mm0_meta = mipmaps_meta[0]
+                total = mm0_meta.get("total", 0)
+                valid = mm0_meta.get("valid", total)
+                if total > 0 and valid < total:
+                    try:
+                        from autoortho.aoconfig import CFG
+                    except ImportError:
+                        from aoconfig import CFG
+                    min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
+                    if valid / total < min_ratio and not tile._dds_needs_healing:
+                        tile._dds_needs_healing = True
+                        if not getattr(tile, '_dds_missing_indices', None):
+                            tile._dds_missing_indices = missing_indices
+                        log.debug(f"DDS cache: quality {valid}/{total} "
+                                  f"({valid/total*100:.0f}%) below threshold "
+                                  f"{min_ratio*100:.0f}%, triggering healing")
+                        self._try_heal_from_disk_cache(tile_id, max_zoom, tile)
+
             # DDM v3: partial DDS awareness -- tell the tile which mipmaps
             # actually contain data so _populate_dds_from_prebuilt() can
             # skip unpopulated slots (avoids allocating zero-filled buffers).
@@ -1808,16 +1832,13 @@ class DynamicDDSCache:
 
         healable = []
 
-        # Missing chunks: all-or-nothing (same semantics as before)
-        all_missing_exist = True
+        # Missing chunks: best-effort (heal whatever JPEGs are available on disk).
+        # Previously used all-or-nothing semantics which discarded ALL healable
+        # chunks if even one JPEG was missing, causing green patches to persist
+        # indefinitely even when most chunks could be healed.
         for idx in missing:
             if self._jpeg_exists_on_disk(idx, tile, jpeg_cache_dir, chunks_per_row, max_zoom):
                 healable.append(idx)
-            else:
-                all_missing_exist = False
-                break
-        if not all_missing_exist:
-            healable = []  # discard partial missing set
 
         # Fallback chunks: best-effort (patch whichever have JPEGs on disk)
         for idx in fallback:
