@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.3">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.4">
     
     
       
@@ -1460,6 +1460,17 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#early-build-threshold-live_aopipeline_min_chunk_ratio" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Early-Build Threshold (live_aopipeline_min_chunk_ratio)
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2526,6 +2537,17 @@
     <span class="md-ellipsis">
       
         Thread Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#early-build-threshold-live_aopipeline_min_chunk_ratio" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Early-Build Threshold (live_aopipeline_min_chunk_ratio)
       
     </span>
   </a>
@@ -3920,10 +3942,14 @@ default_to_exclusion = True
 </table>
 <h3 id="configuration_1">Configuration</h3>
 <pre><code class="language-ini">[autoortho]
-# Maximum threads for native pipeline (0 = auto from CPU cores)
-# Controls parallelism for cache I/O, JPEG decoding, and DDS compression
+# Maximum threads per native build (0 = auto, divided across concurrent builds)
 # Set to 1 for single-threaded mode (lowest CPU, slowest builds)
 native_pipeline_threads = 0
+
+# Early-build threshold: start DDS build when this fraction of chunks are ready (0.5-1.0)
+# 1.0 = wait for all chunks (single build, no placeholders)
+# 0.9 = build at 90%, automatically rebuild when remaining 10% arrive
+live_aopipeline_min_chunk_ratio = 1.0
 
 # Disk-based DDS cache size in MB (0 = disabled)
 # Uses temp directory, auto-cleaned on session end
@@ -3940,7 +3966,7 @@ ephemeral_dds_cache_mb = 4096
 <tbody>
 <tr>
 <td><strong>0</strong> (default)</td>
-<td>Auto-detect CPU cores, use all available</td>
+<td>Auto: divides CPU cores across concurrent builds to avoid oversubscription</td>
 </tr>
 <tr>
 <td><strong>1</strong></td>
@@ -3948,10 +3974,37 @@ ephemeral_dds_cache_mb = 4096
 </tr>
 <tr>
 <td><strong>N</strong></td>
-<td>Limit to N threads (balance performance vs other applications)</td>
+<td>Fixed N threads per build (regardless of concurrent build count)</td>
 </tr>
 </tbody>
 </table>
+<h4 id="early-build-threshold-live_aopipeline_min_chunk_ratio">Early-Build Threshold (<code>live_aopipeline_min_chunk_ratio</code>)</h4>
+<p>Controls a <strong>two-phase build strategy</strong> that trades brief placeholder artifacts for faster first texture appearance:</p>
+<p><strong>Phase 1 — Early build</strong>: fires as soon as this ratio of chunks is available. Any missing chunks are filled with the missing color.</p>
+<p><strong>Phase 2 — Healing pass</strong>: fires automatically when the remaining chunks arrive, replacing placeholder areas with real imagery.</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>1.0</strong> (default)</td>
+<td>Wait for all chunks — single build, no placeholders, no healing needed</td>
+</tr>
+<tr>
+<td><strong>0.9</strong></td>
+<td>Build at 90% — texture appears ~10% sooner, healed silently after</td>
+</tr>
+<tr>
+<td><strong>0.8</strong></td>
+<td>Build at 80% — texture appears earlier, more placeholder area to heal</td>
+</tr>
+</tbody>
+</table>
+<p>At <code>1.0</code> there is no behavioral difference from before — the tile only builds once all chunks are present. Values below <code>1.0</code> are useful on slow connections where waiting for the last few chunks causes noticeable delay before a tile becomes visible.</p>
 <h3 id="ephemeral-dds-cache">Ephemeral DDS Cache</h3>
 <p>The native pipeline includes an <strong>ephemeral disk cache</strong> for pre-built DDS textures:</p>
 <ul>
