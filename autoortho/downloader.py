@@ -707,8 +707,34 @@ class Release(object):
 
     def load(self, info_path):
         log.info(f"Loading local info from {info_path}")
-        with open(info_path) as h:
-            info = json.loads(h.read())
+
+        # Try loading from the main file; fall back to the .tmp file that
+        # may have been left behind if os.replace failed on Windows.
+        raw = None
+        for candidate in (info_path, info_path + ".tmp"):
+            try:
+                with open(candidate) as h:
+                    raw = h.read()
+                info = json.loads(raw)
+                # If we recovered from the .tmp file, promote it
+                if candidate != info_path:
+                    log.warning(
+                        f"Loaded info from leftover {candidate}, "
+                        f"recovering to {info_path}"
+                    )
+                    try:
+                        os.replace(candidate, info_path)
+                    except OSError:
+                        pass
+                break
+            except (json.JSONDecodeError, OSError) as e:
+                log.warning(f"Failed to load {candidate}: {e}")
+                continue
+        else:
+            raise json.JSONDecodeError(
+                f"All info file candidates for {info_path} are corrupt or missing",
+                raw or "", 0
+            )
 
         # Set attrs from info json
         for k,v in info.items():
@@ -1223,7 +1249,14 @@ class Region(object):
                 download_dir = self.download_dir,
             )
             # Load local info from _info.json
-            release.load(release.info_path)
+            try:
+                release.load(release.info_path)
+            except (json.JSONDecodeError, OSError) as e:
+                log.error(
+                    f"Corrupt or unreadable info file for {rel_name}, "
+                    f"skipping: {e}"
+                )
+                continue
 
             if release.legacy:
                 log.info(f"{rel} is a legacy release.")

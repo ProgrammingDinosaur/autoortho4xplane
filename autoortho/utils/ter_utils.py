@@ -1,6 +1,7 @@
 """Module to handle .ter terrain files for SUPER_ROUGHNESS patching"""
 import os
 import json
+import time
 from logging import getLogger
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from enum import Enum
@@ -26,6 +27,27 @@ class TerUtils:
 
     def __init__(self):
         self.ao_path = CFG.paths.scenery_path
+
+    @staticmethod
+    def _replace_with_retry(src, dst, max_retries=5):
+        """Replace dst with src, retrying on PermissionError (Windows file locking)."""
+        for attempt in range(max_retries):
+            try:
+                os.replace(src, dst)
+                return
+            except PermissionError:
+                if attempt < max_retries - 1:
+                    wait = 0.5 * (attempt + 1)
+                    log.warning(
+                        f"PermissionError replacing {dst}, "
+                        f"retrying in {wait}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(wait)
+                else:
+                    log.error(
+                        f"Failed to replace {dst} after {max_retries} attempts"
+                    )
+                    raise
 
     def get_terrain_folder(self, scenery_name: str) -> str:
         """Get the terrain folder path for a scenery package"""
@@ -301,7 +323,7 @@ class TerUtils:
         tmp_path = scenery_info_json + ".tmp"
         with open(tmp_path, "w") as file:
             json.dump(scenery_info, file, indent=4)
-        os.replace(tmp_path, scenery_info_json)
+        self._replace_with_retry(tmp_path, scenery_info_json)
 
         # Check if all files were processed
         total_processed = sum(
@@ -430,7 +452,7 @@ class TerUtils:
         tmp_path = scenery_info_json + ".tmp"
         with open(tmp_path, "w") as file:
             json.dump(scenery_info, file, indent=4)
-        os.replace(tmp_path, scenery_info_json)
+        self._replace_with_retry(tmp_path, scenery_info_json)
 
         return failures == 0
 

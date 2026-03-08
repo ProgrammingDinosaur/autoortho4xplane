@@ -16,3 +16,5 @@ release/
 .version
 dist/
 docs/internal/
+logs/
+.claude/

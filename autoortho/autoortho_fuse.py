@@ -335,7 +335,7 @@ class AutoOrtho(Operations):
         self._size_cache_max = 5000  # Max entries before LRU eviction
         self._ft_started = False
         self._ft_start_lock = threading.Lock()
-        
+
         # Track redirected DSF file handles: fh -> redirect_path
         # Used when time exclusion redirects DSF reads to global scenery
         self._redirected_dsf_fhs = {}
@@ -924,30 +924,19 @@ class AutoOrtho(Operations):
             # - Any processing overhead
             # - Margin of safety to prevent premature lock timeout
             build_timeout = self._calculate_build_timeout()
-            
+
             if not lock.acquire(timeout=build_timeout):
                 # CRITICAL FIX: Instead of raising EIO (which causes CTD on Windows
                 # due to EXCEPTION_IN_PAGE_ERROR), return fallback placeholder data.
                 # X-Plane will show a gray/missing texture, but won't crash.
                 log.error(f"Tile build lock timeout for {key} after {build_timeout}s - returning fallback data")
-                
+
                 # ═══════════════════════════════════════════════════════════════
                 # ENHANCED DIAGNOSTICS: Log tile state to help debug lock stalls
                 # ═══════════════════════════════════════════════════════════════
-                # When a lock timeout occurs, it's often difficult to determine
-                # what caused the stall. This diagnostic block attempts to gather
-                # tile state information (without acquiring locks) to help identify:
-                # - Whether the tile exists and has valid DDS
-                # - How many chunks have been processed
-                # - Whether the tile's ready event is set
-                # - Reference count (is something else holding it?)
                 try:
-                    # Attempt to get tile info WITHOUT acquiring locks (best-effort)
-                    # Use _get_tile which may briefly acquire tc_lock, but won't
-                    # block on the tile's internal lock
                     t = self.tc.tiles.get(self.tc._to_tile_id(row, col, maptype, zoom))
                     if t:
-                        # Gather diagnostic info (all attribute reads are safe)
                         diag_refs = getattr(t, 'refs', 'N/A')
                         diag_ready = t.ready.is_set() if hasattr(t, 'ready') else 'N/A'
                         diag_dds = t.dds is not None if hasattr(t, 'dds') else 'N/A'
@@ -956,7 +945,7 @@ class AutoOrtho(Operations):
                         if hasattr(t, '_tile_time_budget') and t._tile_time_budget:
                             budget = t._tile_time_budget
                             diag_budget = f"elapsed={budget.elapsed:.1f}s, exhausted={budget.exhausted}"
-                        
+
                         log.error(f"  DIAGNOSTIC: tile={t}, refs={diag_refs}, ready={diag_ready}, "
                                  f"has_dds={diag_dds}, chunk_zooms={diag_chunks}, budget={diag_budget}")
                     else:
@@ -964,25 +953,20 @@ class AutoOrtho(Operations):
                 except Exception as diag_err:
                     log.error(f"  DIAGNOSTIC: Failed to gather tile state: {diag_err}")
                 # ═══════════════════════════════════════════════════════════════
-                
+
                 return _generate_fallback_dds_bytes(offset, length)
-            
+
             try:
                 t = self.tc._get_tile(row, col, maptype, zoom)
                 data = t.read_dds_bytes(offset, length)
                 if data is None:
-                    # CRITICAL FIX: Return fallback data instead of EIO
                     log.error(f"Tile read returned None for {key} - returning fallback data")
                     return _generate_fallback_dds_bytes(offset, length)
                 return data
             except FuseOSError:
-                # CRITICAL FIX: Catch EIO and return fallback instead
-                # This prevents Windows EXCEPTION_IN_PAGE_ERROR CTD
                 log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
                 return _generate_fallback_dds_bytes(offset, length)
             except Exception as e:
-                # CRITICAL FIX: Return fallback data instead of EIO
-                # This prevents Windows EXCEPTION_IN_PAGE_ERROR CTD
                 log.error(f"Tile read/build failed for {key} - returning fallback data to prevent CTD")
                 log.exception("cause:", exc_info=e)
                 return _generate_fallback_dds_bytes(offset, length)

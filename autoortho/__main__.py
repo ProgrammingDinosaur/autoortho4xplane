@@ -24,9 +24,36 @@ from pathlib import Path
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
-    from autoortho.aoconfig import CFG
-except ImportError:
-    from aoconfig import CFG
+    try:
+        from autoortho.aoconfig import CFG
+    except ImportError:
+        from aoconfig import CFG
+except Exception as _cfg_err:
+    # Config loading failed (e.g., permission error creating dirs on fresh install).
+    # Log to stderr since logging isn't set up yet, then show a dialog on macOS.
+    import traceback
+    print(f"Fatal: Failed to load config: {_cfg_err}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    _log_path = os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "autoortho.log")
+    _msg = (
+        "AutoOrtho failed to load configuration.\n\n"
+        + str(_cfg_err)
+        + "\n\nTry deleting ~/.autoortho and restarting."
+    )
+    try:
+        if sys.platform == "darwin":
+            import subprocess
+            _apple_script = f'''
+                display dialog "{_msg.replace('"', '\\"').replace(chr(10), '\\n')}" ¬
+                with title "AutoOrtho Error" ¬
+                buttons {{"OK"}} ¬
+                default button "OK" ¬
+                with icon stop
+            '''
+            subprocess.run(['osascript', '-e', _apple_script], capture_output=True)
+    except Exception:
+        pass
+    sys.exit(1)
 
 try:
     from autoortho.utils.constants import system_type

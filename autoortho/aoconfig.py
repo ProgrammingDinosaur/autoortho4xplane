@@ -581,9 +581,12 @@ route_prefetch_radius_nm = 40
         } for s in sceneries]
 
 
-        if not os.path.exists(self.ao_scenery_path):
-            log.info(f"Creating dir {self.ao_scenery_path}")
-            os.makedirs(self.ao_scenery_path)
+        if self.paths.scenery_path and not os.path.exists(self.ao_scenery_path):
+            try:
+                log.info(f"Creating dir {self.ao_scenery_path}")
+                os.makedirs(self.ao_scenery_path)
+            except OSError as e:
+                log.warning(f"Could not create scenery dir {self.ao_scenery_path}: {e}")
 
         # If we patched any values during load, persist them now so next run is stable.
         # Only save in the main process - workers must not write config files.

@@ -835,14 +835,20 @@ class _native_build_context:
         return False
 
 
-def _get_progressive_executor(max_workers):
-    """Get or create the shared progressive tile executor."""
+def _get_progressive_executor(max_workers=None):
+    """Get or create the shared progressive tile executor.
+
+    Pool size is based on system capabilities (CPU count and decode limit),
+    not on the first caller's chunk count. The max_workers parameter is
+    accepted for API compatibility but only used as a fallback.
+    """
     global _progressive_executor
     if _progressive_executor is None:
         with _progressive_executor_lock:
             if _progressive_executor is None:
+                workers = min(CURRENT_CPU_COUNT, _MAX_DECODE)
                 _progressive_executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=max_workers,
+                    max_workers=workers,
                     thread_name_prefix="ao-progressive"
                 )
     return _progressive_executor
@@ -1591,7 +1597,7 @@ if get_pipeline_mode() != PIPELINE_MODE_PYTHON:
 # is sufficient. More workers would just contend on disk I/O.
 # ============================================================================
 _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4,
+    max_workers=2,
     thread_name_prefix="cache_writer"
 )
 
@@ -1650,7 +1656,7 @@ def flush_cache_writer(timeout=30.0):
     finally:
         # Recreate the executor for subsequent operations
         _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=4,
+            max_workers=2,
             thread_name_prefix="cache_writer"
         )
 
@@ -6941,11 +6947,9 @@ class Tile(object):
         # This prevents worker starvation where all 8 executor threads block on chunk.ready.wait()
         # when downloads are slow, leaving no workers to process chunks that become ready.
         
-        max_pool_workers = min(CURRENT_CPU_COUNT, len(chunks), _MAX_DECODE)
-
         total_chunks = len(chunks)
         completed = 0
-        executor = _get_progressive_executor(max_pool_workers)
+        executor = _get_progressive_executor()
         active_futures = {}
         chunks_with_images = set()  # Track which chunks have images for fallback sweep
         
