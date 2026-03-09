@@ -100,6 +100,8 @@ hide = True
 console_log_level = INFO
 # File log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 file_log_level = DEBUG
+# Disable automatic update installation (still checks and notifies, but opens browser instead)
+disable_auto_update = False
 
 [paths]
 # X-Plane install path

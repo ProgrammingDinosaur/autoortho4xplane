@@ -204,9 +204,77 @@ class UpdateCheckWorker(QThread):
             data = resp.json()
             tag = data.get("tag_name") or data.get("name") or ""
             html_url = data.get("html_url") or "https://github.com/ProgrammingDinosaur/autoortho4xplane/releases"
-            self.result.emit((tag, html_url))
+            assets = data.get("assets", [])
+            self.result.emit((tag, html_url, assets))
         except Exception as err:
             self.error.emit(str(err))
+
+
+class UpdateDownloadWorker(QThread):
+    """Worker thread to download, extract, and install an app update."""
+    progress = Signal(dict)     # {stage, status, pcnt_done, MBps}
+    finished = Signal(bool)     # success
+    error = Signal(str)         # error message
+
+    def __init__(self, asset_url, asset_name, download_dir, install_dir):
+        super().__init__()
+        self.asset_url = asset_url
+        self.asset_name = asset_name
+        self.download_dir = download_dir
+        self.install_dir = install_dir
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            try:
+                from autoortho import auto_updater
+            except ImportError:
+                import auto_updater
+
+            # Stage 1: Download
+            self.progress.emit({
+                'stage': 'downloading', 'pcnt_done': 0,
+                'status': 'Downloading update...'
+            })
+            archive = auto_updater.download_update(
+                self.asset_url, self.asset_name, self.download_dir,
+                progress_callback=lambda d: self.progress.emit(
+                    {**d, 'stage': 'downloading'}
+                ),
+                cancel_check=lambda: self._cancelled,
+            )
+            if self._cancelled:
+                return
+
+            # Stage 2: Extract
+            self.progress.emit({
+                'stage': 'extracting', 'pcnt_done': 0,
+                'status': 'Extracting update...'
+            })
+            staging_dir = os.path.join(self.download_dir, 'ao_update_staging')
+            auto_updater.extract_update(archive, staging_dir)
+
+            # Stage 3: Apply (swap files)
+            self.progress.emit({
+                'stage': 'installing', 'pcnt_done': 0,
+                'status': 'Installing update...'
+            })
+            auto_updater.apply_update(staging_dir, self.install_dir)
+
+            # Stage 4: Clean up downloaded archive
+            try:
+                os.remove(archive)
+            except OSError:
+                pass
+
+            self.finished.emit(True)
+        except Exception as err:
+            log.error(f"Auto-update failed: {err}", exc_info=True)
+            self.error.emit(str(err))
+
 
 class AddSeasonsWorker(QThread):
     """Worker thread for adding seasons"""
@@ -5964,16 +6032,51 @@ class ConfigUI(QMainWindow):
         try:
             if not data:
                 return
-            latest_tag, html_url = data
-            from version import __version__ as current_version
+            latest_tag, html_url, assets = data
+            try:
+                from autoortho.version import __version__ as current_version
+            except ImportError:
+                from version import __version__ as current_version
             latest_ver = self._parse_version(latest_tag)
             current_ver = self._parse_version(current_version)
             if latest_ver is None or current_ver is None:
                 return
-            if latest_ver > current_ver:
+            if latest_ver <= current_ver:
+                return
+
+            # Auto-update only for frozen builds, before FUSE mount, when enabled
+            can_auto_update = False
+            install_dir = None
+            asset_info = (None, None)
+
+            if (getattr(sys, 'frozen', False)
+                    and not self.running
+                    and not getattr(self.cfg.general, 'disable_auto_update', False)):
+                try:
+                    try:
+                        from autoortho import auto_updater
+                    except ImportError:
+                        import auto_updater
+                    install_dir = auto_updater.get_install_dir()
+                    can_auto_update = auto_updater.check_write_permission(install_dir)
+                    asset_info = auto_updater.find_platform_asset(assets)
+                except Exception:
+                    log.debug("Auto-update capability check failed", exc_info=True)
+
+            if can_auto_update and asset_info[0]:
                 reply = QMessageBox.question(
-                    self,
-                    "Update Available",
+                    self, "Update Available",
+                    f"AutoOrtho {latest_tag} is available (you have {current_version}).\n\n"
+                    "Download and install automatically?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._start_auto_update(asset_info[0], asset_info[1], install_dir)
+            else:
+                # Fallback: existing browser behavior
+                reply = QMessageBox.question(
+                    self, "Update Available",
                     "An Update for AutoOrtho is Available. Do you want to go to the download page?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.Yes
@@ -5986,6 +6089,143 @@ class ConfigUI(QMainWindow):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Auto-update UI
+    # ------------------------------------------------------------------
+
+    def _start_auto_update(self, asset_url, asset_name, install_dir):
+        """Kick off the background update download and install."""
+        self._auto_update_install_dir = install_dir
+
+        # Build a modal progress dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Updating AutoOrtho")
+        dlg.setFixedSize(420, 130)
+        dlg.setModal(True)
+        layout = QVBoxLayout(dlg)
+        status_label = QLabel("Downloading update...")
+        layout.addWidget(status_label)
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 100)
+        progress_bar.setValue(0)
+        layout.addWidget(progress_bar)
+        cancel_btn = QPushButton("Cancel")
+        layout.addWidget(cancel_btn)
+
+        dlg._status_label = status_label
+        dlg._progress_bar = progress_bar
+        self._auto_update_dialog = dlg
+
+        # Disable "Run" button while updating
+        if hasattr(self, 'run_button'):
+            self.run_button.setEnabled(False)
+
+        # Create and start worker
+        self._update_download_worker = UpdateDownloadWorker(
+            asset_url, asset_name,
+            self.cfg.paths.download_dir,
+            install_dir,
+        )
+        self._update_download_worker.progress.connect(self._on_auto_update_progress)
+        self._update_download_worker.finished.connect(self._on_auto_update_finished)
+        self._update_download_worker.error.connect(self._on_auto_update_error)
+        cancel_btn.clicked.connect(self._on_auto_update_cancel)
+        self._update_download_worker.start()
+
+        dlg.show()
+
+    def _on_auto_update_progress(self, data):
+        """Update progress dialog from worker thread."""
+        dlg = getattr(self, '_auto_update_dialog', None)
+        if not dlg:
+            return
+        stage = data.get('stage', '')
+        status = data.get('status', '')
+        pcnt = data.get('pcnt_done', 0)
+
+        dlg._status_label.setText(status)
+        if stage in ('extracting', 'installing'):
+            # Indeterminate progress for non-granular stages
+            dlg._progress_bar.setRange(0, 0)
+        else:
+            dlg._progress_bar.setRange(0, 100)
+            dlg._progress_bar.setValue(int(pcnt))
+
+    def _on_auto_update_finished(self, success):
+        """Handle successful update completion."""
+        self._close_auto_update_dialog()
+        if not success:
+            return
+
+        reply = QMessageBox.question(
+            self, "Update Installed",
+            "Update installed successfully.\n\nRestart now to apply?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                try:
+                    from autoortho import auto_updater
+                except ImportError:
+                    import auto_updater
+                auto_updater.launch_and_exit(self._auto_update_install_dir)
+            except Exception as exc:
+                log.error("Failed to restart after update: %s", exc, exc_info=True)
+                QMessageBox.warning(
+                    self, "Restart Failed",
+                    f"Could not restart automatically:\n{exc}\n\n"
+                    "Please close and reopen AutoOrtho manually."
+                )
+        else:
+            QMessageBox.information(
+                self, "Update Ready",
+                "The update will be applied when you next start AutoOrtho."
+            )
+
+    def _on_auto_update_error(self, msg):
+        """Handle update failure."""
+        self._close_auto_update_dialog()
+        log.error("Auto-update error: %s", msg)
+        QMessageBox.warning(
+            self, "Update Failed",
+            f"Auto-update failed:\n{msg}\n\n"
+            "You can download the update manually from GitHub."
+        )
+        # Clean up staging
+        try:
+            try:
+                from autoortho import auto_updater
+            except ImportError:
+                import auto_updater
+            auto_updater.cleanup_staging(self.cfg.paths.download_dir)
+        except Exception:
+            pass
+
+    def _on_auto_update_cancel(self):
+        """Handle cancel button click."""
+        worker = getattr(self, '_update_download_worker', None)
+        if worker:
+            worker.cancel()
+        self._close_auto_update_dialog()
+        self.update_status_bar("Update cancelled")
+
+    def _close_auto_update_dialog(self):
+        """Close the progress dialog and re-enable Run button."""
+        dlg = getattr(self, '_auto_update_dialog', None)
+        if dlg:
+            dlg.close()
+            self._auto_update_dialog = None
+        if hasattr(self, 'run_button'):
+            self.run_button.setEnabled(True)
+        # Clean up worker reference
+        worker = getattr(self, '_update_download_worker', None)
+        if worker:
+            try:
+                worker.wait(2000)
+            except Exception:
+                pass
+            self._update_download_worker = None
 
     def update_status_bar(self, message):
         """Update status bar message"""
@@ -6174,6 +6414,15 @@ class ConfigUI(QMainWindow):
                 self._update_worker.terminate()
                 self._update_worker.wait(2000)  # 2 second timeout
                 self._update_worker = None
+        except Exception:
+            pass
+
+        # Stop update download worker if running
+        try:
+            if hasattr(self, '_update_download_worker') and self._update_download_worker:
+                self._update_download_worker.cancel()
+                self._update_download_worker.wait(5000)
+                self._update_download_worker = None
         except Exception:
             pass
 
