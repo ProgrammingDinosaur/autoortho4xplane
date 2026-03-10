@@ -1784,7 +1784,7 @@ class AsyncChunkDownloader:
                     log.warning("APPLE tile got %s; rotating token and retrying", status_code)
                     apple_token_service.reset_apple_maps_token()
                     _url, header, server, MAPTYPES_WITH_SERVER = _build_chunk_url(chunk, server_idx=server_idx)
-                    resp.close()
+                    await resp.aclose()
                     resp = await self._session.get(chunk.url, headers=header, timeout=_http_timeout)
                     status_code = resp.status_code
 
@@ -1868,7 +1868,7 @@ class AsyncChunkDownloader:
             return False
         finally:
             if resp:
-                resp.close()
+                await resp.aclose()
 
         chunk.fetchtime = time.monotonic() - chunk.starttime
 
