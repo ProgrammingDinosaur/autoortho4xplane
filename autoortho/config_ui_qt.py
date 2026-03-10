@@ -3072,32 +3072,50 @@ class ConfigUI(QMainWindow):
         # Initialize time budget control states
         self._update_time_budget_controls()
 
-        # Fetch threads
+        # Download concurrency (adapts label/range based on async mode)
+        self._is_async_downloads = str(getattr(self.cfg.autoortho, 'async_downloads', 'True')).lower() == 'true'
         threads_layout = QHBoxLayout()
-        threads_label = QLabel("Fetch threads per mount:" if self.system == "darwin" else "Global fetch threads:")
-        threads_label.setToolTip(
-            "Number of simultaneous download threads.\n"
-            "More threads = faster downloads but higher CPU/network usage.\n"
-            "Too many threads may cause timeouts or instability.\n"
-            "On macOS, this is the number of threads per mount.\n"
-            "On other systems, fetch threads are shared globally."
-        )
+
+        if self._is_async_downloads:
+            threads_label = QLabel("Max concurrent downloads:")
+            threads_label.setToolTip(
+                "Maximum number of simultaneous HTTP downloads.\n"
+                "Higher = faster cold cache loading, uses more network bandwidth.\n"
+                "Increase if your network is not saturated.\n"
+                "Too high may trigger server rate-limiting."
+            )
+            max_val = 2000
+            initial_val = min(
+                int(getattr(self.cfg.autoortho, 'max_concurrent_downloads', 500)), max_val
+            )
+        else:
+            threads_label = QLabel("Fetch threads per mount:" if self.system == "darwin" else "Global fetch threads:")
+            threads_label.setToolTip(
+                "Number of simultaneous download threads.\n"
+                "More threads = faster downloads but higher CPU/network usage.\n"
+                "Too many threads may cause timeouts or instability.\n"
+                "On macOS, this is the number of threads per mount.\n"
+                "On other systems, fetch threads are shared globally."
+            )
+            max_val = 1000
+            initial_val = min(
+                int(self.cfg.autoortho.fetch_threads), max_val
+            )
+
         threads_layout.addWidget(threads_label)
         self.fetch_threads_spinbox = ModernSpinBox()
         self.fetch_threads_spinbox.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
-
-        max_threads = 1000
-        self.fetch_threads_spinbox.setRange(1, max_threads)
-
-        # Ensure initial value doesn't exceed available threads
-        initial_threads = min(
-            int(self.cfg.autoortho.fetch_threads), max_threads
-        )
-        self.fetch_threads_spinbox.setValue(initial_threads)
+        self.fetch_threads_spinbox.setRange(1, max_val)
+        self.fetch_threads_spinbox.setValue(initial_val)
         self.fetch_threads_spinbox.setObjectName('fetch_threads')
-        self.fetch_threads_spinbox.setToolTip(
-            f"Number of download threads per mount (1-{max_threads})" if self.system == "darwin" else f"Number of global download threads (1-{max_threads})"
-        )
+        if self._is_async_downloads:
+            self.fetch_threads_spinbox.setToolTip(
+                f"Maximum concurrent HTTP downloads (1-{max_val})"
+            )
+        else:
+            self.fetch_threads_spinbox.setToolTip(
+                f"Number of download threads per mount (1-{max_val})" if self.system == "darwin" else f"Number of global download threads (1-{max_val})"
+            )
 
         threads_layout.addWidget(self.fetch_threads_spinbox)
         threads_layout.addStretch()
@@ -4718,7 +4736,10 @@ class ConfigUI(QMainWindow):
         return ['none', 'cache', 'full'][max(0, min(2, index))]
 
     def validate_threads(self, value):
-        """Validate fetch threads value and show warning if too high"""
+        """Validate fetch threads / concurrent downloads value"""
+        if self._is_async_downloads:
+            # Async mode: no CPU-based cap, the spinbox range is sufficient
+            return
         max_threads = os.cpu_count() or 1
         if value > max_threads:
             QMessageBox.information(
@@ -5679,9 +5700,14 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.buffer_pool_size = str(self.buffer_pool_slider.value())
             self.cfg.autoortho.live_aopipeline_min_chunk_ratio = self.min_chunk_ratio_slider.value() / 100.0
             
-            self.cfg.autoortho.fetch_threads = str(
-                self.fetch_threads_spinbox.value()
-            )
+            if self._is_async_downloads:
+                self.cfg.autoortho.max_concurrent_downloads = str(
+                    self.fetch_threads_spinbox.value()
+                )
+            else:
+                self.cfg.autoortho.fetch_threads = str(
+                    self.fetch_threads_spinbox.value()
+                )
             self.cfg.autoortho.missing_color = [self.missing_color.red(),
                                                 self.missing_color.green(),
                                                 self.missing_color.blue()]

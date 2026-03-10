@@ -323,6 +323,10 @@ fetch_threads = 32
 # When True: single event loop with HTTP/2 multiplexing (~5-15x faster cold cache)
 # When False: traditional thread-per-request model (reliable fallback)
 async_downloads = True
+# Maximum concurrent downloads (async mode only, 50-2000)
+# Controls how many HTTP requests can be in flight simultaneously.
+# Increase if your network is not saturated. Too high may trigger server rate-limiting.
+max_concurrent_downloads = 500
 # Simheaven compatibility mode.
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.

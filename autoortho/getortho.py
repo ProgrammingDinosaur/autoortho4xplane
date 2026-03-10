@@ -14,7 +14,6 @@ import asyncio
 import math
 import socket
 import tracemalloc
-from urllib.parse import urlparse
 from typing import Optional, Dict, Tuple, List
 
 from io import BytesIO
@@ -33,6 +32,11 @@ except ImportError:
 import requests
 import httpx
 import psutil
+
+# Silence httpx/httpcore/h2 loggers — they log every request at INFO/DEBUG
+for _logger_name in ('httpx', 'httpcore', 'httpcore.connection', 'httpcore.http11',
+                      'httpcore.http2', 'httpcore.proxy', 'hpack', 'h2'):
+    logging.getLogger(_logger_name).setLevel(logging.WARNING)
 
 try:
     from autoortho.aoimage import AoImage
@@ -1544,12 +1548,19 @@ class ChunkGetter(Getter):
 # The sync API (submit/stop) is preserved for all callers.
 # ============================================================================
 
-class _FakeQueue:
-    """Compatibility shim for code that checks chunk_getter.queue."""
+class _AsyncQueueShim:
+    """Compatibility shim exposing the async priority queue size to sync callers."""
+
+    def __init__(self, async_queue_ref):
+        self._ref = async_queue_ref  # callable returning the asyncio.PriorityQueue
+
     def qsize(self):
-        return 0
+        q = self._ref()
+        return q.qsize() if q else 0
+
     def empty(self):
-        return True
+        q = self._ref()
+        return q.empty() if q else True
 
 
 class AsyncChunkDownloader:
@@ -1559,24 +1570,33 @@ class AsyncChunkDownloader:
     that can sustain hundreds of concurrent HTTP requests over a small number
     of TCP connections via HTTP/2 multiplexing.
 
+    Downloads are dispatched through an asyncio.PriorityQueue so that live
+    chunks (priority=0) are always served before prefetch chunks (priority=100+)
+    when per-host connection slots are contended.
+
     The sync API (submit/stop) is preserved identically for all callers.
     """
     _queued_chunk_ids = set()
     _queued_lock = threading.Lock()
 
-    def __init__(self, max_concurrent=500, max_per_host=50):
+    # Monotonic counter to break priority ties in FIFO order
+    _submit_seq = 0
+
+    def __init__(self, max_concurrent=500, num_consumers=None):
         self.max_concurrent = max_concurrent
-        self.max_per_host = max_per_host
+        # Consumer count: enough to keep connections saturated
+        # but not so many that we waste coroutine overhead
+        self._num_consumers = num_consumers or min(max_concurrent, 200)
         self._loop = None
         self._thread = None
         self._session = None
-        self._semaphore = None
-        self._host_semaphores = {}
+        self._priority_queue = None  # asyncio.PriorityQueue, created in _main()
         self._server_counter = 0
+        self._consumer_tasks = []
         self.WORKING = threading.Event()
         self.WORKING.set()
         self._ready = threading.Event()
-        self._queue = _FakeQueue()
+        self._queue_shim = _AsyncQueueShim(lambda: self._priority_queue)
         self.count = 0
 
         # Start the event loop thread
@@ -1592,7 +1612,7 @@ class AsyncChunkDownloader:
     @property
     def queue(self):
         """Compatibility shim for code that checks chunk_getter.queue."""
-        return self._queue
+        return self._queue_shim
 
     def _run_loop(self):
         """Run the asyncio event loop in a dedicated thread."""
@@ -1609,7 +1629,7 @@ class AsyncChunkDownloader:
                 pass
 
     async def _main(self):
-        """Main coroutine: create async client and wait for shutdown."""
+        """Main coroutine: create async client, consumers, and wait for shutdown."""
         transport = httpx.AsyncHTTPTransport(
             http2=True,
             retries=0,
@@ -1625,7 +1645,14 @@ class AsyncChunkDownloader:
             follow_redirects=True,
             timeout=httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=10.0),
         )
-        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        self._priority_queue = asyncio.PriorityQueue()
+
+        # Spawn consumer coroutines that drain the priority queue
+        for i in range(self._num_consumers):
+            task = asyncio.ensure_future(self._consumer(i))
+            self._consumer_tasks.append(task)
+
+        log.debug(f"AsyncChunkDownloader: {self._num_consumers} consumers started")
         self._ready.set()
 
         # Keep running until stop() is called
@@ -1633,17 +1660,66 @@ class AsyncChunkDownloader:
             while self.WORKING.is_set():
                 await asyncio.sleep(0.1)
         finally:
+            # Cancel all consumer tasks
+            for task in self._consumer_tasks:
+                task.cancel()
+            await asyncio.gather(*self._consumer_tasks, return_exceptions=True)
+            self._consumer_tasks.clear()
             try:
                 await self._session.aclose()
             except Exception:
                 pass
             await asyncio.sleep(0.25)  # Allow SSL cleanup
 
-    def _get_host_semaphore(self, hostname):
-        """Get or create a per-host semaphore for rate limiting."""
-        if hostname not in self._host_semaphores:
-            self._host_semaphores[hostname] = asyncio.Semaphore(self.max_per_host)
-        return self._host_semaphores[hostname]
+    async def _consumer(self, consumer_id):
+        """Consumer coroutine: drains priority queue in priority order.
+
+        Each consumer picks the highest-priority chunk from the queue,
+        acquires the per-host semaphore, and performs the download.
+        This ensures live chunks (priority=0) are always served before
+        prefetch chunks (priority=100+) when host slots are contended.
+        """
+        while self.WORKING.is_set():
+            try:
+                # Wait for a chunk from the priority queue
+                try:
+                    priority, seq, chunk, kwargs = await asyncio.wait_for(
+                        self._priority_queue.get(), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                chunk.in_queue = False
+                chunk.in_flight = True
+
+                try:
+                    success = await self._do_http_get(chunk, **kwargs)
+
+                    chunk_id = getattr(chunk, 'chunk_id', None)
+                    if chunk_id:
+                        with self._queued_lock:
+                            self._queued_chunk_ids.discard(chunk_id)
+                            if success:
+                                bump('chunk_download_completed')
+                                self.count += 1
+
+                    if not success and not chunk.permanent_failure:
+                        chunk.in_flight = False
+                        self.submit(chunk, **kwargs)
+                except Exception as err:
+                    log.error(f"Consumer {consumer_id} ERROR {err} getting: {chunk}, re-submit.")
+                    if not chunk.permanent_failure:
+                        chunk.in_flight = False
+                        self.submit(chunk, **kwargs)
+                finally:
+                    chunk.in_flight = False
+                    self._priority_queue.task_done()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"Consumer {consumer_id} unexpected error: {e}")
+                await asyncio.sleep(0.1)
 
     def submit(self, obj, *args, **kwargs):
         """Submit chunk for download -- IDENTICAL API to ChunkGetter.submit()."""
@@ -1678,11 +1754,16 @@ class AsyncChunkDownloader:
             with self._queued_lock:
                 self._queued_chunk_ids.add(chunk_id)
 
-        # Schedule the coroutine on the event loop
+        # Enqueue with priority ordering: (priority, sequence, chunk, kwargs)
+        # Sequence number breaks ties in FIFO order within the same priority
+        priority = getattr(obj, 'priority', 0)
+        seq = AsyncChunkDownloader._submit_seq
+        AsyncChunkDownloader._submit_seq += 1
+
         if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                self._download_chunk(obj, *args, **kwargs),
-                self._loop
+            self._loop.call_soon_threadsafe(
+                self._priority_queue.put_nowait,
+                (priority, seq, obj, kwargs)
             )
         else:
             log.warning(f"AsyncChunkDownloader: loop not running, cannot submit {obj}")
@@ -1690,35 +1771,6 @@ class AsyncChunkDownloader:
             if chunk_id:
                 with self._queued_lock:
                     self._queued_chunk_ids.discard(chunk_id)
-
-    async def _download_chunk(self, chunk, *args, **kwargs):
-        """Async coroutine that downloads a single chunk with retry logic."""
-        async with self._semaphore:
-            chunk.in_queue = False
-            chunk.in_flight = True
-
-            try:
-                success = await self._do_http_get(chunk, **kwargs)
-
-                chunk_id = getattr(chunk, 'chunk_id', None)
-                if chunk_id:
-                    with self._queued_lock:
-                        self._queued_chunk_ids.discard(chunk_id)
-                        if success:
-                            bump('chunk_download_completed')
-                            self.count += 1
-
-                if not success and not chunk.permanent_failure:
-                    # Re-submit for retry (replicates ChunkGetter worker retry logic)
-                    chunk.in_flight = False
-                    self.submit(chunk, *args, **kwargs)
-            except Exception as err:
-                log.error(f"ERROR {err} getting: {chunk}, re-submit.")
-                if not chunk.permanent_failure:
-                    chunk.in_flight = False
-                    self.submit(chunk, *args, **kwargs)
-            finally:
-                chunk.in_flight = False
 
     async def _do_http_get(self, chunk, timeout=None, max_attempts=None, **kwargs):
         """Async reimplementation of Chunk.get() HTTP logic using httpx.AsyncClient."""
@@ -1771,88 +1823,83 @@ class AsyncChunkDownloader:
 
         resp = None
         try:
-            # Per-host rate limiting
-            hostname = urlparse(chunk.url).hostname or ''
-            host_sem = self._get_host_semaphore(hostname)
+            resp = await self._session.get(chunk.url, headers=header, timeout=_http_timeout)
+            status_code = resp.status_code
 
-            async with host_sem:
+            # APPLE token rotation
+            if chunk.maptype.upper() == "APPLE" and status_code in (403, 410):
+                log.warning("APPLE tile got %s; rotating token and retrying", status_code)
+                apple_token_service.reset_apple_maps_token()
+                _url, header, server, MAPTYPES_WITH_SERVER = _build_chunk_url(chunk, server_idx=server_idx)
+                await resp.aclose()
                 resp = await self._session.get(chunk.url, headers=header, timeout=_http_timeout)
                 status_code = resp.status_code
 
-                # APPLE token rotation
-                if chunk.maptype.upper() == "APPLE" and status_code in (403, 410):
-                    log.warning("APPLE tile got %s; rotating token and retrying", status_code)
-                    apple_token_service.reset_apple_maps_token()
-                    _url, header, server, MAPTYPES_WITH_SERVER = _build_chunk_url(chunk, server_idx=server_idx)
-                    await resp.aclose()
-                    resp = await self._session.get(chunk.url, headers=header, timeout=_http_timeout)
-                    status_code = resp.status_code
+            if status_code != 200:
+                log.warning(f"Failed with status {status_code} to get chunk {chunk}" +
+                            (" on server " + server if chunk.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
+                bump_many({f"http_{status_code}": 1, "req_err": 1})
 
-                if status_code != 200:
-                    log.warning(f"Failed with status {status_code} to get chunk {chunk}" +
-                                (" on server " + server if chunk.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
-                    bump_many({f"http_{status_code}": 1, "req_err": 1})
+                # Permanent failure
+                if status_code in PERMANENT_FAILURE_CODES:
+                    log.info(f"Chunk {chunk} permanently failed with {status_code}")
+                    chunk.permanent_failure = True
+                    chunk.failure_reason = status_code
+                    chunk.data = b''
+                    chunk.ready.set()
+                    bump(f'chunk_permanent_fail_{status_code}')
+                    try:
+                        if tile_completion_tracker is not None and chunk.tile_id:
+                            tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
+                    except Exception:
+                        pass
+                    return True
 
-                    # Permanent failure
-                    if status_code in PERMANENT_FAILURE_CODES:
-                        log.info(f"Chunk {chunk} permanently failed with {status_code}")
+                # Transient failure with retry limits
+                if status_code in TRANSIENT_FAILURE_CODES:
+                    chunk.retry_count += 1
+                    max_retries = MAX_TRANSIENT_RETRIES.get(status_code, 5)
+                    if chunk.retry_count >= max_retries:
+                        log.warning(f"Chunk {chunk} exceeded {max_retries} retries for {status_code}")
                         chunk.permanent_failure = True
-                        chunk.failure_reason = status_code
+                        chunk.failure_reason = f"{status_code}_max_retries"
                         chunk.data = b''
                         chunk.ready.set()
-                        bump(f'chunk_permanent_fail_{status_code}')
+                        bump(f'chunk_transient_fail_{status_code}_exhausted')
                         try:
                             if tile_completion_tracker is not None and chunk.tile_id:
                                 tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
                         except Exception:
                             pass
                         return True
+                    # Rate limit backoff
+                    if status_code == 429:
+                        backoff_time = min(5, chunk.retry_count * 0.5)
+                        log.debug(f"Rate limited, backing off {backoff_time}s")
+                        await asyncio.sleep(backoff_time)
+                    bump(f'chunk_transient_fail_{status_code}_retry')
 
-                    # Transient failure with retry limits
-                    if status_code in TRANSIENT_FAILURE_CODES:
-                        chunk.retry_count += 1
-                        max_retries = MAX_TRANSIENT_RETRIES.get(status_code, 5)
-                        if chunk.retry_count >= max_retries:
-                            log.warning(f"Chunk {chunk} exceeded {max_retries} retries for {status_code}")
-                            chunk.permanent_failure = True
-                            chunk.failure_reason = f"{status_code}_max_retries"
-                            chunk.data = b''
-                            chunk.ready.set()
-                            bump(f'chunk_transient_fail_{status_code}_exhausted')
-                            try:
-                                if tile_completion_tracker is not None and chunk.tile_id:
-                                    tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
-                            except Exception:
-                                pass
-                            return True
-                        # Rate limit backoff
-                        if status_code == 429:
-                            backoff_time = min(5, chunk.retry_count * 0.5)
-                            log.debug(f"Rate limited, backing off {backoff_time}s")
-                            await asyncio.sleep(backoff_time)
-                        bump(f'chunk_transient_fail_{status_code}_retry')
+                # Error rate monitoring
+                err = get_stat("req_err")
+                if err > 50:
+                    ok = get_stat("req_ok")
+                    error_rate = err / (err + ok)
+                    if error_rate >= 0.10:
+                        log.error(f"Very high network error rate: {error_rate * 100:.2f}%")
+                        if error_rate >= 0.25:
+                            log.warning("Severe error rate (>=25%) detected")
+                return False
 
-                    # Error rate monitoring
-                    err = get_stat("req_err")
-                    if err > 50:
-                        ok = get_stat("req_ok")
-                        error_rate = err / (err + ok)
-                        if error_rate >= 0.10:
-                            log.error(f"Very high network error rate: {error_rate * 100:.2f}%")
-                            if error_rate >= 0.25:
-                                log.warning("Severe error rate (>=25%) detected")
-                    return False
+            data = resp.content
 
-                data = resp.content
+            if _is_jpeg(data[:3]):
+                log.debug(f"Data for {chunk} is JPEG")
+                chunk.data = data
+            else:
+                log.debug(f"Loading file {chunk} not a JPEG! {data[:3]} URL: {chunk.url}")
+                chunk.data = b''
 
-                if _is_jpeg(data[:3]):
-                    log.debug(f"Data for {chunk} is JPEG")
-                    chunk.data = data
-                else:
-                    log.debug(f"Loading file {chunk} not a JPEG! {data[:3]} URL: {chunk.url}")
-                    chunk.data = b''
-
-                bump('bytes_dl', len(chunk.data))
+            bump('bytes_dl', len(chunk.data))
 
         except (httpx.ConnectError, httpx.RemoteProtocolError,
                 httpx.ReadTimeout, httpx.WriteTimeout,
@@ -1934,10 +1981,9 @@ def _create_chunk_getter(num_workers: int):
     use_async = str(getattr(CFG.autoortho, 'async_downloads', 'True')).lower() == 'true'
 
     if use_async:
-        max_concurrent = min(num_workers * 5, 500)
-        max_per_host = min(num_workers, 50)
-        log.info(f"Using AsyncChunkDownloader (max_concurrent={max_concurrent}, per_host={max_per_host})")
-        return AsyncChunkDownloader(max_concurrent=max_concurrent, max_per_host=max_per_host)
+        max_concurrent = int(getattr(CFG.autoortho, 'max_concurrent_downloads', 500))
+        log.info(f"Using AsyncChunkDownloader (max_concurrent={max_concurrent})")
+        return AsyncChunkDownloader(max_concurrent=max_concurrent)
 
     log.info(f"Using ChunkGetter ({num_workers} workers)")
     return ChunkGetter(num_workers)
