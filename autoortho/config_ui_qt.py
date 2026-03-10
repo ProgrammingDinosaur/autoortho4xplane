@@ -3084,10 +3084,12 @@ class ConfigUI(QMainWindow):
                 "Increase if your network is not saturated.\n"
                 "Too high may trigger server rate-limiting."
             )
+            min_val = 50
             max_val = 2000
-            initial_val = min(
+            step = 50
+            initial_val = max(min_val, min(
                 int(getattr(self.cfg.autoortho, 'max_concurrent_downloads', 500)), max_val
-            )
+            ))
         else:
             threads_label = QLabel("Fetch threads per mount:" if self.system == "darwin" else "Global fetch threads:")
             threads_label.setToolTip(
@@ -3097,24 +3099,27 @@ class ConfigUI(QMainWindow):
                 "On macOS, this is the number of threads per mount.\n"
                 "On other systems, fetch threads are shared globally."
             )
+            min_val = 1
             max_val = 1000
-            initial_val = min(
+            step = 1
+            initial_val = max(min_val, min(
                 int(self.cfg.autoortho.fetch_threads), max_val
-            )
+            ))
 
         threads_layout.addWidget(threads_label)
         self.fetch_threads_spinbox = ModernSpinBox()
         self.fetch_threads_spinbox.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
-        self.fetch_threads_spinbox.setRange(1, max_val)
+        self.fetch_threads_spinbox.setRange(min_val, max_val)
+        self.fetch_threads_spinbox.setSingleStep(step)
         self.fetch_threads_spinbox.setValue(initial_val)
         self.fetch_threads_spinbox.setObjectName('fetch_threads')
         if self._is_async_downloads:
             self.fetch_threads_spinbox.setToolTip(
-                f"Maximum concurrent HTTP downloads (1-{max_val})"
+                f"Maximum concurrent HTTP downloads ({min_val}-{max_val})"
             )
         else:
             self.fetch_threads_spinbox.setToolTip(
-                f"Number of download threads per mount (1-{max_val})" if self.system == "darwin" else f"Number of global download threads (1-{max_val})"
+                f"Number of download threads per mount ({min_val}-{max_val})" if self.system == "darwin" else f"Number of global download threads ({min_val}-{max_val})"
             )
 
         threads_layout.addWidget(self.fetch_threads_spinbox)

@@ -1584,9 +1584,11 @@ class AsyncChunkDownloader:
 
     def __init__(self, max_concurrent=500, num_consumers=None):
         self.max_concurrent = max_concurrent
-        # Consumer count: enough to keep connections saturated
-        # but not so many that we waste coroutine overhead
-        self._num_consumers = num_consumers or min(max_concurrent, 200)
+        # Consumer count = max_concurrent: each consumer holds one in-flight
+        # request. asyncio coroutines are cheap (~2KB each), so scaling to
+        # thousands is fine — the real concurrency limit is the TCP connection
+        # pool and the server's HTTP/2 MAX_CONCURRENT_STREAMS setting.
+        self._num_consumers = num_consumers or max_concurrent
         self._loop = None
         self._thread = None
         self._session = None
@@ -1630,12 +1632,18 @@ class AsyncChunkDownloader:
 
     async def _main(self):
         """Main coroutine: create async client, consumers, and wait for shutdown."""
+        # max_connections: total TCP connections allowed (high to avoid pool exhaustion)
+        # max_keepalive_connections: how many idle connections to keep alive
+        # With HTTP/2, each connection multiplexes many streams, but servers
+        # typically limit to ~100-128 concurrent streams per connection.
+        # Opening multiple connections spreads the load across TCP windows.
+        max_conns = max(20, self.max_concurrent // 10)
         transport = httpx.AsyncHTTPTransport(
             http2=True,
             retries=0,
             limits=httpx.Limits(
-                max_connections=self.max_concurrent,
-                max_keepalive_connections=self.max_concurrent,
+                max_connections=max_conns,
+                max_keepalive_connections=max_conns,
                 keepalive_expiry=30.0,
             ),
         )
@@ -7387,7 +7395,12 @@ class Tile(object):
         # We defer lazy builds to after the executor completes to avoid lock contention:
         # calling get_img() from within an executor thread would block on self._lock.
         needs_lazy_build = False
-            
+
+        # Cancellation flag: set when get_img gives up (budget expired + drain timeout).
+        # process_chunk checks this before expensive Fallback 3 (network I/O) to avoid
+        # saturating the shared _progressive_executor with stale work that will be discarded.
+        cancelled = threading.Event()
+
         def process_chunk(chunk, skip_download_wait=False):
             """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
             # Calculate position using native chunk size (no scaling)
@@ -7407,6 +7420,14 @@ class Tile(object):
                 # Return placeholder to prevent crash
                 return (chunk, None, 0, 0)
             
+            # === CANCELLATION CHECK ===
+            # If the parent get_img has given up (budget expired + drain timeout),
+            # skip all work. Our result would be discarded anyway.
+            if cancelled.is_set():
+                start_x = int(chunk.width * (chunk.col - col))
+                start_y = int(chunk.height * (chunk.row - row))
+                return (chunk, None, start_x, start_y)
+
             # === TIME BUDGET CHECK ===
             # When the budget is exhausted we no longer wait for downloads
             # (wait_with_budget returns immediately), but we still fall through
@@ -7516,17 +7537,19 @@ class Tile(object):
             
             # Fallback 3: On-demand download of lower-detail chunks (enabled if fallback_level >= 2)
             # This is the expensive network fallback - only use when quality is prioritized
-            if not chunk_img and needs_fallback and fallback_level >= 2:
+            # CRITICAL: Skip if cancelled — the parent get_img has already given up and won't
+            # use our result. Running Fallback 3 here would only waste executor threads.
+            if not chunk_img and needs_fallback and fallback_level >= 2 and not cancelled.is_set():
                 # Budget strategy for cascading fallback:
                 # - Use main budget first (remaining time)
                 # - If fallback_extends_budget is True AND main budget exhausts during fallback,
                 #   switch to the extra fallback_budget
                 # - This ensures max total time is exactly: main_budget + fallback_timeout
                 nonlocal fallback_budget
-                
+
                 # Fallback budget is created lazily ONLY when main budget exhausts
                 # This ensures it truly extends the time rather than running in parallel
-                
+
                 if time_budget.exhausted and not fallback_extends_budget:
                     # Main budget exhausted and no extension allowed - skip
                     log.debug(f"GET_IMG(process_chunk): Skipping Fallback 3 - budget exhausted and fallback_extends_budget=False")
@@ -7560,14 +7583,14 @@ class Tile(object):
                         fallback_timeout=fallback_timeout if fallback_extends_budget else None
                     )
 
-            if not chunk_ready and not chunk_img and not is_permanent_failure:
+            if not chunk_ready and not chunk_img and not is_permanent_failure and not cancelled.is_set():
                 # === FINAL RETRY (OPTIMIZED) ===
                 # Only worth retrying if the chunk download is still pending.
                 # Pending means: in queue, in flight, or already completed (ready).
                 # If none of these are true, the download failed and won't be retried
                 # by the worker - so waiting would be pointless.
                 download_pending = chunk.in_flight or chunk.in_queue or chunk.ready.is_set()
-                
+
                 if time_budget.exhausted:
                     log.debug(f"GET_IMG: Skipping final retry for {chunk} - budget exhausted")
                     time_budget.record_chunk_skipped()
@@ -7678,6 +7701,8 @@ class Tile(object):
                     log.info(f"Time budget exhausted after {time_budget.elapsed:.2f}s for mipmap {mipmap}: "
                             f"processed {time_budget.chunks_processed}, skipped {time_budget.chunks_skipped}, "
                             f"remaining {remaining}/{total_chunks}")
+                    # Signal stale process_chunk futures to skip expensive Fallback 3
+                    cancelled.set()
                     break
                 
                 # Wait for completions with a short timeout to allow budget checks
@@ -7781,6 +7806,8 @@ class Tile(object):
                     if still_missing > 0:
                         bump('chunk_missing_count', still_missing)
         finally:
+            # Signal any still-running process_chunk threads to exit quickly
+            cancelled.set()
             # Cancel any remaining futures from the shared pool (don't shut it down)
             for future in list(active_futures.keys()):
                 if not future.done():
