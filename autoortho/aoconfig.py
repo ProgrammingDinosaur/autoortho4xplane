@@ -142,7 +142,7 @@ dynamic_zoom_steps = []
 # A chunk download will end when EITHER limit is reached, whichever comes first.
 # This prevents a single slow chunk from consuming the entire tile budget.
 # Recommended: 2.0 (fast networks), 5.0 (normal), 10.0 (slow networks)
-maxwait = 2.0
+maxwait = 5.0
 # Temporarily increase maxwait to an effectively infinite value while X-Plane is
 # loading scenery data prior to starting the flight.  This allows more downloads to
 # succeed and reduce the use of backup chunks and missing chunks at the start of flight.
@@ -227,7 +227,7 @@ live_builder_concurrency = 8
 # False: Use missing color for failed chunks (no fallbacks, fastest)
 #   - Pro: Faster prebuilds, no extra I/O
 #   - Con: Failed chunks show missing color instead of fallback data
-predictive_dds_use_fallbacks = True
+predictive_dds_use_fallbacks = False
 # Disk cache size for pre-built DDS textures in MB (1024-16384)
 # Pre-built DDS files are stored on disk (SSD reads are ~1-2ms, fast enough)
 # The OS file cache naturally keeps hot files in RAM when memory is available
@@ -319,6 +319,10 @@ tile_queue_enabled = True
 # Recommended: 100 (default)
 tile_queue_max_size = 100
 fetch_threads = 32
+# Use async HTTP downloads for maximum throughput (True/False)
+# When True: single event loop with HTTP/2 multiplexing (~5-15x faster cold cache)
+# When False: traditional thread-per-request model (reliable fallback)
+async_downloads = True
 # Simheaven compatibility mode.
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.

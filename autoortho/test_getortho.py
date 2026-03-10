@@ -40,7 +40,7 @@ def test_maptype_chunk(maptype, tmpdir):
     assert ret
     assert getortho._is_jpeg(c.data[:3])
    
-    session = requests.Session()
+    session = getortho.create_http_session(pool_size=4)
     c = getortho.Chunk(2176, 3264, maptype, 13, cache_dir=tmpdir)
     ret = c.get(session=session)
     assert ret

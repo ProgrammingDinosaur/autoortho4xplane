@@ -10,8 +10,11 @@ import time
 import threading
 import concurrent.futures
 import uuid
+import asyncio
 import math
+import socket
 import tracemalloc
+from urllib.parse import urlparse
 from typing import Optional, Dict, Tuple, List
 
 from io import BytesIO
@@ -28,6 +31,7 @@ except ImportError:
     import pydds
 
 import requests
+import httpx
 import psutil
 
 try:
@@ -766,23 +770,51 @@ MEMTRACE = False
 log = logging.getLogger(__name__)
 
 
-def create_http_session(pool_size=10):
+def create_http_session(pool_size=4):
     """
-    Factory function to create an HTTP session with connection pooling.
-    
-    Returns a requests session configured with connection pooling.
+    Factory function to create an HTTP/2-capable session with connection pooling.
+
+    Uses httpx with HTTP/2 support (automatic ALPN negotiation, falls back to
+    HTTP/1.1 for servers that don't support HTTP/2). Enables TCP_NODELAY
+    (disables Nagle's algorithm) and SO_KEEPALIVE for lower latency.
     """
-    session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=pool_size,
-        pool_maxsize=pool_size,
-        max_retries=0,
-        pool_block=True,
+    transport = httpx.HTTPTransport(
+        http2=True,
+        retries=0,
+        limits=httpx.Limits(
+            max_connections=pool_size,
+            max_keepalive_connections=pool_size,
+            keepalive_expiry=30.0,
+        ),
+        socket_options=[
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+        ],
     )
-    session.mount('https://', adapter)
-    session.mount('http://', adapter)
-    log.debug(f"Created requests session (pool_size={pool_size})")
-    return session
+    client = httpx.Client(
+        http2=True,
+        transport=transport,
+        follow_redirects=True,
+        timeout=httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=10.0),
+    )
+    log.debug(f"Created httpx client (pool_size={pool_size}, http2=True)")
+    return client
+
+
+# Exception types for HTTP error handling (httpx equivalents of requests exceptions)
+_CONNECTION_ERRORS = (httpx.ConnectError, httpx.RemoteProtocolError)
+_TIMEOUT_ERRORS = (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.ConnectTimeout)
+
+
+# Module-level fallback session for Chunk.get() when no session is injected
+_fallback_session = None
+
+def _get_fallback_session():
+    """Get or create a module-level fallback httpx session."""
+    global _fallback_session
+    if _fallback_session is None:
+        _fallback_session = create_http_session(pool_size=4)
+    return _fallback_session
 
 
 # JPEG decode concurrency: auto-tuned for optimal performance
@@ -1360,12 +1392,13 @@ class Getter(object):
         self.localdata.idx = idx
         
         # Create thread-local session with connection pooling
+        # pool_size=4 is sufficient: each worker makes sequential requests,
+        # and serverlist has at most 4 server variants for keep-alive reuse
         try:
-            pool_size = max(4, int(int(CFG.autoortho.fetch_threads) * 1.5))
-            self.localdata.session = create_http_session(pool_size=pool_size)
+            self.localdata.session = create_http_session(pool_size=4)
         except Exception as _e:
             log.warning(f"Failed to initialize thread-local session: {_e}")
-            self.localdata.session = requests.Session()
+            self.localdata.session = create_http_session(pool_size=4)
         
         while self.WORKING.is_set():
             try:
@@ -1489,7 +1522,7 @@ class ChunkGetter(Getter):
             return True
 
         kwargs['idx'] = self.localdata.idx
-        kwargs['session'] = getattr(self.localdata, 'session', None) or requests
+        kwargs['session'] = getattr(self.localdata, 'session', None) or _get_fallback_session()
         result = obj.get(*args, **kwargs)
         
         chunk_id = getattr(obj, 'chunk_id', None)
@@ -1502,16 +1535,410 @@ class ChunkGetter(Getter):
         return result
 
 
+# ============================================================================
+# ASYNC CHUNK DOWNLOADER
+# ============================================================================
+# High-throughput async download engine using httpx.AsyncClient with HTTP/2.
+# Runs a single asyncio event loop in a dedicated thread, managing hundreds
+# of concurrent HTTP requests over a small number of TCP connections.
+# The sync API (submit/stop) is preserved for all callers.
+# ============================================================================
+
+class _FakeQueue:
+    """Compatibility shim for code that checks chunk_getter.queue."""
+    def qsize(self):
+        return 0
+    def empty(self):
+        return True
+
+
+class AsyncChunkDownloader:
+    """Async HTTP download engine running in a dedicated thread.
+
+    Replaces the N-thread ChunkGetter model with a single asyncio event loop
+    that can sustain hundreds of concurrent HTTP requests over a small number
+    of TCP connections via HTTP/2 multiplexing.
+
+    The sync API (submit/stop) is preserved identically for all callers.
+    """
+    _queued_chunk_ids = set()
+    _queued_lock = threading.Lock()
+
+    def __init__(self, max_concurrent=500, max_per_host=50):
+        self.max_concurrent = max_concurrent
+        self.max_per_host = max_per_host
+        self._loop = None
+        self._thread = None
+        self._session = None
+        self._semaphore = None
+        self._host_semaphores = {}
+        self._server_counter = 0
+        self.WORKING = threading.Event()
+        self.WORKING.set()
+        self._ready = threading.Event()
+        self._queue = _FakeQueue()
+        self.count = 0
+
+        # Start the event loop thread
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name="async-downloader",
+            daemon=True
+        )
+        self._thread.start()
+        if not self._ready.wait(timeout=10.0):
+            log.error("AsyncChunkDownloader: event loop failed to start within 10s")
+
+    @property
+    def queue(self):
+        """Compatibility shim for code that checks chunk_getter.queue."""
+        return self._queue
+
+    def _run_loop(self):
+        """Run the asyncio event loop in a dedicated thread."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._main())
+        except Exception as e:
+            log.error(f"AsyncChunkDownloader event loop error: {e}")
+        finally:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+
+    async def _main(self):
+        """Main coroutine: create async client and wait for shutdown."""
+        transport = httpx.AsyncHTTPTransport(
+            http2=True,
+            retries=0,
+            limits=httpx.Limits(
+                max_connections=self.max_concurrent,
+                max_keepalive_connections=self.max_concurrent,
+                keepalive_expiry=30.0,
+            ),
+        )
+        self._session = httpx.AsyncClient(
+            http2=True,
+            transport=transport,
+            follow_redirects=True,
+            timeout=httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=10.0),
+        )
+        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        self._ready.set()
+
+        # Keep running until stop() is called
+        try:
+            while self.WORKING.is_set():
+                await asyncio.sleep(0.1)
+        finally:
+            try:
+                await self._session.aclose()
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)  # Allow SSL cleanup
+
+    def _get_host_semaphore(self, hostname):
+        """Get or create a per-host semaphore for rate limiting."""
+        if hostname not in self._host_semaphores:
+            self._host_semaphores[hostname] = asyncio.Semaphore(self.max_per_host)
+        return self._host_semaphores[hostname]
+
+    def submit(self, obj, *args, **kwargs):
+        """Submit chunk for download -- IDENTICAL API to ChunkGetter.submit()."""
+        if obj.permanent_failure:
+            bump('submit_skip_permanent_failure')
+            return
+
+        chunk_id = getattr(obj, 'chunk_id', None)
+
+        # Check if already queued (fast path)
+        if chunk_id:
+            with self._queued_lock:
+                if chunk_id in self._queued_chunk_ids:
+                    bump('submit_skip_id_already_queued')
+                    return
+
+        # Per-object coalescing checks
+        if obj.ready.is_set():
+            bump('submit_skip_already_ready')
+            return
+        if obj.in_queue:
+            bump('submit_skip_already_queued')
+            return
+        if obj.in_flight:
+            bump('submit_skip_in_flight')
+            return
+
+        obj.in_queue = True
+
+        # Add to tracked set
+        if chunk_id:
+            with self._queued_lock:
+                self._queued_chunk_ids.add(chunk_id)
+
+        # Schedule the coroutine on the event loop
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self._download_chunk(obj, *args, **kwargs),
+                self._loop
+            )
+        else:
+            log.warning(f"AsyncChunkDownloader: loop not running, cannot submit {obj}")
+            obj.in_queue = False
+            if chunk_id:
+                with self._queued_lock:
+                    self._queued_chunk_ids.discard(chunk_id)
+
+    async def _download_chunk(self, chunk, *args, **kwargs):
+        """Async coroutine that downloads a single chunk with retry logic."""
+        async with self._semaphore:
+            chunk.in_queue = False
+            chunk.in_flight = True
+
+            try:
+                success = await self._do_http_get(chunk, **kwargs)
+
+                chunk_id = getattr(chunk, 'chunk_id', None)
+                if chunk_id:
+                    with self._queued_lock:
+                        self._queued_chunk_ids.discard(chunk_id)
+                        if success:
+                            bump('chunk_download_completed')
+                            self.count += 1
+
+                if not success and not chunk.permanent_failure:
+                    # Re-submit for retry (replicates ChunkGetter worker retry logic)
+                    chunk.in_flight = False
+                    self.submit(chunk, *args, **kwargs)
+            except Exception as err:
+                log.error(f"ERROR {err} getting: {chunk}, re-submit.")
+                if not chunk.permanent_failure:
+                    chunk.in_flight = False
+                    self.submit(chunk, *args, **kwargs)
+            finally:
+                chunk.in_flight = False
+
+    async def _do_http_get(self, chunk, timeout=None, max_attempts=None, **kwargs):
+        """Async reimplementation of Chunk.get() HTTP logic using httpx.AsyncClient."""
+        chunk.download_started.set()
+
+        # Check cache first (sync, fast)
+        if chunk.get_cache():
+            chunk.ready.set()
+            return True
+
+        _max_attempts = max_attempts or MAX_TOTAL_ATTEMPTS
+
+        # Total attempt limit
+        if chunk.attempt >= _max_attempts:
+            log.warning(f"Chunk {chunk} exceeded {_max_attempts} total attempts, marking as permanently failed")
+            chunk.permanent_failure = True
+            chunk.failure_reason = "max_total_attempts"
+            chunk.data = b''
+            chunk.ready.set()
+            bump('chunk_max_attempts_exhausted')
+            try:
+                if tile_completion_tracker is not None and chunk.tile_id:
+                    tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
+            except Exception:
+                pass
+            return True
+
+        if not chunk.starttime:
+            chunk.starttime = time.time()
+
+        # Build URL using shared helper (server rotation via atomic counter)
+        server_idx = self._server_counter
+        self._server_counter = (self._server_counter + 1) % 1000000
+        _url, header, server, MAPTYPES_WITH_SERVER = _build_chunk_url(chunk, server_idx=server_idx)
+
+        # Capped backoff (async sleep)
+        backoff_sleep = min(2.0, chunk.attempt / 10.0)
+        if backoff_sleep > 0:
+            await asyncio.sleep(backoff_sleep)
+        chunk.attempt += 1
+
+        # Convert timeout
+        _raw_timeout = timeout or (5, 20)
+        if isinstance(_raw_timeout, tuple):
+            _http_timeout = httpx.Timeout(connect=_raw_timeout[0], read=_raw_timeout[1], write=5.0, pool=10.0)
+        else:
+            _http_timeout = _raw_timeout
+
+        log.debug(f"Async requesting {chunk.url} ..")
+
+        resp = None
+        try:
+            # Per-host rate limiting
+            hostname = urlparse(chunk.url).hostname or ''
+            host_sem = self._get_host_semaphore(hostname)
+
+            async with host_sem:
+                resp = await self._session.get(chunk.url, headers=header, timeout=_http_timeout)
+                status_code = resp.status_code
+
+                # APPLE token rotation
+                if chunk.maptype.upper() == "APPLE" and status_code in (403, 410):
+                    log.warning("APPLE tile got %s; rotating token and retrying", status_code)
+                    apple_token_service.reset_apple_maps_token()
+                    _url, header, server, MAPTYPES_WITH_SERVER = _build_chunk_url(chunk, server_idx=server_idx)
+                    resp.close()
+                    resp = await self._session.get(chunk.url, headers=header, timeout=_http_timeout)
+                    status_code = resp.status_code
+
+                if status_code != 200:
+                    log.warning(f"Failed with status {status_code} to get chunk {chunk}" +
+                                (" on server " + server if chunk.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
+                    bump_many({f"http_{status_code}": 1, "req_err": 1})
+
+                    # Permanent failure
+                    if status_code in PERMANENT_FAILURE_CODES:
+                        log.info(f"Chunk {chunk} permanently failed with {status_code}")
+                        chunk.permanent_failure = True
+                        chunk.failure_reason = status_code
+                        chunk.data = b''
+                        chunk.ready.set()
+                        bump(f'chunk_permanent_fail_{status_code}')
+                        try:
+                            if tile_completion_tracker is not None and chunk.tile_id:
+                                tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
+                        except Exception:
+                            pass
+                        return True
+
+                    # Transient failure with retry limits
+                    if status_code in TRANSIENT_FAILURE_CODES:
+                        chunk.retry_count += 1
+                        max_retries = MAX_TRANSIENT_RETRIES.get(status_code, 5)
+                        if chunk.retry_count >= max_retries:
+                            log.warning(f"Chunk {chunk} exceeded {max_retries} retries for {status_code}")
+                            chunk.permanent_failure = True
+                            chunk.failure_reason = f"{status_code}_max_retries"
+                            chunk.data = b''
+                            chunk.ready.set()
+                            bump(f'chunk_transient_fail_{status_code}_exhausted')
+                            try:
+                                if tile_completion_tracker is not None and chunk.tile_id:
+                                    tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
+                            except Exception:
+                                pass
+                            return True
+                        # Rate limit backoff
+                        if status_code == 429:
+                            backoff_time = min(5, chunk.retry_count * 0.5)
+                            log.debug(f"Rate limited, backing off {backoff_time}s")
+                            await asyncio.sleep(backoff_time)
+                        bump(f'chunk_transient_fail_{status_code}_retry')
+
+                    # Error rate monitoring
+                    err = get_stat("req_err")
+                    if err > 50:
+                        ok = get_stat("req_ok")
+                        error_rate = err / (err + ok)
+                        if error_rate >= 0.10:
+                            log.error(f"Very high network error rate: {error_rate * 100:.2f}%")
+                            if error_rate >= 0.25:
+                                log.warning("Severe error rate (>=25%) detected")
+                    return False
+
+                data = resp.content
+
+                if _is_jpeg(data[:3]):
+                    log.debug(f"Data for {chunk} is JPEG")
+                    chunk.data = data
+                else:
+                    log.debug(f"Loading file {chunk} not a JPEG! {data[:3]} URL: {chunk.url}")
+                    chunk.data = b''
+
+                bump('bytes_dl', len(chunk.data))
+
+        except (httpx.ConnectError, httpx.RemoteProtocolError,
+                httpx.ReadTimeout, httpx.WriteTimeout,
+                httpx.PoolTimeout, httpx.ConnectTimeout) as err:
+            chunk.attempt += 1
+            backoff = min(10.0, 0.5 * (2 ** min(chunk.attempt, 5)))
+            log.warning(f"{chunk} connection/timeout error (attempt {chunk.attempt}), "
+                        f"backoff {backoff:.1f}s: {err}")
+            await asyncio.sleep(backoff)
+            return False
+        except Exception as err:
+            log.warning(f"Failed to get chunk {chunk}. Err: {err} URL: {chunk.url}")
+            return False
+        finally:
+            if resp:
+                resp.close()
+
+        chunk.fetchtime = time.monotonic() - chunk.starttime
+
+        # Signal ready IMMEDIATELY - data is in memory for consumers
+        chunk.ready.set()
+
+        # Track slow downloads
+        try:
+            duration_ms = int((chunk.fetchtime or 0) * 1000)
+            if duration_ms > 5000:
+                bump('chunk_slow_download')
+            if duration_ms > 15000:
+                bump('chunk_very_slow_download')
+        except Exception:
+            pass
+
+        # Notify tile completion tracker (BEFORE cache write)
+        try:
+            if tile_completion_tracker is not None and chunk.tile_id:
+                tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
+        except Exception:
+            pass
+
+        bump('req_ok')
+
+        # Async cache write (fire-and-forget via ThreadPoolExecutor)
+        try:
+            _cache_write_executor.submit(_async_cache_write, chunk)
+        except Exception:
+            try:
+                chunk.save_cache()
+            except Exception:
+                pass
+
+        return True
+
+    def stop(self):
+        """Graceful shutdown -- preserves the Getter.stop() contract."""
+        self.WORKING.clear()
+        if self._loop and self._loop.is_running():
+            try:
+                async def _shutdown():
+                    if self._session:
+                        await self._session.aclose()
+                future = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
+                future.result(timeout=5.0)
+            except Exception:
+                pass
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread:
+            self._thread.join(timeout=10.0)
+            if self._thread.is_alive():
+                log.warning("AsyncChunkDownloader thread did not terminate")
+
+
 def _create_chunk_getter(num_workers: int):
+    """Factory: choose between async AsyncChunkDownloader and sync ChunkGetter.
+
+    When async_downloads=True (default), uses a single asyncio event loop with
+    httpx.AsyncClient for HTTP/2 multiplexed downloads (highest throughput).
+    When False, falls back to the traditional thread-per-request ChunkGetter.
     """
-    Factory function to create the chunk getter.
-    
-    Uses Python ChunkGetter with per-thread connection pooling via requests.Session.
-    Each worker thread maintains its own HTTP session for connection reuse.
-    
-    Native aopipeline components (AoCache, AoDDS) are used for cache I/O and
-    DDS building where parallel native processing provides clear benefits.
-    """
+    use_async = str(getattr(CFG.autoortho, 'async_downloads', 'True')).lower() == 'true'
+
+    if use_async:
+        max_concurrent = min(num_workers * 5, 500)
+        max_per_host = min(num_workers, 50)
+        log.info(f"Using AsyncChunkDownloader (max_concurrent={max_concurrent}, per_host={max_per_host})")
+        return AsyncChunkDownloader(max_concurrent=max_concurrent, max_per_host=max_per_host)
+
     log.info(f"Using ChunkGetter ({num_workers} workers)")
     return ChunkGetter(num_workers)
 
@@ -1579,9 +2006,41 @@ def _warmup_native_pipeline():
     except Exception as e:
         log.debug(f"Native cache warmup failed: {e}")
 
+# ============================================================================
+# DNS PRE-RESOLUTION WARMUP
+# ============================================================================
+# Pre-resolve all known tile server hostnames to warm the OS DNS cache,
+# eliminating ~50-200ms first-request latency per host.
+# ============================================================================
+
+_KNOWN_TILE_HOSTS = [
+    's2maps-tiles.eu',
+    't.ssl.ak.tiles.virtualearth.net',
+    'mts0.google.com', 'mts1.google.com', 'mts2.google.com', 'mts3.google.com',
+    'services.arcgisonline.com',
+    'naip.maptiles.arcgis.com',
+    'basemap.nationalmap.gov',
+    'fly.maptiles.arcgis.com',
+    'sat01.maps.yandex.net', 'sat02.maps.yandex.net',
+    'sat03.maps.yandex.net', 'sat04.maps.yandex.net',
+    'sat-cdn.apple-mapkit.com',
+]
+
+def _warmup_dns():
+    """Pre-resolve all known tile server hostnames to warm OS DNS cache."""
+    for host in _KNOWN_TILE_HOSTS:
+        try:
+            socket.getaddrinfo(host, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        except Exception:
+            pass
+    log.debug("DNS pre-resolution warmup complete")
+
 # Call warmup during module init if native pipeline is being used
 if get_pipeline_mode() != PIPELINE_MODE_PYTHON:
     _warmup_native_pipeline()
+
+# Always warm DNS regardless of pipeline mode
+_warmup_dns()
 #log.info(f"tile_getter: {tile_getter}")
 
 
@@ -4298,6 +4757,45 @@ MAX_TRANSIENT_RETRIES = {
 MAX_TOTAL_ATTEMPTS = 15
 
 
+def _build_chunk_url(chunk, server_idx=0):
+    """Build the download URL and headers for a chunk.
+
+    Shared by both sync Chunk.get() and AsyncChunkDownloader to ensure
+    a single source of truth for URL construction across all map sources.
+
+    Returns:
+        (url, header, server, maptypes_with_server): URL string, headers dict,
+        server letter, and list of map types that use server rotation.
+    """
+    server_num = server_idx % len(chunk.serverlist)
+    server = chunk.serverlist[server_num]
+    quadkey = _gtile_to_quadkey(chunk.col, chunk.row, chunk.zoom)
+
+    MAPID = "s2cloudless-2024_3857"
+    MATRIXSET = "g"
+    MAPTYPES = {
+        "EOX": f"https://s2maps-tiles.eu/wmts?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={chunk.zoom}&TileCol={chunk.col}&TileRow={chunk.row}",
+        "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
+        "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={chunk.col}&y={chunk.row}&z={chunk.zoom}",
+        "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{chunk.zoom}/{chunk.row}/{chunk.col}",
+        "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{chunk.zoom}/{chunk.row}/{chunk.col}",
+        "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{chunk.zoom}/{chunk.row}/{chunk.col}",
+        "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{chunk.zoom}/{chunk.row}/{chunk.col}",
+        "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={chunk.col}&y={chunk.row}&z={chunk.zoom}",
+        "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={chunk.zoom}&x={chunk.col}&y={chunk.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
+    }
+    MAPTYPES_WITH_SERVER = ["YNDX", "EOX", "GO2"]
+
+    url = MAPTYPES[chunk.maptype.upper()]
+    chunk.url = url
+
+    header = {"user-agent": "curl/7.68.0"}
+    if chunk.maptype.upper() == "EOX":
+        header['referer'] = 'https://s2maps.eu/'
+
+    return url, header, server, MAPTYPES_WITH_SERVER
+
+
 class Chunk(object):
     col = -1
     row = -1
@@ -4515,7 +5013,7 @@ class Chunk(object):
                 log.warning(f"Failed to save cache for {self}: {e}")
                 return
 
-    def get(self, idx=0, session=requests, timeout=None, max_attempts=None):
+    def get(self, idx=0, session=None, timeout=None, max_attempts=None):
         log.debug(f"Getting {self}")
 
         # Signal that download has started (not waiting in queue anymore)
@@ -4548,37 +5046,7 @@ class Chunk(object):
         if not self.starttime:
             self.starttime = time.time()
 
-        server_num = idx % (len(self.serverlist))
-        server = self.serverlist[server_num]
-        quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
-
-        # Hack override maptype
-        #maptype = "ARC"
-
-        MAPID = "s2cloudless-2024_3857"
-        MATRIXSET = "g"
-        MAPTYPES = {
-            "EOX": f"https://s2maps-tiles.eu/wmts?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
-            "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
-            "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
-            "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
-            "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
-        }
-
-        MAPTYPES_WITH_SERVER = ["YNDX", "EOX", "GO2"]
-
-        self.url = MAPTYPES[self.maptype.upper()]
-        #log.debug(f"{self} getting {url}")
-        header = {
-                "user-agent": "curl/7.68.0"
-        }
-        if self.maptype.upper() == "EOX":
-            log.debug("EOX DETECTED")
-            header.update({'referer': 'https://s2maps.eu/'})
+        _url, header, server, MAPTYPES_WITH_SERVER = _build_chunk_url(self, server_idx=idx)
        
         # Capped backoff: grows with attempts but maxes at 2 seconds
         # This prevents runaway delays when server is slow/throttling
@@ -4586,24 +5054,30 @@ class Chunk(object):
         time.sleep(backoff_sleep)
         self.attempt += 1
 
-        _http_timeout = timeout or (5, 20)
+        # Convert timeout tuples to httpx.Timeout (httpx does not accept (connect, read) tuples)
+        _raw_timeout = timeout or (5, 20)
+        if isinstance(_raw_timeout, tuple):
+            _http_timeout = httpx.Timeout(connect=_raw_timeout[0], read=_raw_timeout[1], write=5.0, pool=10.0)
+        else:
+            _http_timeout = _raw_timeout
 
         log.debug(f"Requesting {self.url} ..")
 
+        _session = session or _get_fallback_session()
         resp = None
         try:
 
-            resp = session.get(self.url, headers=header, timeout=_http_timeout)
+            resp = _session.get(self.url, headers=header, timeout=_http_timeout)
             status_code = resp.status_code
 
             if self.maptype.upper() == "APPLE" and status_code in (403, 410):
                 log.warning("APPLE tile got %s; rotating token and retrying", status_code)
                 apple_token_service.reset_apple_maps_token()
-                MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
-                self.url = MAPTYPES[self.maptype.upper()]
+                # Rebuild URL with refreshed token
+                _url, header, server, MAPTYPES_WITH_SERVER = _build_chunk_url(self, server_idx=idx)
                 if resp is not None:
                     resp.close()
-                resp = session.get(self.url, headers=header, timeout=_http_timeout)
+                resp = _session.get(self.url, headers=header, timeout=_http_timeout)
                 status_code = resp.status_code
 
             if status_code != 200:
@@ -4678,8 +5152,7 @@ class Chunk(object):
 
             bump('bytes_dl', len(self.data))
                 
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout) as err:
+        except (*_CONNECTION_ERRORS, *_TIMEOUT_ERRORS) as err:
             self.attempt += 1
             backoff = min(10.0, 0.5 * (2 ** min(self.attempt, 5)))
             log.warning(f"{self} connection/timeout error (attempt {self.attempt}), "
@@ -5417,6 +5890,215 @@ class Tile(object):
         
         return build_success
 
+    def _try_unified_aopipeline_build(self, time_budget=None) -> bool:
+        """
+        Unified build: collect chunks → resolve fallbacks → build entire DDS
+        with parallel C pipeline in one pass. Replaces the batch → streaming →
+        progressive cascade with a single path that always uses the C pipeline.
+
+        Args:
+            time_budget: Optional TimeBudget to limit processing time
+
+        Returns:
+            True if build succeeded, False to fall back to progressive path
+        """
+        build_start = time.monotonic()
+
+        # ═══════════════════════════════════════════════════════════════════
+        # CHECK 1: Is aopipeline enabled in config?
+        # ═══════════════════════════════════════════════════════════════════
+        if not getattr(CFG.autoortho, 'live_aopipeline_enabled', True):
+            return False
+
+        # ═══════════════════════════════════════════════════════════════════
+        # CHECK 2: Is native DDS module available?
+        # ═══════════════════════════════════════════════════════════════════
+        native_dds = _get_native_dds()
+        if native_dds is None:
+            return False
+
+        # ═══════════════════════════════════════════════════════════════════
+        # CHECK 3: Is buffer pool available?
+        # ═══════════════════════════════════════════════════════════════════
+        pool = _get_dds_buffer_pool()
+        if pool is None:
+            return False
+
+        # ═══════════════════════════════════════════════════════════════════
+        # CHECK 4: Are streaming builder imports available?
+        # ═══════════════════════════════════════════════════════════════════
+        try:
+            from autoortho.aopipeline.AoDDS import get_default_builder_pool
+            from autoortho.aopipeline.fallback_resolver import FallbackResolver, TimeBudget as FBTimeBudget
+        except ImportError:
+            try:
+                from aopipeline.AoDDS import get_default_builder_pool
+                from aopipeline.fallback_resolver import FallbackResolver, TimeBudget as FBTimeBudget
+            except ImportError:
+                return False
+
+        builder_pool = get_default_builder_pool()
+        if builder_pool is None:
+            return False
+
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 1: Collect chunk JPEGs (always return partial)
+        # ═══════════════════════════════════════════════════════════════════
+        jpeg_datas = self._collect_chunk_jpegs(
+            self.max_zoom,
+            time_budget=time_budget,
+            min_available_ratio=1.0,
+            return_partial=True
+        )
+        if jpeg_datas is None:
+            return False
+
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 2: Resolve fallbacks for missing indices (before builder)
+        # ═══════════════════════════════════════════════════════════════════
+        missing_indices = [i for i, d in enumerate(jpeg_datas) if d is None]
+        fallback_results = {}  # {index: rgba_bytes_or_None}
+        mm0_fallback = []
+        mm0_missing = []
+
+        fallback_level = self._get_fallback_level()
+
+        dxt_format = CFG.pydds.format.upper()
+        dxt_format = "BC1" if dxt_format in ("DXT1", "BC1") else "BC3"
+        missing_color = tuple(CFG.autoortho.missing_color[:3]) if hasattr(CFG.autoortho, 'missing_color') else (66, 77, 55)
+
+        if missing_indices and fallback_level > 0:
+            resolver = FallbackResolver(
+                cache_dir=self.cache_dir,
+                maptype=self.maptype,
+                tile_col=self.col,
+                tile_row=self.row,
+                tile_zoom=self.max_zoom,
+                fallback_level=fallback_level,
+                max_mipmap=self.max_mipmap,
+                downloader=None
+            )
+            resolver.set_mipmap_images(self.imgs)
+
+            fb_budget_seconds = time_budget.remaining if (time_budget and not time_budget.exhausted) else float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
+            max_workers = min(8, len(missing_indices))
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def resolve_one(idx):
+                chunk_col = self.col + (idx % self.chunks_per_row)
+                chunk_row = self.row + (idx // self.chunks_per_row)
+                fb_budget = FBTimeBudget(fb_budget_seconds) if fb_budget_seconds > 0 else None
+                return idx, resolver.resolve(chunk_col, chunk_row, self.max_zoom,
+                                             target_mipmap=0, time_budget=fb_budget)
+
+            try:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(resolve_one, i): i for i in missing_indices}
+                    deadline = time.monotonic() + min(fb_budget_seconds, 10.0)
+                    for future in as_completed(futures, timeout=max(0.1, deadline - time.monotonic())):
+                        try:
+                            idx, rgba = future.result(timeout=0.1)
+                            fallback_results[idx] = rgba
+                        except Exception:
+                            fallback_results[futures[future]] = None
+            except Exception:
+                pass  # Timeout — remaining indices will be marked missing
+
+        # ═══════════════════════════════════════════════════════════════════
+        # STEP 3: Acquire streaming builder (short timeout)
+        # ═══════════════════════════════════════════════════════════════════
+        config = {
+            'chunks_per_side': self.chunks_per_row,
+            'format': dxt_format,
+            'missing_color': missing_color,
+        }
+        builder_timeout = max(1.0, time_budget.remaining if time_budget and not time_budget.exhausted else 5.0)
+        builder = builder_pool.acquire(config=config, timeout=builder_timeout)
+        if not builder:
+            log.debug(f"_try_unified_build: builder pool timeout for {self.id}")
+            return False
+
+        jpeg_refs_for_nocopy = []
+        try:
+            # ═══════════════════════════════════════════════════════════
+            # STEP 4: Feed data to builder
+            # ═══════════════════════════════════════════════════════════
+
+            # 4a. Batch-add all available JPEGs (zero-copy)
+            ready_chunks = [(i, data) for i, data in enumerate(jpeg_datas) if data is not None]
+            if ready_chunks:
+                builder.add_chunks_batch_nocopy(ready_chunks, jpeg_refs_for_nocopy)
+
+            # 4b. Add resolved fallback images
+            for idx, rgba in fallback_results.items():
+                if rgba is not None:
+                    builder.add_fallback_image(idx, rgba)
+                    mm0_fallback.append(idx)
+                else:
+                    builder.mark_missing(idx)
+                    mm0_missing.append(idx)
+
+            # 4c. Mark unresolved missing chunks
+            for idx in missing_indices:
+                if idx not in fallback_results:
+                    builder.mark_missing(idx)
+                    mm0_missing.append(idx)
+
+            # ═══════════════════════════════════════════════════════════
+            # STEP 5: Acquire DDS buffer
+            # ═══════════════════════════════════════════════════════════
+            acquire_timeout = max(1.0, time_budget.remaining if time_budget and not time_budget.exhausted else 5.0)
+            try:
+                buffer, buffer_id = pool.acquire(timeout=acquire_timeout, priority=PRIORITY_LIVE)
+            except TimeoutError:
+                log.debug(f"_try_unified_build: buffer pool timeout for {self.id}")
+                return False
+
+            try:
+                # ═══════════════════════════════════════════════════════
+                # STEP 6: Finalize (parallel C call)
+                # ═══════════════════════════════════════════════════════
+                with _native_build_context():
+                    result = builder.finalize(buffer, max_threads=_compute_thread_budget())
+
+                if result.success and result.bytes_written >= 128:
+                    dds_bytes = bytes(buffer[:result.bytes_written])
+                    if self._populate_dds_from_prebuilt(dds_bytes):
+                        build_time = (time.monotonic() - build_start) * 1000
+                        log.debug(f"_try_unified_build: SUCCESS for {self.id} in {build_time:.0f}ms")
+                        bump('unified_build_success')
+
+                        # Store to persistent cache (non-blocking)
+                        if dynamic_dds_cache is not None:
+                            try:
+                                dynamic_dds_cache.store(self.id, self.max_zoom, dds_bytes, self,
+                                                        mm0_missing_indices=mm0_missing or None,
+                                                        mm0_fallback_indices=mm0_fallback or None)
+                            except Exception:
+                                pass
+                        return True
+
+                log.debug(f"_try_unified_build: finalize failed for {self.id}")
+                bump('unified_build_finalize_failed')
+                return False
+
+            finally:
+                pool.release(buffer_id)
+
+        except Exception as e:
+            log.debug(f"_try_unified_build: exception for {self.id}: {e}")
+            bump('unified_build_exception')
+            return False
+
+        finally:
+            jpeg_refs_for_nocopy.clear()
+            builder.release()
+            # Clear stale collection data to free memory
+            self._last_collected_jpegs = None
+            self._last_collected_missing = None
+            self._last_collected_ratio = None
+
     def _try_streaming_aopipeline_build(self, time_budget=None) -> bool:
         """
         Build DDS using streaming aopipeline with fallback integration.
@@ -6145,66 +6827,18 @@ class Tile(object):
                     budget_seconds = float(getattr(CFG.autoortho, 'tile_time_budget', 30.0))
                     aopipeline_budget = TimeBudget(budget_seconds)
                 
-                # ═══════════════════════════════════════════════════════════════
-                # AOPIPELINE FLOW:
-                # ═══════════════════════════════════════════════════════════════
-                # 1. Batch aopipeline uses the request's time_budget for chunk collection
-                # 2. If threshold met: build directly (fast path)
-                # 3. If threshold NOT met:
-                #    - Fallbacks DISABLED: build as-is with missing_color
-                #    - Fallbacks ENABLED: hand to streaming with fallback_timeout budget
-                # ═══════════════════════════════════════════════════════════════
-                
-                # Check fallback configuration
-                fallback_level = self._get_fallback_level()
-                fallbacks_enabled = fallback_level > 0  # 0 = none, 1 = cache, 2 = full
-                
-                if fallbacks_enabled:
-                    # FALLBACKS ENABLED: Try batch, then streaming for fallback resolution
-                    
-                    # Try batch aopipeline (uses the request's time_budget)
-                    if self._try_aopipeline_build(time_budget=aopipeline_budget, force_build_partial=False):
-                        log.debug(f"GET_BYTES: batch aopipeline succeeded for {self.id}")
-                        return True
-                    
-                    # Batch didn't reach threshold - use streaming as fallback route
-                    # Give streaming a NEW budget based on fallback_timeout
-                    if getattr(CFG.autoortho, 'streaming_builder_enabled', True):
-                        fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
-                        streaming_budget = TimeBudget(fallback_timeout)
-                        log.debug(f"GET_BYTES: batch threshold not met, using streaming with "
-                                  f"fallback_timeout={fallback_timeout}s for {self.id}")
-                        
-                        if self._try_streaming_aopipeline_build(time_budget=streaming_budget):
-                            log.debug(f"GET_BYTES: streaming builder succeeded for {self.id}")
-                            return True
-                    
-                    # Both failed - continue to progressive path
-                    log.debug(f"GET_BYTES: aopipeline build failed, using progressive path for {self.id}")
-                    bump('live_aopipeline_fallback')
+                # ═══════════════════════════════════════════════════════
+                # UNIFIED BUILD: Collect chunks → resolve fallbacks →
+                # build entire DDS with parallel C pipeline in one pass
+                # ═══════════════════════════════════════════════════════
+                if self._try_unified_aopipeline_build(time_budget=aopipeline_budget):
+                    log.debug(f"GET_BYTES: unified aopipeline succeeded for {self.id}")
+                    return True
 
-                    # BUDGET PROTECTION: Give progressive path a minimum budget.
-                    # Batch collection may have consumed the entire original budget,
-                    # leaving 0 seconds for progressive. Without this, the progressive
-                    # path can't download any chunks and fills mm0 with missing_color.
-                    min_progressive_budget = float(getattr(CFG.autoortho, 'progressive_min_budget', 15.0))
-                    if time_budget is not None and time_budget.remaining < min_progressive_budget:
-                        log.debug(f"GET_BYTES: Budget exhausted ({time_budget.remaining:.1f}s remaining), "
-                                  f"granting progressive minimum budget of {min_progressive_budget}s")
-                        time_budget = TimeBudget(min_progressive_budget)
-                    
-                else:
-                    # FALLBACKS DISABLED: Build with whatever batch collects
-                    # force_build_partial=True means build even if threshold not met
-                    
-                    if self._try_aopipeline_build(time_budget=aopipeline_budget, force_build_partial=True):
-                        log.debug(f"GET_BYTES: batch aopipeline (no fallbacks) succeeded for {self.id}")
-                        return True
-                    
-                    # Build failed (shouldn't happen with force_build_partial, but handle it)
-                    log.debug(f"GET_BYTES: batch aopipeline failed even with force_build_partial for {self.id}")
-                    bump('live_aopipeline_force_failed')
-                    
+                # Unified build failed — continue to progressive path
+                log.debug(f"GET_BYTES: unified build failed, using progressive for {self.id}")
+                bump('unified_build_fallback_to_progressive')
+
             except Exception as e:
                 log.debug(f"GET_BYTES: aopipeline exception: {e}, using progressive path")
                 bump('live_aopipeline_exception')
