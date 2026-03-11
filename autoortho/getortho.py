@@ -10,7 +10,6 @@ import time
 import threading
 import concurrent.futures
 import uuid
-import asyncio
 import math
 import socket
 import tracemalloc
@@ -30,13 +29,7 @@ except ImportError:
     import pydds
 
 import requests
-import httpx
 import psutil
-
-# Silence httpx/httpcore/h2 loggers — they log every request at INFO/DEBUG
-for _logger_name in ('httpx', 'httpcore', 'httpcore.connection', 'httpcore.http11',
-                      'httpcore.http2', 'httpcore.proxy', 'hpack', 'h2'):
-    logging.getLogger(_logger_name).setLevel(logging.WARNING)
 
 try:
     from autoortho.aoimage import AoImage
@@ -774,51 +767,23 @@ MEMTRACE = False
 log = logging.getLogger(__name__)
 
 
-def create_http_session(pool_size=4):
+def create_http_session(pool_size=10):
     """
-    Factory function to create an HTTP/2-capable session with connection pooling.
+    Factory function to create an HTTP session with connection pooling.
 
-    Uses httpx with HTTP/2 support (automatic ALPN negotiation, falls back to
-    HTTP/1.1 for servers that don't support HTTP/2). Enables TCP_NODELAY
-    (disables Nagle's algorithm) and SO_KEEPALIVE for lower latency.
+    Returns a requests session configured with connection pooling.
     """
-    transport = httpx.HTTPTransport(
-        http2=True,
-        retries=0,
-        limits=httpx.Limits(
-            max_connections=pool_size,
-            max_keepalive_connections=pool_size,
-            keepalive_expiry=30.0,
-        ),
-        socket_options=[
-            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
-            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
-        ],
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+        max_retries=0,
+        pool_block=True,
     )
-    client = httpx.Client(
-        http2=True,
-        transport=transport,
-        follow_redirects=True,
-        timeout=httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=10.0),
-    )
-    log.debug(f"Created httpx client (pool_size={pool_size}, http2=True)")
-    return client
-
-
-# Exception types for HTTP error handling (httpx equivalents of requests exceptions)
-_CONNECTION_ERRORS = (httpx.ConnectError, httpx.RemoteProtocolError)
-_TIMEOUT_ERRORS = (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout, httpx.ConnectTimeout)
-
-
-# Module-level fallback session for Chunk.get() when no session is injected
-_fallback_session = None
-
-def _get_fallback_session():
-    """Get or create a module-level fallback httpx session."""
-    global _fallback_session
-    if _fallback_session is None:
-        _fallback_session = create_http_session(pool_size=4)
-    return _fallback_session
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    log.debug(f"Created requests session (pool_size={pool_size})")
+    return session
 
 
 # JPEG decode concurrency: auto-tuned for optimal performance
@@ -1396,13 +1361,12 @@ class Getter(object):
         self.localdata.idx = idx
         
         # Create thread-local session with connection pooling
-        # pool_size=4 is sufficient: each worker makes sequential requests,
-        # and serverlist has at most 4 server variants for keep-alive reuse
         try:
-            self.localdata.session = create_http_session(pool_size=4)
+            pool_size = max(4, int(int(CFG.autoortho.fetch_threads) * 1.5))
+            self.localdata.session = create_http_session(pool_size=pool_size)
         except Exception as _e:
             log.warning(f"Failed to initialize thread-local session: {_e}")
-            self.localdata.session = create_http_session(pool_size=4)
+            self.localdata.session = requests.Session()
         
         while self.WORKING.is_set():
             try:
@@ -1526,7 +1490,7 @@ class ChunkGetter(Getter):
             return True
 
         kwargs['idx'] = self.localdata.idx
-        kwargs['session'] = getattr(self.localdata, 'session', None) or _get_fallback_session()
+        kwargs['session'] = getattr(self.localdata, 'session', None) or requests
         result = obj.get(*args, **kwargs)
         
         chunk_id = getattr(obj, 'chunk_id', None)
@@ -1539,460 +1503,16 @@ class ChunkGetter(Getter):
         return result
 
 
-# ============================================================================
-# ASYNC CHUNK DOWNLOADER
-# ============================================================================
-# High-throughput async download engine using httpx.AsyncClient with HTTP/2.
-# Runs a single asyncio event loop in a dedicated thread, managing hundreds
-# of concurrent HTTP requests over a small number of TCP connections.
-# The sync API (submit/stop) is preserved for all callers.
-# ============================================================================
-
-class _AsyncQueueShim:
-    """Compatibility shim exposing the async priority queue size to sync callers."""
-
-    def __init__(self, async_queue_ref):
-        self._ref = async_queue_ref  # callable returning the asyncio.PriorityQueue
-
-    def qsize(self):
-        q = self._ref()
-        return q.qsize() if q else 0
-
-    def empty(self):
-        q = self._ref()
-        return q.empty() if q else True
-
-
-class AsyncChunkDownloader:
-    """Async HTTP download engine running in a dedicated thread.
-
-    Replaces the N-thread ChunkGetter model with a single asyncio event loop
-    that can sustain hundreds of concurrent HTTP requests over a small number
-    of TCP connections via HTTP/2 multiplexing.
-
-    Downloads are dispatched through an asyncio.PriorityQueue so that live
-    chunks (priority=0) are always served before prefetch chunks (priority=100+)
-    when per-host connection slots are contended.
-
-    The sync API (submit/stop) is preserved identically for all callers.
-    """
-    _queued_chunk_ids = set()
-    _queued_lock = threading.Lock()
-
-    # Monotonic counter to break priority ties in FIFO order
-    _submit_seq = 0
-
-    def __init__(self, max_concurrent=500, num_consumers=None):
-        self.max_concurrent = max_concurrent
-        # Consumer count = max_concurrent: each consumer holds one in-flight
-        # request. asyncio coroutines are cheap (~2KB each), so scaling to
-        # thousands is fine — the real concurrency limit is the TCP connection
-        # pool and the server's HTTP/2 MAX_CONCURRENT_STREAMS setting.
-        self._num_consumers = num_consumers or max_concurrent
-        self._loop = None
-        self._thread = None
-        self._session = None
-        self._priority_queue = None  # asyncio.PriorityQueue, created in _main()
-        self._server_counter = 0
-        self._consumer_tasks = []
-        self.WORKING = threading.Event()
-        self.WORKING.set()
-        self._ready = threading.Event()
-        self._queue_shim = _AsyncQueueShim(lambda: self._priority_queue)
-        self.count = 0
-
-        # Start the event loop thread
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name="async-downloader",
-            daemon=True
-        )
-        self._thread.start()
-        if not self._ready.wait(timeout=10.0):
-            log.error("AsyncChunkDownloader: event loop failed to start within 10s")
-
-    @property
-    def queue(self):
-        """Compatibility shim for code that checks chunk_getter.queue."""
-        return self._queue_shim
-
-    def _run_loop(self):
-        """Run the asyncio event loop in a dedicated thread."""
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._main())
-        except Exception as e:
-            log.error(f"AsyncChunkDownloader event loop error: {e}")
-        finally:
-            try:
-                self._loop.close()
-            except Exception:
-                pass
-
-    async def _main(self):
-        """Main coroutine: create async client, consumers, and wait for shutdown."""
-        # max_connections: total TCP connections allowed (high to avoid pool exhaustion)
-        # max_keepalive_connections: how many idle connections to keep alive
-        # With HTTP/2, each connection multiplexes many streams, but servers
-        # typically limit to ~100-128 concurrent streams per connection.
-        # Opening multiple connections spreads the load across TCP windows.
-        max_conns = max(20, self.max_concurrent // 10)
-        transport = httpx.AsyncHTTPTransport(
-            http2=True,
-            retries=0,
-            limits=httpx.Limits(
-                max_connections=max_conns,
-                max_keepalive_connections=max_conns,
-                keepalive_expiry=30.0,
-            ),
-        )
-        self._session = httpx.AsyncClient(
-            http2=True,
-            transport=transport,
-            follow_redirects=True,
-            timeout=httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=10.0),
-        )
-        self._priority_queue = asyncio.PriorityQueue()
-
-        # Spawn consumer coroutines that drain the priority queue
-        for i in range(self._num_consumers):
-            task = asyncio.ensure_future(self._consumer(i))
-            self._consumer_tasks.append(task)
-
-        log.debug(f"AsyncChunkDownloader: {self._num_consumers} consumers started")
-        self._ready.set()
-
-        # Keep running until stop() is called
-        try:
-            while self.WORKING.is_set():
-                await asyncio.sleep(0.1)
-        finally:
-            # Cancel all consumer tasks
-            for task in self._consumer_tasks:
-                task.cancel()
-            await asyncio.gather(*self._consumer_tasks, return_exceptions=True)
-            self._consumer_tasks.clear()
-            try:
-                await self._session.aclose()
-            except Exception:
-                pass
-            await asyncio.sleep(0.25)  # Allow SSL cleanup
-
-    async def _consumer(self, consumer_id):
-        """Consumer coroutine: drains priority queue in priority order.
-
-        Each consumer picks the highest-priority chunk from the queue,
-        acquires the per-host semaphore, and performs the download.
-        This ensures live chunks (priority=0) are always served before
-        prefetch chunks (priority=100+) when host slots are contended.
-        """
-        while self.WORKING.is_set():
-            try:
-                # Wait for a chunk from the priority queue
-                try:
-                    priority, seq, chunk, kwargs = await asyncio.wait_for(
-                        self._priority_queue.get(), timeout=1.0
-                    )
-                except asyncio.TimeoutError:
-                    continue
-
-                chunk.in_queue = False
-                chunk.in_flight = True
-
-                try:
-                    success = await self._do_http_get(chunk, **kwargs)
-
-                    chunk_id = getattr(chunk, 'chunk_id', None)
-                    if chunk_id:
-                        with self._queued_lock:
-                            self._queued_chunk_ids.discard(chunk_id)
-                            if success:
-                                bump('chunk_download_completed')
-                                self.count += 1
-
-                    if not success and not chunk.permanent_failure:
-                        chunk.in_flight = False
-                        self.submit(chunk, **kwargs)
-                except Exception as err:
-                    log.error(f"Consumer {consumer_id} ERROR {err} getting: {chunk}, re-submit.")
-                    if not chunk.permanent_failure:
-                        chunk.in_flight = False
-                        self.submit(chunk, **kwargs)
-                finally:
-                    chunk.in_flight = False
-                    self._priority_queue.task_done()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                log.error(f"Consumer {consumer_id} unexpected error: {e}")
-                await asyncio.sleep(0.1)
-
-    def submit(self, obj, *args, **kwargs):
-        """Submit chunk for download -- IDENTICAL API to ChunkGetter.submit()."""
-        if obj.permanent_failure:
-            bump('submit_skip_permanent_failure')
-            return
-
-        chunk_id = getattr(obj, 'chunk_id', None)
-
-        # Check if already queued (fast path)
-        if chunk_id:
-            with self._queued_lock:
-                if chunk_id in self._queued_chunk_ids:
-                    bump('submit_skip_id_already_queued')
-                    return
-
-        # Per-object coalescing checks
-        if obj.ready.is_set():
-            bump('submit_skip_already_ready')
-            return
-        if obj.in_queue:
-            bump('submit_skip_already_queued')
-            return
-        if obj.in_flight:
-            bump('submit_skip_in_flight')
-            return
-
-        obj.in_queue = True
-
-        # Add to tracked set
-        if chunk_id:
-            with self._queued_lock:
-                self._queued_chunk_ids.add(chunk_id)
-
-        # Enqueue with priority ordering: (priority, sequence, chunk, kwargs)
-        # Sequence number breaks ties in FIFO order within the same priority
-        priority = getattr(obj, 'priority', 0)
-        seq = AsyncChunkDownloader._submit_seq
-        AsyncChunkDownloader._submit_seq += 1
-
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(
-                self._priority_queue.put_nowait,
-                (priority, seq, obj, kwargs)
-            )
-        else:
-            log.warning(f"AsyncChunkDownloader: loop not running, cannot submit {obj}")
-            obj.in_queue = False
-            if chunk_id:
-                with self._queued_lock:
-                    self._queued_chunk_ids.discard(chunk_id)
-
-    async def _do_http_get(self, chunk, timeout=None, max_attempts=None, **kwargs):
-        """Async reimplementation of Chunk.get() HTTP logic using httpx.AsyncClient."""
-        chunk.download_started.set()
-
-        # Check cache first (sync, fast)
-        if chunk.get_cache():
-            chunk.ready.set()
-            return True
-
-        _max_attempts = max_attempts or MAX_TOTAL_ATTEMPTS
-
-        # Total attempt limit
-        if chunk.attempt >= _max_attempts:
-            log.warning(f"Chunk {chunk} exceeded {_max_attempts} total attempts, marking as permanently failed")
-            chunk.permanent_failure = True
-            chunk.failure_reason = "max_total_attempts"
-            chunk.data = b''
-            chunk.ready.set()
-            bump('chunk_max_attempts_exhausted')
-            try:
-                if tile_completion_tracker is not None and chunk.tile_id:
-                    tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
-            except Exception:
-                pass
-            return True
-
-        if not chunk.starttime:
-            chunk.starttime = time.time()
-
-        # Build URL using shared helper (server rotation via atomic counter)
-        server_idx = self._server_counter
-        self._server_counter = (self._server_counter + 1) % 1000000
-        _url, header, server, MAPTYPES_WITH_SERVER = _build_chunk_url(chunk, server_idx=server_idx)
-
-        # Capped backoff (async sleep)
-        backoff_sleep = min(2.0, chunk.attempt / 10.0)
-        if backoff_sleep > 0:
-            await asyncio.sleep(backoff_sleep)
-        chunk.attempt += 1
-
-        # Convert timeout
-        _raw_timeout = timeout or (5, 20)
-        if isinstance(_raw_timeout, tuple):
-            _http_timeout = httpx.Timeout(connect=_raw_timeout[0], read=_raw_timeout[1], write=5.0, pool=10.0)
-        else:
-            _http_timeout = _raw_timeout
-
-        log.debug(f"Async requesting {chunk.url} ..")
-
-        resp = None
-        try:
-            resp = await self._session.get(chunk.url, headers=header, timeout=_http_timeout)
-            status_code = resp.status_code
-
-            # APPLE token rotation
-            if chunk.maptype.upper() == "APPLE" and status_code in (403, 410):
-                log.warning("APPLE tile got %s; rotating token and retrying", status_code)
-                apple_token_service.reset_apple_maps_token()
-                _url, header, server, MAPTYPES_WITH_SERVER = _build_chunk_url(chunk, server_idx=server_idx)
-                await resp.aclose()
-                resp = await self._session.get(chunk.url, headers=header, timeout=_http_timeout)
-                status_code = resp.status_code
-
-            if status_code != 200:
-                log.warning(f"Failed with status {status_code} to get chunk {chunk}" +
-                            (" on server " + server if chunk.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
-                bump_many({f"http_{status_code}": 1, "req_err": 1})
-
-                # Permanent failure
-                if status_code in PERMANENT_FAILURE_CODES:
-                    log.info(f"Chunk {chunk} permanently failed with {status_code}")
-                    chunk.permanent_failure = True
-                    chunk.failure_reason = status_code
-                    chunk.data = b''
-                    chunk.ready.set()
-                    bump(f'chunk_permanent_fail_{status_code}')
-                    try:
-                        if tile_completion_tracker is not None and chunk.tile_id:
-                            tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
-                    except Exception:
-                        pass
-                    return True
-
-                # Transient failure with retry limits
-                if status_code in TRANSIENT_FAILURE_CODES:
-                    chunk.retry_count += 1
-                    max_retries = MAX_TRANSIENT_RETRIES.get(status_code, 5)
-                    if chunk.retry_count >= max_retries:
-                        log.warning(f"Chunk {chunk} exceeded {max_retries} retries for {status_code}")
-                        chunk.permanent_failure = True
-                        chunk.failure_reason = f"{status_code}_max_retries"
-                        chunk.data = b''
-                        chunk.ready.set()
-                        bump(f'chunk_transient_fail_{status_code}_exhausted')
-                        try:
-                            if tile_completion_tracker is not None and chunk.tile_id:
-                                tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
-                        except Exception:
-                            pass
-                        return True
-                    # Rate limit backoff
-                    if status_code == 429:
-                        backoff_time = min(5, chunk.retry_count * 0.5)
-                        log.debug(f"Rate limited, backing off {backoff_time}s")
-                        await asyncio.sleep(backoff_time)
-                    bump(f'chunk_transient_fail_{status_code}_retry')
-
-                # Error rate monitoring
-                err = get_stat("req_err")
-                if err > 50:
-                    ok = get_stat("req_ok")
-                    error_rate = err / (err + ok)
-                    if error_rate >= 0.10:
-                        log.error(f"Very high network error rate: {error_rate * 100:.2f}%")
-                        if error_rate >= 0.25:
-                            log.warning("Severe error rate (>=25%) detected")
-                return False
-
-            data = resp.content
-
-            if _is_jpeg(data[:3]):
-                log.debug(f"Data for {chunk} is JPEG")
-                chunk.data = data
-            else:
-                log.debug(f"Loading file {chunk} not a JPEG! {data[:3]} URL: {chunk.url}")
-                chunk.data = b''
-
-            bump('bytes_dl', len(chunk.data))
-
-        except (httpx.ConnectError, httpx.RemoteProtocolError,
-                httpx.ReadTimeout, httpx.WriteTimeout,
-                httpx.PoolTimeout, httpx.ConnectTimeout) as err:
-            chunk.attempt += 1
-            backoff = min(10.0, 0.5 * (2 ** min(chunk.attempt, 5)))
-            log.warning(f"{chunk} connection/timeout error (attempt {chunk.attempt}), "
-                        f"backoff {backoff:.1f}s: {err}")
-            await asyncio.sleep(backoff)
-            return False
-        except Exception as err:
-            log.warning(f"Failed to get chunk {chunk}. Err: {err} URL: {chunk.url}")
-            return False
-        finally:
-            if resp:
-                await resp.aclose()
-
-        chunk.fetchtime = time.monotonic() - chunk.starttime
-
-        # Signal ready IMMEDIATELY - data is in memory for consumers
-        chunk.ready.set()
-
-        # Track slow downloads
-        try:
-            duration_ms = int((chunk.fetchtime or 0) * 1000)
-            if duration_ms > 5000:
-                bump('chunk_slow_download')
-            if duration_ms > 15000:
-                bump('chunk_very_slow_download')
-        except Exception:
-            pass
-
-        # Notify tile completion tracker (BEFORE cache write)
-        try:
-            if tile_completion_tracker is not None and chunk.tile_id:
-                tile_completion_tracker.notify_chunk_ready(chunk.tile_id, chunk)
-        except Exception:
-            pass
-
-        bump('req_ok')
-
-        # Async cache write (fire-and-forget via ThreadPoolExecutor)
-        try:
-            _cache_write_executor.submit(_async_cache_write, chunk)
-        except Exception:
-            try:
-                chunk.save_cache()
-            except Exception:
-                pass
-
-        return True
-
-    def stop(self):
-        """Graceful shutdown -- preserves the Getter.stop() contract."""
-        self.WORKING.clear()
-        if self._loop and self._loop.is_running():
-            try:
-                async def _shutdown():
-                    if self._session:
-                        await self._session.aclose()
-                future = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
-                future.result(timeout=5.0)
-            except Exception:
-                pass
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread:
-            self._thread.join(timeout=10.0)
-            if self._thread.is_alive():
-                log.warning("AsyncChunkDownloader thread did not terminate")
-
-
 def _create_chunk_getter(num_workers: int):
-    """Factory: choose between async AsyncChunkDownloader and sync ChunkGetter.
-
-    When async_downloads=True (default), uses a single asyncio event loop with
-    httpx.AsyncClient for HTTP/2 multiplexed downloads (highest throughput).
-    When False, falls back to the traditional thread-per-request ChunkGetter.
     """
-    use_async = str(getattr(CFG.autoortho, 'async_downloads', 'True')).lower() == 'true'
-
-    if use_async:
-        max_concurrent = int(getattr(CFG.autoortho, 'max_concurrent_downloads', 500))
-        log.info(f"Using AsyncChunkDownloader (max_concurrent={max_concurrent})")
-        return AsyncChunkDownloader(max_concurrent=max_concurrent)
-
+    Factory function to create the chunk getter.
+    
+    Uses Python ChunkGetter with per-thread connection pooling via requests.Session.
+    Each worker thread maintains its own HTTP session for connection reuse.
+    
+    Native aopipeline components (AoCache, AoDDS) are used for cache I/O and
+    DDS building where parallel native processing provides clear benefits.
+    """
     log.info(f"Using ChunkGetter ({num_workers} workers)")
     return ChunkGetter(num_workers)
 
@@ -4814,7 +4334,7 @@ MAX_TOTAL_ATTEMPTS = 15
 def _build_chunk_url(chunk, server_idx=0):
     """Build the download URL and headers for a chunk.
 
-    Shared by both sync Chunk.get() and AsyncChunkDownloader to ensure
+    Shared helper for URL construction to ensure
     a single source of truth for URL construction across all map sources.
 
     Returns:
@@ -5067,7 +4587,7 @@ class Chunk(object):
                 log.warning(f"Failed to save cache for {self}: {e}")
                 return
 
-    def get(self, idx=0, session=None, timeout=None, max_attempts=None):
+    def get(self, idx=0, session=requests, timeout=None, max_attempts=None):
         log.debug(f"Getting {self}")
 
         # Signal that download has started (not waiting in queue anymore)
@@ -5108,20 +4628,13 @@ class Chunk(object):
         time.sleep(backoff_sleep)
         self.attempt += 1
 
-        # Convert timeout tuples to httpx.Timeout (httpx does not accept (connect, read) tuples)
-        _raw_timeout = timeout or (5, 20)
-        if isinstance(_raw_timeout, tuple):
-            _http_timeout = httpx.Timeout(connect=_raw_timeout[0], read=_raw_timeout[1], write=5.0, pool=10.0)
-        else:
-            _http_timeout = _raw_timeout
+        _http_timeout = timeout or (5, 20)
 
         log.debug(f"Requesting {self.url} ..")
-
-        _session = session or _get_fallback_session()
         resp = None
         try:
 
-            resp = _session.get(self.url, headers=header, timeout=_http_timeout)
+            resp = session.get(self.url, headers=header, timeout=_http_timeout)
             status_code = resp.status_code
 
             if self.maptype.upper() == "APPLE" and status_code in (403, 410):
@@ -5131,7 +4644,7 @@ class Chunk(object):
                 _url, header, server, MAPTYPES_WITH_SERVER = _build_chunk_url(self, server_idx=idx)
                 if resp is not None:
                     resp.close()
-                resp = _session.get(self.url, headers=header, timeout=_http_timeout)
+                resp = session.get(self.url, headers=header, timeout=_http_timeout)
                 status_code = resp.status_code
 
             if status_code != 200:
@@ -5206,7 +4719,8 @@ class Chunk(object):
 
             bump('bytes_dl', len(self.data))
                 
-        except (*_CONNECTION_ERRORS, *_TIMEOUT_ERRORS) as err:
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as err:
             self.attempt += 1
             backoff = min(10.0, 0.5 * (2 ** min(self.attempt, 5)))
             log.warning(f"{self} connection/timeout error (attempt {self.attempt}), "
@@ -5658,7 +5172,7 @@ class Tile(object):
         # For chunks not in cache, submit download requests and wait.
         # Uses the FULL remaining time_budget to maximize chunk collection.
         # This ensures batch aopipeline gets maximum opportunity to reach threshold.
-        
+
         # Determine download wait time - use FULL remaining budget
         if time_budget and not time_budget.exhausted:
             wait_time = time_budget.remaining
@@ -6857,20 +6371,20 @@ class Tile(object):
                      f"already_attempted={self._aopipeline_attempted} "
                      f"retrieved={self.dds.mipmap_list[0].retrieved if self.dds and self.dds.mipmap_list else 'N/A'}")
         
-        if (mipmap == 0 and 
+        if (mipmap == 0 and
             request_reaches_mipmap_0_data and
             is_pure_mipmap_request and  # Don't trigger for header reads (offset=0)
             not self._aopipeline_attempted and
             self.dds is not None and
             len(self.dds.mipmap_list) > 0 and
             not self.dds.mipmap_list[0].retrieved):
-            
+
             # DIAGNOSTIC: Track when we actually trigger aopipeline for mipmap 0
             bump('aopipeline_mipmap_0_triggered')
             log.info(f"AOPIPELINE_TRIGGER: {self.id} offset={offset} length={length}")
-            
+
             self._aopipeline_attempted = True  # Prevent retry loops on failure
-            
+
             try:
                 # Use the per-request budget passed from read_dds_bytes()
                 # This ensures each X-Plane read() gets its own independent budget
