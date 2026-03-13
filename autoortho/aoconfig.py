@@ -290,6 +290,8 @@ live_aopipeline_enabled = True
 # 0.9 = build at 90%%, heal remaining 10%% when they arrive (faster first texture, then corrected)
 # 0.5 = build at 50%% (fastest first texture, more healing work)
 # Recommended: 1.0 (quality, no artifacts), 0.9 (balanced), 0.8 (faster)
+# DEPRECATED: min_chunk_ratio is now always 1.0 (require all chunks).
+# Kept for config file backwards compatibility — value is ignored.
 live_aopipeline_min_chunk_ratio = 1.0
 # === STREAMING BUILDER SETTINGS ===
 # Enable streaming builder for incremental DDS generation (True/False)

@@ -108,7 +108,14 @@ def test_get_bytes_mip_span(tmpdir):
     mm1start = tile.dds.mipmap_list[1].startpos
     ret = tile.get_bytes(mm0end-16384, 32768)
     assert ret
-    
+
+    # Explicitly request mipmap 1 as well — the progressive path builds
+    # each mipmap on demand (native all-at-once path requires 100% chunks
+    # which aren't available without network).
+    mm1end = tile.dds.mipmap_list[1].endpos
+    ret1 = tile.get_bytes(mm1start, mm1end - mm1start)
+    assert ret1
+
     testfile = tile.write()
     with open(testfile, 'rb') as h:
         #h.seek(20709504)
@@ -119,8 +126,6 @@ def test_get_bytes_mip_span(tmpdir):
         data1 = h.read(8)
 
     assert data0 != b'\x00'*8
-    # With aopipeline optimization, when mipmap 0 is built, all mipmaps are
-    # populated together for performance. So mipmap 1 will also have data.
     assert data1 != b'\x00'*8
 
 

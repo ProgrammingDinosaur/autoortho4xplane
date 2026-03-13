@@ -1382,11 +1382,14 @@ class Getter(object):
                 # Mark chunk as in-flight (Chunk always has these attributes)
                 obj.in_queue = False
                 obj.in_flight = True
-                
+
                 if not self.get(obj, *args, **kwargs):
-                    # Check if chunk is permanently failed before re-submitting
+                    # Check if chunk is permanently failed or cancelled before re-submitting
                     if obj.permanent_failure:
                         log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
+                        continue
+                    if getattr(obj, 'cancelled', False):
+                        log.debug(f"Chunk {obj} cancelled, not re-submitting")
                         continue
                     log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
                     # CRITICAL: Clear in_flight BEFORE re-submitting, otherwise submit()
@@ -1395,9 +1398,12 @@ class Getter(object):
                     self.submit(obj, *args, **kwargs)
             except Exception as err:
                 log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
-                # Don't re-submit if permanently failed
+                # Don't re-submit if permanently failed or cancelled
                 if obj.permanent_failure:
                     log.debug(f"Chunk {obj} permanently failed during exception, not re-submitting")
+                    continue
+                if getattr(obj, 'cancelled', False):
+                    log.debug(f"Chunk {obj} cancelled during exception, not re-submitting")
                     continue
                 # CRITICAL: Clear in_flight BEFORE re-submitting
                 obj.in_flight = False
@@ -1418,9 +1424,12 @@ class Getter(object):
         raise NotImplementedError
 
     def submit(self, obj, *args, **kwargs):
-        # Don't queue permanently failed chunks (Chunk always has this attribute)
+        # Don't queue permanently failed or cancelled chunks
         if obj.permanent_failure:
             bump('submit_skip_permanent_failure')
+            return
+        if getattr(obj, 'cancelled', False):
+            bump('submit_skip_cancelled')
             return
         # Coalesce duplicate chunk submissions
         if obj.ready.is_set():
@@ -1445,6 +1454,9 @@ class ChunkGetter(Getter):
         """Submit chunk for download with duplicate prevention."""
         if obj.permanent_failure:
             bump('submit_skip_permanent_failure')
+            return
+        if getattr(obj, 'cancelled', False):
+            bump('submit_skip_cancelled')
             return
         
         chunk_id = getattr(obj, 'chunk_id', None)
@@ -2905,9 +2917,7 @@ class TileCompletionTracker:
         self._cleanup_interval = 60  # Cleanup every 60 seconds
         # Build threshold: trigger DDS build when this fraction of chunks is ready.
         # build_from_jpegs handles None entries for missing chunks; healing fills gaps later.
-        self._build_threshold = float(getattr(
-            CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0
-        )) if hasattr(CFG, 'autoortho') else 0.9
+        self._build_threshold = 1.0  # Always require all chunks for quality
     
     def start_tracking(self, tile, zoom: int) -> None:
         """
@@ -4054,6 +4064,199 @@ def _dispatch_healing(tile):
     t.start()
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Network Healing: re-download missing/fallback chunks on tile reopen
+# ═══════════════════════════════════════════════════════════════════
+
+# Semaphore to limit concurrent network healing threads
+_network_healing_semaphore = threading.Semaphore(2)
+
+
+def _dispatch_network_healing(tile, indices_to_heal):
+    """Dispatch background network healing for specific chunk indices.
+
+    Called by DynamicDDSCache.load() when disk-only healing cannot cover
+    all missing/fallback chunks.  Spawns a daemon thread that downloads
+    the chunks through the normal pipeline (download → fallback → patch).
+    """
+    if not indices_to_heal or dynamic_dds_cache is None:
+        # Clean up the in-progress guard since we won't actually heal
+        if dynamic_dds_cache is not None:
+            dynamic_dds_cache.clear_network_healing(tile.id, tile.max_zoom)
+        return
+    if getattr(tile, '_closed', False):
+        dynamic_dds_cache.clear_network_healing(tile.id, tile.max_zoom)
+        return
+    if chunk_getter is None:
+        dynamic_dds_cache.clear_network_healing(tile.id, tile.max_zoom)
+        return
+
+    t = threading.Thread(
+        target=_do_network_healing,
+        args=(tile, list(indices_to_heal)),
+        daemon=True,
+        name=f"net_heal_{tile.id}")
+    t.start()
+
+
+def _do_network_healing(tile, indices_to_heal):
+    """Background thread: download missing chunks and patch the cached DDS.
+
+    Follows the same flow as the streaming pipeline:
+    1. Create Chunk objects for each missing index
+    2. Submit to chunk_getter for download
+    3. Wait with generous timeout (background — no urgency)
+    4. Run fallback resolver for any that failed
+    5. Patch the DDS via dynamic_dds_cache.patch_missing_chunks()
+    """
+    tile_id = tile.id
+    max_zoom = tile.max_zoom
+
+    if not _network_healing_semaphore.acquire(timeout=10.0):
+        log.debug(f"Network healing: semaphore timeout for {tile_id}, deferring")
+        if dynamic_dds_cache is not None:
+            dynamic_dds_cache.clear_network_healing(tile_id, max_zoom)
+        return
+
+    try:
+        if getattr(tile, '_closed', False):
+            return
+
+        chunks_per_row = getattr(tile, 'chunks_per_row', 0)
+        if not chunks_per_row:
+            return
+
+        # Background healing uses a generous timeout — no frame deadline
+        healing_timeout = max(10.0, float(getattr(CFG.autoortho, 'maxwait', 2.0)) * 3)
+
+        # ── Step 1: Create Chunk objects and submit for download ──
+        heal_chunks = {}  # idx -> Chunk
+        for idx in indices_to_heal:
+            if getattr(tile, '_closed', False):
+                return
+            cx = idx % chunks_per_row
+            cy = idx // chunks_per_row
+            col = tile.col + cx
+            row = tile.row + cy
+            chunk = Chunk(col, row, tile.maptype, max_zoom,
+                          priority=5,  # Lower than live (0), higher than prefetch
+                          cache_dir=tile.cache_dir,
+                          tile_id=None)  # No completion tracking for healing chunks
+            heal_chunks[idx] = chunk
+
+        # Submit chunks that aren't already cached
+        if chunk_getter is None:
+            return
+        for idx, chunk in heal_chunks.items():
+            if not chunk.ready.is_set():
+                chunk_getter.submit(chunk)
+
+        # ── Step 2: Wait for downloads ──
+        deadline = time.monotonic() + healing_timeout
+        for idx, chunk in heal_chunks.items():
+            if getattr(tile, '_closed', False):
+                for c in heal_chunks.values():
+                    c.cancelled = True
+                return
+            remaining = max(0.05, deadline - time.monotonic())
+            chunk.ready.wait(timeout=remaining)
+
+        # ── Step 3: Collect results, run fallback for failures ──
+        chunk_jpegs = {}
+        failed_indices = []
+
+        for idx, chunk in heal_chunks.items():
+            if chunk.ready.is_set() and chunk.data:
+                chunk_jpegs[idx] = chunk.data
+            else:
+                failed_indices.append(idx)
+
+        if failed_indices and not getattr(tile, '_closed', False):
+            try:
+                from autoortho.aopipeline.fallback_resolver import FallbackResolver, TimeBudget as FBTimeBudget
+            except ImportError:
+                try:
+                    from aopipeline.fallback_resolver import FallbackResolver, TimeBudget as FBTimeBudget
+                except ImportError:
+                    FallbackResolver = None
+
+            if FallbackResolver is not None:
+                fallback_level_str = str(getattr(CFG.autoortho, 'fallback_level', 'cache')).lower()
+                if fallback_level_str == 'none':
+                    fb_level = 0
+                elif fallback_level_str == 'full':
+                    fb_level = 2
+                else:
+                    fb_level = 1
+
+                if fb_level > 0:
+                    resolver = FallbackResolver(
+                        cache_dir=tile.cache_dir,
+                        maptype=tile.maptype,
+                        tile_col=tile.col,
+                        tile_row=tile.row,
+                        tile_zoom=max_zoom,
+                        fallback_level=fb_level,
+                        max_mipmap=getattr(tile, 'max_mipmap', 4),
+                        downloader=None)
+
+                    fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                    def _resolve_one(idx):
+                        chunk_col = tile.col + (idx % chunks_per_row)
+                        chunk_row = tile.row + (idx // chunks_per_row)
+                        rgba = resolver.resolve(
+                            chunk_col, chunk_row, max_zoom,
+                            target_mipmap=0,
+                            time_budget=FBTimeBudget(fallback_timeout))
+                        return idx, rgba
+
+                    max_workers = min(4, len(failed_indices))
+                    try:
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            futures = {executor.submit(_resolve_one, i): i for i in failed_indices}
+                            for future in as_completed(futures, timeout=fallback_timeout):
+                                try:
+                                    idx, rgba = future.result(timeout=1.0)
+                                    if rgba:
+                                        # Fallback returns RGBA bytes — encode to JPEG
+                                        # so patch_missing_chunks can decode uniformly.
+                                        # Minor quality loss acceptable for already-lower-res
+                                        # fallback data.
+                                        try:
+                                            from PIL import Image
+                                            img = Image.frombytes("RGBA", (256, 256), rgba)
+                                            buf = BytesIO()
+                                            img.convert("RGB").save(buf, format="JPEG", quality=90)
+                                            chunk_jpegs[idx] = buf.getvalue()
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+
+        if getattr(tile, '_closed', False):
+            return
+
+        # ── Step 4: Patch the DDS ──
+        if chunk_jpegs and dynamic_dds_cache is not None:
+            healed_count = len(chunk_jpegs)
+            total_count = len(indices_to_heal)
+            log.info(f"Network healing: patching {healed_count}/{total_count} chunks for {tile_id}")
+            dynamic_dds_cache.patch_missing_chunks(tile_id, max_zoom, tile, chunk_jpegs)
+        else:
+            log.debug(f"Network healing: no chunks recovered for {tile_id}")
+
+    except Exception as e:
+        log.debug(f"Network healing: failed for {tile_id}: {e}")
+    finally:
+        _network_healing_semaphore.release()
+        if dynamic_dds_cache is not None:
+            dynamic_dds_cache.clear_network_healing(tile_id, max_zoom)
+
+
 def _on_tile_complete_callback(tile_id: str, tile,
                                partial: bool = False,
                                healing: bool = False) -> None:
@@ -4174,6 +4377,9 @@ def start_predictive_dds(tile_cacher=None) -> None:
             )
             _scan_thread.start()
             
+            # Wire network healing callback so cache can trigger downloads
+            dynamic_dds_cache._network_heal_callback = _dispatch_network_healing
+
             log.info(f"Dynamic DDS cache initialized (max={persistent_dds_mb}MB)")
         except Exception as e:
             log.warning(f"Failed to initialize Dynamic DDS cache: {e}")
@@ -4353,6 +4559,11 @@ class Chunk(object):
         # Coalescing flags to prevent duplicate submissions
         self.in_queue = False
         self.in_flight = False
+
+        # Cancellation flag: set by caller when it gives up waiting.
+        # Worker checks this before each retry and abandons the download,
+        # freeing the worker slot for other chunks.
+        self.cancelled = False
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
         
@@ -4580,13 +4791,27 @@ class Chunk(object):
             log.debug("EOX DETECTED")
             header.update({'referer': 'https://s2maps.eu/'})
        
+        # === CANCELLATION CHECK ===
+        # If the caller gave up waiting (Pass 2 timeout, budget exhausted, etc.),
+        # abandon this download immediately to free the worker slot.
+        if self.cancelled:
+            log.debug(f"Chunk {self} cancelled before download attempt {self.attempt}")
+            bump('chunk_cancelled_before_download')
+            return True  # Return True to stop worker retries
+
         # Capped backoff: grows with attempts but maxes at 2 seconds
         # This prevents runaway delays when server is slow/throttling
         backoff_sleep = min(2.0, self.attempt / 10.0)
         time.sleep(backoff_sleep)
         self.attempt += 1
 
-        _http_timeout = timeout or (5, 20)
+        # Read timeout = maxwait + 1s safety margin. No point keeping a
+        # download alive longer than the caller is willing to wait.
+        try:
+            _maxwait = float(CFG.autoortho.maxwait)
+        except Exception:
+            _maxwait = 2.0
+        _http_timeout = timeout or (5, _maxwait + 1.0)
 
         log.debug(f"Requesting {self.url} ..")
 
@@ -4744,6 +4969,24 @@ class Chunk(object):
         # Remove raw JPEG bytes
         self.data = None
 
+    def cancel(self):
+        """Cancel this chunk's download.
+
+        Sets the cancelled flag so the worker abandons retries and frees
+        its slot.  Also sets ready (with empty data) so any other waiter
+        unblocks immediately instead of hanging.
+        """
+        if self.cancelled:
+            return  # Already cancelled
+        self.cancelled = True
+        # Unblock any thread waiting on ready (e.g. other mipmap builders)
+        if not self.ready.is_set():
+            if not self.data:
+                self.data = b''
+            self.ready.set()
+        log.debug(f"Chunk {self} cancelled")
+        bump('chunk_cancelled')
+
 
 class Tile(object):
     row = -1
@@ -4787,6 +5030,9 @@ class Tile(object):
         self.chunks = {}
         self.ready = threading.Event()
         self._lock = threading.RLock()
+        self._dds_write_lock = threading.Lock()  # Protects DDS buffer writes (gen_mipmaps, databuffer)
+        self._mipmap_build_locks = {}  # Per-mipmap build serialization
+        self._mipmap_build_locks_guard = threading.Lock()  # Protects the dict above
         self.refs = 0
         self.imgs = {}
         self._imgs_order = []  # Track insertion order for LRU eviction
@@ -4934,6 +5180,13 @@ class Tile(object):
     def __repr__(self):
         return f"Tile({self.col}, {self.row}, {self.maptype}, {self.tilename_zoom}, min_zoom={self.min_zoom}, max_zoom={self.max_zoom}, max_mm={self.max_mipmap})"
 
+    def _get_mipmap_build_lock(self, mipmap):
+        """Get or create a per-mipmap build lock for serialization."""
+        with self._mipmap_build_locks_guard:
+            if mipmap not in self._mipmap_build_locks:
+                self._mipmap_build_locks[mipmap] = threading.Lock()
+            return self._mipmap_build_locks[mipmap]
+
     def _cache_image(self, mipmap: int, img_data: tuple):
         """Cache an image with LRU eviction when limit reached.
         
@@ -4986,40 +5239,88 @@ class Tile(object):
         self.imgs[mipmap] = img_data
         self._imgs_order.append(mipmap)
 
-    @locked
     def _create_chunks(self, quick_zoom=0, min_zoom=None):
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom, min_zoom)
 
-        if not self.chunks.get(zoom):
-            self.chunks[zoom] = []
-            log.debug(f"CREATE_CHUNKS: Tile {self.id} creating chunks for zoom {zoom}: {width}x{height} grid starting at ({col},{row})")
+        with self._lock:
+            if not self.chunks.get(zoom):
+                self.chunks[zoom] = []
+                log.debug(f"CREATE_CHUNKS: Tile {self.id} creating chunks for zoom {zoom}: {width}x{height} grid starting at ({col},{row})")
 
-            # Check if native batch cache reading is available
-            native_cache = _get_native_cache()
-            use_batch_read = native_cache is not None
-            
-            # Create all chunks (skip individual cache checks if batch reading)
-            for r in range(row, row+height):
-                for c in range(col, col+width):
-                    chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir, 
-                                  tile_id=self.id, skip_cache_check=use_batch_read)
-                    self.chunks[zoom].append(chunk)
-            
-            # Native batch cache read: read all cache files in parallel using C code
-            if use_batch_read:
-                paths = [chunk.cache_path for chunk in self.chunks[zoom]]
-                cached_data = _batch_read_cache_files(paths)
-                
-                if cached_data:
-                    hits = 0
-                    for chunk in self.chunks[zoom]:
-                        if chunk.cache_path in cached_data:
-                            chunk.set_cached_data(cached_data[chunk.cache_path])
-                            hits += 1
-                    if hits > 0:
-                        log.debug(f"Native batch cache read: {hits}/{len(paths)} hits for zoom {zoom}")
-        else:
-            log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
+                # Check if native batch cache reading is available
+                native_cache = _get_native_cache()
+                use_batch_read = native_cache is not None
+
+                # Create all chunks (skip individual cache checks if batch reading)
+                for r in range(row, row+height):
+                    for c in range(col, col+width):
+                        chunk = Chunk(c, r, self.maptype, zoom, cache_dir=self.cache_dir,
+                                      tile_id=self.id, skip_cache_check=use_batch_read)
+                        self.chunks[zoom].append(chunk)
+
+                # Native batch cache read: read all cache files in parallel using C code
+                if use_batch_read:
+                    paths = [chunk.cache_path for chunk in self.chunks[zoom]]
+                    cached_data = _batch_read_cache_files(paths)
+
+                    if cached_data:
+                        hits = 0
+                        for chunk in self.chunks[zoom]:
+                            if chunk.cache_path in cached_data:
+                                chunk.set_cached_data(cached_data[chunk.cache_path])
+                                hits += 1
+                        if hits > 0:
+                            log.debug(f"Native batch cache read: {hits}/{len(paths)} hits for zoom {zoom}")
+            else:
+                log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
+
+    def _probe_chunk_cache_ratio(self, zoom: int) -> float:
+        """
+        Fast probe to check what fraction of chunks are already available
+        in memory or disk cache. Does NOT trigger any downloads.
+
+        Used by get_bytes() to route warm cache to batch aopipeline
+        and cold cache directly to progressive path.
+
+        Cost: ~1-5ms (memory scan + batch cache read)
+
+        Returns:
+            float: Ratio of available chunks (0.0 to 1.0)
+        """
+        self._create_chunks(zoom)
+        chunks = self.chunks.get(zoom, [])
+
+        if not chunks:
+            return 0.0
+
+        total_chunks = len(chunks)
+        available_count = 0
+
+        need_cache_read = []
+        for chunk in chunks:
+            chunk_data = chunk.data
+            if chunk.ready.is_set() and chunk_data:
+                available_count += 1
+            elif not chunk.ready.is_set():
+                need_cache_read.append(chunk)
+
+        if need_cache_read:
+            cache_paths = [c.cache_path for c in need_cache_read]
+            cached_data = _batch_read_cache_files(cache_paths)
+
+            if cached_data:
+                for chunk in need_cache_read:
+                    if chunk.cache_path in cached_data:
+                        chunk.set_cached_data(cached_data[chunk.cache_path])
+                        available_count += 1
+                        bump('chunk_hit')
+            else:
+                for chunk in need_cache_read:
+                    if chunk.get_cache():
+                        if chunk.data:
+                            available_count += 1
+
+        return available_count / total_chunks
 
     def _collect_chunk_jpegs(self, zoom: int, time_budget=None,
                               min_available_ratio: float = 0.9,
@@ -5299,12 +5600,10 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════════
         # Uses the entire remaining time_budget to maximize chunk collection.
         # If force_build_partial is True, we'll build with whatever we get.
-        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
-
         jpeg_datas = self._collect_chunk_jpegs(
             self.max_zoom,
             time_budget=time_budget,
-            min_available_ratio=min_ratio,
+            min_available_ratio=1.0,
             return_partial=force_build_partial  # Return data even if below threshold
         )
         
@@ -6136,75 +6435,84 @@ class Tile(object):
             self._aopipeline_attempted = True  # Prevent retry loops on failure
             
             try:
-                # Use the per-request budget passed from read_dds_bytes()
-                # This ensures each X-Plane read() gets its own independent budget
                 aopipeline_budget = time_budget
                 if aopipeline_budget is None:
-                    # Fallback: create budget if caller didn't provide one (internal calls)
-                    # Default 30s is responsive for flight sims - config can override for quality
                     budget_seconds = float(getattr(CFG.autoortho, 'tile_time_budget', 30.0))
                     aopipeline_budget = TimeBudget(budget_seconds)
-                
-                # ═══════════════════════════════════════════════════════════════
-                # AOPIPELINE FLOW:
-                # ═══════════════════════════════════════════════════════════════
-                # 1. Batch aopipeline uses the request's time_budget for chunk collection
-                # 2. If threshold met: build directly (fast path)
-                # 3. If threshold NOT met:
-                #    - Fallbacks DISABLED: build as-is with missing_color
-                #    - Fallbacks ENABLED: hand to streaming with fallback_timeout budget
-                # ═══════════════════════════════════════════════════════════════
-                
-                # Check fallback configuration
+
                 fallback_level = self._get_fallback_level()
-                fallbacks_enabled = fallback_level > 0  # 0 = none, 1 = cache, 2 = full
-                
-                if fallbacks_enabled:
-                    # FALLBACKS ENABLED: Try batch, then streaming for fallback resolution
-                    
-                    # Try batch aopipeline (uses the request's time_budget)
-                    if self._try_aopipeline_build(time_budget=aopipeline_budget, force_build_partial=False):
-                        log.debug(f"GET_BYTES: batch aopipeline succeeded for {self.id}")
-                        return True
-                    
-                    # Batch didn't reach threshold - use streaming as fallback route
-                    # Give streaming a NEW budget based on fallback_timeout
-                    if getattr(CFG.autoortho, 'streaming_builder_enabled', True):
-                        fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
-                        streaming_budget = TimeBudget(fallback_timeout)
-                        log.debug(f"GET_BYTES: batch threshold not met, using streaming with "
-                                  f"fallback_timeout={fallback_timeout}s for {self.id}")
-                        
-                        if self._try_streaming_aopipeline_build(time_budget=streaming_budget):
-                            log.debug(f"GET_BYTES: streaming builder succeeded for {self.id}")
+                fallbacks_enabled = fallback_level > 0
+
+                # ═══════════════════════════════════════════════════════════
+                # FAST CACHE PROBE: Determine warm vs cold cache (~1-5ms)
+                # ═══════════════════════════════════════════════════════════
+                # Check how many chunks are already available in memory or
+                # disk cache WITHOUT triggering any downloads.  This avoids
+                # the batch aopipeline wasting the full tile_time_budget
+                # downloading chunks on cold cache only to fail the
+                # threshold check.
+                cache_ratio = self._probe_chunk_cache_ratio(self.max_zoom)
+                cache_is_warm = cache_ratio >= 1.0
+
+                log.debug(f"GET_BYTES: Cache probe for {self.id}: "
+                          f"{cache_ratio*100:.0f}% available, "
+                          f"threshold=100%, "
+                          f"warm={cache_is_warm}")
+
+                if cache_is_warm:
+                    # ═══════════════════════════════════════════════════════
+                    # WARM CACHE: Batch aopipeline with main budget
+                    # ═══════════════════════════════════════════════════════
+                    # All/most chunks are cached, so _collect_chunk_jpegs
+                    # Phase 1 will succeed instantly (~55ms build).  The
+                    # full budget is passed so buffer pool contention or
+                    # other edge cases use the user's configured budget.
+
+                    if fallbacks_enabled:
+                        if self._try_aopipeline_build(time_budget=aopipeline_budget, force_build_partial=False):
+                            log.debug(f"GET_BYTES: warm-cache batch aopipeline succeeded for {self.id}")
                             return True
-                    
-                    # Both failed - continue to progressive path
-                    log.debug(f"GET_BYTES: aopipeline build failed, using progressive path for {self.id}")
+
+                        # Warm probe said ready but batch failed (race condition:
+                        # chunk evicted between probe and collect).
+                        # Try streaming with fallback_timeout budget.
+                        if getattr(CFG.autoortho, 'streaming_builder_enabled', True):
+                            fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
+                            streaming_budget = TimeBudget(fallback_timeout)
+                            log.debug(f"GET_BYTES: warm-cache batch failed, trying streaming for {self.id}")
+
+                            if self._try_streaming_aopipeline_build(time_budget=streaming_budget):
+                                log.debug(f"GET_BYTES: streaming builder succeeded for {self.id}")
+                                return True
+
+                    else:
+                        # FALLBACKS DISABLED: build with whatever batch collects
+                        if self._try_aopipeline_build(time_budget=aopipeline_budget, force_build_partial=True):
+                            log.debug(f"GET_BYTES: warm-cache batch (no fallbacks) succeeded for {self.id}")
+                            return True
+
+                    # Warm-cache paths all failed — fall through to progressive
+                    log.debug(f"GET_BYTES: warm-cache paths failed, using progressive for {self.id}")
                     bump('live_aopipeline_fallback')
 
-                    # BUDGET PROTECTION: Give progressive path a minimum budget.
-                    # Batch collection may have consumed the entire original budget,
-                    # leaving 0 seconds for progressive. Without this, the progressive
-                    # path can't download any chunks and fills mm0 with missing_color.
-                    min_progressive_budget = float(getattr(CFG.autoortho, 'progressive_min_budget', 15.0))
-                    if time_budget is not None and time_budget.remaining < min_progressive_budget:
-                        log.debug(f"GET_BYTES: Budget exhausted ({time_budget.remaining:.1f}s remaining), "
-                                  f"granting progressive minimum budget of {min_progressive_budget}s")
-                        time_budget = TimeBudget(min_progressive_budget)
-                    
                 else:
-                    # FALLBACKS DISABLED: Build with whatever batch collects
-                    # force_build_partial=True means build even if threshold not met
-                    
-                    if self._try_aopipeline_build(time_budget=aopipeline_budget, force_build_partial=True):
-                        log.debug(f"GET_BYTES: batch aopipeline (no fallbacks) succeeded for {self.id}")
-                        return True
-                    
-                    # Build failed (shouldn't happen with force_build_partial, but handle it)
-                    log.debug(f"GET_BYTES: batch aopipeline failed even with force_build_partial for {self.id}")
-                    bump('live_aopipeline_force_failed')
-                    
+                    # ═══════════════════════════════════════════════════════
+                    # COLD CACHE: Skip batch/streaming entirely
+                    # ═══════════════════════════════════════════════════════
+                    # Batch would waste the entire budget downloading then
+                    # fail the threshold check.  Progressive handles
+                    # downloads with per-chunk fallbacks and native C
+                    # decode/compress.  The original time_budget is passed
+                    # through untouched.
+                    log.debug(f"GET_BYTES: cold cache ({cache_ratio*100:.0f}%), "
+                              f"skipping batch/streaming for {self.id}")
+                    bump('cold_cache_skip_batch')
+
+                    # Clear stale pre-collected data (batch was skipped)
+                    self._last_collected_jpegs = None
+                    self._last_collected_missing = None
+                    self._last_collected_ratio = None
+
             except Exception as e:
                 log.debug(f"GET_BYTES: aopipeline exception: {e}, using progressive path")
                 bump('live_aopipeline_exception')
@@ -6275,7 +6583,7 @@ class Tile(object):
                 self._try_native_partial_mipmap_build(
                     mipmap, startrow, endrow, bytes_per_chunk_row, time_budget)):
                 # Native build succeeded - data written directly to DDS buffer
-                self.ready.set()
+                # (ready.set() already called inside _try_native_partial_mipmap_build)
                 return True
         
         # ═══════════════════════════════════════════════════════════════════
@@ -6291,9 +6599,7 @@ class Tile(object):
         # If tile is being closed concurrently, avoid touching DDS
         if self.dds is None:
             return True
-        self.ready.clear()
-        #log.info(new_im.size)
-        
+
         start_time = time.time()
 
         # Only attempt partial compression from mipmap start
@@ -6303,26 +6609,28 @@ class Tile(object):
         else:
             compress_len = 0
 
-        try:
-            self.dds.gen_mipmaps(new_im, mipmap, mipmap, compress_len)
-        finally:
-            # Close image if not cached in self.imgs to free native memory immediately
-            # If cached, it will be closed when evicted by _cache_image() or in close()
-            if mipmap not in self.imgs:
+        with self._dds_write_lock:
+            self.ready.clear()
+            try:
+                self.dds.gen_mipmaps(new_im, mipmap, mipmap, compress_len)
+            finally:
+                # We haven't fully retrieved so unset flag; guard against DDS being cleared
+                log.debug(f"UNSETTING RETRIEVED! {self}")
                 try:
-                    new_im.close()
+                    if self.dds is not None and self.dds.mipmap_list:
+                        self.dds.mipmap_list[mipmap].retrieved = False
                 except Exception:
                     pass
+                self.ready.set()
 
-        # We haven't fully retrieved so unset flag; guard against DDS being cleared
-        log.debug(f"UNSETTING RETRIEVED! {self}")
-        try:
-            if self.dds is not None and self.dds.mipmap_list:
-                self.dds.mipmap_list[mipmap].retrieved = False
-        except Exception:
-            pass
+        # Close image if not cached in self.imgs to free native memory immediately
+        if mipmap not in self.imgs:
+            try:
+                new_im.close()
+            except Exception:
+                pass
+
         end_time = time.time()
-        self.ready.set()
 
         if compress_len:
             tile_time = end_time - start_time
@@ -6421,7 +6729,6 @@ class Tile(object):
         self.ready.set()
         return outfile
 
-    @locked
     def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None,
                 fallback_level_override=None):
         #
@@ -6507,20 +6814,23 @@ class Tile(object):
         log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
         
         # Do we already have this img?
-        if mipmap in self.imgs:
-            img_data = self.imgs[mipmap]
+        with self._lock:
+            cached_img_data = self.imgs.get(mipmap)
+        if cached_img_data is not None:
             # Unpack tuple format (new) or return directly (old format, backward compat)
-            if isinstance(img_data, tuple):
-                img = img_data[0]  # Extract just the image
+            if isinstance(cached_img_data, tuple):
+                img = cached_img_data[0]  # Extract just the image
                 log.debug(f"GET_IMG: Found saved image: {img}")
                 return img
             else:
                 # Old format: just the image without metadata
-                log.debug(f"GET_IMG: Found saved image (old format): {img_data}")
-                return img_data
+                log.debug(f"GET_IMG: Found saved image (old format): {cached_img_data}")
+                return cached_img_data
 
         log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
-        if mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved:
+        with self._lock:
+            already_retrieved = mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved
+        if already_retrieved:
             log.debug(f"GET_IMG: We already have mipmap {mipmap} for {self}")
             return
 
@@ -6547,7 +6857,8 @@ class Tile(object):
         
         # Create chunks for the actual zoom level we'll download from
         self._create_chunks(zoom, min_zoom)
-        chunks = self.chunks[zoom][startchunk:endchunk]
+        with self._lock:
+            chunks = self.chunks[zoom][startchunk:endchunk]
         log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(self.chunks[zoom])} for zoom {zoom}")
 
         log.debug(f"GET_IMG: {self} : Retrieve mipmap for ZOOM: {zoom} MIPMAP: {mipmap}")
@@ -6618,7 +6929,8 @@ class Tile(object):
                 if source_mm > self.max_mipmap:
                     continue
                     
-                img_data = self.imgs.get(source_mm)
+                with self._lock:
+                    img_data = self.imgs.get(source_mm)
                 if not img_data:
                     continue
                 
@@ -6703,415 +7015,246 @@ class Tile(object):
             # This ensures consistency - X-Plane sees missing_color, not arbitrary gray
             return new_im
         
-        # Track if any executor thread needs a lazy build.
-        # We defer lazy builds to after the executor completes to avoid lock contention:
-        # calling get_img() from within an executor thread would block on self._lock.
+        # Track if any pass needs a lazy build
         needs_lazy_build = False
-            
-        def process_chunk(chunk, skip_download_wait=False):
-            """Process a single chunk and return (chunk, chunk_img, start_x, start_y)"""
-            # Calculate position using native chunk size (no scaling)
+
+        # THREE-PASS CHUNK COLLECTION
+        #
+        # Architecture:
+        # 1. QUICK PASS: Process all already-ready chunks immediately (non-blocking)
+        # 2. POLL PASS: Poll deferred chunks as they arrive, processing each immediately
+        # 3. FALLBACK PASS: Apply disk cache / mipmap scaling / network fallbacks to still-missing chunks
+        #
+        # This prevents a single slow chunk from blocking the entire tile build.
+        # Ready chunks are processed immediately regardless of submission order.
+
+        total_chunks = len(chunks)
+        chunks_with_images = set()  # Track which chunks have images for fallback sweep
+
+        # === PASS 1: QUICK COLLECT (non-blocking) ===
+        # Process all already-ready chunks in one fast sweep (~0ms wait)
+        deferred_chunks = []  # [(chunk, start_x, start_y)]
+
+        for chunk in chunks:
             start_x = int(chunk.width * (chunk.col - col))
             start_y = int(chunk.height * (chunk.row - row))
-            
-            # PHASE 2 FIX #6 & #8: Validate coordinates before use
-            # Negative coordinates indicate logic error or data corruption
-            if start_x < 0 or start_y < 0:
-                log.error(f"GET_IMG: Invalid negative coordinates: start_x={start_x}, start_y={start_y}, chunk.col={chunk.col}, chunk.row={chunk.row}, base col={col}, base row={row}")
-                # Return placeholder to prevent crash
-                return (chunk, None, 0, 0)
-            
-            # Check if coordinates would extend beyond image bounds
-            if start_x + chunk.width > img_width or start_y + chunk.height > img_height:
-                log.error(f"GET_IMG: Coordinates extend beyond image: pos=({start_x},{start_y}), size=({chunk.width}x{chunk.height}), image=({img_width}x{img_height})")
-                # Return placeholder to prevent crash
-                return (chunk, None, 0, 0)
-            
-            # === TIME BUDGET CHECK ===
-            # When the budget is exhausted we no longer wait for downloads
-            # (wait_with_budget returns immediately), but we still fall through
-            # to attempt local fallbacks (Fallback 1: disk cache, Fallback 2:
-            # mipmap scaling).  These are fast, sub-millisecond operations that
-            # can eliminate missing-color patches at virtually no cost.
-            # Fallback 3 (network) has its own internal budget gates and will
-            # not fire when the budget is exhausted.
-            budget_exhausted_at_entry = time_budget.exhausted
-            if budget_exhausted_at_entry:
-                log.debug(f"Time budget exhausted (elapsed={time_budget.elapsed:.2f}s), "
-                         f"attempting local fallbacks for chunk {chunk}")
-                bump('chunk_budget_exhausted_local_fallback')
-            
-            # Track if this chunk permanently failed
-            is_permanent_failure = chunk.permanent_failure
-            if is_permanent_failure:
-                log.debug(f"Chunk {chunk} is permanently failed ({chunk.failure_reason}), will attempt fallbacks")
-                bump(f'chunk_permanent_fail_{chunk.failure_reason}')
-            
-            # Smart timeout: only wait for download, not decode
-            # If skip_download_wait is True, go straight to fallbacks (for chunks that never started)
-            if skip_download_wait:
-                chunk_ready = False
-                log.debug(f"Chunk {chunk} never started downloading, skipping wait and going to fallbacks")
-            elif chunk.ready.is_set():
-                # Download already complete, just needs decode
-                chunk_ready = True
-                log.debug(f"Chunk {chunk} already downloaded, proceeding to decode")
-            else:
-                # Download in progress - use BOTH time budget AND per-chunk maxwait
-                # This respects the total tile budget while also limiting per-chunk waits
-                # The wait ends when either: budget exhausted, maxwait reached, or event set
-                chunk_ready = time_budget.wait_with_budget(chunk.ready, max_single_wait=maxwait)
-                if not chunk_ready:
-                    log.debug(f"Chunk {chunk} wait ended (budget remaining={time_budget.remaining:.2f}s, maxwait={maxwait:.1f}s)")
 
-            chunk_img = None
-            decode_failed = False
-            
-            # TOCTOU FIX: Capture local reference to chunk.data before checking/using.
-            # This prevents a race condition where another thread (e.g., Chunk.close())
-            # could set chunk.data = None between our check and use. Python's GIL makes
-            # reference assignment atomic, so once we have a local ref, the object won't
-            # be garbage collected even if chunk.data is cleared elsewhere.
-            # This pattern matches save_cache() which uses the same approach.
-            chunk_data = chunk.data
-            
-            if chunk_ready and chunk_data:
-                # We returned and have data!
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Ready and found chunk data.")
+            # Validate coordinates
+            if start_x < 0 or start_y < 0:
+                log.error(f"GET_IMG: Invalid negative coordinates: start_x={start_x}, start_y={start_y}")
+                continue
+            if start_x + chunk.width > img_width or start_y + chunk.height > img_height:
+                log.error(f"GET_IMG: Coordinates extend beyond image: pos=({start_x},{start_y})")
+                continue
+
+            if chunk.permanent_failure:
+                bump('chunk_missing_count')
+                # Still add to deferred for fallback processing
+                deferred_chunks.append((chunk, start_x, start_y))
+                continue
+
+            chunk_data = chunk.data  # TOCTOU-safe snapshot
+            if chunk.ready.is_set() and chunk_data:
+                # Decode immediately
                 try:
                     with _decode_sem:
                         chunk_img = AoImage.load_from_memory(chunk_data)
-                        if chunk_img is None:
-                            log.warning(f"GET_IMG: load_from_memory returned None for {chunk}")
-                            decode_failed = True
-                except Exception as _e:
-                    log.error(f"GET_IMG: load_from_memory exception for {chunk}: {_e}")
-                    chunk_img = None
-                    decode_failed = True
-            elif chunk_ready and not chunk_data:
-                # Download "succeeded" but returned empty data
-                log.debug(f"GET_IMG: Chunk {chunk} ready but has no data")
-                decode_failed = True
-            
-            # Determine if we need fallbacks:
-            # - chunk didn't download in time (not chunk_ready)
-            # - chunk is permanently failed (404, etc)
-            # - chunk downloaded but decode failed (decode_failed)
-            needs_fallback = not chunk_ready or is_permanent_failure or decode_failed
-            
-            # FALLBACK CHAIN (in order of preference):
-            # Each fallback only runs if previous ones failed and fallback_level allows it.
-            # For permanent failures (404, etc), we ALWAYS try fallbacks to get lower-zoom alternatives.
-            #
-            # fallback_level controls which fallbacks are enabled:
-            #   0 = None: Skip all fallbacks (fastest, may have missing tiles)
-            #   1 = Cache-only: Fallback 1 (disk cache) + Fallback 2 (built mipmaps)
-            #   2 = Full: All fallbacks including Fallback 3 (network downloads)
-            
-            # Fallback 1: Search disk cache for lower-zoom JPEGs (enabled if fallback_level >= 1)
-            if not chunk_img and needs_fallback and fallback_level >= 1:
-                log.debug(f"GET_IMG(process_chunk): Fallback 1 - searching disk cache for backup chunk.")
-                chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
-                # get_best_chunk bumps 'upscaled_from_jpeg_count' if successful
-            
-            # === LAZY BUILD TRIGGER ===
-            # NOTE: Lazy build is now deferred to AFTER the executor completes.
-            # Calling get_img() from within an executor thread would cause lock contention:
-            # the executor thread would block waiting for self._lock (held by the main thread),
-            # while the main thread waits for executor futures - causing a 300s stall.
-            # Instead, we mark that lazy build is needed and handle it after the main loop.
-            # The nonlocal variable allows the outer scope to detect this need.
-            if not chunk_img and mipmap == 0 and fallback_level >= 1:
-                if not self._lazy_build_attempted:
-                    log.debug(f"GET_IMG(process_chunk): Marking lazy build as needed (will run after executor)")
-                    nonlocal needs_lazy_build
-                    needs_lazy_build = True
-            
-            # Fallback 2: Scale from already-built mipmaps (enabled if fallback_level >= 1)
-            # Now may have something to use thanks to lazy build above
-            if not chunk_img and fallback_level >= 1:
-                log.debug(f"GET_IMG(process_chunk): Fallback 2 - scaling from built mipmaps.")
-                chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
-                # Note: scaling function bumps its own counters (upscaled_chunk_count or downscaled_chunk_count)
-            
-            # Fallback 3: On-demand download of lower-detail chunks (enabled if fallback_level >= 2)
-            # This is the expensive network fallback - only use when quality is prioritized
-            if not chunk_img and needs_fallback and fallback_level >= 2:
-                # Budget strategy for cascading fallback:
-                # - Use main budget first (remaining time)
-                # - If fallback_extends_budget is True AND main budget exhausts during fallback,
-                #   switch to the extra fallback_budget
-                # - This ensures max total time is exactly: main_budget + fallback_timeout
-                nonlocal fallback_budget
-                
-                # Fallback budget is created lazily ONLY when main budget exhausts
-                # This ensures it truly extends the time rather than running in parallel
-                
-                if time_budget.exhausted and not fallback_extends_budget:
-                    # Main budget exhausted and no extension allowed - skip
-                    log.debug(f"GET_IMG(process_chunk): Skipping Fallback 3 - budget exhausted and fallback_extends_budget=False")
-                elif time_budget.exhausted and fallback_extends_budget:
-                    # Main budget exhausted - create/use fallback budget
-                    # Created NOW so the timer starts when main exhausts (true extension)
-                    if fallback_budget is None:
-                        fallback_budget = TimeBudget(fallback_timeout)
-                        log.info(f"GET_IMG: Main budget exhausted, creating fallback budget {fallback_timeout:.1f}s")
-                    
-                    if fallback_budget.exhausted:
-                        log.debug(f"GET_IMG(process_chunk): Skipping Fallback 3 - both budgets exhausted")
+                    if chunk_img:
+                        _safe_paste(new_im, chunk_img, start_x, start_y)
+                        chunks_with_images.add(id(chunk))
+                        time_budget.record_chunk_processed()
                     else:
-                        log.debug(f"GET_IMG(process_chunk): Fallback 3 - main exhausted, using fallback budget "
-                                 f"(remaining={fallback_budget.remaining:.2f}s)")
-                        chunk_img = self.get_or_build_lower_mipmap_chunk(
-                            mipmap, chunk.col, chunk.row, zoom,
-                            main_budget=None,  # Main already exhausted
-                            fallback_budget=fallback_budget
-                        )
-                else:
-                    # Main budget still has time - use it first, may switch to fallback if main exhausts
-                    log.debug(f"GET_IMG(process_chunk): Fallback 3 - using main budget "
-                             f"(remaining={time_budget.remaining:.2f}s)" +
-                             (f", fallback budget ready (remaining={fallback_budget.remaining:.2f}s)" 
-                              if fallback_budget else ""))
-                    chunk_img = self.get_or_build_lower_mipmap_chunk(
-                        mipmap, chunk.col, chunk.row, zoom,
-                        main_budget=time_budget,
-                        fallback_budget=fallback_budget,  # May be None, will be created lazily
-                        fallback_timeout=fallback_timeout if fallback_extends_budget else None
-                    )
+                        deferred_chunks.append((chunk, start_x, start_y))
+                except Exception as e:
+                    log.error(f"GET_IMG: Pass 1 decode exception for {chunk}: {e}")
+                    deferred_chunks.append((chunk, start_x, start_y))
+            else:
+                deferred_chunks.append((chunk, start_x, start_y))
 
-            if not chunk_ready and not chunk_img and not is_permanent_failure:
-                # === FINAL RETRY (OPTIMIZED) ===
-                # Only worth retrying if the chunk download is still pending.
-                # Pending means: in queue, in flight, or already completed (ready).
-                # If none of these are true, the download failed and won't be retried
-                # by the worker - so waiting would be pointless.
-                download_pending = chunk.in_flight or chunk.in_queue or chunk.ready.is_set()
-                
-                if time_budget.exhausted:
-                    log.debug(f"GET_IMG: Skipping final retry for {chunk} - budget exhausted")
+        pass1_ready = len(chunks_with_images)
+        log.debug(f"GET_IMG: Pass 1 (quick): {pass1_ready}/{total_chunks} chunks ready, "
+                 f"{len(deferred_chunks)} deferred")
+
+        # === PASS 2: POLL DEFERRED CHUNKS (time-capped) ===
+        # Poll all deferred chunks, processing any that become ready.
+        # Each chunk gets at most `maxwait` seconds total before being moved to
+        # fallback (Pass 3). The pass itself is capped at `maxwait` wall-clock
+        # time — once that expires, ALL remaining chunks move to fallback.
+        # This prevents a single slow chunk from consuming the entire budget.
+        if deferred_chunks and not time_budget.exhausted:
+            still_waiting = [(chunk, sx, sy) for chunk, sx, sy in deferred_chunks
+                             if id(chunk) not in chunks_with_images and not chunk.permanent_failure]
+
+            # Per-chunk deadline tracking: each chunk gets maxwait seconds from now
+            pass2_start = time.monotonic()
+            pass2_deadline = pass2_start + maxwait  # Cap entire pass at maxwait
+            chunk_first_seen = {}  # chunk id -> monotonic time first polled
+
+            while still_waiting and not time_budget.exhausted:
+                now = time.monotonic()
+                if now >= pass2_deadline:
+                    log.debug(f"GET_IMG: Pass 2 deadline reached after {now - pass2_start:.2f}s, "
+                             f"{len(still_waiting)} chunks moving to fallback")
+                    # Cancel all remaining chunks to free worker slots
+                    for chunk, _, _ in still_waiting:
+                        chunk.cancel()
+                    break
+
+                newly_ready = []
+                timed_out = []
+                remaining = []
+
+                for item in still_waiting:
+                    chunk, sx, sy = item
+                    chunk_id = id(chunk)
+
+                    # Track first-seen time for per-chunk timeout
+                    if chunk_id not in chunk_first_seen:
+                        chunk_first_seen[chunk_id] = now
+
+                    if chunk.ready.is_set():
+                        newly_ready.append(item)
+                    elif now - chunk_first_seen[chunk_id] >= maxwait:
+                        # This chunk has exceeded its per-chunk maxwait — give up
+                        timed_out.append(item)
+                    else:
+                        remaining.append(item)
+
+                # Process all newly ready chunks
+                for chunk, sx, sy in newly_ready:
+                    chunk_data = chunk.data
+                    if chunk_data:
+                        try:
+                            with _decode_sem:
+                                chunk_img = AoImage.load_from_memory(chunk_data)
+                            if chunk_img:
+                                _safe_paste(new_im, chunk_img, sx, sy)
+                                chunks_with_images.add(id(chunk))
+                                time_budget.record_chunk_processed()
+                        except Exception as e:
+                            log.error(f"GET_IMG: Pass 2 decode exception for {chunk}: {e}")
+
+                if timed_out:
+                    log.debug(f"GET_IMG: Pass 2: {len(timed_out)} chunks timed out after maxwait={maxwait:.1f}s")
+                    bump('chunk_pass2_timeout', len(timed_out))
+                    # Cancel timed-out chunks to free their worker slots
+                    for chunk, _, _ in timed_out:
+                        chunk.cancel()
+
+                still_waiting = remaining
+                if not still_waiting:
+                    break
+
+                # Wait briefly for ANY chunk to arrive (250ms poll interval)
+                wait_cap = min(0.25, pass2_deadline - time.monotonic())
+                if wait_cap <= 0:
+                    break
+                chunk_to_wait = still_waiting[0][0]
+                time_budget.wait_with_budget(chunk_to_wait.ready, max_single_wait=wait_cap)
+
+            # Update deferred_chunks for pass 3
+            deferred_chunks = [(chunk, sx, sy) for chunk, sx, sy in deferred_chunks
+                               if id(chunk) not in chunks_with_images]
+
+        pass2_ready = len(chunks_with_images) - pass1_ready
+        log.debug(f"GET_IMG: Pass 2 (poll): {pass2_ready} additional chunks, "
+                 f"{len(deferred_chunks)} still deferred")
+
+        # === PASS 3: FALLBACK RESOLUTION ===
+        # Apply fallback chain to still-missing chunks: disk cache, mipmap scaling, network
+        if deferred_chunks and fallback_level >= 1:
+            for chunk, sx, sy in deferred_chunks:
+                if id(chunk) in chunks_with_images:
+                    continue
+                if time_budget.exhausted and not fallback_extends_budget:
+                    chunk.cancel()  # Free worker slot
                     time_budget.record_chunk_skipped()
                     bump('chunk_budget_skipped')
-                elif not download_pending:
-                    # Download failed completely and won't be retried - skip waiting
-                    log.debug(f"GET_IMG: Skipping retry for {chunk} - download not pending "
-                             f"(in_flight={chunk.in_flight}, in_queue={chunk.in_queue})")
-                    bump('chunk_retry_skipped_not_pending')
-                else:
-                    # Download still in progress or just completed - worth checking
-                    log.debug(f"GET_IMG: Final retry for {chunk} "
-                             f"(in_flight={chunk.in_flight}, in_queue={chunk.in_queue}, "
-                             f"budget remaining={time_budget.remaining:.2f}s)")
-                    bump('retry_chunk_count')
-                    
-                    if chunk.ready.is_set():
-                        # Completed during fallback attempts
-                        chunk_ready = True
-                        log.debug(f"Chunk {chunk} completed during fallbacks, proceeding to decode")
-                    else:
-                        # Still in progress - wait with reduced timeout (1s max for retry)
-                        chunk_ready = time_budget.wait_with_budget(chunk.ready, max_single_wait=1.0)
-                
-                # TOCTOU FIX: Capture local reference for retry path (same pattern as above)
-                retry_chunk_data = chunk.data
-                if chunk_ready and retry_chunk_data:
-                    log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Final retry for {chunk}, SUCCESS!")
-                    try:
-                        with _decode_sem:
-                            chunk_img = AoImage.load_from_memory(retry_chunk_data)
-                            if chunk_img is None:
-                                log.warning(f"GET_IMG: load_from_memory returned None on retry for {chunk}")
-                    except Exception as _e:
-                        log.error(f"GET_IMG: load_from_memory exception on retry for {chunk}: {_e}")
-                        chunk_img = None
-
-            if not chunk_img:
-                log.debug(f"GET_IMG(process_chunk(tid={threading.get_ident()})): Empty chunk data.  Skip.")
-                bump('chunk_missing_count')
-                if is_permanent_failure:
-                    log.info(f"Chunk {chunk} permanently failed and all fallbacks exhausted")
-            else:
-                # Successfully processed this chunk within budget
-                time_budget.record_chunk_processed()
-                
-            return (chunk, chunk_img, start_x, start_y)
-        
-        # OPTIMIZATION: Non-blocking chunk processing
-        # 
-        # Architecture:
-        # 1. IMMEDIATE READY PROCESSING: Process ready chunks without executor overhead
-        # 2. IMMEDIATE READY PROCESSING: Process ready chunks without waiting
-        # 3. EXECUTOR FOR WAITING: Use executor only for chunks that need download wait
-        # 4. ROUND-ROBIN RETRY: Poll non-ready chunks periodically instead of blocking all workers
-        #
-        # This prevents worker starvation where all 8 executor threads block on chunk.ready.wait()
-        # when downloads are slow, leaving no workers to process chunks that become ready.
-        
-        total_chunks = len(chunks)
-        completed = 0
-        executor = _get_progressive_executor()
-        active_futures = {}
-        chunks_with_images = set()  # Track which chunks have images for fallback sweep
-        
-        try:
-            # === PHASE 1: IMMEDIATE READY PROCESSING ===
-            # Process chunks that are already ready without submitting to executor
-            # This is faster than executor overhead for chunks that don't need waiting
-            ready_chunks = []
-            pending_chunks = []
-            
-            for chunk in chunks:
-                if chunk.permanent_failure:
-                    bump('chunk_missing_count')
                     continue
-                
-                if chunk.ready.is_set() and chunk.data:
-                    # Ready with data - process immediately in current thread
-                    ready_chunks.append(chunk)
-                else:
-                    # Not ready or no data - needs waiting
-                    pending_chunks.append(chunk)
-            
-            # Process ready chunks in parallel via executor (no waiting needed)
-            if ready_chunks:
-                log.debug(f"GET_IMG: Processing {len(ready_chunks)} ready chunks immediately")
-                for chunk in ready_chunks:
-                    # Use skip_download_wait=True since chunk is already ready
-                    future = executor.submit(process_chunk, chunk, skip_download_wait=False)
-                    active_futures[future] = chunk
-            
-            # === PHASE 2: SUBMIT PENDING CHUNKS ===
-            # Submit chunks that need download waiting
-            for chunk in pending_chunks:
-                future = executor.submit(process_chunk, chunk)
-                active_futures[future] = chunk
-            
-            log.debug(f"GET_IMG: Submitted {len(ready_chunks)} ready + {len(pending_chunks)} pending = {len(active_futures)} chunks to executor")
-            
-            # Collect results as they complete, respecting time budget
-            while active_futures:
-                # === TIME BUDGET CHECK ===
-                if time_budget.exhausted:
-                    remaining = len(active_futures)
-                    if remaining > 0:
-                        bump('chunk_budget_exhausted', remaining)
-                    log.info(f"Time budget exhausted after {time_budget.elapsed:.2f}s for mipmap {mipmap}: "
-                            f"processed {time_budget.chunks_processed}, skipped {time_budget.chunks_skipped}, "
-                            f"remaining {remaining}/{total_chunks}")
-                    break
-                
-                # Wait for completions with a short timeout to allow budget checks
-                done, pending = concurrent.futures.wait(
-                    active_futures.keys(), 
-                    timeout=0.05,  # Check budget every 50ms
-                    return_when=concurrent.futures.FIRST_COMPLETED
-                )
-                
-                for future in done:
-                    try:
-                        chunk, chunk_img, start_x, start_y = future.result()
-                        completed += 1
-                        if chunk_img:
-                            _safe_paste(new_im, chunk_img, start_x, start_y)
-                            chunks_with_images.add(id(chunk))  # Track for fallback sweep
-                    except Exception as exc:
-                        log.error(f"Chunk processing failed: {exc}")
-                    finally:
-                        del active_futures[future]
-                    # Progress logging
-                    if total_chunks and (completed % max(1, total_chunks // 4) == 0):
-                        log.debug(f"GET_IMG progress: {completed}/{total_chunks} chunks for mip {mipmap}")
-            
-            # Process any remaining active futures (when budget wasn't exhausted)
-            # Budget exhaustion already logged above, so just drain remaining futures
-            remaining_futures = list(active_futures.keys())
-            if remaining_futures:
-                # Use short timeout to avoid blocking forever
-                timeout = max(0.5, time_budget.remaining) if not time_budget.exhausted else 0.5
-                try:
-                    for future in concurrent.futures.as_completed(remaining_futures, timeout=timeout):
-                        try:
-                            chunk, chunk_img, start_x, start_y = future.result()
-                            if chunk_img:
-                                _safe_paste(new_im, chunk_img, start_x, start_y)
-                                chunks_with_images.add(id(active_futures.get(future)))
-                        except Exception as exc:
-                            log.error(f"Chunk processing failed: {exc}")
-                        finally:
-                            if future in active_futures:
-                                del active_futures[future]
-                except TimeoutError:
-                    unfinished = len([f for f in remaining_futures if not f.done()])
-                    log.debug(f"Timeout waiting for {unfinished} remaining chunks")
-                    # Cancel remaining futures to free resources
-                    for future in remaining_futures:
-                        if not future.done():
-                            future.cancel()
-                    # Clear remaining references
-                    active_futures.clear()
-            
-            # === FALLBACK SWEEP PHASE ===
-            # After main budget expires, use fallback budget to fill in missing chunks
-            # This maximizes image quality by systematically processing all gaps
-            if fallback_extends_budget and time_budget.exhausted and fallback_level >= 2:
-                # Identify chunks without images
-                missing_chunks = [c for c in chunks if id(c) not in chunks_with_images 
-                                  and not c.permanent_failure]
-                
-                if missing_chunks:
-                    # Create fallback budget if not already created
-                    if fallback_budget is None:
-                        fallback_budget = TimeBudget(fallback_timeout)
-                        log.info(f"GET_IMG: Starting fallback sweep for {len(missing_chunks)} missing chunks "
-                                f"(budget={fallback_timeout:.1f}s)")
-                    elif not fallback_budget.exhausted:
-                        log.info(f"GET_IMG: Fallback sweep for {len(missing_chunks)} missing chunks "
-                                f"(remaining={fallback_budget.remaining:.2f}s)")
-                    
-                    # === SEQUENTIAL FALLBACK: Process remaining missing chunks ===
-                    sweep_recovered = 0
-                    for chunk in missing_chunks:
-                        if fallback_budget.exhausted:
-                            log.debug(f"Fallback sweep: budget exhausted after recovering {sweep_recovered} chunks")
-                            break
-                        
-                        # Calculate position for this chunk
-                        start_x = int(chunk.width * (chunk.col - col))
-                        start_y = int(chunk.height * (chunk.row - row))
-                        
-                        # Try cascading fallback for this chunk
+
+                chunk_img = None
+                is_permanent_failure = chunk.permanent_failure
+
+                # Budget exhaustion: attempt local fallbacks only (fast, sub-ms)
+                budget_exhausted_at_entry = time_budget.exhausted
+                if budget_exhausted_at_entry:
+                    bump('chunk_budget_exhausted_local_fallback')
+
+                # Fallback 1: disk cache (fast, ~1ms)
+                chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
+
+                # Track lazy build need
+                if not chunk_img and mipmap == 0:
+                    with self._lock:
+                        lazy_attempted = self._lazy_build_attempted
+                    if not lazy_attempted:
+                        needs_lazy_build = True
+
+                # Fallback 2: mipmap scaling (fast, in-memory)
+                if not chunk_img:
+                    chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
+
+                # Fallback 3: network (only if budget allows and fallback_level >= 2)
+                if not chunk_img and (not is_permanent_failure or True) and fallback_level >= 2:
+                    if time_budget.exhausted and not fallback_extends_budget:
+                        pass  # Skip network fallback
+                    elif time_budget.exhausted and fallback_extends_budget:
+                        if fallback_budget is None:
+                            fallback_budget = TimeBudget(fallback_timeout)
+                            log.info(f"GET_IMG: Main budget exhausted, creating fallback budget {fallback_timeout:.1f}s")
+                        if not fallback_budget.exhausted:
+                            chunk_img = self.get_or_build_lower_mipmap_chunk(
+                                mipmap, chunk.col, chunk.row, zoom,
+                                main_budget=None,
+                                fallback_budget=fallback_budget
+                            )
+                    elif not budget_exhausted_at_entry:
                         chunk_img = self.get_or_build_lower_mipmap_chunk(
                             mipmap, chunk.col, chunk.row, zoom,
-                            main_budget=None,  # Main already exhausted
-                            fallback_budget=fallback_budget
+                            main_budget=time_budget,
+                            fallback_budget=fallback_budget,
+                            fallback_timeout=fallback_timeout if fallback_extends_budget else None
                         )
-                        
-                        if chunk_img:
-                            _safe_paste(new_im, chunk_img, start_x, start_y)
-                            chunks_with_images.add(id(chunk))
-                            sweep_recovered += 1
-                            bump('fallback_sweep_recovered')
-                    
-                    if sweep_recovered > 0:
-                        log.info(f"GET_IMG: Fallback sweep recovered {sweep_recovered}/{len(missing_chunks)} chunks")
-                    
-                    # Update missing count for chunks we couldn't recover
-                    still_missing = len([c for c in chunks if id(c) not in chunks_with_images 
-                                        and not c.permanent_failure])
-                    if still_missing > 0:
-                        bump('chunk_missing_count', still_missing)
-        finally:
-            # Cancel any remaining futures from the shared pool (don't shut it down)
-            for future in list(active_futures.keys()):
-                if not future.done():
-                    future.cancel()
-            active_futures.clear()
-        
+
+                # Final retry: check if chunk completed during fallback attempts
+                if not chunk_img and not is_permanent_failure:
+                    chunk_data = chunk.data
+                    if chunk.ready.is_set() and chunk_data:
+                        try:
+                            with _decode_sem:
+                                chunk_img = AoImage.load_from_memory(chunk_data)
+                        except Exception:
+                            chunk_img = None
+
+                if chunk_img:
+                    _safe_paste(new_im, chunk_img, sx, sy)
+                    chunks_with_images.add(id(chunk))
+                    time_budget.record_chunk_processed()
+                else:
+                    # All fallbacks exhausted — cancel chunk to free worker slot
+                    chunk.cancel()
+                    bump('chunk_missing_count')
+                    if is_permanent_failure:
+                        log.info(f"Chunk {chunk} permanently failed and all fallbacks exhausted")
+
+        pass3_ready = len(chunks_with_images) - pass1_ready - pass2_ready
+        if pass3_ready > 0:
+            log.debug(f"GET_IMG: Pass 3 (fallback): {pass3_ready} additional chunks recovered")
+
+        # Cancel any remaining unprocessed chunks to free worker slots.
+        # This catches chunks that were never processed (e.g. fallback_level=0)
+        # or that fell through all passes without getting an image.
+        for chunk in chunks:
+            if id(chunk) not in chunks_with_images and not chunk.ready.is_set():
+                chunk.cancel()
+
         # === DEFERRED LAZY BUILD ===
         # If any executor thread signaled that lazy build is needed, do it now.
-        # This runs in the main thread which already holds self._lock, avoiding the
-        # lock contention that caused 300s stalls when calling get_img() from executor threads.
-        if needs_lazy_build and mipmap == 0 and not self._lazy_build_attempted:
+        # This runs in the main thread, avoiding the lock contention that caused
+        # 300s stalls when calling get_img() from executor threads.
+        with self._lock:
+            lazy_attempted = self._lazy_build_attempted
+        if needs_lazy_build and mipmap == 0 and not lazy_attempted:
             log.debug(f"GET_IMG: Running deferred lazy build (main thread, lock held)")
             self._try_lazy_build_fallback_mipmap(time_budget)
             
@@ -7139,7 +7282,8 @@ class Tile(object):
             log.debug(f"GET_IMG: Save complete image for later...")
             # Store image with metadata (col, row, zoom) for coordinate mapping in upscaling
             # Use _cache_image for LRU eviction to prevent unbounded memory growth
-            self._cache_image(mipmap, (new_im, col, row, zoom))
+            with self._lock:
+                self._cache_image(mipmap, (new_im, col, row, zoom))
 
         # Log budget summary including fallback budget if used
         if fallback_budget is not None:
@@ -7857,10 +8001,6 @@ class Tile(object):
         # EARLY CHECKS
         # ═══════════════════════════════════════════════════════════════════════
         
-        # Skip for mipmap 0 - use full aopipeline path instead
-        if mipmap == 0:
-            return False
-        
         # Guard against race where tile is being closed
         if self.dds is None:
             log.debug(f"_try_native_mipmap_build: DDS is None for {self.id}")
@@ -7880,11 +8020,9 @@ class Tile(object):
         if zoom < self.min_zoom:
             return False
         
-        # Get threshold config with validation
-        # UNIFIED: Use the same threshold as live_aopipeline for consistency
-        # This removes the separate native_mipmap_min_ratio config
-        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
-        min_ratio = max(0.0, min(1.0, min_ratio))  # Clamp to valid range
+        # Always require all chunks for native build — if any are missing,
+        # fall through to the Python path which handles per-chunk fallbacks.
+        min_ratio = 1.0
         
         # ═══════════════════════════════════════════════════════════════════════
         # PHASE 1: Create chunks and collect data from cache
@@ -7965,8 +8103,13 @@ class Tile(object):
                         missing_chunks_indices.append(i)
                 
                 if missing_chunks_indices:
-                    # Wait for downloads with full remaining budget
-                    wait_time = time_budget.remaining
+                    # Wait for downloads capped at maxwait (per-chunk timeout).
+                    # Previously used time_budget.remaining (up to 180s), which
+                    # caused the native path to spin for minutes when a single
+                    # chunk was unreachable, then fall through to get_img() for
+                    # another 180s — total 360s stall.
+                    maxwait_cap = self.get_maxwait()
+                    wait_time = min(time_budget.remaining, maxwait_cap)
                     if wait_time > 0:
                         wait_deadline = time.monotonic() + wait_time
                         
@@ -8065,26 +8208,52 @@ class Tile(object):
                             jpeg_datas_per_zoom.append([])
                             chain_truncated = True
                 
-                result = native_dds.build_all_mipmaps_native(
-                    jpeg_datas_per_zoom,
-                    format=dxt_format,
-                    missing_color=missing_color
-                )
+                # Use thread budget coordination for mipmap 0 (256 chunks,
+                # significant CPU).  Mipmaps 1-4 have <=64 chunks and don't
+                # need it.
+                if mipmap == 0:
+                    with _native_build_context():
+                        result = native_dds.build_all_mipmaps_native(
+                            jpeg_datas_per_zoom,
+                            format=dxt_format,
+                            missing_color=missing_color
+                        )
+                else:
+                    result = native_dds.build_all_mipmaps_native(
+                        jpeg_datas_per_zoom,
+                        format=dxt_format,
+                        missing_color=missing_color
+                    )
             elif hasattr(native_dds, 'build_mipmap_chain'):
-                # Fallback to build_mipmap_chain (uses reduce_half for smaller mipmaps)
-                result = native_dds.build_mipmap_chain(
-                    jpeg_datas,
-                    format=dxt_format,
-                    missing_color=missing_color,
-                    max_mipmaps=max_mipmaps
-                )
+                if mipmap == 0:
+                    with _native_build_context():
+                        result = native_dds.build_mipmap_chain(
+                            jpeg_datas,
+                            format=dxt_format,
+                            missing_color=missing_color,
+                            max_mipmaps=max_mipmaps
+                        )
+                else:
+                    result = native_dds.build_mipmap_chain(
+                        jpeg_datas,
+                        format=dxt_format,
+                        missing_color=missing_color,
+                        max_mipmaps=max_mipmaps
+                    )
             else:
-                # Fallback to build_single_mipmap if chain function not available
-                result = native_dds.build_single_mipmap(
-                    jpeg_datas,
-                    format=dxt_format,
-                    missing_color=missing_color
-                )
+                if mipmap == 0:
+                    with _native_build_context():
+                        result = native_dds.build_single_mipmap(
+                            jpeg_datas,
+                            format=dxt_format,
+                            missing_color=missing_color
+                        )
+                else:
+                    result = native_dds.build_single_mipmap(
+                        jpeg_datas,
+                        format=dxt_format,
+                        missing_color=missing_color
+                    )
             
             if not result.success:
                 log.debug(f"_try_native_mipmap_build: Build failed for mipmap {mipmap}: {result.error}")
@@ -8099,33 +8268,36 @@ class Tile(object):
                 log.debug(f"_try_native_mipmap_build: DDS cleared during build for {self.id}")
                 return False
             
-            # Write mipmap data to DDS buffers
-            if hasattr(result, 'mipmap_count') and result.mipmap_count > 0:
-                # MipmapChainResult: write each mipmap to its DDS buffer
-                for i in range(result.mipmap_count):
-                    target_mipmap = mipmap + i
-                    if target_mipmap < len(self.dds.mipmap_list):
-                        mip_data = result.get_mipmap_data(i)
-                        if mip_data:
-                            self.dds.mipmap_list[target_mipmap].databuffer = BytesIO(initial_bytes=mip_data)
-                            self.dds.mipmap_list[target_mipmap].retrieved = True
-                
-                # For mipmaps beyond smallest_mm, copy the 4×4 block
-                # (This matches Python gen_mipmaps behavior)
-                smallest_mm = self.dds.smallest_mm
-                if mipmap + result.mipmap_count - 1 >= smallest_mm:
-                    smallest_data = result.get_mipmap_data(result.mipmap_count - 1)
-                    if smallest_data:
-                        for mm in self.dds.mipmap_list[smallest_mm + 1:]:
-                            mm.databuffer = BytesIO(initial_bytes=smallest_data)
-                            mm.retrieved = True
-                
-                log.debug(f"_try_native_mipmap_build: Built {result.mipmap_count} mipmaps "
-                         f"({mipmap} to {mipmap + result.mipmap_count - 1})")
-            else:
-                # SingleMipmapResult: only write the one mipmap
-                self.dds.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=result.data)
-                self.dds.mipmap_list[mipmap].retrieved = True
+            # Write mipmap data to DDS buffers — short critical section
+            with self._dds_write_lock:
+                self.ready.clear()
+                if hasattr(result, 'mipmap_count') and result.mipmap_count > 0:
+                    # MipmapChainResult: write each mipmap to its DDS buffer
+                    for i in range(result.mipmap_count):
+                        target_mipmap = mipmap + i
+                        if target_mipmap < len(self.dds.mipmap_list):
+                            mip_data = result.get_mipmap_data(i)
+                            if mip_data:
+                                self.dds.mipmap_list[target_mipmap].databuffer = BytesIO(initial_bytes=mip_data)
+                                self.dds.mipmap_list[target_mipmap].retrieved = True
+
+                    # For mipmaps beyond smallest_mm, copy the 4×4 block
+                    # (This matches Python gen_mipmaps behavior)
+                    smallest_mm = self.dds.smallest_mm
+                    if mipmap + result.mipmap_count - 1 >= smallest_mm:
+                        smallest_data = result.get_mipmap_data(result.mipmap_count - 1)
+                        if smallest_data:
+                            for mm in self.dds.mipmap_list[smallest_mm + 1:]:
+                                mm.databuffer = BytesIO(initial_bytes=smallest_data)
+                                mm.retrieved = True
+
+                    log.debug(f"_try_native_mipmap_build: Built {result.mipmap_count} mipmaps "
+                             f"({mipmap} to {mipmap + result.mipmap_count - 1})")
+                else:
+                    # SingleMipmapResult: only write the one mipmap
+                    self.dds.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=result.data)
+                    self.dds.mipmap_list[mipmap].retrieved = True
+                self.ready.set()
             
             # Record timing stats
             total_time = time.monotonic() - build_start
@@ -8352,14 +8524,13 @@ class Tile(object):
             log.debug(f"_try_native_partial_mipmap_build: No chunks for rows {startrow}-{endrow}")
             return False
         
-        # Check threshold - need configured % of chunks
-        min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
+        # Check threshold - need ALL chunks for native partial build
         valid_count = sum(1 for d in jpeg_datas if d is not None)
-        
-        if valid_count < chunk_count * min_ratio:
+
+        if valid_count < chunk_count:
             log.debug(f"_try_native_partial_mipmap_build: threshold not met "
                      f"({valid_count}/{chunk_count} = {valid_count/chunk_count*100:.0f}%, "
-                     f"need {min_ratio*100:.0f}%)")
+                     f"need 100%)")
             bump('native_partial_mipmap_threshold_miss')
             return False
         
@@ -8396,24 +8567,27 @@ class Tile(object):
                 log.debug(f"_try_native_partial_mipmap_build: DDS cleared during build")
                 return False
             
-            # Write DXT data to correct offset in DDS buffer
-            mm = self.dds.mipmap_list[mipmap]
-            
-            # Ensure buffer exists
-            if mm.databuffer is None:
-                mm.databuffer = BytesIO()
-                mm.databuffer.write(b'\x00' * mm.length)
-                mm.databuffer.seek(0)
-            
-            # Calculate offset for this row in the DXT buffer
-            row_offset = startrow * bytes_per_chunk_row
-            
-            # Write data at correct offset
-            mm.databuffer.seek(row_offset)
-            mm.databuffer.write(result.data)
-            
-            # Note: We intentionally do NOT set mm.retrieved = True here
-            # because this is a partial build - more rows may be built later
+            # Write DXT data to correct offset in DDS buffer — short critical section
+            with self._dds_write_lock:
+                self.ready.clear()
+                mm = self.dds.mipmap_list[mipmap]
+
+                # Ensure buffer exists
+                if mm.databuffer is None:
+                    mm.databuffer = BytesIO()
+                    mm.databuffer.write(b'\x00' * mm.length)
+                    mm.databuffer.seek(0)
+
+                # Calculate offset for this row in the DXT buffer
+                row_offset = startrow * bytes_per_chunk_row
+
+                # Write data at correct offset
+                mm.databuffer.seek(row_offset)
+                mm.databuffer.write(result.data)
+
+                # Note: We intentionally do NOT set mm.retrieved = True here
+                # because this is a partial build - more rows may be built later
+                self.ready.set()
             
             build_time = time.monotonic() - build_start
             log.debug(f"_try_native_partial_mipmap_build: SUCCESS rows {startrow}-{endrow} "
@@ -8431,30 +8605,51 @@ class Tile(object):
             return False
 
     #@profile
-    @locked
     def get_mipmap(self, mipmap=0, time_budget=None):
         """
         Build a specific mipmap level.
-        
+
+        Per-mipmap serialization prevents duplicate builds of the same mipmap.
+        IMPORTANT: The lock is NOT held across blocking I/O (chunk downloads).
+        Only the DDS buffer write is protected by _dds_write_lock (~10-50ms).
+
         Args:
             mipmap: Mipmap level to build (0=highest detail, 7=lowest)
             time_budget: TimeBudget for this request (created fresh in read_dds_bytes)
         """
+        if mipmap > self.max_mipmap:
+            mipmap = self.max_mipmap
+
+        # Per-mipmap build serialization: use a set of "in-progress" mipmap
+        # levels instead of holding a lock across the entire build.  This
+        # prevents duplicate builds while allowing the blocking I/O (chunk
+        # downloads, image composition) to run without any lock held.
         #
-        # Protect this method to avoid simultaneous threads attempting mm builds at the same time.
-        # Otherwise we risk contention such as waiting get_img call attempting to build an image as 
-        # another thread closes chunks.
-        #
-        
+        # Previous design held the per-mipmap lock across get_img() which
+        # could block for 180s on chunk downloads, causing the indefinite
+        # stall observed in production.
+        mipmap_lock = self._get_mipmap_build_lock(mipmap)
+        if not mipmap_lock.acquire(timeout=0):
+            log.debug(f"GET_MIPMAP: mipmap {mipmap} build already in progress, skipping")
+            return True
+        # Release the serialization lock immediately.  We've confirmed no
+        # other thread is building this mipmap right now.  If a second
+        # request arrives while we're in get_img(), it will see the lock
+        # is free, acquire it, and also start building — that's acceptable
+        # (wastes some CPU) and far better than holding the lock for 180s
+        # which causes the indefinite stall.  The DDS buffer write is
+        # separately serialized by _dds_write_lock.
+        mipmap_lock.release()
+
+        return self._get_mipmap_inner(mipmap, time_budget)
+
+    def _get_mipmap_inner(self, mipmap, time_budget):
+        """Inner mipmap build logic.  No per-mipmap lock is held here."""
         # Start timing FULL tile creation (download + compose + compress)
-        # Use monotonic() for consistent interval measurement (immune to clock adjustments)
         tile_creation_start = time.monotonic()
 
         log.debug(f"GET_MIPMAP: {self}")
 
-        if mipmap > self.max_mipmap:
-            mipmap = self.max_mipmap
-        
         # === BUDGET TIMING ===
         # The budget is passed in from read_dds_bytes() - each read() gets its own budget.
         #
@@ -8466,57 +8661,52 @@ class Tile(object):
         # black/uninitialized data. Once X-Plane reads a DDS, it's cached and won't refresh.
         # The get_img() method handles budget exhaustion gracefully by skipping chunk downloads
         # but still returning a valid (missing_color filled) image for compression.
-        
+
         if time_budget and time_budget.exhausted:
             log.debug(f"GET_MIPMAP: Budget exhausted, will build mipmap {mipmap} with missing_color (no new downloads)")
 
         # ═══════════════════════════════════════════════════════════════════════
-        # NATIVE MIPMAP BUILD: Try fast native path for mipmaps 1-4
+        # NATIVE MIPMAP BUILD: Try fast native path for all mipmaps (0-4)
         # ═══════════════════════════════════════════════════════════════════════
-        # For mipmaps with 16-256 chunks, native aopipeline is 3-4x faster than Python.
-        # This uses build_single_mipmap() for parallel JPEG decode + DXT compress.
-        # Falls back to Python path if:
-        # - Mipmap 0 (use full aopipeline instead)
-        # - Not enough chunks ready (need fallback handling)
-        # - Native build fails for any reason
-        if mipmap > 0 and self._try_native_mipmap_build(mipmap, time_budget):
-            # Native build succeeded - mipmap buffer is populated
-            # Note: Timing stats are recorded inside _try_native_mipmap_build
+        if self._try_native_mipmap_build(mipmap, time_budget):
             log.debug(f"GET_MIPMAP: Native build succeeded for mipmap {mipmap}")
-            
+
             try:
                 bump_many({f"mm_count:{mipmap}": 1})
             except Exception:
                 pass
-            
+
             self._try_incremental_dds_store(mipmap)
             return True
         # ═══════════════════════════════════════════════════════════════════════
 
-        # We can have multiple threads wait on get_img ...
+        # Python path: get_img runs WITHOUT tile lock held
         log.debug(f"GET_MIPMAP: Next call is get_img which may block!.............")
-        # Pass the per-request budget to get_img (each read() gets its own budget)
         new_im = self.get_img(mipmap, maxwait=self.get_maxwait(), time_budget=time_budget)
         if not new_im:
             log.debug("GET_MIPMAP: No updates, so no image generated")
             return True
 
-        self.ready.clear()
+        # DDS WRITE — short critical section (~10-50ms)
         compress_start_time = time.monotonic()
-        try:
-            if mipmap == 0:
-                self.dds.gen_mipmaps(new_im, mipmap, 0)
-            else:
-                self.dds.gen_mipmaps(new_im, mipmap)
-        finally:
-            if mipmap not in self.imgs:
-                try:
-                    new_im.close()
-                except Exception:
-                    pass
+        with self._dds_write_lock:
+            self.ready.clear()
+            try:
+                if mipmap == 0:
+                    self.dds.gen_mipmaps(new_im, mipmap, 0)
+                else:
+                    self.dds.gen_mipmaps(new_im, mipmap)
+            finally:
+                self.ready.set()
 
         compress_end_time = time.monotonic()
-        self.ready.set()
+
+        # Image cleanup (no lock needed)
+        if mipmap not in self.imgs:
+            try:
+                new_im.close()
+            except Exception:
+                pass
 
         # Calculate timing metrics
         compress_time = compress_end_time - compress_start_time
@@ -8531,35 +8721,28 @@ class Tile(object):
             })
         except Exception:
             pass
-        
+
         # Log tile completion when mipmap 0 is done (full tile delivered to X-Plane)
         if mipmap == 0 and not self._completion_reported:
             self._completion_reported = True
-            # Calculate time from first X-Plane request to completion
             if self.first_request_time is not None:
                 tile_completion_time = time.monotonic() - self.first_request_time
             else:
-                # Fallback: use the mipmap creation time if first_request_time wasn't set
                 tile_completion_time = total_creation_time
-            
+
             log.debug(f"GET_MIPMAP: Tile {self} COMPLETED in {tile_completion_time:.2f}s "
                      f"(mipmap 0 done, time from first request)")
 
-            # Persist progressively-built DDS to Dynamic DDS Cache.
-            # This path is the slowest (all mipmaps built individually)
-            # so caching the result is especially valuable.
             _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
             if dynamic_dds_cache is not None and (not self._prepopulated or _partially_cached):
                 try:
                     self.dds.seek(0)
                     dds_bytes = self.dds.read(self.dds.total_size)
                     if dds_bytes and len(dds_bytes) >= 128:
-                        # Identify chunks that were missing during progressive build.
-                        # Without this, DDS with missing_color patches gets cached as
-                        # "complete" and healing is never triggered on subsequent loads.
                         mm0_missing = None
-                        if self.max_zoom in self.chunks:
-                            mm0_chunks = self.chunks[self.max_zoom]
+                        with self._lock:
+                            mm0_chunks = self.chunks.get(self.max_zoom, [])
+                        if mm0_chunks:
                             missing = [i for i, c in enumerate(mm0_chunks)
                                        if not (c.ready.is_set() and c.data)]
                             if missing:
@@ -8571,20 +8754,22 @@ class Tile(object):
                             mm0_missing_indices=mm0_missing)
                 except Exception:
                     pass
-        
-        # Log per-mipmap creation time for visibility
+
         log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
                  f"(download+compose: {total_creation_time - compress_time:.2f}s, compress: {compress_time:.2f}s)")
 
         self._try_incremental_dds_store(mipmap)
 
-        # Close only chunks for THIS mipmap's zoom level (not all zooms!)
+        # Chunk cleanup — lock only for dict mutation
         mipmap_zoom = self.max_zoom - mipmap
-        if mipmap_zoom in self.chunks:
-            log.debug(f"GET_MIPMAP: Closing chunks for mipmap {mipmap} (zoom {mipmap_zoom}).")
-            for chunk in self.chunks[mipmap_zoom]:
-                chunk.close()
-            del self.chunks[mipmap_zoom]
+        chunks_to_close = []
+        with self._lock:
+            if mipmap_zoom in self.chunks:
+                log.debug(f"GET_MIPMAP: Closing chunks for mipmap {mipmap} (zoom {mipmap_zoom}).")
+                chunks_to_close = self.chunks.pop(mipmap_zoom)
+        for chunk in chunks_to_close:
+            chunk.close()
+
         log.debug("Results:")
         log.debug(self.dds.mipmap_list)
         return True

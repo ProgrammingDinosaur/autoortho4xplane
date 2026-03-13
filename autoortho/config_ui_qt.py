@@ -3025,41 +3025,6 @@ class ConfigUI(QMainWindow):
         buffer_pool_layout.addWidget(self.buffer_pool_value_label)
         autoortho_layout.addLayout(buffer_pool_layout)
         
-        # --- Min Chunk Ratio (quality vs speed tradeoff) ---
-        min_chunk_layout = QHBoxLayout()
-        self.min_chunk_ratio_label = QLabel("Min chunk ratio:")
-        self.min_chunk_ratio_label.setToolTip(
-            "Threshold ratio of chunks that triggers the first DDS build.\n"
-            "Uses a two-phase strategy:\n\n"
-            "1. Early build: fires when this threshold is reached.\n"
-            "   Missing chunks are filled with the missing color.\n"
-            "2. Healing pass: fires automatically when remaining\n"
-            "   chunks arrive, replacing placeholder areas.\n\n"
-            "• 100% - Quality (default): single build, no placeholders\n"
-            "• 90%  - Balanced: texture appears ~10% sooner, healed after\n"
-            "• 80%  - Fast: texture appears earlier, more healing work\n\n"
-            "Lower values show textures sooner at the cost of a\n"
-            "brief placeholder until the healing pass completes."
-        )
-        min_chunk_layout.addWidget(self.min_chunk_ratio_label)
-        
-        self.min_chunk_ratio_slider = ModernSlider(Qt.Orientation.Horizontal)
-        self.min_chunk_ratio_slider.setRange(50, 100)  # 50% to 100%
-        current_ratio = float(getattr(self.cfg.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
-        current_ratio_pct = int(current_ratio * 100)
-        current_ratio_pct = max(50, min(100, current_ratio_pct))
-        self.min_chunk_ratio_slider.setValue(current_ratio_pct)
-        self.min_chunk_ratio_slider.setObjectName('live_aopipeline_min_chunk_ratio')
-        self.min_chunk_ratio_slider.setToolTip("Early-build threshold: tile builds at this chunk ratio, healed when remaining chunks arrive (50-100%)")
-        
-        self.min_chunk_ratio_value_label = QLabel(f"{current_ratio_pct}%")
-        self.min_chunk_ratio_slider.valueChanged.connect(
-            lambda v: self.min_chunk_ratio_value_label.setText(f"{v}%")
-        )
-        min_chunk_layout.addWidget(self.min_chunk_ratio_slider)
-        min_chunk_layout.addWidget(self.min_chunk_ratio_value_label)
-        autoortho_layout.addLayout(min_chunk_layout)
-        
         # Initialize pipeline control states
         self._update_pipeline_controls()
         
@@ -4534,25 +4499,12 @@ class ConfigUI(QMainWindow):
         self.buffer_pool_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
         self.buffer_pool_value_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
         
-        # Min chunk ratio is also only relevant for native/hybrid modes
-        if hasattr(self, 'min_chunk_ratio_slider'):
-            self.min_chunk_ratio_slider.setEnabled(buffer_pool_enabled)
-            self.min_chunk_ratio_label.setEnabled(buffer_pool_enabled)
-            self.min_chunk_ratio_value_label.setEnabled(buffer_pool_enabled)
-            self.min_chunk_ratio_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
-            self.min_chunk_ratio_value_label.setStyleSheet(enabled_style if buffer_pool_enabled else disabled_style)
-        
         # Update tooltip to explain why disabled
         if not buffer_pool_enabled:
             self.buffer_pool_label.setToolTip(
                 "Buffer pool is only used in Native and Hybrid modes.\n"
                 "Select a different pipeline mode to configure this setting."
             )
-            if hasattr(self, 'min_chunk_ratio_label'):
-                self.min_chunk_ratio_label.setToolTip(
-                    "Early-build threshold is only active in Native and Hybrid modes.\n"
-                    "Select a different pipeline mode to configure this setting."
-                )
 
     def _init_dynamic_zoom_manager(self):
         """Initialize the dynamic zoom manager from config."""
@@ -5677,8 +5629,7 @@ class ConfigUI(QMainWindow):
             # Native pipeline settings
             self.cfg.autoortho.pipeline_mode = self.pipeline_mode_combo.currentText()
             self.cfg.autoortho.buffer_pool_size = str(self.buffer_pool_slider.value())
-            self.cfg.autoortho.live_aopipeline_min_chunk_ratio = self.min_chunk_ratio_slider.value() / 100.0
-            
+
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
             )

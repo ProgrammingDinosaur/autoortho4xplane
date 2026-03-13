@@ -121,6 +121,15 @@ class DynamicDDSCache:
         # In-flight healing guard (prevents duplicate patch work)
         self._healing_in_progress: set = set()
 
+        # Network healing callback: set by getortho.py to dispatch network
+        # downloads for chunks that can't be healed from disk cache alone.
+        # Signature: callback(tile, indices_to_heal: List[int]) -> None
+        self._network_heal_callback = None
+
+        # Guard to prevent duplicate network healing dispatches.
+        # Protected by self._lock for thread safety.
+        self._network_healing_in_progress: set = set()
+
         # Statistics
         self._hits = 0
         self._misses = 0
@@ -423,6 +432,7 @@ class DynamicDDSCache:
             # Healing detection: check for missing or fallback chunks
             missing_indices = meta.get("missing_indices", [])
             fallback_indices = meta.get("fallback_indices", [])
+            unhealable = []
             if missing_indices or fallback_indices:
                 tile._dds_needs_healing = True
                 tile._dds_missing_indices = missing_indices
@@ -430,31 +440,40 @@ class DynamicDDSCache:
                 log.debug(f"DDS cache: serving incomplete tile {tile_id} "
                           f"({len(missing_indices)} missing, "
                           f"{len(fallback_indices)} fallback chunks need healing)")
-                self._try_heal_from_disk_cache(tile_id, max_zoom, tile)
+                unhealable = self._try_heal_from_disk_cache(tile_id, max_zoom, tile)
 
-            # Quality gate: if cached DDS is below current min_chunk_ratio,
-            # serve it (preserving valid data) but trigger healing for the gap.
-            # This ensures raising min_chunk_ratio heals existing tiles instead
-            # of permanently serving stale quality.
+            # Quality gate: if cached DDS has missing chunks, trigger healing.
             mipmaps_meta = meta.get("mipmaps", [])
             if mipmaps_meta and len(mipmaps_meta) > 0:
                 mm0_meta = mipmaps_meta[0]
                 total = mm0_meta.get("total", 0)
                 valid = mm0_meta.get("valid", total)
-                if total > 0 and valid < total:
+                if total > 0 and valid < total and not tile._dds_needs_healing:
+                    tile._dds_needs_healing = True
+                    if not getattr(tile, '_dds_missing_indices', None):
+                        tile._dds_missing_indices = missing_indices
+                    log.debug(f"DDS cache: quality {valid}/{total} "
+                              f"({valid/total*100:.0f}%) below 100%, "
+                              f"triggering healing")
+                    unhealable = self._try_heal_from_disk_cache(tile_id, max_zoom, tile)
+
+            # Dispatch network healing for chunks not healable from disk
+            if unhealable and self._network_heal_callback:
+                key = self._tile_key(tile_id, max_zoom)
+                dispatch = False
+                with self._lock:
+                    if key not in self._network_healing_in_progress:
+                        self._network_healing_in_progress.add(key)
+                        dispatch = True
+                if dispatch:
+                    log.debug(f"DDS cache: dispatching network healing for {tile_id} "
+                              f"({len(unhealable)} chunks)")
                     try:
-                        from autoortho.aoconfig import CFG
-                    except ImportError:
-                        from aoconfig import CFG
-                    min_ratio = float(getattr(CFG.autoortho, 'live_aopipeline_min_chunk_ratio', 1.0))
-                    if valid / total < min_ratio and not tile._dds_needs_healing:
-                        tile._dds_needs_healing = True
-                        if not getattr(tile, '_dds_missing_indices', None):
-                            tile._dds_missing_indices = missing_indices
-                        log.debug(f"DDS cache: quality {valid}/{total} "
-                                  f"({valid/total*100:.0f}%) below threshold "
-                                  f"{min_ratio*100:.0f}%, triggering healing")
-                        self._try_heal_from_disk_cache(tile_id, max_zoom, tile)
+                        self._network_heal_callback(tile, unhealable)
+                    except Exception as e:
+                        log.debug(f"DDS cache: network healing dispatch failed: {e}")
+                        with self._lock:
+                            self._network_healing_in_progress.discard(key)
 
             # DDM v3: partial DDS awareness -- tell the tile which mipmaps
             # actually contain data so _populate_dds_from_prebuilt() can
@@ -1810,25 +1829,29 @@ class DynamicDDSCache:
             f"{col}_{row}_{max_zoom}_{tile.maptype}.jpg")
         return os.path.exists(jpeg_path)
 
-    def _try_heal_from_disk_cache(self, tile_id: str, max_zoom: int, tile) -> None:
+    def _try_heal_from_disk_cache(self, tile_id: str, max_zoom: int, tile) -> List[int]:
         """Check if healable chunk JPEGs exist on disk and dispatch healing.
 
         Missing chunks are checked first (all-or-nothing). Fallback chunks
         are checked individually (best-effort) so missing-chunk healing is
         never delayed by unavailable fallback JPEGs.
+
+        Returns list of chunk indices that could NOT be healed from disk
+        (candidates for network healing).
         """
         missing = getattr(tile, '_dds_missing_indices', [])
         fallback = getattr(tile, '_dds_fallback_indices', [])
-        if not missing and not fallback:
-            return
+        all_indices = list(missing) + list(fallback)
+        if not all_indices:
+            return []
 
         jpeg_cache_dir = getattr(tile, 'cache_dir', None)
         if not jpeg_cache_dir:
-            return
+            return all_indices
 
         chunks_per_row = getattr(tile, 'chunks_per_row', 0)
         if not chunks_per_row:
-            return
+            return all_indices
 
         healable = []
 
@@ -1845,6 +1868,8 @@ class DynamicDDSCache:
             if self._jpeg_exists_on_disk(idx, tile, jpeg_cache_dir, chunks_per_row, max_zoom):
                 healable.append(idx)
 
+        unhealable = [i for i in all_indices if i not in healable]
+
         if healable:
             log.debug(f"DDS cache: {len(healable)} healable JPEGs on disk for {tile_id}, "
                       f"dispatching cross-session healing")
@@ -1853,6 +1878,8 @@ class DynamicDDSCache:
                 args=(tile_id, max_zoom, tile, healable),
                 daemon=True)
             t.start()
+
+        return unhealable
 
     def _heal_from_disk(self, tile_id: str, max_zoom: int, tile,
                         missing: List[int]) -> None:
@@ -1881,6 +1908,16 @@ class DynamicDDSCache:
                 return
 
         self.patch_missing_chunks(tile_id, max_zoom, tile, chunk_jpegs)
+
+    def clear_network_healing(self, tile_id: str, max_zoom: int) -> None:
+        """Remove a tile from the network healing in-progress set.
+
+        Called by the healing thread in getortho.py when it finishes
+        (success or failure) so the tile can be re-healed on next load.
+        """
+        key = self._tile_key(tile_id, max_zoom)
+        with self._lock:
+            self._network_healing_in_progress.discard(key)
 
     @staticmethod
     def _delete_pair(dds_path: str, ddm_path: str) -> None:
