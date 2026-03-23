@@ -312,7 +312,7 @@ def diagnose(CFG):
     log.info(f"Checking maptypes:")
     import getortho
     for maptype in MAPTYPES:
-        if maptype == "Use tile default":
+        if maptype in ("Use tile default", "Custom Map"):
             continue
         # Use ignore_cleanup_errors=True to handle race with async cache writes
         # The async cache writer may still be writing when the temp dir is cleaned up

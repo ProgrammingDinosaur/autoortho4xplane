@@ -189,11 +189,11 @@ prefetch_enabled = True
 # Lower = fewer tiles prefetched, less resource usage
 # Recommended: 15 (fast aircraft), 30 (balanced), 60 (slow internet or long haul)
 # Set to 0 for Unlimited lookahead (continues until max_chunks or other limits)
-prefetch_lookahead = 30
-# How often to check for prefetch opportunities in seconds (1-10)
-prefetch_interval = 2.0
-# Maximum chunks to prefetch per cycle (8-512)
-prefetch_max_chunks = 48
+prefetch_lookahead = 0
+# How often to check for prefetch opportunities in seconds (0.5-10)
+prefetch_interval = 1.0
+# Maximum chunks to prefetch per cycle (32-4096)
+prefetch_max_chunks = 512
 # Prefetch radius in nautical miles (10-150)
 # Tiles within this radius of the flight path are prefetched
 # Used by both velocity-based and SimBrief prefetching
@@ -202,18 +202,18 @@ prefetch_radius_nm = 40
 # When enabled, tiles are compressed to DDS in the background, eliminating stutters
 # when X-Plane loads new scenery areas. Falls back gracefully on cache miss.
 predictive_dds_enabled = True
-# Minimum interval between DDS builds in milliseconds (100-2000)
+# Minimum interval between DDS builds in milliseconds (50-2000)
 # Rate limits background builds to prevent CPU spikes during flight
 # Lower = faster building, higher CPU usage
 # Higher = slower building, lower CPU usage
 # Recommended: 250 (fast CPU), 500 (balanced), 1000 (low-end CPU)
-predictive_dds_build_interval_ms = 500
-# Number of parallel prefetch workers for predictive DDS builds (1-8)
+predictive_dds_build_interval_ms = 250
+# Number of parallel prefetch workers for predictive DDS builds (1-16)
 # These run in the background to pre-build tiles ahead of where you're flying
 # Higher values = faster prefetch throughput, but more CPU usage during flight
 # Lower values = less CPU impact, slower prefetch
-# Recommended: 2 (low-end CPU or battery saving), 4 (balanced, default), 6-8 (fast CPU)
-background_builder_workers = 4
+# Recommended: 2 (low-end CPU or battery saving), 8 (balanced, default), 12-16 (fast CPU)
+background_builder_workers = 8
 # Number of concurrent tile build workers (1-32)
 # Controls how many tiles can be built simultaneously by the native pipeline
 # Higher values = faster tile processing, more CPU/RAM usage
@@ -236,9 +236,8 @@ predictive_dds_use_fallbacks = True
 ephemeral_dds_cache_mb = 4096
 # Persistent DDS cache - stores pre-built DDS textures across sessions
 # Eliminates JPEG decode + DXT compress on subsequent loads (~1-2ms read vs ~390ms rebuild)
-# Set to 0 to disable persistent DDS caching
-# Recommended: 4096 (balanced), 8192 (large regions), 0 (disk constrained)
-persistent_dds_cache_mb = 4096
+# Set to 0 for unlimited cache (recommended). Uses disk budget manager for cleanup.
+persistent_dds_cache_mb = 0
 # Disk budget enforcement - automatically cleans up old cache data
 # When total cache exceeds file_cache_size, oldest data is evicted
 # Categories: DDS cache (compiled textures), JPEGs (source images)

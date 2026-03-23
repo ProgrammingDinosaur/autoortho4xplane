@@ -1,7 +1,9 @@
 import argparse
+import gc
 import logging
 import logging.handlers
 import os
+import signal
 import sys
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
@@ -111,6 +113,45 @@ def main():
             "Loading FUSE with options: %s",
             ", ".join(sorted(map(str, additional_args.keys())))
     )
+
+    def _handle_sigusr1(signum, frame):
+        """Reload maptype override from config on SIGUSR1."""
+        try:
+            try:
+                from autoortho.aoconfig import CFG
+            except ImportError:
+                from aoconfig import CFG
+            CFG.load()
+            new_maptype = CFG.autoortho.maptype_override
+            try:
+                from autoortho.getortho import TileCacher
+            except ImportError:
+                from getortho import TileCacher
+            for obj in gc.get_objects():
+                try:
+                    if isinstance(obj, TileCacher):
+                        obj.maptype_override = new_maptype
+                        if new_maptype == "Custom Map":
+                            try:
+                                from autoortho.utils.custom_map import reload_custom_map_config
+                            except ImportError:
+                                from utils.custom_map import reload_custom_map_config
+                            obj.custom_map = reload_custom_map_config()
+                        elif new_maptype == "APPLE":
+                            try:
+                                from autoortho.utils.apple_token_service import apple_token_service
+                            except ImportError:
+                                from utils.apple_token_service import apple_token_service
+                            apple_token_service.reset_apple_maps_token()
+                        else:
+                            obj.custom_map = None
+                        log.info(f"Worker reloaded maptype to {new_maptype}")
+                except Exception:
+                    pass
+        except Exception as e:
+            log.error(f"SIGUSR1 handler failed: {e}")
+
+    signal.signal(signal.SIGUSR1, _handle_sigusr1)
 
     try:
         # Initial heartbeat before mounting

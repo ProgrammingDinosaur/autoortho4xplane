@@ -2022,3 +2022,134 @@ class TestPerformanceConfig:
         assert cfg.autoortho.use_time_budget == False
         assert float(cfg.autoortho.tile_time_budget) == 3.5
         assert cfg.autoortho.fallback_level == 'full', f"Expected 'full', got {cfg.autoortho.fallback_level}"
+
+
+# ============================================================================
+# TERRAIN TILE LOOKUP & HIGH-ZOOM SPATIAL INDEX TESTS
+# ============================================================================
+
+class TestTerrainTileLookup:
+    """Tests for TerrainTileLookup coordinate math and spatial index."""
+
+    def test_latlon_to_tile_grid_alignment(self):
+        """All tile coordinates must be aligned to 16-tile grid."""
+        test_positions = [
+            (40.0, -74.0),    # NYC
+            (51.47, -0.46),   # London Heathrow
+            (-33.9, 151.2),   # Sydney
+            (0.0, 0.0),       # Equator/prime meridian
+            (60.0, 25.0),     # Helsinki
+            (-85.0, 179.9),   # Near south pole, near date line
+        ]
+        for lat, lon in test_positions:
+            for zoom in (16, 17, 18, 19):
+                row, col = getortho.TerrainTileLookup._latlon_to_tile(lat, lon, zoom)
+                assert row % 16 == 0, f"row={row} not aligned at ({lat},{lon}) ZL{zoom}"
+                assert col % 16 == 0, f"col={col} not aligned at ({lat},{lon}) ZL{zoom}"
+
+    def test_tile_to_latlon_round_trip(self):
+        """_tile_to_latlon should be the approximate inverse of _latlon_to_tile."""
+        test_cases = [
+            (40.0, -74.0, 16),
+            (51.5, -0.1, 18),
+            (-33.9, 151.2, 18),
+            (0.0, 0.0, 16),
+            (60.0, 25.0, 18),
+        ]
+        for lat, lon, zoom in test_cases:
+            row, col = getortho.TerrainTileLookup._latlon_to_tile(lat, lon, zoom)
+            lat2, lon2 = getortho.TerrainTileLookup._tile_to_latlon(row, col, zoom)
+            # Error should be within one tile width
+            tile_width_deg = 360.0 / (2 ** zoom) * 16
+            assert abs(lat2 - lat) < tile_width_deg, \
+                f"lat error {abs(lat2 - lat):.4f} > {tile_width_deg:.4f} for ({lat},{lon}) ZL{zoom}"
+            assert abs(lon2 - lon) < tile_width_deg, \
+                f"lon error {abs(lon2 - lon):.4f} > {tile_width_deg:.4f} for ({lat},{lon}) ZL{zoom}"
+
+    def test_highzoom_index_builds_from_ter_files(self, tmp_path):
+        """Sparse index should find ZL18 .ter files and ignore ZL16 files."""
+        # Create ZL18 tiles near London
+        row, col = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 18)
+        step = 16
+        for dr in range(3):
+            for dc in range(3):
+                r = row + dr * step
+                c = col + dc * step
+                (tmp_path / f"{r}_{c}_BI18.ter").touch()
+
+        # Create a ZL16 tile (should NOT be indexed)
+        row16, col16 = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 16)
+        (tmp_path / f"{row16}_{col16}_BI16.ter").touch()
+
+        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        assert lookup._highzoom_count == 9, f"Expected 9 indexed tiles, got {lookup._highzoom_count}"
+
+    def test_highzoom_query_radius_filter(self, tmp_path):
+        """Query should return tiles within radius and exclude those outside."""
+        # Create ZL18 tiles near London Heathrow
+        row, col = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 18)
+        step = 16
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                (tmp_path / f"{row + dr * step}_{col + dc * step}_BI18.ter").touch()
+
+        # Create ZL18 tile far away (NYC area)
+        row_nyc, col_nyc = getortho.TerrainTileLookup._latlon_to_tile(40.6, -73.8, 18)
+        (tmp_path / f"{row_nyc}_{col_nyc}_BI18.ter").touch()
+
+        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        assert lookup._highzoom_count == 10
+
+        # Query near London - should find 9 tiles, not the NYC one
+        results = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=5.0)
+        assert len(results) == 9, f"Expected 9 near London, got {len(results)}"
+
+        # Query near NYC - should find 1 tile
+        results_nyc = lookup.get_highzoom_tiles_near(40.6, -73.8, radius_nm=5.0)
+        assert len(results_nyc) == 1, f"Expected 1 near NYC, got {len(results_nyc)}"
+
+    def test_highzoom_query_maptype_filter(self, tmp_path):
+        """Query should respect maptype filter."""
+        row, col = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 18)
+        (tmp_path / f"{row}_{col}_BI18.ter").touch()
+        (tmp_path / f"{row}_{col}_EOX18.ter").touch()
+
+        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        assert lookup._highzoom_count == 2
+
+        results_bi = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=5.0, maptype_filter="BI")
+        assert len(results_bi) == 1
+        assert results_bi[0][2] == "BI"
+
+        results_all = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=5.0)
+        assert len(results_all) == 2
+
+    def test_highzoom_empty_folder(self, tmp_path):
+        """Index should be empty when no high-zoom tiles exist."""
+        # Create only ZL16 tiles
+        row, col = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 16)
+        (tmp_path / f"{row}_{col}_BI16.ter").touch()
+
+        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        assert lookup._highzoom_count == 0
+        results = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=40.0)
+        assert len(results) == 0
+
+    def test_highzoom_nonexistent_folder(self):
+        """Index should handle nonexistent folder gracefully."""
+        lookup = getortho.TerrainTileLookup("/nonexistent/path", "test")
+        assert lookup._highzoom_count == 0
+        results = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=40.0)
+        assert len(results) == 0
+
+    def test_clear_cache_clears_index(self, tmp_path):
+        """clear_cache should clear both lookup cache and spatial index."""
+        row, col = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 18)
+        (tmp_path / f"{row}_{col}_BI18.ter").touch()
+
+        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        assert lookup._highzoom_count == 1
+
+        lookup.clear_cache()
+        assert lookup._highzoom_count == 0
+        assert len(lookup._highzoom_index) == 0

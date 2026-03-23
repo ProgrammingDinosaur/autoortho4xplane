@@ -2,7 +2,7 @@
 import platform
 import os
 
-MAPTYPES = ['Use tile default', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly', 'GO2', 'ARC', 'YNDX', 'APPLE']
+MAPTYPES = ['Use tile default', 'BI', 'NAIP', 'EOX', 'USGS', 'Firefly', 'GO2', 'ARC', 'YNDX', 'APPLE', 'Custom Map']
 
 system_type = platform.system().lower()
 

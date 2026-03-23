@@ -109,8 +109,8 @@ class DynamicDDSCache:
         """
         self._cache_dir = cache_dir
         self._dds_root = os.path.join(cache_dir, "dds_cache")
-        self._max_size = max_size_mb * 1024 * 1024  # bytes
-        self._enabled = enabled and max_size_mb > 0
+        self._max_size = max_size_mb * 1024 * 1024 if max_size_mb > 0 else 0  # 0 = unlimited
+        self._enabled = enabled
         self._current_size = 0
 
         # LRU tracking: tile_key -> (dds_path, ddm_path, size, last_access)
@@ -1794,6 +1794,11 @@ class DynamicDDSCache:
             tile._dds_missing_indices = remaining_missing
             tile._dds_fallback_indices = remaining_fallback
             log.info(f"Healing complete: {tile_id} ({patched} chunks patched)")
+
+            # Clean up source JPEGs now that the DDS is fully healed
+            if remaining_total == 0:
+                self._cleanup_jpegs_async(tile)
+
             return True
 
         # Partial patch — update DDM with remaining indices

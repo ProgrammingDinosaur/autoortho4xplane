@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Custom Map Editor</title>
+<link rel="stylesheet" href="leaflet.css" />
+<script src="leaflet.min.js"></script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; }
+  #map { width: 100%; height: 100vh; }
+  .leaflet-control-container { z-index: 800; position: relative; }
+
+  #legend {
+    position: absolute; top: 10px; right: 10px; z-index: 1000;
+    background: rgba(26, 26, 46, 0.92); border-radius: 8px; padding: 6px 8px;
+    color: #e0e0e0; font-size: 11px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    cursor: pointer; user-select: none;
+  }
+  #legend h4 { font-size: 12px; color: #fff; margin: 0; }
+  #legend h4::after { content: ' \25B2'; font-size: 8px; color: #888; }
+  #legend.collapsed h4::after { content: ' \25BC'; }
+  #legend.collapsed .legend-body { display: none; }
+  .legend-body { margin-top: 4px; }
+  .legend-item { display: flex; align-items: center; margin: 2px 0; }
+  .legend-color { width: 12px; height: 12px; border-radius: 2px; margin-right: 5px; border: 1px solid rgba(255,255,255,0.2); }
+  .legend-label { font-size: 10px; }
+  .legend-note { font-size: 9px; color: #888; font-style: italic; margin-top: 3px; line-height: 1.3; }
+
+  #status {
+    position: absolute; bottom: 10px; left: 10px; z-index: 1000;
+    background: rgba(26, 26, 46, 0.85); border-radius: 6px; padding: 6px 12px;
+    color: #aaa; font-size: 11px;
+  }
+
+  .selection-rect {
+    position: absolute; z-index: 1000;
+    border: 2px dashed rgba(255,255,255,0.8);
+    background: rgba(255,255,255,0.1);
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="legend" onclick="this.classList.toggle('collapsed')">
+  <h4>Legend</h4>
+  <div class="legend-body"></div>
+</div>
+<div id="status">Paint mode — left-click & drag to paint, right-click & drag to pan</div>
+
+<script>
+// ============================================================================
+// Config
+// ============================================================================
+const MAPTYPE_COLORS = {
+  'BI':      '#4285F4',
+  'NAIP':    '#34A853',
+  'EOX':     '#FBBC04',
+  'USGS':    '#EA4335',
+  'Firefly': '#FF6D01',
+  'GO2':     '#46BDC6',
+  'ARC':     '#7B1FA2',
+  'YNDX':    '#D81B60',
+  'APPLE':   '#333333'
+};
+
+let currentMaptype = 'BI';
+let eraseMode = false;
+let bridge = null;
+let debounceTimer = null;
+
+// Available DSF tiles (set of "lat,lon" keys)
+let availableTiles = new Set();
+let availableTilesLoaded = false;
+let availableTileGridLayer = null;
+
+// Drag-selection state
+let dragStart = null;
+let dragStartLatLng = null;
+let selectionDiv = null;
+
+// ============================================================================
+// Undo / Redo
+// ============================================================================
+const undoStack = [];  // Each entry: { set: {key: maptype}, removed: {key: prevMaptype|null} }
+const redoStack = [];
+const MAX_UNDO = 100;
+
+// Snapshot the cells that will be affected before an action
+function snapshotKeys(keys) {
+  const before = {};
+  for (const key of keys) {
+    before[key] = cellRects[key] ? cellRects[key]._maptype : null;
+  }
+  return before;
+}
+
+// Record an action for undo. before = {key: prevMaptype|null}, after = {key: newMaptype|null}
+function pushUndo(before, after) {
+  // Only record if something actually changed
+  let changed = false;
+  for (const key of Object.keys(after)) {
+    if (before[key] !== after[key]) { changed = true; break; }
+  }
+  if (!changed) return;
+
+  undoStack.push({ before, after });
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+  redoStack.length = 0;  // clear redo on new action
+
+}
+
+function applySnapshot(snapshot) {
+  // snapshot is {key: maptype|null}
+  const toSet = {};
+  const toRemove = [];
+  for (const [key, maptype] of Object.entries(snapshot)) {
+    if (maptype === null) {
+      removeCellRect(key);
+      toRemove.push(key);
+    } else {
+      addCellRect(key, maptype);
+      toSet[key] = maptype;
+    }
+  }
+  // Persist to Python
+  if (bridge) {
+    if (Object.keys(toSet).length > 0) bridge.set_cells(JSON.stringify(toSet));
+    if (toRemove.length > 0) bridge.remove_cells(JSON.stringify(toRemove));
+  }
+  updateStatus();
+}
+
+function undo() {
+  if (undoStack.length === 0) return;
+  const action = undoStack.pop();
+  redoStack.push(action);
+  applySnapshot(action.before);
+
+}
+
+function redo() {
+  if (redoStack.length === 0) return;
+  const action = redoStack.pop();
+  undoStack.push(action);
+  applySnapshot(action.after);
+
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', function(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+    e.preventDefault();
+    undo();
+  } else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+    e.preventDefault();
+    redo();
+  }
+});
+
+// ============================================================================
+// Leaflet Map
+// ============================================================================
+const map = L.map('map', {
+  center: [30, 0],
+  zoom: 3,
+  minZoom: 2,
+  maxZoom: 10,
+  worldCopyJump: true
+});
+
+L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
+  subdomains: 'abcd',
+  maxZoom: 20
+}).addTo(map);
+
+// Cell rectangles layer
+const cellLayer = L.layerGroup().addTo(map);
+const cellRects = {};
+
+// Grid overlay (visible at zoom >= 3)
+const GridLayer = L.GridLayer.extend({
+  createTile: function(coords) {
+    const tile = document.createElement('canvas');
+    const size = this.getTileSize();
+    tile.width = size.x;
+    tile.height = size.y;
+
+    if (map.getZoom() < 3) return tile;
+
+    const ctx = tile.getContext('2d');
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+
+    const nw = this._map.unproject([coords.x * size.x, coords.y * size.y], coords.z);
+    const se = this._map.unproject([(coords.x + 1) * size.x, (coords.y + 1) * size.y], coords.z);
+
+    const latStart = Math.floor(se.lat);
+    const latEnd = Math.ceil(nw.lat);
+    const lonStart = Math.floor(nw.lng);
+    const lonEnd = Math.ceil(se.lng);
+
+    for (let lat = latStart; lat <= latEnd; lat++) {
+      const pixelY = this._map.project([lat, 0], coords.z).y - coords.y * size.y;
+      ctx.beginPath();
+      ctx.moveTo(0, pixelY);
+      ctx.lineTo(size.x, pixelY);
+      ctx.stroke();
+    }
+    for (let lon = lonStart; lon <= lonEnd; lon++) {
+      const pixelX = this._map.project([0, lon], coords.z).x - coords.x * size.x;
+      ctx.beginPath();
+      ctx.moveTo(pixelX, 0);
+      ctx.lineTo(pixelX, size.y);
+      ctx.stroke();
+    }
+    return tile;
+  }
+});
+new GridLayer({ opacity: 1, zIndex: 400 }).addTo(map);
+
+// ============================================================================
+// Cell Management
+// ============================================================================
+function cellKey(lat, lon) {
+  return Math.floor(lat) + ',' + Math.floor(lon);
+}
+
+function addCellRect(key, maptype) {
+  if (cellRects[key]) {
+    cellLayer.removeLayer(cellRects[key]);
+  }
+  const parts = key.split(',');
+  const lat = parseInt(parts[0]);
+  const lon = parseInt(parts[1]);
+  const color = MAPTYPE_COLORS[maptype] || '#888';
+  const rect = L.rectangle([[lat, lon], [lat + 1, lon + 1]], {
+    color: color,
+    fillColor: color,
+    fillOpacity: 0.35,
+    weight: 1,
+    opacity: 0.7
+  });
+  rect._maptype = maptype;
+  rect._cellKey = key;
+  cellLayer.addLayer(rect);
+  cellRects[key] = rect;
+}
+
+function removeCellRect(key) {
+  if (cellRects[key]) {
+    cellLayer.removeLayer(cellRects[key]);
+    delete cellRects[key];
+  }
+}
+
+function loadCells(cellsJson) {
+  cellLayer.clearLayers();
+  for (const k in cellRects) delete cellRects[k];
+
+  const cells = typeof cellsJson === 'string' ? JSON.parse(cellsJson) : cellsJson;
+  for (const [key, maptype] of Object.entries(cells)) {
+    addCellRect(key, maptype);
+  }
+  updateStatus();
+}
+
+function updateStatus() {
+  const count = Object.keys(cellRects).length;
+  let mode = eraseMode
+    ? 'Erase mode \u2014 left-click & drag to erase'
+    : 'Paint: ' + currentMaptype + ' \u2014 left-click & drag to paint';
+  mode += ' | right-click & drag to pan';
+  let tileInfo = '';
+  if (!availableTilesLoaded) tileInfo = ' | Loading tiles...';
+  else if (availableTiles.size === 0) tileInfo = ' | No scenery tiles found';
+  else tileInfo = ' | ' + availableTiles.size + ' tiles available';
+  document.getElementById('status').textContent =
+    count + ' cell' + (count !== 1 ? 's' : '') + ' configured | ' + mode + tileInfo;
+}
+
+// ============================================================================
+// Available DSF Tiles
+// ============================================================================
+function loadAvailableTiles(tilesJson) {
+  const tiles = typeof tilesJson === 'string' ? JSON.parse(tilesJson) : tilesJson;
+  availableTiles = new Set(tiles);
+  availableTilesLoaded = true;
+
+  // Remove old layer if reloading
+  if (availableTileGridLayer) {
+    map.removeLayer(availableTileGridLayer);
+  }
+
+  // Canvas-based GridLayer: only renders tiles visible in the viewport
+  const AvailableTileOverlay = L.GridLayer.extend({
+    createTile: function(coords) {
+      const tile = document.createElement('canvas');
+      const size = this.getTileSize();
+      tile.width = size.x;
+      tile.height = size.y;
+
+      if (map.getZoom() < 2) return tile;
+
+      const ctx = tile.getContext('2d');
+      const nw = this._map.unproject([coords.x * size.x, coords.y * size.y], coords.z);
+      const se = this._map.unproject([(coords.x + 1) * size.x, (coords.y + 1) * size.y], coords.z);
+
+      const latStart = Math.floor(se.lat);
+      const latEnd = Math.ceil(nw.lat);
+      const lonStart = Math.floor(nw.lng);
+      const lonEnd = Math.ceil(se.lng);
+
+      for (let lat = latStart; lat < latEnd; lat++) {
+        for (let lon = lonStart; lon < lonEnd; lon++) {
+          const key = lat + ',' + lon;
+          if (!availableTiles.has(key)) continue;
+
+          // Convert geo bounds to pixel coords within this tile
+          const nwPx = this._map.project([lat + 1, lon], coords.z);
+          const sePx = this._map.project([lat, lon + 1], coords.z);
+          const x = nwPx.x - coords.x * size.x;
+          const y = nwPx.y - coords.y * size.y;
+          const w = sePx.x - nwPx.x;
+          const h = sePx.y - nwPx.y;
+
+          // Fill
+          ctx.fillStyle = 'rgba(200, 200, 200, 0.15)';
+          ctx.fillRect(x, y, w, h);
+
+          // Dashed border
+          ctx.strokeStyle = 'rgba(200, 200, 200, 0.7)';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([4, 2]);
+          ctx.strokeRect(x + 0.75, y + 0.75, w - 1.5, h - 1.5);
+          ctx.setLineDash([]);
+        }
+      }
+      return tile;
+    }
+  });
+
+  availableTileGridLayer = new AvailableTileOverlay({ opacity: 1, zIndex: 350 });
+  availableTileGridLayer.addTo(map);
+  updateStatus();
+}
+
+function isTileAvailable(key) {
+  if (!availableTilesLoaded) return false;
+  if (availableTiles.size === 0) return false;
+  return availableTiles.has(key);
+}
+
+// ============================================================================
+// Apply action to all 1\u00b0 cells within a geographic bounding box
+// ============================================================================
+function applyCellsInBounds(south, north, west, east) {
+  const latMin = Math.floor(Math.min(south, north));
+  const latMax = Math.floor(Math.max(south, north));
+  const lonMin = Math.floor(Math.min(west, east));
+  const lonMax = Math.floor(Math.max(west, east));
+
+  // Collect keys that will be affected (only available tiles)
+  const keys = [];
+  for (let lat = latMin; lat <= latMax; lat++) {
+    for (let lon = lonMin; lon <= lonMax; lon++) {
+      const key = lat + ',' + lon;
+      if (isTileAvailable(key)) {
+        keys.push(key);
+      }
+    }
+  }
+
+  // Snapshot before
+  const before = snapshotKeys(keys);
+
+  // Apply
+  const after = {};
+  const toSet = {};
+  const toRemove = [];
+  for (const key of keys) {
+    if (eraseMode) {
+      removeCellRect(key);
+      after[key] = null;
+      toRemove.push(key);
+    } else {
+      addCellRect(key, currentMaptype);
+      after[key] = currentMaptype;
+      toSet[key] = currentMaptype;
+    }
+  }
+
+  // Persist
+  if (bridge) {
+    if (Object.keys(toSet).length > 0) bridge.set_cells(JSON.stringify(toSet));
+    if (toRemove.length > 0) bridge.remove_cells(JSON.stringify(toRemove));
+  }
+
+  pushUndo(before, after);
+  updateStatus();
+}
+
+// ============================================================================
+// Drag-selection rectangle (visual feedback)
+// ============================================================================
+function createSelectionDiv() {
+  const div = document.createElement('div');
+  div.className = 'selection-rect';
+  document.body.appendChild(div);
+  return div;
+}
+
+function updateSelectionDiv(startX, startY, curX, curY) {
+  if (!selectionDiv) selectionDiv = createSelectionDiv();
+  const x = Math.min(startX, curX);
+  const y = Math.min(startY, curY);
+  const w = Math.abs(curX - startX);
+  const h = Math.abs(curY - startY);
+  selectionDiv.style.left = x + 'px';
+  selectionDiv.style.top = y + 'px';
+  selectionDiv.style.width = w + 'px';
+  selectionDiv.style.height = h + 'px';
+  selectionDiv.style.display = 'block';
+}
+
+function removeSelectionDiv() {
+  if (selectionDiv) {
+    selectionDiv.style.display = 'none';
+  }
+}
+
+// ============================================================================
+// Mouse Interaction: left-click to paint/erase, right-click to pan
+// ============================================================================
+
+// Disable default left-click dragging; we handle pan via right-click
+map.dragging.disable();
+
+// Right-click drag panning state
+let rightDragStart = null;
+let rightDragCenter = null;
+
+map.on('mousedown', function(e) {
+  // Right-click: start panning
+  if (e.originalEvent.button === 2) {
+    rightDragStart = { x: e.originalEvent.clientX, y: e.originalEvent.clientY };
+    rightDragCenter = map.getCenter();
+    map.getContainer().style.cursor = 'grabbing';
+    return;
+  }
+
+  // Left-click: start paint/erase drag selection
+  if (e.originalEvent.button !== 0) return;
+  if (!availableTilesLoaded || availableTiles.size === 0) return;
+
+  dragStart = { x: e.originalEvent.clientX, y: e.originalEvent.clientY };
+  dragStartLatLng = e.latlng;
+});
+
+map.on('mousemove', function(e) {
+  // Right-click panning
+  if (rightDragStart) {
+    const dx = e.originalEvent.clientX - rightDragStart.x;
+    const dy = e.originalEvent.clientY - rightDragStart.y;
+    const startPoint = map.latLngToContainerPoint(rightDragCenter);
+    const newCenter = map.containerPointToLatLng(
+      L.point(startPoint.x - dx, startPoint.y - dy)
+    );
+    map.setView(newCenter, map.getZoom(), { animate: false });
+    return;
+  }
+
+  // Left-click drag selection
+  if (!dragStart) return;
+  updateSelectionDiv(
+    dragStart.x, dragStart.y,
+    e.originalEvent.clientX, e.originalEvent.clientY
+  );
+});
+
+map.on('mouseup', function(e) {
+  // End right-click pan
+  if (e.originalEvent.button === 2 && rightDragStart) {
+    rightDragStart = null;
+    rightDragCenter = null;
+    map.getContainer().style.cursor = 'crosshair';
+    return;
+  }
+
+  // End left-click drag selection
+  if (!dragStart) return;
+  removeSelectionDiv();
+
+  const endLatLng = e.latlng;
+  applyCellsInBounds(
+    dragStartLatLng.lat, endLatLng.lat,
+    dragStartLatLng.lng, endLatLng.lng
+  );
+
+  dragStart = null;
+  dragStartLatLng = null;
+});
+
+// Disable context menu on map
+map.getContainer().addEventListener('contextmenu', function(e) {
+  e.preventDefault();
+});
+
+// Set initial cursor to crosshair since we're always in paint/erase mode
+map.getContainer().style.cursor = 'crosshair';
+
+// ============================================================================
+// Bridge API (called from Python)
+// ============================================================================
+function setCurrentMaptype(maptype) {
+  currentMaptype = maptype;
+  updateStatus();
+}
+
+function setEraseMode(enabled) {
+  eraseMode = enabled;
+  updateStatus();
+}
+
+function clearAllCells() {
+  // Record undo for clear-all
+  const before = {};
+  const after = {};
+  for (const [key, rect] of Object.entries(cellRects)) {
+    before[key] = rect._maptype;
+    after[key] = null;
+  }
+  cellLayer.clearLayers();
+  for (const k in cellRects) delete cellRects[k];
+  pushUndo(before, after);
+  updateStatus();
+}
+
+function refreshCells(cellsJson) {
+  loadCells(cellsJson);
+}
+
+function overrideAllVisible(maptype) {
+  const bounds = map.getBounds();
+  const latMin = Math.floor(bounds.getSouth());
+  const latMax = Math.floor(bounds.getNorth());
+  const lonMin = Math.floor(bounds.getWest());
+  const lonMax = Math.floor(bounds.getEast());
+
+  const keys = [];
+  for (let lat = latMin; lat <= latMax; lat++) {
+    for (let lon = lonMin; lon <= lonMax; lon++) {
+      const key = lat + ',' + lon;
+      if (isTileAvailable(key)) {
+        keys.push(key);
+      }
+    }
+  }
+
+  const before = snapshotKeys(keys);
+  const after = {};
+  const toSet = {};
+  for (const key of keys) {
+    addCellRect(key, maptype);
+    after[key] = maptype;
+    toSet[key] = maptype;
+  }
+  if (bridge && Object.keys(toSet).length > 0) {
+    bridge.set_cells(JSON.stringify(toSet));
+  }
+  pushUndo(before, after);
+  updateStatus();
+}
+
+// ============================================================================
+// Legend
+// ============================================================================
+function buildLegend() {
+  const body = document.querySelector('#legend .legend-body');
+  for (const [name, color] of Object.entries(MAPTYPE_COLORS)) {
+    const item = document.createElement('div');
+    item.className = 'legend-item';
+    item.innerHTML = '<div class="legend-color" style="background:' + color + '"></div>' +
+                     '<span class="legend-label">' + name + '</span>';
+    body.appendChild(item);
+  }
+  // Available tile indicator
+  const availItem = document.createElement('div');
+  availItem.className = 'legend-item';
+  availItem.innerHTML = '<div class="legend-color" style="background:rgba(200,200,200,0.2);border:1.5px dashed rgba(200,200,200,0.7)"></div>' +
+                        '<span class="legend-label">Use default maptype</span>';
+  body.appendChild(availItem);
+}
+buildLegend();
+
+// ============================================================================
+// QWebChannel Init
+// ============================================================================
+new QWebChannel(qt.webChannelTransport, function(channel) {
+  bridge = channel.objects.bridge;
+  bridge.get_cells(function(cellsJson) {
+    loadCells(cellsJson);
+  });
+});
+</script>
+</body>
+</html>
