@@ -852,10 +852,19 @@ def _compute_thread_budget() -> int:
     return max(2, CURRENT_CPU_COUNT // active)
 
 
+_native_build_semaphore = threading.Semaphore(1)
+
 class _native_build_context:
-    """Track entry/exit of native DDS builds for thread budget coordination."""
+    """Serialize native DDS builds to prevent concurrent OpenMP crashes.
+
+    The ISPC/OpenMP runtime is not safe when multiple threads enter
+    ``omp_set_num_threads`` or parallel regions simultaneously.  Using a
+    semaphore (count=1) ensures only one ``finalize_to_file`` executes at
+    a time while still tracking active builds for thread budget math.
+    """
     def __enter__(self):
         global _active_native_builds
+        _native_build_semaphore.acquire()
         with _active_native_builds_lock:
             _active_native_builds += 1
         return self
@@ -864,6 +873,7 @@ class _native_build_context:
         global _active_native_builds
         with _active_native_builds_lock:
             _active_native_builds -= 1
+        _native_build_semaphore.release()
         return False
 
 
@@ -1984,6 +1994,12 @@ class TerrainTileLookup:
                 except (ValueError, IndexError):
                     continue
 
+                # Skip entries where the extracted maptype is a zoom-level
+                # notation (e.g. "ZL18.ter") rather than a real map source.
+                # "ZL" is not a valid imagery source for the prefetcher.
+                if maptype.upper() in ("ZL", ""):
+                    continue
+
                 # Only index the target zoom levels (the glob may match
                 # files like *118.ter at ZL18 pattern, so verify)
                 if file_zoom != zoom:
@@ -2955,7 +2971,7 @@ class SpatialPrefetcher:
         # Get maptype from parameter or config
         if maptype is None:
             maptype = getattr(CFG.autoortho, 'maptype_override', None)
-            if not maptype or maptype == "Use tile default":
+            if not maptype or maptype in ("Use tile default", "Custom Map"):
                 maptype = "EOX"
         
         tile = None
@@ -3551,14 +3567,14 @@ class BackgroundDDSBuilder:
         if not builder:
             log.warning(f"BackgroundDDSBuilder: Failed to acquire streaming builder for {tile_id}")
             return False
-        
+
         # Setup transition tracking
         tile._live_transition_event = threading.Event()
         tile._active_streaming_builder = builder
-        
+
         # Keep references alive for zero-copy mode (cleared after finalize)
         jpeg_refs_for_nocopy = []
-        
+
         try:
             # Get chunks for max zoom
             chunks = tile.chunks.get(tile.max_zoom, [])
@@ -9446,14 +9462,23 @@ class TileCacher(object):
         return min(default_zoom + 1, uncapped_target_zoom)
 
     def _resolve_maptype(self, row, col, map_type, zoom):
-        """Resolve the effective maptype, accounting for Custom Map per-cell overrides."""
+        """Resolve the effective maptype, accounting for Custom Map per-cell overrides.
+
+        Never returns the sentinel string ``"Custom Map"`` — if the custom map
+        has no entry for a position, the caller's ``map_type`` is returned
+        (but only when it is itself a real imagery source).
+        """
         if not self.maptype_override or self.maptype_override == "Use tile default":
             return map_type
         if self.maptype_override == "Custom Map":
             if self.custom_map:
                 lat, lon = _chunk_to_latlon(row, col, zoom)
-                return self.custom_map.get_maptype(lat, lon) or map_type
-            return map_type
+                resolved = self.custom_map.get_maptype(lat, lon)
+                if resolved:
+                    return resolved
+            # Fallback: use the caller's maptype only if it is a real source,
+            # otherwise default to "BI" to avoid passing "Custom Map" downstream.
+            return map_type if map_type != "Custom Map" else "BI"
         return self.maptype_override
 
     def _to_tile_id(self, row, col, map_type, zoom):

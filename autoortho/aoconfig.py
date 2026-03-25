@@ -358,8 +358,8 @@ threading = True
 # This ensures the lock timeout always exceeds the maximum possible tile build time.
 
 [flightdata]
-# Local port for map and stats
-webui_port = 5000
+# Local port for map and stats (default 5847 to avoid macOS AirPlay on 5000)
+webui_port = 5847
 # UDP port XPlane listens on
 xplane_udp_port = 49000
 

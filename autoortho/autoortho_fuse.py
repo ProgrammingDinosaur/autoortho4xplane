@@ -299,8 +299,8 @@ class AutoOrtho(Operations):
 
     def __init__(self, root, cache_dir='.cache', *args, **kwargs):
         log.info(f"ROOT: {root}")
-        self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\S*)(\d{2}).dds")
-        self.ktx2_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\D*)(\d+).ktx2")
+        self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_](\S*)(\d{2}).dds")
+        self.ktx2_re = re.compile(r".*/(\d+)[-_](\d+)[-_](\D*)(\d+).ktx2")
         self.dsf_re = re.compile(r".*/[-+]\d+[-+]\d+.dsf")
         self.ter_re = re.compile(r".*/\d+[-_]\d+[-_](\D*)(\d+).ter")
         self.root = os.path.abspath(root)
@@ -605,6 +605,23 @@ class AutoOrtho(Operations):
             # Real filesystem files - never cache, always get fresh stats
             return self._getattr_real_file(path)
 
+    @staticmethod
+    def _resolve_dds_maptype(maptype: str) -> str:
+        """Resolve virtual DDS maptype, remapping non-source placeholders.
+
+        Some scenery packages use ``ZL`` (zoom-level notation) in .ter
+        filenames instead of a real map source identifier.  When X-Plane
+        reads these .ter files it requests the corresponding DDS through
+        FUSE.  We remap ``ZL`` (and the empty string) to a concrete
+        source so the tile pipeline can actually fetch imagery.
+        """
+        if not maptype or maptype.upper() == "ZL":
+            override = getattr(CFG.autoortho, 'maptype_override', None)
+            if override and override not in ("Use tile default",):
+                return override
+            return "BI"
+        return maptype
+
     def _get_dds_size_cached(self, row, col, maptype, zoom):
         """Get DDS size from cache or compute it.
         
@@ -639,6 +656,7 @@ class AutoOrtho(Operations):
         """Get attributes for virtual DDS files."""
         self._ensure_flighttrack_started(reason_path=path)
         row, col, maptype, zoom = match.groups()
+        maptype = self._resolve_dds_maptype(maptype)
         dds_size = self._get_dds_size_cached(int(row), int(col), maptype, int(zoom))
         log.debug("GETATTR: Fetch for path: %s", path)
         
@@ -693,9 +711,12 @@ class AutoOrtho(Operations):
     def _getattr_real_file(self, path):
         """Get attributes for real filesystem files - never cached."""
         full_path = self._full_path(path)
-        exists = os.path.exists(full_path)
-        log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
-        st = os.lstat(full_path)
+        log.debug(f"GETATTR FULLPATH {full_path}")
+        try:
+            st = os.lstat(full_path)
+        except OSError as e:
+            log.debug(f"GETATTR: lstat failed for {full_path}: {e}")
+            raise FuseOSError(errno.ENOENT)
         log.debug(f"GETATTR: Orig stat: {st}")
         attrs = {k: getattr(st, k) for k in (
             'st_atime',
@@ -874,12 +895,13 @@ class AutoOrtho(Operations):
             row = int(row)
             col = int(col)
             zoom = int(zoom)
-            
+            maptype = self._resolve_dds_maptype(maptype)
+
             # Register non-BI maptypes for terrain lookup (custom Ortho4XP tiles)
             # This allows the prefetcher to also check for custom tile maptypes
             if maptype != "BI":
                 getortho.register_discovered_maptype(maptype)
-            
+
             t = self.tc._open_tile(row, col, maptype, zoom)
             try:
                 self._set_dds_size_cached(row, col, maptype, zoom, t.dds.total_size)
@@ -912,6 +934,7 @@ class AutoOrtho(Operations):
             row = int(row)
             col = int(col)
             zoom = int(zoom)
+            maptype = self._resolve_dds_maptype(maptype)
             key = self._tile_key(row, col, maptype, zoom)
             lock = self._tile_locks[key]
             
@@ -1031,6 +1054,7 @@ class AutoOrtho(Operations):
             row = int(row)
             col = int(col)
             zoom = int(zoom)
+            maptype = self._resolve_dds_maptype(maptype)
             self.tc._close_tile(row, col, maptype, zoom)
             return 0
         try:

@@ -28,9 +28,44 @@ try:
     from autoortho.aostats import STATS
 except ImportError:
     from aostats import STATS
+
+try:
+    from autoortho.utils.custom_map import get_custom_map_config, discover_dsf_tiles
+    from autoortho.utils.constants import MAPTYPES
+except ImportError:
+    from utils.custom_map import get_custom_map_config, discover_dsf_tiles
+    from utils.constants import MAPTYPES
 #STATS = {'count': 71036, 'chunk_hit': 66094, 'mm_counts': {0: 19, 1: 39, 2: 97, 3: 294, 4: 2982}, 'mm_averages': {0: 0.56, 1: 0.14, 2: 0.04, 3: 0.01, 4: 0.0}, 'chunk_miss': 4942, 'bytes_dl': 65977757}
 
 RUNNING=True
+
+# Custom map editor state
+_config_ui_ref = None
+_available_tiles_cache = None
+
+
+def set_config_ui_ref(ui):
+    """Store a reference to the config UI for worker notification."""
+    global _config_ui_ref
+    _config_ui_ref = ui
+
+
+def _notify_custom_map_workers():
+    """Signal macOS workers to reload custom map if running."""
+    ui = _config_ui_ref
+    if ui is None or not ui.running:
+        return
+    if ui.cfg.autoortho.maptype_override != "Custom Map":
+        return
+    import platform
+    if platform.system() == "Darwin" and hasattr(ui, 'mac_os_procs'):
+        import signal
+        for p in ui.mac_os_procs:
+            try:
+                if p.poll() is None:
+                    p.send_signal(signal.SIGUSR1)
+            except Exception:
+                pass
 
 # Shutdown flag for the Flask-SocketIO server
 _server_shutdown_requested = threading.Event()
@@ -234,6 +269,84 @@ def stats():
 def metrics():
     return STATS
 
+# =============================================================================
+# Custom Map Editor API
+# =============================================================================
+
+@app.route("/custommap")
+def custommap():
+    return render_template("custommap_editor.html")
+
+
+@app.route("/api/custommap/cells", methods=["GET"])
+def custommap_get_cells():
+    config = get_custom_map_config()
+    return jsonify(config.get_all_cells())
+
+
+@app.route("/api/custommap/cells", methods=["POST"])
+def custommap_set_cells():
+    data = request.get_json()
+    config = get_custom_map_config()
+    config.set_cells(data.get("cells", {}))
+    _notify_custom_map_workers()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/custommap/cells", methods=["DELETE"])
+def custommap_remove_cells():
+    data = request.get_json()
+    config = get_custom_map_config()
+    config.remove_cells(data.get("keys", []))
+    _notify_custom_map_workers()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/custommap/clear", methods=["POST"])
+def custommap_clear():
+    config = get_custom_map_config()
+    config.clear()
+    _notify_custom_map_workers()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/custommap/tiles")
+def custommap_tiles():
+    global _available_tiles_cache
+    if _available_tiles_cache is None:
+        _available_tiles_cache = discover_dsf_tiles(CFG.ao_scenery_path)
+    return jsonify(_available_tiles_cache)
+
+
+@app.route("/api/custommap/maptypes")
+def custommap_maptypes():
+    return jsonify([m for m in MAPTYPES if m not in ('Use tile default', 'Custom Map')])
+
+
+@app.route("/api/custommap/export")
+def custommap_export():
+    config = get_custom_map_config()
+    from flask import Response
+    return Response(
+        config.export_json(),
+        mimetype="application/json",
+        headers={"Content-Disposition": "attachment; filename=custom_map.json"}
+    )
+
+
+@app.route("/api/custommap/import", methods=["POST"])
+def custommap_import():
+    config = get_custom_map_config()
+    if "file" in request.files:
+        json_str = request.files["file"].read().decode("utf-8")
+    else:
+        json_str = request.get_data(as_text=True)
+    merge = request.args.get("merge", "false").lower() == "true"
+    config.import_json(json_str, merge=merge)
+    _notify_custom_map_workers()
+    return jsonify(config.get_all_cells())
+
+
 def shutdown_server():
     """
     Shutdown the Flask-SocketIO server gracefully.
@@ -251,14 +364,39 @@ def shutdown_server():
         log.debug(f"socketio.stop() error (may be expected): {e}")
 
 
+# The port the server is actually listening on (may differ from config if port was busy).
+active_port = None
+
+
 def run():
-    #app.run(host='0.0.0.0', port=CFG.flightdata.webui_port, debug=CFG.general.debug, threaded=True, use_reloader=False)
+    global active_port
     log.info("Start flighttracker...")
-    try:
-        socketio.run(app, host='0.0.0.0', port=int(CFG.flightdata.webui_port))
-    except Exception as e:
-        if not _server_shutdown_requested.is_set():
-            log.error(f"FlightTracker server error: {e}")
+    preferred_port = int(CFG.flightdata.webui_port)
+    # Try the configured port first, then a few fallbacks to avoid conflicts
+    # (e.g. macOS AirPlay Receiver occupies port 5000 by default).
+    ports_to_try = [preferred_port] + [p for p in (5847, 7847, 8847, 0) if p != preferred_port]
+    for port in ports_to_try:
+        try:
+            active_port = port
+            if port == 0:
+                log.warning("All preferred ports busy, binding to OS-assigned port.")
+            elif port != preferred_port:
+                log.warning(f"Port {preferred_port} unavailable, trying {port}.")
+            socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
+            break  # normal exit (server was stopped gracefully)
+        except OSError as e:
+            # Port already in use — try the next one
+            log.warning(f"Could not bind to port {port}: {e}")
+            active_port = None
+            continue
+        except Exception as e:
+            if not _server_shutdown_requested.is_set():
+                log.error(f"FlightTracker server error: {e}")
+            break
+    if active_port is not None:
+        log.info(f"FlightTracker was running on port {active_port}.")
+    else:
+        log.error("FlightTracker failed to start on any port.")
     log.info("Exiting flighttracker ...") 
 
 def main():

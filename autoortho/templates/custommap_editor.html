@@ -3,14 +3,25 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Custom Map Editor</title>
-<link rel="stylesheet" href="leaflet.css" />
-<script src="leaflet.min.js"></script>
-<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<title>Custom Map Editor - AutoOrtho</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" integrity="sha512-xodZBNTC5n17Xt2atTPuE1HxjVMSvLVW9ocqUKLsCC5CXdbqCmblAshOMAS6/keqq/sMZMZ19scR4PsZChSR7A==" crossorigin=""/>
+<script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js" integrity="sha512-XQoYMqMTK8LvdxXYG3nZ448hOEQiglfqkJs1NOQV44cWnUrBc8PkAOcXy20w0vlaXaVUearIOBhiXZ5V3ynxwA==" crossorigin=""></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; }
-  #map { width: 100%; height: 100vh; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; display: flex; flex-direction: column; height: 100vh; }
+  #toolbar {
+    display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+    background: #16213e; border-bottom: 1px solid #0f3460; flex-shrink: 0; flex-wrap: wrap;
+  }
+  #toolbar label { color: #e0e0e0; font-size: 13px; }
+  #toolbar select, #toolbar button {
+    font-size: 12px; padding: 4px 10px; border-radius: 4px; border: 1px solid #0f3460;
+    background: #1a1a2e; color: #e0e0e0; cursor: pointer;
+  }
+  #toolbar button:hover { background: #0f3460; }
+  #toolbar button.active { background: #d9534f; color: white; border-color: #d9534f; }
+  #toolbar .separator { width: 1px; height: 24px; background: #0f3460; margin: 0 4px; }
+  #map { flex: 1; }
   .leaflet-control-container { z-index: 800; position: relative; }
 
   #legend {
@@ -28,7 +39,6 @@
   .legend-item { display: flex; align-items: center; margin: 2px 0; }
   .legend-color { width: 12px; height: 12px; border-radius: 2px; margin-right: 5px; border: 1px solid rgba(255,255,255,0.2); }
   .legend-label { font-size: 10px; }
-  .legend-note { font-size: 9px; color: #888; font-style: italic; margin-top: 3px; line-height: 1.3; }
 
   #status {
     position: absolute; bottom: 10px; left: 10px; z-index: 1000;
@@ -45,12 +55,31 @@
 </style>
 </head>
 <body>
+
+<!-- Toolbar -->
+<div id="toolbar">
+  <label for="maptype-select">Paint type:</label>
+  <select id="maptype-select"></select>
+  <div class="separator"></div>
+  <button id="btn-undo" title="Undo (Ctrl+Z)">Undo</button>
+  <button id="btn-redo" title="Redo (Ctrl+Y)">Redo</button>
+  <div class="separator"></div>
+  <button id="btn-mode">Mode: Paint</button>
+  <div class="separator"></div>
+  <button id="btn-clear">Clear All</button>
+  <button id="btn-override">Override All Visible</button>
+  <div class="separator"></div>
+  <button id="btn-import">Import</button>
+  <button id="btn-export">Export</button>
+  <input type="file" id="import-file" accept=".json" style="display:none">
+</div>
+
 <div id="map"></div>
 <div id="legend" onclick="this.classList.toggle('collapsed')">
   <h4>Legend</h4>
   <div class="legend-body"></div>
 </div>
-<div id="status">Paint mode — left-click & drag to paint, right-click & drag to pan</div>
+<div id="status">Loading...</div>
 
 <script>
 // ============================================================================
@@ -70,7 +99,6 @@ const MAPTYPE_COLORS = {
 
 let currentMaptype = 'BI';
 let eraseMode = false;
-let bridge = null;
 let debounceTimer = null;
 
 // Available DSF tiles (set of "lat,lon" keys)
@@ -84,13 +112,31 @@ let dragStartLatLng = null;
 let selectionDiv = null;
 
 // ============================================================================
+// REST API helpers
+// ============================================================================
+async function apiSetCells(cells) {
+  await fetch('/api/custommap/cells', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({cells: cells})
+  });
+}
+
+async function apiRemoveCells(keys) {
+  await fetch('/api/custommap/cells', {
+    method: 'DELETE',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({keys: keys})
+  });
+}
+
+// ============================================================================
 // Undo / Redo
 // ============================================================================
-const undoStack = [];  // Each entry: { set: {key: maptype}, removed: {key: prevMaptype|null} }
+const undoStack = [];
 const redoStack = [];
 const MAX_UNDO = 100;
 
-// Snapshot the cells that will be affected before an action
 function snapshotKeys(keys) {
   const before = {};
   for (const key of keys) {
@@ -99,23 +145,18 @@ function snapshotKeys(keys) {
   return before;
 }
 
-// Record an action for undo. before = {key: prevMaptype|null}, after = {key: newMaptype|null}
 function pushUndo(before, after) {
-  // Only record if something actually changed
   let changed = false;
   for (const key of Object.keys(after)) {
     if (before[key] !== after[key]) { changed = true; break; }
   }
   if (!changed) return;
-
   undoStack.push({ before, after });
   if (undoStack.length > MAX_UNDO) undoStack.shift();
-  redoStack.length = 0;  // clear redo on new action
-
+  redoStack.length = 0;
 }
 
 function applySnapshot(snapshot) {
-  // snapshot is {key: maptype|null}
   const toSet = {};
   const toRemove = [];
   for (const [key, maptype] of Object.entries(snapshot)) {
@@ -127,11 +168,8 @@ function applySnapshot(snapshot) {
       toSet[key] = maptype;
     }
   }
-  // Persist to Python
-  if (bridge) {
-    if (Object.keys(toSet).length > 0) bridge.set_cells(JSON.stringify(toSet));
-    if (toRemove.length > 0) bridge.remove_cells(JSON.stringify(toRemove));
-  }
+  if (Object.keys(toSet).length > 0) apiSetCells(toSet);
+  if (toRemove.length > 0) apiRemoveCells(toRemove);
   updateStatus();
 }
 
@@ -140,7 +178,6 @@ function undo() {
   const action = undoStack.pop();
   redoStack.push(action);
   applySnapshot(action.before);
-
 }
 
 function redo() {
@@ -148,7 +185,6 @@ function redo() {
   const action = redoStack.pop();
   undoStack.push(action);
   applySnapshot(action.after);
-
 }
 
 // Keyboard shortcuts
@@ -259,12 +295,10 @@ function removeCellRect(key) {
   }
 }
 
-function loadCells(cellsJson) {
+function loadCells(cellsObj) {
   cellLayer.clearLayers();
   for (const k in cellRects) delete cellRects[k];
-
-  const cells = typeof cellsJson === 'string' ? JSON.parse(cellsJson) : cellsJson;
-  for (const [key, maptype] of Object.entries(cells)) {
+  for (const [key, maptype] of Object.entries(cellsObj)) {
     addCellRect(key, maptype);
   }
   updateStatus();
@@ -287,17 +321,14 @@ function updateStatus() {
 // ============================================================================
 // Available DSF Tiles
 // ============================================================================
-function loadAvailableTiles(tilesJson) {
-  const tiles = typeof tilesJson === 'string' ? JSON.parse(tilesJson) : tilesJson;
+function loadAvailableTiles(tiles) {
   availableTiles = new Set(tiles);
   availableTilesLoaded = true;
 
-  // Remove old layer if reloading
   if (availableTileGridLayer) {
     map.removeLayer(availableTileGridLayer);
   }
 
-  // Canvas-based GridLayer: only renders tiles visible in the viewport
   const AvailableTileOverlay = L.GridLayer.extend({
     createTile: function(coords) {
       const tile = document.createElement('canvas');
@@ -321,7 +352,6 @@ function loadAvailableTiles(tilesJson) {
           const key = lat + ',' + lon;
           if (!availableTiles.has(key)) continue;
 
-          // Convert geo bounds to pixel coords within this tile
           const nwPx = this._map.project([lat + 1, lon], coords.z);
           const sePx = this._map.project([lat, lon + 1], coords.z);
           const x = nwPx.x - coords.x * size.x;
@@ -329,11 +359,9 @@ function loadAvailableTiles(tilesJson) {
           const w = sePx.x - nwPx.x;
           const h = sePx.y - nwPx.y;
 
-          // Fill
           ctx.fillStyle = 'rgba(200, 200, 200, 0.15)';
           ctx.fillRect(x, y, w, h);
 
-          // Dashed border
           ctx.strokeStyle = 'rgba(200, 200, 200, 0.7)';
           ctx.lineWidth = 1.5;
           ctx.setLineDash([4, 2]);
@@ -351,13 +379,12 @@ function loadAvailableTiles(tilesJson) {
 }
 
 function isTileAvailable(key) {
-  if (!availableTilesLoaded) return false;
-  if (availableTiles.size === 0) return false;
+  if (!availableTilesLoaded || availableTiles.size === 0) return false;
   return availableTiles.has(key);
 }
 
 // ============================================================================
-// Apply action to all 1\u00b0 cells within a geographic bounding box
+// Apply action to all 1-degree cells within a geographic bounding box
 // ============================================================================
 function applyCellsInBounds(south, north, west, east) {
   const latMin = Math.floor(Math.min(south, north));
@@ -365,21 +392,15 @@ function applyCellsInBounds(south, north, west, east) {
   const lonMin = Math.floor(Math.min(west, east));
   const lonMax = Math.floor(Math.max(west, east));
 
-  // Collect keys that will be affected (only available tiles)
   const keys = [];
   for (let lat = latMin; lat <= latMax; lat++) {
     for (let lon = lonMin; lon <= lonMax; lon++) {
       const key = lat + ',' + lon;
-      if (isTileAvailable(key)) {
-        keys.push(key);
-      }
+      if (isTileAvailable(key)) keys.push(key);
     }
   }
 
-  // Snapshot before
   const before = snapshotKeys(keys);
-
-  // Apply
   const after = {};
   const toSet = {};
   const toRemove = [];
@@ -395,11 +416,8 @@ function applyCellsInBounds(south, north, west, east) {
     }
   }
 
-  // Persist
-  if (bridge) {
-    if (Object.keys(toSet).length > 0) bridge.set_cells(JSON.stringify(toSet));
-    if (toRemove.length > 0) bridge.remove_cells(JSON.stringify(toRemove));
-  }
+  if (Object.keys(toSet).length > 0) apiSetCells(toSet);
+  if (toRemove.length > 0) apiRemoveCells(toRemove);
 
   pushUndo(before, after);
   updateStatus();
@@ -429,41 +447,31 @@ function updateSelectionDiv(startX, startY, curX, curY) {
 }
 
 function removeSelectionDiv() {
-  if (selectionDiv) {
-    selectionDiv.style.display = 'none';
-  }
+  if (selectionDiv) selectionDiv.style.display = 'none';
 }
 
 // ============================================================================
 // Mouse Interaction: left-click to paint/erase, right-click to pan
 // ============================================================================
-
-// Disable default left-click dragging; we handle pan via right-click
 map.dragging.disable();
 
-// Right-click drag panning state
 let rightDragStart = null;
 let rightDragCenter = null;
 
 map.on('mousedown', function(e) {
-  // Right-click: start panning
   if (e.originalEvent.button === 2) {
     rightDragStart = { x: e.originalEvent.clientX, y: e.originalEvent.clientY };
     rightDragCenter = map.getCenter();
     map.getContainer().style.cursor = 'grabbing';
     return;
   }
-
-  // Left-click: start paint/erase drag selection
   if (e.originalEvent.button !== 0) return;
   if (!availableTilesLoaded || availableTiles.size === 0) return;
-
   dragStart = { x: e.originalEvent.clientX, y: e.originalEvent.clientY };
   dragStartLatLng = e.latlng;
 });
 
 map.on('mousemove', function(e) {
-  // Right-click panning
   if (rightDragStart) {
     const dx = e.originalEvent.clientX - rightDragStart.x;
     const dy = e.originalEvent.clientY - rightDragStart.y;
@@ -474,8 +482,6 @@ map.on('mousemove', function(e) {
     map.setView(newCenter, map.getZoom(), { animate: false });
     return;
   }
-
-  // Left-click drag selection
   if (!dragStart) return;
   updateSelectionDiv(
     dragStart.x, dragStart.y,
@@ -484,38 +490,28 @@ map.on('mousemove', function(e) {
 });
 
 map.on('mouseup', function(e) {
-  // End right-click pan
   if (e.originalEvent.button === 2 && rightDragStart) {
     rightDragStart = null;
     rightDragCenter = null;
     map.getContainer().style.cursor = 'crosshair';
     return;
   }
-
-  // End left-click drag selection
   if (!dragStart) return;
   removeSelectionDiv();
-
   const endLatLng = e.latlng;
   applyCellsInBounds(
     dragStartLatLng.lat, endLatLng.lat,
     dragStartLatLng.lng, endLatLng.lng
   );
-
   dragStart = null;
   dragStartLatLng = null;
 });
 
-// Disable context menu on map
-map.getContainer().addEventListener('contextmenu', function(e) {
-  e.preventDefault();
-});
-
-// Set initial cursor to crosshair since we're always in paint/erase mode
+map.getContainer().addEventListener('contextmenu', function(e) { e.preventDefault(); });
 map.getContainer().style.cursor = 'crosshair';
 
 // ============================================================================
-// Bridge API (called from Python)
+// Toolbar API (called from buttons)
 // ============================================================================
 function setCurrentMaptype(maptype) {
   currentMaptype = maptype;
@@ -524,11 +520,15 @@ function setCurrentMaptype(maptype) {
 
 function setEraseMode(enabled) {
   eraseMode = enabled;
+  const btn = document.getElementById('btn-mode');
+  btn.textContent = enabled ? 'Mode: Erase' : 'Mode: Paint';
+  if (enabled) btn.classList.add('active');
+  else btn.classList.remove('active');
   updateStatus();
 }
 
-function clearAllCells() {
-  // Record undo for clear-all
+async function clearAllCells() {
+  if (!confirm('Remove all cell assignments?')) return;
   const before = {};
   const after = {};
   for (const [key, rect] of Object.entries(cellRects)) {
@@ -538,14 +538,13 @@ function clearAllCells() {
   cellLayer.clearLayers();
   for (const k in cellRects) delete cellRects[k];
   pushUndo(before, after);
+  await fetch('/api/custommap/clear', { method: 'POST' });
   updateStatus();
 }
 
-function refreshCells(cellsJson) {
-  loadCells(cellsJson);
-}
-
-function overrideAllVisible(maptype) {
+async function overrideAllVisible() {
+  const maptype = document.getElementById('maptype-select').value;
+  if (!confirm("Paint all visible cells with '" + maptype + "'?")) return;
   const bounds = map.getBounds();
   const latMin = Math.floor(bounds.getSouth());
   const latMax = Math.floor(bounds.getNorth());
@@ -556,9 +555,7 @@ function overrideAllVisible(maptype) {
   for (let lat = latMin; lat <= latMax; lat++) {
     for (let lon = lonMin; lon <= lonMax; lon++) {
       const key = lat + ',' + lon;
-      if (isTileAvailable(key)) {
-        keys.push(key);
-      }
+      if (isTileAvailable(key)) keys.push(key);
     }
   }
 
@@ -570,11 +567,32 @@ function overrideAllVisible(maptype) {
     after[key] = maptype;
     toSet[key] = maptype;
   }
-  if (bridge && Object.keys(toSet).length > 0) {
-    bridge.set_cells(JSON.stringify(toSet));
-  }
+  if (Object.keys(toSet).length > 0) apiSetCells(toSet);
   pushUndo(before, after);
   updateStatus();
+}
+
+async function importMap() {
+  const fileInput = document.getElementById('import-file');
+  fileInput.value = '';
+  fileInput.onchange = async function() {
+    if (!fileInput.files.length) return;
+    const text = await fileInput.files[0].text();
+    const merge = confirm('Merge with existing cells?\n\nOK = merge, Cancel = replace all');
+    const url = '/api/custommap/import?merge=' + (merge ? 'true' : 'false');
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: text
+    });
+    const cells = await resp.json();
+    loadCells(cells);
+  };
+  fileInput.click();
+}
+
+function exportMap() {
+  window.location.href = '/api/custommap/export';
 }
 
 // ============================================================================
@@ -589,7 +607,6 @@ function buildLegend() {
                      '<span class="legend-label">' + name + '</span>';
     body.appendChild(item);
   }
-  // Available tile indicator
   const availItem = document.createElement('div');
   availItem.className = 'legend-item';
   availItem.innerHTML = '<div class="legend-color" style="background:rgba(200,200,200,0.2);border:1.5px dashed rgba(200,200,200,0.7)"></div>' +
@@ -599,14 +616,48 @@ function buildLegend() {
 buildLegend();
 
 // ============================================================================
-// QWebChannel Init
+// Toolbar wiring
 // ============================================================================
-new QWebChannel(qt.webChannelTransport, function(channel) {
-  bridge = channel.objects.bridge;
-  bridge.get_cells(function(cellsJson) {
-    loadCells(cellsJson);
-  });
+document.getElementById('maptype-select').addEventListener('change', function() {
+  setCurrentMaptype(this.value);
 });
+document.getElementById('btn-undo').addEventListener('click', undo);
+document.getElementById('btn-redo').addEventListener('click', redo);
+document.getElementById('btn-mode').addEventListener('click', function() {
+  setEraseMode(!eraseMode);
+});
+document.getElementById('btn-clear').addEventListener('click', clearAllCells);
+document.getElementById('btn-override').addEventListener('click', overrideAllVisible);
+document.getElementById('btn-import').addEventListener('click', importMap);
+document.getElementById('btn-export').addEventListener('click', exportMap);
+
+// ============================================================================
+// Init: load data from server
+// ============================================================================
+async function init() {
+  const [cellsResp, tilesResp, maptypesResp] = await Promise.all([
+    fetch('/api/custommap/cells'),
+    fetch('/api/custommap/tiles'),
+    fetch('/api/custommap/maptypes')
+  ]);
+  const cells = await cellsResp.json();
+  const tiles = await tilesResp.json();
+  const maptypes = await maptypesResp.json();
+
+  // Populate maptype selector
+  const select = document.getElementById('maptype-select');
+  for (const mt of maptypes) {
+    const opt = document.createElement('option');
+    opt.value = mt;
+    opt.textContent = mt;
+    select.appendChild(opt);
+  }
+  currentMaptype = maptypes[0] || 'BI';
+
+  loadAvailableTiles(tiles);
+  loadCells(cells);
+}
+init();
 </script>
 </body>
 </html>

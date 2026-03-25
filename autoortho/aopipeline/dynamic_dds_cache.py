@@ -1005,7 +1005,8 @@ class DynamicDDSCache:
 
             # Write DDM metadata
             dds_format, compressor = self._get_format_and_compressor()
-            meta = self._build_ddm(tile, max_zoom, None, dds_format, compressor,
+            meta = self._build_ddm(tile, max_zoom,
+                                   dds_format, compressor,
                                    mm0_missing_indices=mm0_missing_indices,
                                    mm0_fallback_indices=mm0_fallback_indices,
                                    disk_compression=disk_compression)
