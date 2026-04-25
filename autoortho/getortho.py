@@ -1490,6 +1490,7 @@ class Getter(object):
 class ChunkGetter(Getter):
     # Track in-progress chunk_ids GLOBALLY to prevent queueing duplicates
     _queued_chunk_ids = set()
+    _queued_chunk_waiters = {}
     _queued_lock = threading.Lock()
 
     def submit(self, obj, *args, **kwargs):
@@ -1501,15 +1502,6 @@ class ChunkGetter(Getter):
             bump('submit_skip_cancelled')
             return
         
-        chunk_id = getattr(obj, 'chunk_id', None)
-        
-        # Check if already queued (fast path)
-        if chunk_id:
-            with self._queued_lock:
-                if chunk_id in self._queued_chunk_ids:
-                    bump('submit_skip_id_already_queued')
-                    return
-        
         # Per-object coalescing checks
         if obj.ready.is_set():
             bump('submit_skip_already_ready')
@@ -1520,6 +1512,19 @@ class ChunkGetter(Getter):
         if obj.in_flight:
             bump('submit_skip_in_flight')
             return
+
+        chunk_id = getattr(obj, 'chunk_id', None)
+
+        # Check if an equivalent chunk is already queued or in flight.  Keep this
+        # chunk as a waiter so it receives the downloaded bytes and completion
+        # notification instead of waiting forever on a skipped duplicate.
+        if chunk_id:
+            with self._queued_lock:
+                if chunk_id in self._queued_chunk_ids:
+                    obj.in_queue = True
+                    self._queued_chunk_waiters.setdefault(chunk_id, []).append(obj)
+                    bump('submit_skip_id_already_queued')
+                    return
         
         obj.in_queue = True
         
@@ -1529,6 +1534,27 @@ class ChunkGetter(Getter):
                 self._queued_chunk_ids.add(chunk_id)
         
         self.queue.put((obj, args, kwargs))
+
+    def _complete_duplicate_waiters(self, obj, waiters):
+        """Fan out one downloaded chunk result to duplicate Chunk objects."""
+        if not waiters:
+            return
+        for waiter in waiters:
+            if waiter is obj or waiter.ready.is_set():
+                continue
+            waiter.data = obj.data
+            waiter.permanent_failure = obj.permanent_failure
+            waiter.failure_reason = obj.failure_reason
+            waiter.fetchtime = obj.fetchtime
+            waiter.url = getattr(obj, 'url', None)
+            waiter.in_queue = False
+            waiter.in_flight = False
+            waiter.ready.set()
+            try:
+                if tile_completion_tracker is not None and waiter.tile_id:
+                    tile_completion_tracker.notify_chunk_ready(waiter.tile_id, waiter)
+            except Exception:
+                pass
 
     def show_stats(self):
         while self.WORKING.is_set():
@@ -1547,11 +1573,16 @@ class ChunkGetter(Getter):
         result = obj.get(*args, **kwargs)
         
         chunk_id = getattr(obj, 'chunk_id', None)
+        waiters = []
         if chunk_id:
             with self._queued_lock:
                 self._queued_chunk_ids.discard(chunk_id)
                 if result:
+                    waiters = self._queued_chunk_waiters.pop(chunk_id, [])
                     bump('chunk_download_completed')
+
+        if result:
+            self._complete_duplicate_waiters(obj, waiters)
         
         return result
 
@@ -2991,7 +3022,6 @@ class SpatialPrefetcher:
             
             submitted = 0
             total_submittable = 0
-
             # =========================================================================
             # Download chunks for ALL mipmap levels (not just mipmap 0)
             # This ensures prebuilt DDS matches on-demand behavior where X-Plane
@@ -3019,6 +3049,9 @@ class SpatialPrefetcher:
                 if not mipmap_chunks:
                     continue
 
+                if mipmap == 0 and tile_completion_tracker is not None:
+                    tile_completion_tracker.start_tracking(tile, zoom)
+
                 for chunk in mipmap_chunks:
                     # Skip if already ready, in flight, or failed
                     if chunk.ready.is_set():
@@ -3039,11 +3072,6 @@ class SpatialPrefetcher:
                     # the healing system handles any permanently failed chunks later
                     chunk_getter.submit(chunk, timeout=(5, 10), max_attempts=8)
                     submitted += 1
-
-            # Register tile with completion tracker for predictive DDS generation
-            # This must happen AFTER creating all chunks so the tracker can count them
-            if tile_completion_tracker is not None and submitted > 0:
-                tile_completion_tracker.start_tracking(tile, zoom, submitted_count=submitted)
 
             complete = (total_submittable == 0) or (submitted == total_submittable)
             return submitted, complete
@@ -3137,7 +3165,7 @@ class TileCompletionTracker:
     
     def start_tracking(self, tile, zoom: int, submitted_count: int = 0) -> None:
         """
-        Begin tracking a tile's chunk completion for ALL mipmap levels.
+        Begin tracking a tile's native mipmap-0 chunk resolution.
 
         Called by SpatialPrefetcher when it starts prefetching a tile.
         If tile is already being tracked, this is a no-op.
@@ -3145,46 +3173,60 @@ class TileCompletionTracker:
         Args:
             tile: Tile object to track
             zoom: Max zoom level for this tile (tile.max_zoom)
-            submitted_count: Actual number of chunks submitted by _prefetch_tile().
-                             When > 0, used as the expected count (guarantees match).
-                             When 0, falls back to counting non-ready chunks.
+            submitted_count: Deprecated compatibility argument. Completion is
+                             now based on all native mipmap-0 chunks resolving,
+                             not on a submitted subset.
         """
         if tile is None:
             return
 
         tile_id = tile.id
+        tile_to_callback = None
+
+        required_chunks = list(tile.chunks.get(tile.max_zoom, []))
+        if not required_chunks:
+            return
 
         with self._lock:
             # Already tracking this tile
             if tile_id in self._tracked_tiles:
                 return
 
-            if submitted_count > 0:
-                total_expected = submitted_count
-            else:
-                # Fallback: count non-ready chunks in tile.chunks
-                total_expected = 0
-                for mipmap in range(tile.max_mipmap + 1):
-                    mipmap_zoom = tile.max_zoom - mipmap
-                    if mipmap_zoom < tile.min_zoom:
-                        break
-                    for chunk in tile.chunks.get(mipmap_zoom, []):
-                        if not chunk.ready.is_set():
-                            total_expected += 1
-
+            total_expected = len(required_chunks)
             if total_expected == 0:
                 return  # Nothing to track
 
-            # Enforce max tracked limit (evict oldest if needed)
-            if len(self._tracked_tiles) >= self._max_tracked:
-                self._evict_oldest_unlocked()
+            completed_ids = {
+                chunk.chunk_id
+                for chunk in required_chunks
+                if chunk.ready.is_set()
+            }
 
-            self._tracked_tiles[tile_id] = _TrackedTile(tile, zoom, total_expected)
-            log.debug(f"TileCompletionTracker: Started tracking {tile_id} "
-                     f"(expecting {total_expected} chunks across all mipmaps)")
-            
+            if len(completed_ids) >= total_expected:
+                tile_to_callback = tile
+            else:
+                # Enforce max tracked limit (evict oldest if needed)
+                if len(self._tracked_tiles) >= self._max_tracked:
+                    self._evict_oldest_unlocked()
+
+                tracked = _TrackedTile(tile, zoom, total_expected)
+                tracked.completed_chunk_ids = completed_ids
+                tracked.completed_chunks = len(completed_ids)
+                self._tracked_tiles[tile_id] = tracked
+                log.debug(f"TileCompletionTracker: Started tracking {tile_id} "
+                         f"(expecting {total_expected} native chunks, "
+                         f"{len(completed_ids)} already ready)")
+
             # Periodic cleanup of stale entries
             self._maybe_cleanup_unlocked()
+
+        if tile_to_callback is not None and self._on_tile_complete is not None:
+            try:
+                self._on_tile_complete(tile_id, tile_to_callback,
+                                       partial=False,
+                                       healing=False)
+            except Exception as e:
+                log.warning(f"TileCompletionTracker: Callback error for {tile_id}: {e}")
     
     def notify_chunk_ready(self, tile_id: str, chunk) -> None:
         """
@@ -3212,6 +3254,8 @@ class TileCompletionTracker:
 
             # Avoid double-counting the same chunk
             chunk_key = chunk.chunk_id if chunk else None
+            if chunk is None:
+                return
             if chunk_key and chunk_key in tracked.completed_chunk_ids:
                 return
 
@@ -3374,10 +3418,13 @@ class BackgroundDDSBuilder:
                 pass
             self._coordinator_thread.join(timeout=2.0)
             self._coordinator_thread = None
-        
-        # Shutdown executor (wait for active builds)
+
+        # Shutdown executor — don't wait for in-flight builds since they are
+        # speculative background work.  cancel_futures=True prevents queued
+        # futures from starting; wait=False avoids blocking on builds that
+        # may be stuck on network I/O or holding the native build semaphore.
         if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=False)
+            self._executor.shutdown(wait=False, cancel_futures=True)
             self._executor = None
         
         log.info(f"BackgroundDDSBuilder stopped "
@@ -3676,6 +3723,8 @@ class BackgroundDDSBuilder:
             # Finalize directly to disk via DynamicDDSCache staging path
             if self._dds_cache is not None:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
+                if not staging_path:
+                    return False
                 with _native_build_context():
                     success, bytes_written = builder.finalize_to_file(
                         staging_path, max_threads=_compute_thread_budget()
@@ -3815,6 +3864,8 @@ class BackgroundDDSBuilder:
                                 if valid_count > 0:
                                     staging_path = self._dds_cache.get_staging_path(
                                         tile_id, tile.max_zoom, tile)
+                                    if not staging_path:
+                                        return
                                     
                                     with _native_build_context():
                                         result = native_dds.build_from_jpegs_to_file(
@@ -3894,6 +3945,8 @@ class BackgroundDDSBuilder:
                     try:
                         staging_path = self._dds_cache.get_staging_path(
                             tile_id, tile.max_zoom, tile)
+                        if not staging_path:
+                            return
                         
                         result = native_dds.build_tile_to_file(
                             cache_dir=tile.cache_dir,
@@ -4220,9 +4273,8 @@ def _collect_healing_jpegs(tile, missing_indices):
         if idx < len(chunks) and chunks[idx].data:
             chunk_jpegs[idx] = chunks[idx].data
         elif idx < len(chunks):
-            cache_data = chunks[idx].get_cache()
-            if cache_data:
-                chunk_jpegs[idx] = cache_data
+            if chunks[idx].get_cache() and chunks[idx].data:
+                chunk_jpegs[idx] = chunks[idx].data
             else:
                 return None
         else:
@@ -4509,7 +4561,16 @@ def start_predictive_dds(tile_cacher=None) -> None:
         log.debug("Predictive DDS already initialized, skipping")
         return
 
-    # Check if enabled
+    # Check if enabled. Predictive DDS is fed by spatial prefetch; keep the
+    # runtime dependency explicit so a disabled prefetch setting really means
+    # no speculative DDS work.
+    prefetch_enabled = getattr(CFG.autoortho, 'prefetch_enabled', True)
+    if isinstance(prefetch_enabled, str):
+        prefetch_enabled = prefetch_enabled.lower() in ('true', '1', 'yes', 'on')
+    if not prefetch_enabled:
+        log.info("Predictive DDS generation disabled because spatial prefetching is disabled")
+        return
+
     enabled = getattr(CFG.autoortho, 'predictive_dds_enabled', True)
     if isinstance(enabled, str):
         enabled = enabled.lower() in ('true', '1', 'yes', 'on')

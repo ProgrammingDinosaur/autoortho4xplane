@@ -299,8 +299,8 @@ class AutoOrtho(Operations):
 
     def __init__(self, root, cache_dir='.cache', *args, **kwargs):
         log.info(f"ROOT: {root}")
-        self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_](\S*)(\d{2}).dds")
-        self.ktx2_re = re.compile(r".*/(\d+)[-_](\d+)[-_](\D*)(\d+).ktx2")
+        self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\S*)(\d{2}).dds")
+        self.ktx2_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\D*)(\d+).ktx2")
         self.dsf_re = re.compile(r".*/[-+]\d+[-+]\d+.dsf")
         self.ter_re = re.compile(r".*/\d+[-_]\d+[-_](\D*)(\d+).ter")
         self.root = os.path.abspath(root)
@@ -333,6 +333,10 @@ class AutoOrtho(Operations):
         self._tile_locks = defaultdict(threading.Lock)
         self._size_cache = OrderedDict()  # LRU cache for DDS sizes
         self._size_cache_max = 5000  # Max entries before LRU eviction
+        self._negative_getattr_cache = OrderedDict()
+        self._negative_getattr_cache_max = 16384
+        self._negative_getattr_cache_ttl = 30.0
+        self._negative_getattr_cache_lock = threading.Lock()
         self._ft_started = False
         self._ft_start_lock = threading.Lock()
 
@@ -709,13 +713,35 @@ class AutoOrtho(Operations):
         return attrs
 
     def _getattr_real_file(self, path):
-        """Get attributes for real filesystem files - never cached."""
+        """Get attributes for real filesystem files.
+
+        Positive results are kept uncached so real files reflect the backing
+        scenery directory.  Missing paths get a short negative cache because
+        X-Plane can probe the same library/texture fallback paths many times
+        during scenery loading.
+        """
         full_path = self._full_path(path)
+        cache_key = os.path.normcase(full_path)
+        now = time.monotonic()
+
+        with self._negative_getattr_cache_lock:
+            cached_at = self._negative_getattr_cache.get(cache_key)
+            if cached_at is not None:
+                if now - cached_at < self._negative_getattr_cache_ttl:
+                    self._negative_getattr_cache.move_to_end(cache_key)
+                    raise FuseOSError(errno.ENOENT)
+                del self._negative_getattr_cache[cache_key]
+
         log.debug(f"GETATTR FULLPATH {full_path}")
         try:
             st = os.lstat(full_path)
         except OSError as e:
             log.debug(f"GETATTR: lstat failed for {full_path}: {e}")
+            if getattr(e, "errno", None) in (errno.ENOENT, errno.ENOTDIR):
+                with self._negative_getattr_cache_lock:
+                    while len(self._negative_getattr_cache) >= self._negative_getattr_cache_max:
+                        self._negative_getattr_cache.popitem(last=False)
+                    self._negative_getattr_cache[cache_key] = now
             raise FuseOSError(errno.ENOENT)
         log.debug(f"GETATTR: Orig stat: {st}")
         attrs = {k: getattr(st, k) for k in (

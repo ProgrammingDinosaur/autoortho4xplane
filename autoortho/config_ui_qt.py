@@ -4435,6 +4435,8 @@ class ConfigUI(QMainWindow):
         self.prefetch_radius_value.setEnabled(enabled)
         
         # Predictive DDS controls depend on prefetch being enabled
+        if not enabled and self.predictive_dds_enabled_check.isChecked():
+            self.predictive_dds_enabled_check.setChecked(False)
         self.predictive_dds_enabled_check.setEnabled(enabled)
         self._update_predictive_dds_controls()
     
@@ -5738,7 +5740,10 @@ class ConfigUI(QMainWindow):
             )
             
             # Predictive DDS settings
-            self.cfg.autoortho.predictive_dds_enabled = self.predictive_dds_enabled_check.isChecked()
+            self.cfg.autoortho.predictive_dds_enabled = (
+                self.prefetch_enabled_check.isChecked()
+                and self.predictive_dds_enabled_check.isChecked()
+            )
             self.cfg.autoortho.predictive_dds_build_interval_ms = str(
                 self.predictive_interval_slider.value()
             )

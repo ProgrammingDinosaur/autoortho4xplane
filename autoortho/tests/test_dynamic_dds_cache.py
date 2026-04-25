@@ -15,8 +15,8 @@ import threading
 import time
 import pytest
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Add repository root to path for package-style imports.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 # ============================================================================
@@ -187,7 +187,7 @@ class TestDynamicDDSCache:
     def test_disabled_cache(self, cache_dir, mock_tile, sample_dds_bytes):
         """Test that disabled cache is a no-op."""
         from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
-        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=0, enabled=True)
+        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=0, enabled=False)
         
         result = cache.store(mock_tile.id, 16, sample_dds_bytes, mock_tile)
         assert result is False
@@ -375,7 +375,7 @@ class TestDynamicDDSCache:
         with open(ddm_path, 'r') as f:
             meta = json.load(f)
         
-        assert meta['v'] == 2
+        assert meta['v'] == 3
         assert meta['w'] == 4096
         assert meta['h'] == 4096
         assert meta['max_zl'] == 16
@@ -756,7 +756,7 @@ class TestDDMv2:
         with open(ddm_path, 'r') as f:
             meta = json.load(f)
 
-        assert meta['v'] == 2
+        assert meta['v'] == 3
         assert meta['needs_healing'] is False
         assert meta['healing_chunks'] == 0
         assert meta['missing_indices'] == []
@@ -774,7 +774,7 @@ class TestDDMv2:
         with open(ddm_path, 'r') as f:
             meta = json.load(f)
 
-        assert meta['v'] == 2
+        assert meta['v'] == 3
         assert meta['needs_healing'] is True
         assert meta['healing_chunks'] == 3
         assert meta['missing_indices'] == [0, 3, 7]
@@ -801,8 +801,8 @@ class TestDDMv2:
         assert total > 0
         assert valid == total - 2
 
-    def test_load_sets_healing_flags(self, dds_cache, mock_tile, sample_dds_bytes):
-        """Test that load() sets healing flags on tile when DDM indicates missing chunks."""
+    def test_load_rejects_missing_chunks_and_sets_healing_flags(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Incomplete DDS entries request healing but are not served as cache hits."""
         missing = [1, 4]
         dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
                         mock_tile, mm0_missing_indices=missing)
@@ -811,7 +811,7 @@ class TestDDMv2:
         tile2.cache_dir = mock_tile.cache_dir
         loaded = dds_cache.load(tile2.id, tile2.max_zoom, tile2)
 
-        assert loaded is not None
+        assert loaded is None
         assert tile2._dds_needs_healing is True
         assert tile2._dds_missing_indices == [1, 4]
 
@@ -848,6 +848,18 @@ class TestDDMv2:
         assert dds_cache.contains(mock_tile.id, mock_tile.max_zoom, mock_tile) is False
         dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
         assert dds_cache.contains(mock_tile.id, mock_tile.max_zoom, mock_tile) is True
+
+    def test_contains_rejects_incomplete_tile(self, dds_cache, mock_tile, sample_dds_bytes):
+        """contains() should only accept full-quality mipmap-0 cache entries."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
+                        mock_tile, mm0_missing_indices=[0])
+        assert dds_cache.contains(mock_tile.id, mock_tile.max_zoom, mock_tile) is False
+
+    def test_contains_rejects_fallback_tile(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Fallback/upscaled mipmap-0 entries are not complete cache hits."""
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
+                        mock_tile, mm0_fallback_indices=[0])
+        assert dds_cache.contains(mock_tile.id, mock_tile.max_zoom, mock_tile) is False
 
 
 # ============================================================================
@@ -916,8 +928,8 @@ class TestFallbackIndices:
         assert mm0['complete'] is False
         assert mm0['valid'] == mm0['total'] - 1  # only missing reduces valid
 
-    def test_load_sets_fallback_flags(self, dds_cache, mock_tile, sample_dds_bytes):
-        """Test that load() sets _dds_fallback_indices on tile."""
+    def test_load_rejects_fallback_chunks_and_sets_flags(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Fallback DDS entries request healing but are not served as cache hits."""
         dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
                         mock_tile, mm0_fallback_indices=[2, 5])
 
@@ -925,13 +937,13 @@ class TestFallbackIndices:
         tile2.cache_dir = mock_tile.cache_dir
         loaded = dds_cache.load(tile2.id, tile2.max_zoom, tile2)
 
-        assert loaded is not None
+        assert loaded is None
         assert tile2._dds_needs_healing is True
         assert tile2._dds_missing_indices == []
         assert tile2._dds_fallback_indices == [2, 5]
 
-    def test_load_sets_both_flags(self, dds_cache, mock_tile, sample_dds_bytes):
-        """Test that load() sets both missing and fallback flags."""
+    def test_load_rejects_missing_and_fallback_chunks(self, dds_cache, mock_tile, sample_dds_bytes):
+        """Strict cache misses still expose both healing index lists."""
         dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
                         mock_tile, mm0_missing_indices=[1],
                         mm0_fallback_indices=[4, 9])
@@ -940,7 +952,7 @@ class TestFallbackIndices:
         tile2.cache_dir = mock_tile.cache_dir
         loaded = dds_cache.load(tile2.id, tile2.max_zoom, tile2)
 
-        assert loaded is not None
+        assert loaded is None
         assert tile2._dds_needs_healing is True
         assert tile2._dds_missing_indices == [1]
         assert tile2._dds_fallback_indices == [4, 9]
@@ -979,7 +991,7 @@ class TestFallbackIndices:
         tile2.cache_dir = mock_tile.cache_dir
         loaded = dds_cache.load(tile2.id, tile2.max_zoom, tile2)
 
-        assert loaded is not None
+        assert loaded is None
         assert tile2._dds_needs_healing is True
         assert tile2._dds_missing_indices == [1]
         assert tile2._dds_fallback_indices == []
@@ -999,7 +1011,7 @@ class TestFallbackIndices:
         tile2 = MockTile()
         tile2.cache_dir = mock_tile.cache_dir
         loaded = dds_cache.load(tile2.id, tile2.max_zoom, tile2)
-        assert loaded is not None
+        assert loaded is None
         assert tile2._dds_fallback_indices == [6, 8]
 
 
@@ -1098,7 +1110,7 @@ class TestDynamicDDSCacheDowngrade:
     def test_downgrade_zl_disabled_cache(self, cache_dir):
         """Test that downgrade_zl returns None when cache is disabled."""
         from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
-        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=0, enabled=True)
+        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=0, enabled=False)
         tile = MockTile(max_zoom=15, dds_width=2048, dds_height=2048)
         tile.cache_dir = cache_dir
 
@@ -1118,7 +1130,7 @@ class TestJPEGCleanup:
         from autoortho.aopipeline.dynamic_dds_cache import cleanup_source_jpegs
 
         for i in range(3):
-            jpeg_path = os.path.join(cache_dir, f"{100+i}_{200}_{16}_BI.jpg")
+            jpeg_path = os.path.join(cache_dir, f"{1600+i}_{3200}_{16}_BI.jpg")
             with open(jpeg_path, 'wb') as f:
                 f.write(b'\xff\xd8\xff' + b'\x00' * 100)
 
@@ -1132,7 +1144,7 @@ class TestJPEGCleanup:
 
         for i in range(3):
             assert not os.path.exists(
-                os.path.join(cache_dir, f"{100+i}_{200}_{16}_BI.jpg"))
+                os.path.join(cache_dir, f"{1600+i}_{3200}_{16}_BI.jpg"))
 
     def test_cleanup_source_jpegs_missing_files(self, cache_dir):
         """Test that cleanup handles missing JPEG files gracefully."""
@@ -1150,7 +1162,7 @@ class TestJPEGCleanup:
         """Test cleanup deletes only existing files."""
         from autoortho.aopipeline.dynamic_dds_cache import cleanup_source_jpegs
 
-        jpeg_path = os.path.join(cache_dir, f"100_200_16_BI.jpg")
+        jpeg_path = os.path.join(cache_dir, f"1600_3200_16_BI.jpg")
         with open(jpeg_path, 'wb') as f:
             f.write(b'\xff\xd8\xff' + b'\x00' * 100)
 
@@ -1181,7 +1193,7 @@ class TestGetStagingPath:
     def test_staging_path_disabled(self, cache_dir, mock_tile):
         """Test staging path returns None when cache is disabled."""
         from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
-        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=0, enabled=True)
+        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=0, enabled=False)
         path = cache.get_staging_path(mock_tile.id, mock_tile.max_zoom, mock_tile)
         assert path is None
 

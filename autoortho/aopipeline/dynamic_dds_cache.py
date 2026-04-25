@@ -104,7 +104,7 @@ class DynamicDDSCache:
         Args:
             cache_dir: Base cache directory (same as CFG.paths.cache_dir).
             max_size_mb: Maximum disk usage in MB for the DDS cache.
-                         Set to 0 to disable caching.
+                         Set to 0 for unlimited cache size.
             enabled: Master enable flag. When False, all methods are no-ops.
         """
         self._cache_dir = cache_dir
@@ -259,8 +259,36 @@ class DynamicDDSCache:
             "needs_healing": False,
             "healing_chunks": 0,
             "missing_indices": [],
+            "fallback_indices": [],
             "disk_compression": disk_compression,
         }
+
+    @staticmethod
+    def _mm0_cache_complete(meta: dict) -> bool:
+        """Return True only when cached mipmap 0 is safe to serve live."""
+        if not meta:
+            return False
+
+        populated = meta.get("populated_mipmaps")
+        if populated is not None and 0 not in populated:
+            return False
+
+        if meta.get("needs_healing"):
+            return False
+        if meta.get("missing_indices") or meta.get("fallback_indices"):
+            return False
+
+        mipmaps = meta.get("mipmaps") or []
+        if mipmaps:
+            mm0 = mipmaps[0]
+            if mm0.get("complete") is False:
+                return False
+            total = mm0.get("total", 0)
+            valid = mm0.get("valid", total)
+            if total > 0 and valid < total:
+                return False
+
+        return True
 
     @staticmethod
     def _write_ddm(ddm_path: str, meta: dict) -> None:
@@ -374,8 +402,9 @@ class DynamicDDSCache:
             # Check if DDM exists for the requested ZL
             meta = self._read_ddm(ddm_path)
             if meta is None:
-                # No entry at requested ZL. Check for a lower-ZL upgrade candidate.
+                # No entry at requested ZL. Check for adjacent-ZL candidates.
                 self._check_upgrade_candidate(tile_id, max_zoom, tile)
+                self._check_downgrade_candidate(tile_id, max_zoom, tile)
                 self._misses += 1
                 return None
 
@@ -400,6 +429,24 @@ class DynamicDDSCache:
                               f"z{cached_zl} -> z{max_zoom}")
                 else:
                     self._delete_pair(dds_path, ddm_path)
+                self._misses += 1
+                return None
+
+            # Strict quality gate: do not serve prebuilt DDS files that still
+            # contain missing-color or lower-ZL fallback chunks.  Returning None
+            # lets the live path build a fresh tile instead of showing degraded
+            # predictive-cache output for the rest of the flight.
+            missing_indices = meta.get("missing_indices", []) or []
+            fallback_indices = meta.get("fallback_indices", []) or []
+            if not self._mm0_cache_complete(meta):
+                tile._dds_needs_healing = True
+                tile._dds_missing_indices = missing_indices
+                tile._dds_fallback_indices = fallback_indices
+                log.debug(f"DDS cache: strict miss for incomplete tile {tile_id} "
+                          f"({len(missing_indices)} missing, "
+                          f"{len(fallback_indices)} fallback chunks)")
+
+                self._dispatch_healing_for_incomplete(tile_id, max_zoom, tile)
                 self._misses += 1
                 return None
 
@@ -429,51 +476,9 @@ class DynamicDDSCache:
                 self._misses += 1
                 return None
 
-            # Healing detection: check for missing or fallback chunks
-            missing_indices = meta.get("missing_indices", [])
-            fallback_indices = meta.get("fallback_indices", [])
-            unhealable = []
-            if missing_indices or fallback_indices:
-                tile._dds_needs_healing = True
-                tile._dds_missing_indices = missing_indices
-                tile._dds_fallback_indices = fallback_indices
-                log.debug(f"DDS cache: serving incomplete tile {tile_id} "
-                          f"({len(missing_indices)} missing, "
-                          f"{len(fallback_indices)} fallback chunks need healing)")
-                unhealable = self._try_heal_from_disk_cache(tile_id, max_zoom, tile)
-
-            # Quality gate: if cached DDS has missing chunks, trigger healing.
-            mipmaps_meta = meta.get("mipmaps", [])
-            if mipmaps_meta and len(mipmaps_meta) > 0:
-                mm0_meta = mipmaps_meta[0]
-                total = mm0_meta.get("total", 0)
-                valid = mm0_meta.get("valid", total)
-                if total > 0 and valid < total and not tile._dds_needs_healing:
-                    tile._dds_needs_healing = True
-                    if not getattr(tile, '_dds_missing_indices', None):
-                        tile._dds_missing_indices = missing_indices
-                    log.debug(f"DDS cache: quality {valid}/{total} "
-                              f"({valid/total*100:.0f}%) below 100%, "
-                              f"triggering healing")
-                    unhealable = self._try_heal_from_disk_cache(tile_id, max_zoom, tile)
-
-            # Dispatch network healing for chunks not healable from disk
-            if unhealable and self._network_heal_callback:
-                key = self._tile_key(tile_id, max_zoom)
-                dispatch = False
-                with self._lock:
-                    if key not in self._network_healing_in_progress:
-                        self._network_healing_in_progress.add(key)
-                        dispatch = True
-                if dispatch:
-                    log.debug(f"DDS cache: dispatching network healing for {tile_id} "
-                              f"({len(unhealable)} chunks)")
-                    try:
-                        self._network_heal_callback(tile, unhealable)
-                    except Exception as e:
-                        log.debug(f"DDS cache: network healing dispatch failed: {e}")
-                        with self._lock:
-                            self._network_healing_in_progress.discard(key)
+            tile._dds_needs_healing = False
+            tile._dds_missing_indices = []
+            tile._dds_fallback_indices = []
 
             # DDM v3: partial DDS awareness -- tell the tile which mipmaps
             # actually contain data so _populate_dds_from_prebuilt() can
@@ -541,24 +546,24 @@ class DynamicDDSCache:
             if not os.path.exists(dds_path):
                 return False
 
-            # Read DDM sidecar to check if mm0 is populated.
+            # Read DDM sidecar to check if mm0 is populated and fully native.
             # If no DDM exists, assume complete (v2 compat / pre-DDM entries).
             meta = self._read_ddm(ddm_path)
             if meta is not None:
-                populated = meta.get("populated_mipmaps")
-                if populated is not None and 0 not in populated:
-                    return False  # Partial DDS — mm0 missing
+                return self._mm0_cache_complete(meta)
 
             return True
         except Exception:
             return False
 
-    def get_staging_path(self, tile_id: str, max_zoom: int, tile) -> str:
+    def get_staging_path(self, tile_id: str, max_zoom: int, tile) -> Optional[str]:
         """Get a temp file path for native direct-to-disk writes.
 
         After the native C code writes to this path, call
         ``store_from_file()`` to atomically move it into the cache.
         """
+        if not self._enabled:
+            return None
         dds_path, _ = self._paths_for(
             tile.row, tile.col, tile.maptype,
             tile.tilename_zoom, max_zoom)
@@ -751,7 +756,10 @@ class DynamicDDSCache:
             log.debug(f"DDS cache STORE: {tile_id} z{max_zoom} ({size} bytes)")
 
             if not mm0_missing_indices and not mm0_fallback_indices:
-                self._cleanup_jpegs_async(tile)
+                try:
+                    self._cleanup_jpegs_async(tile)
+                except Exception as e:
+                    log.debug(f"DDS cache JPEG cleanup dispatch failed for {tile_id}: {e}")
 
             return True
 
@@ -1027,7 +1035,10 @@ class DynamicDDSCache:
                       f"({disk_size} bytes, compression={disk_compression})")
 
             if not mm0_missing_indices and not mm0_fallback_indices:
-                self._cleanup_jpegs_async(tile)
+                try:
+                    self._cleanup_jpegs_async(tile)
+                except Exception as e:
+                    log.debug(f"DDS cache JPEG cleanup dispatch failed for {tile_id}: {e}")
 
             return True
 
@@ -1887,6 +1898,45 @@ class DynamicDDSCache:
 
         return unhealable
 
+    def _dispatch_healing_for_incomplete(self, tile_id: str, max_zoom: int, tile) -> None:
+        """Start incomplete-DDS healing without delaying the cache miss path."""
+        all_indices = list(getattr(tile, '_dds_missing_indices', []) or [])
+        all_indices.extend(getattr(tile, '_dds_fallback_indices', []) or [])
+        if not all_indices:
+            return
+
+        key = self._tile_key(tile_id, max_zoom)
+        with self._lock:
+            if key in self._network_healing_in_progress:
+                return
+            self._network_healing_in_progress.add(key)
+
+        t = threading.Thread(
+            target=self._heal_incomplete_async,
+            args=(tile_id, max_zoom, tile),
+            daemon=True,
+            name=f"dds_heal_{tile_id}")
+        t.start()
+
+    def _heal_incomplete_async(self, tile_id: str, max_zoom: int, tile) -> None:
+        """Background healing coordinator for strict cache misses."""
+        network_dispatched = False
+        try:
+            unhealable = self._try_heal_from_disk_cache(tile_id, max_zoom, tile)
+            if unhealable and self._network_heal_callback:
+                log.debug(f"DDS cache: dispatching network healing for {tile_id} "
+                          f"({len(unhealable)} chunks)")
+                try:
+                    self._network_heal_callback(tile, unhealable)
+                    network_dispatched = True
+                except Exception as e:
+                    log.debug(f"DDS cache: network healing dispatch failed: {e}")
+        finally:
+            if not network_dispatched:
+                key = self._tile_key(tile_id, max_zoom)
+                with self._lock:
+                    self._network_healing_in_progress.discard(key)
+
     def _heal_from_disk(self, tile_id: str, max_zoom: int, tile,
                         missing: List[int]) -> None:
         """Read missing JPEGs from disk cache and patch the DDS.
@@ -1944,7 +1994,8 @@ class DynamicDDSCache:
             args=(jpeg_cache_dir, tile.col, tile.row,
                   tile.tilename_zoom, tile.max_zoom,
                   getattr(tile, 'min_zoom', 12),
-                  tile.width, tile.height, tile.maptype),
+                  getattr(tile, 'width', 1), getattr(tile, 'height', 1),
+                  tile.maptype),
             daemon=True)
         t.start()
 
