@@ -4,6 +4,7 @@ import atexit
 import ctypes
 import gc
 import glob as glob_mod
+import heapq
 import os
 import re
 import sys
@@ -812,6 +813,30 @@ _active_native_builds_lock = threading.Lock()
 _live_reads_in_progress = 0
 _live_reads_lock = threading.Lock()
 
+# Bounded repair queue for partial DDS entries that are missing mipmap 0.
+_partial_mm0_promotions = OrderedDict()
+_partial_mm0_promotions_lock = threading.Lock()
+
+_shutdown_requested = threading.Event()
+
+
+def begin_shutdown(reason="shutdown"):
+    """Signal shutdown and unblock queued/waiting chunk work immediately."""
+    _shutdown_requested.set()
+    try:
+        chunk_getter.cancel_all_work(reason)
+    except Exception:
+        pass
+
+
+def clear_shutdown_request():
+    """Clear shutdown state for a subsequent run in the same process."""
+    _shutdown_requested.clear()
+
+
+def is_shutdown_requested() -> bool:
+    return _shutdown_requested.is_set()
+
 
 def _live_read_start():
     """Signal that a live tile read has started."""
@@ -1078,6 +1103,14 @@ def _haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> f
     a = math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
     c = 2 * math.asin(math.sqrt(a))
     return EARTH_RADIUS_M * c
+
+
+def _get_bool_config(section, name: str, default: bool) -> bool:
+    """Read a boolean config value that may be stored as a string."""
+    value = getattr(section, name, default)
+    if isinstance(value, str):
+        return value.lower().strip() in ('true', '1', 'yes', 'on')
+    return bool(value)
 
 
 def _calculate_spatial_priority(chunk_row: int, chunk_col: int, chunk_zoom: int, base_mipmap_priority: int) -> float:
@@ -1365,6 +1398,8 @@ class Getter(object):
         self.WORKING = threading.Event()
         self.WORKING.set()
         self.localdata = threading.local()
+        self._inflight_objs = set()
+        self._inflight_objs_lock = threading.Lock()
         # Thread-local sessions created in worker() to avoid shared-state contention
 
         for i in range(num_workers):
@@ -1424,6 +1459,8 @@ class Getter(object):
                 # Mark chunk as in-flight (Chunk always has these attributes)
                 obj.in_queue = False
                 obj.in_flight = True
+                with self._inflight_objs_lock:
+                    self._inflight_objs.add(obj)
 
                 if not self.get(obj, *args, **kwargs):
                     # Check if chunk is permanently failed or cancelled before re-submitting
@@ -1452,6 +1489,8 @@ class Getter(object):
                 self.submit(obj, *args, **kwargs)
             finally:
                 obj.in_flight = False
+                with self._inflight_objs_lock:
+                    self._inflight_objs.discard(obj)
         
         # Worker loop ended - cleanup thread-local HTTP session
         try:
@@ -1486,32 +1525,108 @@ class Getter(object):
         obj.in_queue = True
         self.queue.put((obj, args, kwargs))
 
-
 class ChunkGetter(Getter):
     # Track in-progress chunk_ids GLOBALLY to prevent queueing duplicates
     _queued_chunk_ids = set()
     _queued_chunk_waiters = {}
     _queued_lock = threading.Lock()
 
+    def _cancel_work(self, reason="", prefetch_only=True,
+                     include_inflight=False) -> int:
+        """Cancel queued downloads so live/shutdown work can drain.
+
+        In-flight HTTP requests cannot be interrupted safely, but removing the
+        queued tail prevents prefetch from keeping the worker pool busy after a
+        flight stops or while AutoOrtho is unmounting.  During shutdown we also
+        mark in-flight chunks cancelled so any thread waiting on their ready
+        event unblocks immediately.
+        """
+        cancelled = []
+
+        with self.queue.mutex:
+            kept = []
+            for item in list(self.queue.queue):
+                obj = item[0]
+                if (not prefetch_only) or getattr(obj, 'prefetch', False):
+                    cancelled.append(obj)
+                else:
+                    kept.append(item)
+            if cancelled:
+                self.queue.queue[:] = kept
+                heapq.heapify(self.queue.queue)
+                self.queue.not_full.notify_all()
+
+        for obj in cancelled:
+            try:
+                obj.in_queue = False
+                chunk_id = getattr(obj, 'chunk_id', None)
+                waiters = []
+                if chunk_id:
+                    with self._queued_lock:
+                        self._queued_chunk_ids.discard(chunk_id)
+                        waiters = self._queued_chunk_waiters.pop(
+                            chunk_id, [])
+                obj.cancel()
+                for waiter in waiters:
+                    try:
+                        waiter.in_queue = False
+                        waiter.cancel()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        if include_inflight:
+            try:
+                with self._inflight_objs_lock:
+                    inflight = list(self._inflight_objs)
+                for obj in inflight:
+                    if prefetch_only and not getattr(obj, 'prefetch', False):
+                        continue
+                    try:
+                        obj.cancel()
+                        cancelled.append(obj)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        if cancelled:
+            msg = f" ({reason})" if reason else ""
+            work_type = "prefetch" if prefetch_only else "chunk"
+            log.info(f"Cancelled {len(cancelled)} {work_type} work items{msg}")
+            bump(f'{work_type}_cancelled', len(cancelled))
+        return len(cancelled)
+
+    def cancel_prefetch_work(self, reason="") -> int:
+        return self._cancel_work(reason, prefetch_only=True,
+                                 include_inflight=False)
+
+    def cancel_all_work(self, reason="") -> int:
+        return self._cancel_work(reason, prefetch_only=False,
+                                 include_inflight=True)
+
     def submit(self, obj, *args, **kwargs):
         """Submit chunk for download with duplicate prevention."""
+        if getattr(obj, 'prefetch', False) and getattr(obj, 'priority', 0) < 100:
+            obj.prefetch = False
         if obj.permanent_failure:
             bump('submit_skip_permanent_failure')
-            return
+            return False
         if getattr(obj, 'cancelled', False):
             bump('submit_skip_cancelled')
-            return
+            return False
         
         # Per-object coalescing checks
         if obj.ready.is_set():
             bump('submit_skip_already_ready')
-            return
+            return False
         if obj.in_queue:
             bump('submit_skip_already_queued')
-            return
+            return False
         if obj.in_flight:
             bump('submit_skip_in_flight')
-            return
+            return False
 
         chunk_id = getattr(obj, 'chunk_id', None)
 
@@ -1524,7 +1639,7 @@ class ChunkGetter(Getter):
                     obj.in_queue = True
                     self._queued_chunk_waiters.setdefault(chunk_id, []).append(obj)
                     bump('submit_skip_id_already_queued')
-                    return
+                    return True
         
         obj.in_queue = True
         
@@ -1534,6 +1649,7 @@ class ChunkGetter(Getter):
                 self._queued_chunk_ids.add(chunk_id)
         
         self.queue.put((obj, args, kwargs))
+        return True
 
     def _complete_duplicate_waiters(self, obj, waiters):
         """Fan out one downloaded chunk result to duplicate Chunk objects."""
@@ -2347,12 +2463,16 @@ class SpatialPrefetcher:
         if self._thread:
             self._thread.join(timeout=5.0)
             self._thread = None
+        try:
+            chunk_getter.cancel_prefetch_work("prefetcher stopped")
+        except Exception:
+            pass
         log.info(f"Spatial prefetcher stopped (prefetched {self._prefetch_count} chunks total)")
         bump('prefetch_total', self._prefetch_count)
         
     def _prefetch_loop(self):
         """Main prefetch loop - runs in background thread."""
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not is_shutdown_requested():
             try:
                 self._do_prefetch_cycle()
             except Exception as e:
@@ -3066,12 +3186,13 @@ class SpatialPrefetcher:
                     # Priority: mipmap 0 = most important, higher mipmaps = less important
                     # Lower priority number = more urgent
                     chunk.priority = self.PREFETCH_PRIORITY_OFFSET + mipmap
+                    chunk.prefetch = True
 
                     # Submit to chunk getter with shorter prefetch timeouts
                     # Prefetch chunks should fail fast to keep the pipeline flowing;
                     # the healing system handles any permanently failed chunks later
-                    chunk_getter.submit(chunk, timeout=(5, 10), max_attempts=8)
-                    submitted += 1
+                    if chunk_getter.submit(chunk, timeout=(5, 10), max_attempts=8):
+                        submitted += 1
 
             complete = (total_submittable == 0) or (submitted == total_submittable)
             return submitted, complete
@@ -3096,6 +3217,7 @@ spatial_prefetcher = SpatialPrefetcher()
 
 def start_prefetcher(tile_cacher):
     """Start the spatial prefetcher with the given tile cacher."""
+    clear_shutdown_request()
     spatial_prefetcher.set_tile_cacher(tile_cacher)
     spatial_prefetcher.start()
 
@@ -3472,12 +3594,12 @@ class BackgroundDDSBuilder:
         Fills ALL available worker slots each cycle instead of rate-limiting
         to half the workers, maximizing CPU utilization for background builds.
         """
-        while not self._stop_event.is_set():
+        while not self._stop_event.is_set() and not is_shutdown_requested():
             # Wait for work signal or timeout as fallback
             self._work_event.wait(timeout=self._build_interval)
             self._work_event.clear()
 
-            if self._stop_event.is_set():
+            if self._stop_event.is_set() or is_shutdown_requested():
                 break
 
             # Yield all resources to live tile reads when X-Plane is active
@@ -3520,6 +3642,10 @@ class BackgroundDDSBuilder:
     def _build_tile_wrapper(self, tile) -> None:
         """Wrapper for _build_tile_dds that handles exceptions and stats."""
         try:
+            if is_shutdown_requested():
+                bump('prebuilt_dds_skip_shutdown')
+                return
+
             # Skip if tile was evicted while queued/waiting
             if getattr(tile, '_closed', False):
                 log.debug(
@@ -3530,6 +3656,10 @@ class BackgroundDDSBuilder:
                 return
             self._build_tile_dds(tile)
         finally:
+            try:
+                tile._clear_mm0_promotion_pin()
+            except Exception:
+                pass
             with self._active_lock:
                 self._active_builds -= 1
             self._work_event.set()  # Signal coordinator a slot freed up
@@ -3833,8 +3963,10 @@ class BackgroundDDSBuilder:
                 # ───────────────────────────────────────────────────────────────────
                 if pipeline_mode == PIPELINE_MODE_HYBRID:
                     chunks_for_hybrid = tile.chunks.get(tile.max_zoom, [])
-                    hybrid_mm0_missing = [i for i, c in enumerate(chunks_for_hybrid)
-                                          if not (c.data and len(c.data) > 0)]
+                    hybrid_mm0_missing = [
+                        i for i, c in enumerate(chunks_for_hybrid)
+                        if not getattr(c, 'data', None)
+                    ]
                     if chunks_for_hybrid:
                         # ═══════════════════════════════════════════════════════════════
                         # DIRECT-TO-DISK OPTIMIZATION (Phase 1: ~65ms copy eliminated)
@@ -4257,6 +4389,7 @@ tile_completion_tracker: Optional[TileCompletionTracker] = None
 # Persistent DDS cache (cross-session) and disk budget manager
 dynamic_dds_cache = None       # type: ignore[assignment]  # DynamicDDSCache instance
 disk_budget_manager = None     # type: ignore[assignment]  # DiskBudgetManager instance
+_persist_partial_dds: bool = False
 
 
 def _collect_healing_jpegs(tile, missing_indices):
@@ -4532,6 +4665,8 @@ def _on_tile_complete_callback(tile_id: str, tile,
     elif getattr(tile, '_dds_needs_healing', False) and dynamic_dds_cache is not None:
         _dispatch_healing(tile)
     elif background_dds_builder is not None:
+        if getattr(tile, '_mm0_promotion_queued', False):
+            tile._pin_mm0_promotion()
         background_dds_builder.submit(tile)
 
 
@@ -4694,14 +4829,20 @@ def start_predictive_dds(tile_cacher=None) -> None:
                 name="disk_budget_scan"
             )
             _budget_thread.start()
-            
+
+            if dynamic_dds_cache is not None:
+                dynamic_dds_cache._budget_manager = disk_budget_manager
             log.info(f"Disk budget manager initialized (total={total_budget_gb}GB, dds_pct={dds_pct}%)")
         except Exception as e:
             log.warning(f"Failed to initialize Disk Budget Manager: {e}")
             disk_budget_manager = None
     else:
         log.info("Disk budget enforcement disabled by config")
-    
+
+    global _persist_partial_dds
+    _persist_partial_dds = _get_bool_config(
+        CFG.autoortho, 'persist_partial_dds_cache', False)
+
     # Start the builder thread
     background_dds_builder.start()
     
@@ -4828,6 +4969,7 @@ class Chunk(object):
         # Worker checks this before each retry and abandons the download,
         # freeing the worker slot for other chunks.
         self.cancelled = False
+        self.prefetch = False
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
         
@@ -4963,6 +5105,8 @@ class Chunk(object):
                     log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
                     return
                 os.replace(temp_filename, self.cache_path)
+                if disk_budget_manager is not None:
+                    disk_budget_manager.account_jpeg(len(data))
                 return
             except FileExistsError:
                 try:
@@ -4996,8 +5140,17 @@ class Chunk(object):
         # Signal that download has started (not waiting in queue anymore)
         self.download_started.set()
 
+        if is_shutdown_requested():
+            self.cancel()
+            return True
+
         if self.get_cache():
             self.ready.set()
+            try:
+                if tile_completion_tracker is not None and self.tile_id:
+                    tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+            except Exception:
+                pass
             return True
 
         _max_attempts = max_attempts or MAX_TOTAL_ATTEMPTS
@@ -5058,9 +5211,10 @@ class Chunk(object):
         # === CANCELLATION CHECK ===
         # If the caller gave up waiting (Pass 2 timeout, budget exhausted, etc.),
         # abandon this download immediately to free the worker slot.
-        if self.cancelled:
+        if self.cancelled or is_shutdown_requested():
             log.debug(f"Chunk {self} cancelled before download attempt {self.attempt}")
             bump('chunk_cancelled_before_download')
+            self.cancel()
             return True  # Return True to stop worker retries
 
         # Capped backoff: grows with attempts but maxes at 2 seconds
@@ -5103,7 +5257,7 @@ class Chunk(object):
                 if status_code in PERMANENT_FAILURE_CODES:
                     log.info(f"Chunk {self} permanently failed with {status_code}, marking as failed")
                     self.permanent_failure = True
-                    self.failure_reason = status_code
+                    self.failure_reason = str(status_code)
                     self.data = b''  # Empty data
                     self.ready.set()  # Mark as ready (with no data) to unblock waiters
                     bump(f'chunk_permanent_fail_{status_code}')
@@ -5135,11 +5289,14 @@ class Chunk(object):
                         except Exception:
                             pass
                         return True
-                    # Increase backoff for rate limiting
+                    # Back off for all transient failures, not only rate limits.
+                    backoff_time = min(10.0, 0.5 * (2 ** min(self.retry_count, 5)))
                     if status_code == 429:
-                        backoff_time = min(5, self.retry_count * 0.5)
                         log.debug(f"Rate limited, backing off for {backoff_time}s (attempt {self.retry_count}/{max_retries})")
-                        time.sleep(backoff_time)
+                        bump('chunk_rate_limited')
+                    else:
+                        log.debug(f"Transient error {status_code}, backing off for {backoff_time}s (attempt {self.retry_count}/{max_retries})")
+                    time.sleep(backoff_time)
                     bump(f'chunk_transient_fail_{status_code}_retry')
 
                 err = get_stat("req_err")
@@ -5156,13 +5313,14 @@ class Chunk(object):
 
             data = resp.content
 
-            if _is_jpeg(data[:3]):
+            if data and _is_jpeg(data[:3]):
                 log.debug(f"Data for {self} is JPEG")
                 self.data = data
             else:
-                # FFD8FF identifies image as a JPEG
-                log.debug(f"Loading file {self} not a JPEG! {data[:3]} URL: {self.url}")
-            #    return False
+                log.debug(f"Invalid JPEG for {self} (HTTP {resp.status_code} "
+                          f"content-type={resp.headers.get('content-type', '?')} "
+                          f"size={len(data) if data else 0})")
+                bump('chunk_invalid_jpeg')
                 self.data = b''
 
             bump('bytes_dl', len(self.data))
@@ -5374,6 +5532,10 @@ class Tile(object):
         # (BackgroundDDSBuilder, TileCompletionTracker) can detect
         # evicted tiles and skip stale work.
         self._closed = False
+
+        # Bounded repair state for partial DDS cache entries missing mipmap 0.
+        self._mm0_promotion_queued = False
+        self._mm0_promotion_pin_until = 0.0
 
         #self.tile_condition = threading.Condition()
         if min_zoom:
@@ -5697,12 +5859,13 @@ class Tile(object):
         # Uses the FULL remaining time_budget to maximize chunk collection.
         # This ensures batch aopipeline gets maximum opportunity to reach threshold.
         
-        # Determine download wait time - use FULL remaining budget
+        # Determine download wait time, capped by the user's per-chunk wait.
+        maxwait_cap = self.get_maxwait()
         if time_budget and not time_budget.exhausted:
-            wait_time = time_budget.remaining
+            wait_time = min(time_budget.remaining, maxwait_cap)
         else:
             # No budget - use a reasonable default
-            wait_time = 5.0
+            wait_time = min(5.0, maxwait_cap)
         
         if wait_time <= 0:
             log.debug(f"_collect_chunk_jpegs: No time for Phase 2 downloads")
@@ -6060,40 +6223,12 @@ class Tile(object):
         pre_collected_missing = getattr(self, '_last_collected_missing', None)
         use_precollected = (pre_collected is not None and pre_collected_missing is not None)
         
-        # Acquire streaming builder from pool
-        # Enable nocopy_mode when using pre-collected data for zero-copy optimization
-        config = {
-            'chunks_per_side': self.chunks_per_row,
-            'format': dxt_format,
-            'missing_color': missing_color,
-            'nocopy_mode': use_precollected,  # Zero-copy when we hold JPEG refs
-        }
-        
-        # BLOCKING ACQUIRE: Wait for builder (bank-queue style)
-        # Use remaining time budget as timeout, or default
-        if time_budget is not None and hasattr(time_budget, 'remaining'):
-            builder_timeout = max(1.0, time_budget.remaining)
-        else:
-            builder_timeout = 30.0
-        
-        wait_start = time.monotonic()
-        builder = builder_pool.acquire(config=config, timeout=builder_timeout)
-        if not builder:
-            wait_time_ms = (time.monotonic() - wait_start) * 1000
-            log.debug(f"_try_streaming_aopipeline_build: Builder pool timeout after {wait_time_ms:.0f}ms")
-            bump('streaming_builder_queue_timeout')
-            # Clear pre-collected data to free memory on early return
-            self._last_collected_jpegs = None
-            self._last_collected_missing = None
-            self._last_collected_ratio = None
-            return False
-        
-        wait_time_ms = (time.monotonic() - wait_start) * 1000
-        if wait_time_ms > 10:
-            bump('streaming_builder_queue_wait_count')
-        
-        # Keep references alive for zero-copy mode (cleared after finalize)
+        # Keep references alive for zero-copy mode (cleared after finalize).
+        # Builder acquisition is delayed until data/fallback collection is done
+        # so scarce native builder slots are not held during network/disk waits.
         jpeg_refs_for_nocopy = []
+        final_ready_chunks = []
+        builder = None
         
         try:
             
@@ -6111,21 +6246,20 @@ class Tile(object):
             
             # Streaming builder now uses time_budget for download waits (not deprecated max_download_wait)
             # Default to 5s if no budget provided
+            maxwait_cap = self.get_maxwait()
             if time_budget and not time_budget.exhausted:
-                max_wait = time_budget.remaining
+                max_wait = min(time_budget.remaining, maxwait_cap)
             else:
-                max_wait = 5.0
+                max_wait = min(5.0, maxwait_cap)
             
             if use_precollected:
                 # Use pre-collected data from batch attempt
                 log.debug(f"_try_streaming_aopipeline_build: Reusing {len(pre_collected) - len(pre_collected_missing)} "
                           f"chunks from batch collection (missing: {len(pre_collected_missing)})")
                 
-                # ZERO-COPY: Batch add all ready chunks using nocopy mode
-                # C stores pointers directly, we keep references in jpeg_refs_for_nocopy
                 ready_chunks = [(i, data) for i, data in enumerate(pre_collected) if data is not None]
                 if ready_chunks:
-                    builder.add_chunks_batch_nocopy(ready_chunks, jpeg_refs_for_nocopy)
+                    final_ready_chunks.extend(ready_chunks)
                 
                 # Use pre-computed missing indices
                 pending_indices = list(pre_collected_missing)
@@ -6148,12 +6282,8 @@ class Tile(object):
                             chunk_getter.submit(chunk)
                         pending_indices.append(i)
                 
-                # ZERO-COPY: Batch add all ready chunks using nocopy mode
-                # C stores pointers directly, we keep references in jpeg_refs_for_nocopy
-                # CRITICAL: jpeg_refs_for_nocopy keeps bytes objects alive for zero-copy mode.
-                # Do NOT clear this list until after finalize() returns.
                 if ready_chunks:
-                    builder.add_chunks_batch_nocopy(ready_chunks, jpeg_refs_for_nocopy)
+                    final_ready_chunks.extend(ready_chunks)
             
             # Phase 2: Wait for pending downloads, then collect results
             # Single wait with reasonable timeout - much more efficient than iterating
@@ -6178,76 +6308,69 @@ class Tile(object):
                 else:
                     failed_indices.append(i)
             
-            # ZERO-COPY: Batch add newly-ready chunks using nocopy mode
-            # References kept alive in jpeg_refs_for_nocopy until finalize completes
             if newly_ready:
-                builder.add_chunks_batch_nocopy(newly_ready, jpeg_refs_for_nocopy)
+                final_ready_chunks.extend(newly_ready)
             
-            # Phase 4: Resolve fallbacks for failed chunks
-            # Use ThreadPoolExecutor for parallel disk I/O and image operations.
+            # Phase 4: Resolve fallbacks for failed chunks.
             # Always attempt fallback resolution even if the main time budget is
             # exhausted: the resolver only does disk cache lookups and mipmap
             # scaling (downloader=None) which are fast, sub-second operations.
-            # Skipping this phase when the budget exhausted was the root cause of
-            # permanent missing-color patches on first load, because the DDS was
-            # built with missing_color baked in and marked retrieved=True,
-            # preventing any later retry.
+            fallback_results = []
             if failed_indices:
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                
                 # When main budget is exhausted, give fallback resolution a
                 # fresh budget for disk-only operations (no network), using the
                 # user-configured fallback_timeout.
                 fallback_resolve_budget = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
-                
-                def resolve_fallback(idx):
-                    """Resolve fallback for a single chunk - can run in parallel."""
+                resolve_deadline_secs = max(1.0, max_wait) if not (time_budget and time_budget.exhausted) else fallback_resolve_budget
+                shared_fb_budget = FBTimeBudget(resolve_deadline_secs)
+
+                # Resolve serially because AoImage/aodds native paths are not
+                # consistently thread-safe under fallback scaling.
+                for idx in failed_indices:
+                    if shared_fb_budget.exhausted:
+                        log.debug(f"_try_streaming_aopipeline_build: Fallback budget exhausted for {self.id}")
+                        break
+
                     chunk_col = self.col + (idx % self.chunks_per_row)
                     chunk_row = self.row + (idx // self.chunks_per_row)
-                    
-                    # Create fallback time budget:
-                    # - If main budget has time remaining, use that
-                    # - Otherwise use a fresh small budget for disk-only fallbacks
-                    fb_budget = None
-                    if time_budget:
-                        fb_remaining = time_budget.remaining
-                        if fb_remaining > 0:
-                            fb_budget = FBTimeBudget(fb_remaining)
-                        else:
-                            fb_budget = FBTimeBudget(fallback_resolve_budget)
-                    
-                    rgba = resolver.resolve(
-                        chunk_col, chunk_row, self.max_zoom,
-                        target_mipmap=0,
-                        time_budget=fb_budget
-                    )
-                    return idx, rgba
-                
-                # Limit parallelism to avoid overwhelming disk I/O
-                max_workers = min(8, len(failed_indices))
-                fallback_results = []
-                
-                # Use remaining budget or a fresh small budget for collection
-                resolve_deadline_secs = max(1.0, max_wait) if not (time_budget and time_budget.exhausted) else fallback_resolve_budget
-                
-                try:
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = {executor.submit(resolve_fallback, i): i for i in failed_indices}
-                        
-                        # Collect results with timeout
-                        deadline = time.monotonic() + resolve_deadline_secs
-                        for future in as_completed(futures, timeout=max(0.1, deadline - time.monotonic())):
-                            try:
-                                idx, rgba = future.result(timeout=0.1)
-                                fallback_results.append((idx, rgba))
-                            except Exception:
-                                # Fallback failed, will be marked missing
-                                idx = futures[future]
-                                fallback_results.append((idx, None))
-                except Exception:
-                    # Timeout or other error - mark remaining as missing
-                    pass
-                
+                    try:
+                        rgba = resolver.resolve(
+                            chunk_col, chunk_row, self.max_zoom,
+                            target_mipmap=0,
+                            time_budget=shared_fb_budget
+                        )
+                        fallback_results.append((idx, rgba))
+                    except Exception as e:
+                        log.debug(f"_try_streaming_aopipeline_build: Fallback failed for {self.id} chunk {idx}: {e}")
+                        fallback_results.append((idx, None))
+
+            config = {
+                'chunks_per_side': self.chunks_per_row,
+                'format': dxt_format,
+                'missing_color': missing_color,
+                'nocopy_mode': use_precollected,
+            }
+            if time_budget is not None and hasattr(time_budget, 'remaining'):
+                builder_timeout = max(1.0, time_budget.remaining)
+            else:
+                builder_timeout = 30.0
+
+            wait_start = time.monotonic()
+            builder = builder_pool.acquire(config=config, timeout=builder_timeout)
+            if not builder:
+                wait_time_ms = (time.monotonic() - wait_start) * 1000
+                log.debug(f"_try_streaming_aopipeline_build: Builder pool timeout after {wait_time_ms:.0f}ms")
+                bump('streaming_builder_queue_timeout')
+                return False
+
+            wait_time_ms = (time.monotonic() - wait_start) * 1000
+            if wait_time_ms > 10:
+                bump('streaming_builder_queue_wait_count')
+
+            if final_ready_chunks:
+                builder.add_chunks_batch_nocopy(final_ready_chunks, jpeg_refs_for_nocopy)
+
+            if failed_indices:
                 # Apply fallback results to builder
                 resolved_indices = set()
                 for idx, rgba in fallback_results:
@@ -6333,7 +6456,8 @@ class Tile(object):
         finally:
             # Clear JPEG refs to release memory held for zero-copy mode
             jpeg_refs_for_nocopy.clear()
-            builder.release()
+            if builder is not None:
+                builder.release()
 
     def _get_fallback_level(self) -> int:
         """
@@ -6565,6 +6689,173 @@ class Tile(object):
                 return m.idx
         return self.dds.mipmap_list[-1].idx
 
+    def _pin_mm0_promotion(self) -> None:
+        try:
+            ttl_sec = float(getattr(CFG.autoortho, 'partial_cache_promote_pin_sec', 180.0))
+        except Exception:
+            ttl_sec = 180.0
+        ttl_sec = max(30.0, min(600.0, ttl_sec))
+        self._mm0_promotion_pin_until = time.monotonic() + ttl_sec
+
+    def _clear_mm0_promotion_pin(self) -> None:
+        self._mm0_promotion_pin_until = 0.0
+
+    def _mm0_promotion_is_pinned(self, now: Optional[float] = None) -> bool:
+        if now is None:
+            now = time.monotonic()
+        return self._mm0_promotion_pin_until > now
+
+    def _release_mm0_promotion_claim(self) -> None:
+        self._mm0_promotion_queued = False
+        self._clear_mm0_promotion_pin()
+        with _partial_mm0_promotions_lock:
+            _partial_mm0_promotions.pop(self.id, None)
+
+    def _maybe_promote_partial_cache_to_mm0(self, requested_mipmap: int) -> bool:
+        """Queue bounded full-detail repair for a partial DDS cache entry."""
+        if self._mm0_promotion_queued:
+            bump('partial_mm0_promote_duplicate')
+            return False
+        if requested_mipmap <= 0:
+            return False
+        if background_dds_builder is None or tile_completion_tracker is None:
+            bump('partial_mm0_promote_no_builder')
+            return False
+        if not _get_bool_config(CFG.autoortho, 'partial_cache_promote_mm0', True):
+            bump('partial_mm0_promote_disabled')
+            return False
+        if self.dds is None or self.dds.mipmap_list[0].retrieved:
+            return False
+
+        have_position = bool(datareftracker.data_valid and datareftracker.connected)
+
+        try:
+            radius_nm = float(getattr(CFG.autoortho, 'partial_cache_promote_radius_nm', 12.0))
+        except Exception:
+            radius_nm = 12.0
+        radius_nm = max(1.0, min(80.0, radius_nm))
+
+        try:
+            max_promotions = int(getattr(CFG.autoortho, 'partial_cache_promote_max_tiles', 160))
+        except Exception:
+            max_promotions = 160
+        max_promotions = max(0, min(1000, max_promotions))
+        if max_promotions <= 0:
+            bump('partial_mm0_promote_cap_zero')
+            return False
+
+        try:
+            promotion_window_sec = float(getattr(CFG.autoortho, 'partial_cache_promote_window_sec', 90.0))
+        except Exception:
+            promotion_window_sec = 90.0
+        promotion_window_sec = max(15.0, min(600.0, promotion_window_sec))
+
+        distance_nm = None
+        if have_position:
+            try:
+                with datareftracker._lock:
+                    player_lat = datareftracker.lat
+                    player_lon = datareftracker.lon
+
+                center_row = self.row + (self.height / 2.0) - 0.5
+                center_col = self.col + (self.width / 2.0) - 0.5
+                tile_lat, tile_lon = _chunk_to_latlon(center_row, center_col, self.tilename_zoom)
+                distance_nm = _haversine_distance(player_lat, player_lon, tile_lat, tile_lon) / 1852.0
+            except Exception as e:
+                log.debug(f"Partial mm0 promotion distance check failed for {self.id}: {e}")
+                bump('partial_mm0_promote_distance_error')
+                return False
+
+            if distance_nm > radius_nm:
+                bump('partial_mm0_promote_too_far')
+                return False
+        else:
+            try:
+                startup_cap = int(getattr(CFG.autoortho, 'partial_cache_promote_startup_max_tiles', 96))
+            except Exception:
+                startup_cap = 96
+            startup_cap = max(0, min(max_promotions, startup_cap))
+            if startup_cap <= 0:
+                bump('partial_mm0_promote_no_position')
+                return False
+            max_promotions = startup_cap
+
+        with _partial_mm0_promotions_lock:
+            cutoff = time.monotonic() - promotion_window_sec
+            while _partial_mm0_promotions:
+                _old_id, old_ts = next(iter(_partial_mm0_promotions.items()))
+                if old_ts >= cutoff:
+                    break
+                _partial_mm0_promotions.popitem(last=False)
+
+            if self.id in _partial_mm0_promotions:
+                self._mm0_promotion_queued = True
+                bump('partial_mm0_promote_duplicate')
+                return False
+            if len(_partial_mm0_promotions) >= max_promotions:
+                bump('partial_mm0_promote_cap_hit')
+                return False
+            _partial_mm0_promotions[self.id] = time.monotonic()
+
+        try:
+            self._create_chunks(self.max_zoom)
+            chunks = self.chunks.get(self.max_zoom, [])
+            if not chunks:
+                bump('partial_mm0_promote_no_chunks')
+                self._release_mm0_promotion_claim()
+                return False
+
+            not_ready = [c for c in chunks if not c.ready.is_set()]
+            self._mm0_promotion_queued = True
+
+            if not not_ready:
+                self._pin_mm0_promotion()
+                if background_dds_builder.submit(self, priority=-10):
+                    bump('partial_mm0_promote_builder_ready')
+                    log.info(
+                        f"PARTIAL_MM0_PROMOTE: {self.id} queued DDS build "
+                        f"(distance={distance_nm:.1f}nm, chunks=cached)"
+                        if distance_nm is not None else
+                        f"PARTIAL_MM0_PROMOTE: {self.id} queued DDS build "
+                        f"(distance=unknown, chunks=cached)"
+                    )
+                    return True
+                bump('partial_mm0_promote_builder_rejected')
+                self._release_mm0_promotion_claim()
+                return False
+
+            self._pin_mm0_promotion()
+            tile_completion_tracker.start_tracking(self, self.max_zoom)
+
+            submitted = 0
+            for chunk in not_ready:
+                if chunk.ready.is_set():
+                    continue
+                if not getattr(chunk, 'in_queue', False) and not getattr(chunk, 'in_flight', False):
+                    chunk.priority = _calculate_spatial_priority(
+                        chunk.row, chunk.col, chunk.zoom, 0
+                    )
+                    chunk_getter.submit(chunk)
+                    submitted += 1
+
+            bump('partial_mm0_promote_queued')
+            if submitted:
+                bump('partial_mm0_promote_chunks_submitted', submitted)
+            log.info(
+                f"PARTIAL_MM0_PROMOTE: {self.id} queued mm0 repair "
+                f"(distance={distance_nm:.1f}nm, submitted={submitted}, "
+                f"pending={len(not_ready)})"
+                if distance_nm is not None else
+                f"PARTIAL_MM0_PROMOTE: {self.id} queued mm0 repair "
+                f"(distance=unknown, submitted={submitted}, pending={len(not_ready)})"
+            )
+            return True
+        except Exception as e:
+            self._release_mm0_promotion_claim()
+            log.debug(f"Partial mm0 promotion failed for {self.id}: {e}")
+            bump('partial_mm0_promote_error')
+            return False
+
     def get_bytes(self, offset, length, time_budget=None):
         """
         Get bytes from DDS at specified offset.
@@ -6578,14 +6869,41 @@ class Tile(object):
         if self.dds is None:
             log.debug(f"GET_BYTES: DDS is None for {self}, likely closing; skipping")
             return True
-        
+
+        requested_mipmap = self.find_mipmap_pos(offset)
+
         # ═══════════════════════════════════════════════════════════════════
         # PERSISTENT DDS CACHE: Check Dynamic DDS Cache first (disk, cross-session)
         # ═══════════════════════════════════════════════════════════════════
         # The persistent cache survives across sessions. On a warm start this
         # provides ~1-2ms per tile vs ~390ms for a full rebuild.
         if dynamic_dds_cache is not None and not self._prepopulated:
-            cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
+            cache_has_requested_mipmap = True
+            try:
+                meta = dynamic_dds_cache.load_metadata(self.id, self.max_zoom, self)
+                populated = meta.get("populated_mipmaps") if meta else None
+                if populated is not None and 0 not in populated:
+                    cache_has_requested_mipmap = False
+                    log.debug(
+                        f"GET_BYTES: DDS cache entry for {self.id} is partial "
+                        f"and missing mipmap 0; ignoring partial cache"
+                    )
+                    bump("dynamic_dds_cache_skip_partial_missing_mm0")
+                    self._maybe_promote_partial_cache_to_mm0(requested_mipmap)
+                elif populated is not None and requested_mipmap not in populated:
+                    cache_has_requested_mipmap = False
+                    log.debug(
+                        f"GET_BYTES: DDS cache entry for {self.id} is partial "
+                        f"and missing mipmap {requested_mipmap}; using live build"
+                    )
+                    bump("dynamic_dds_cache_skip_missing_mipmap")
+            except Exception:
+                cache_has_requested_mipmap = False
+
+            cached_bytes = (
+                dynamic_dds_cache.load(self.id, self.max_zoom, self)
+                if cache_has_requested_mipmap else None
+            )
             if cached_bytes is not None:
                 if self._populate_dds_from_prebuilt(cached_bytes):
                     # FIX: Only return early if mm0 was actually populated.
@@ -6640,7 +6958,7 @@ class Tile(object):
                                     return True
         # ═══════════════════════════════════════════════════════════════════
 
-        mipmap = self.find_mipmap_pos(offset)
+        mipmap = requested_mipmap
         log.debug(f"Get_bytes for mipmap {mipmap} ...")
         
         # ═══════════════════════════════════════════════════════════════════
@@ -8215,6 +8533,8 @@ class Tile(object):
         """Persist intermediate mipmaps (1+) incrementally to DDS cache."""
         if mipmap == 0 or dynamic_dds_cache is None or self.dds is None:
             return
+        if not _persist_partial_dds:
+            return
         _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
         if self._prepopulated and not _partially_cached:
             return
@@ -8717,7 +9037,8 @@ class Tile(object):
         
         # Collect JPEG data, waiting for downloads within budget
         jpeg_datas = []
-        max_wait = time_budget.remaining if time_budget else 2.0
+        maxwait_cap = self.get_maxwait()
+        max_wait = min(time_budget.remaining, maxwait_cap) if time_budget else min(2.0, maxwait_cap)
         
         for i, chunk in enumerate(row_chunks):
             if chunk.ready.is_set():
@@ -8731,7 +9052,7 @@ class Tile(object):
                     jpeg_datas.append(None)
                 # Update remaining time
                 if time_budget:
-                    max_wait = max(0.01, time_budget.remaining)
+                    max_wait = min(max(0.01, time_budget.remaining), maxwait_cap)
             else:
                 # No time left
                 jpeg_datas.append(None)
@@ -9649,6 +9970,7 @@ class TileCacher(object):
             # PHASE 1: Collect batch to evict (under lock - fast dict ops only)
             # Store (tile_id, tile) pairs so we can release external refs
             batch = []
+            now = time.monotonic()
             with self.tc_lock:
                 for idx in list(self._lru_candidates()):
                     if len(batch) >= BATCH_SIZE:
@@ -9659,6 +9981,12 @@ class TileCacher(object):
                     if not t:
                         continue
                     if t.refs > 0:
+                        continue
+                    if (
+                        hasattr(t, '_mm0_promotion_is_pinned') and
+                        t._mm0_promotion_is_pinned(now)
+                    ):
+                        bump('partial_mm0_promote_pin_evict_skip')
                         continue
                     # Pop from dict immediately - tile is now "orphaned"
                     try:
@@ -10048,6 +10376,11 @@ def shutdown():
     8. Process memory stats
     """
     global chunk_getter
+
+    try:
+        begin_shutdown("module shutdown")
+    except Exception as _err:
+        log.debug(f"Begin shutdown error: {_err}")
 
     # 1. Stop spatial prefetcher first (stop new prefetch requests)
     try:

@@ -12,6 +12,11 @@ try:
 except ImportError:
     from utils.constants import system_type
 
+try:
+    from autoortho.worker_modes import is_mount_worker_mode
+except ImportError:
+    from worker_modes import is_mount_worker_mode
+
 import logging
 log = logging.getLogger(__name__)
 
@@ -435,10 +440,10 @@ route_prefetch_radius_nm = 40
         self.ready = self.load()
         
         # Save to update new defaults, but ONLY in the main process.
-        # macfuse worker subprocesses must NOT save config to avoid race conditions
+        # Mount worker subprocesses must NOT save config to avoid race conditions
         # that can overwrite the main process's configuration and reset user settings.
         # Workers are identified by the AO_RUN_MODE environment variable set during launch.
-        if os.environ.get("AO_RUN_MODE") != "macfuse_worker":
+        if not is_mount_worker_mode():
             self.save()
 
 
@@ -592,7 +597,7 @@ route_prefetch_radius_nm = 40
         # If we patched any values during load, persist them now so next run is stable.
         # Only save in the main process - workers must not write config files.
         if getattr(self, "_patched_during_load", False):
-            if os.environ.get("AO_RUN_MODE") != "macfuse_worker":
+            if not is_mount_worker_mode():
                 try:
                     self.save()
                 except Exception as e:

@@ -111,6 +111,12 @@ class DiskBudgetManager:
         if self._dds_usage > self._dds_budget:
             self._schedule_eviction("dds")
 
+    def account_jpeg(self, size_bytes: int) -> None:
+        """Account for a JPEG cache write or deletion."""
+        with self._lock:
+            self._jpeg_usage += size_bytes
+            self._jpeg_usage = max(0, self._jpeg_usage)
+
     # ------------------------------------------------------------------
     # Eviction
     # ------------------------------------------------------------------

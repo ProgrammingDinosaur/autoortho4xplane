@@ -57,15 +57,28 @@ def _notify_custom_map_workers():
         return
     if ui.cfg.autoortho.maptype_override != "Custom Map":
         return
-    import platform
-    if platform.system() == "Darwin" and hasattr(ui, 'mac_os_procs'):
-        import signal
-        for p in ui.mac_os_procs:
+    if hasattr(ui, 'mac_os_procs') and ui.mac_os_procs:
+        try:
             try:
-                if p.poll() is None:
-                    p.send_signal(signal.SIGUSR1)
-            except Exception:
-                pass
+                from autoortho import aostats
+                from autoortho.mount_worker import RELOAD_GENERATION_STAT
+            except ImportError:
+                import aostats
+                from mount_worker import RELOAD_GENERATION_STAT
+            import time
+            aostats.set_stat(RELOAD_GENERATION_STAT, int(time.time() * 1000))
+        except Exception:
+            pass
+
+        import signal
+        sigusr1 = getattr(signal, "SIGUSR1", None)
+        if sigusr1 is not None:
+            for p in ui.mac_os_procs:
+                try:
+                    if p.poll() is None:
+                        p.send_signal(sigusr1)
+                except Exception:
+                    pass
 
 # Shutdown flag for the Flask-SocketIO server
 _server_shutdown_requested = threading.Event()
