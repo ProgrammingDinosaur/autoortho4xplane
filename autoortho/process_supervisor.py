@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 
 
 DEFAULT_WORKER_STOP_TIMEOUT = 3.0
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @dataclass
@@ -70,8 +71,10 @@ class AOProcessSupervisor:
 
         if _is_frozen():
             cmd = [sys.executable]
+            cwd = None
         else:
-            cmd = [sys.executable, "-m", "autoortho"]
+            cmd = [sys.executable, str(_REPO_ROOT / "autoortho")]
+            cwd = str(_REPO_ROOT)
 
         cmd += [
             "--root",
@@ -96,6 +99,8 @@ class AOProcessSupervisor:
             "stdout": std_file,
             "stderr": std_file,
         }
+        if cwd:
+            popen_kwargs["cwd"] = cwd
         if os.name == "nt":
             popen_kwargs["creationflags"] = (
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
@@ -105,9 +110,10 @@ class AOProcessSupervisor:
             popen_kwargs["start_new_session"] = True
 
         log.debug(
-            "Launching mount worker: frozen=%s exe=%s cmd=%s",
+            "Launching mount worker: frozen=%s exe=%s cwd=%s cmd=%s",
             _is_frozen(),
             sys.executable,
+            cwd,
             cmd,
         )
         try:
