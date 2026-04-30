@@ -3673,6 +3673,9 @@ class BackgroundDDSBuilder:
                 bump('prebuilt_dds_skip_closed')
                 return
             self._build_tile_dds(tile)
+        except _NativeBuildBusy:
+            bump('background_build_yielded')
+            self.submit(tile)
         finally:
             try:
                 tile._clear_mm0_promotion_pin()
@@ -3873,7 +3876,7 @@ class BackgroundDDSBuilder:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
                 if not staging_path:
                     return False
-                with _native_build_context():
+                with _native_build_context(timeout=0):
                     success, bytes_written = builder.finalize_to_file(
                         staging_path, max_threads=_compute_thread_budget()
                     )
@@ -3897,6 +3900,8 @@ class BackgroundDDSBuilder:
             log.debug(f"BackgroundDDSBuilder: Streaming finalize failed for {tile_id}")
             return False
             
+        except _NativeBuildBusy:
+            raise
         except Exception as e:
             log.debug(f"BackgroundDDSBuilder: Streaming build failed for {tile_id}: {e}")
             return False
@@ -4017,7 +4022,7 @@ class BackgroundDDSBuilder:
                                     if not staging_path:
                                         return
                                     
-                                    with _native_build_context():
+                                    with _native_build_context(timeout=0):
                                         result = native_dds.build_from_jpegs_to_file(
                                             jpeg_datas,
                                             staging_path,
@@ -4040,6 +4045,8 @@ class BackgroundDDSBuilder:
                                     else:
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for "
                                                   f"{tile_id}: {result.error}, trying buffer path")
+                            except _NativeBuildBusy:
+                                raise
                             except Exception as e:
                                 log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for {tile_id}: "
                                           f"{e}, trying buffer path")
