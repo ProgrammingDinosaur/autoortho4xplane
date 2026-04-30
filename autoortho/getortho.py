@@ -879,6 +879,11 @@ def _compute_thread_budget() -> int:
 
 _native_build_semaphore = threading.Semaphore(1)
 
+
+class _NativeBuildBusy(Exception):
+    """Raised when the native build semaphore cannot be acquired within the timeout."""
+
+
 class _native_build_context:
     """Serialize native DDS builds to prevent concurrent OpenMP crashes.
 
@@ -887,9 +892,13 @@ class _native_build_context:
     semaphore (count=1) ensures only one ``finalize_to_file`` executes at
     a time while still tracking active builds for thread budget math.
     """
+    def __init__(self, timeout=5.0):
+        self._timeout = timeout
+
     def __enter__(self):
         global _active_native_builds
-        _native_build_semaphore.acquire()
+        if not _native_build_semaphore.acquire(timeout=self._timeout):
+            raise _NativeBuildBusy(f"native build semaphore not acquired within {self._timeout}s")
         with _active_native_builds_lock:
             _active_native_builds += 1
         return self
@@ -1455,6 +1464,7 @@ class Getter(object):
 
             #STATS.setdefault('count', 0) + 1
 
+            did_resubmit = False
             try:
                 # Mark chunk as in-flight (Chunk always has these attributes)
                 obj.in_queue = False
@@ -1474,6 +1484,8 @@ class Getter(object):
                     # CRITICAL: Clear in_flight BEFORE re-submitting, otherwise submit()
                     # will see in_flight=True and silently drop the chunk!
                     obj.in_flight = False
+                    did_resubmit = True
+                    bump('worker_resubmit')
                     self.submit(obj, *args, **kwargs)
             except Exception as err:
                 log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
@@ -1486,11 +1498,17 @@ class Getter(object):
                     continue
                 # CRITICAL: Clear in_flight BEFORE re-submitting
                 obj.in_flight = False
+                did_resubmit = True
+                bump('worker_resubmit')
                 self.submit(obj, *args, **kwargs)
             finally:
-                obj.in_flight = False
-                with self._inflight_objs_lock:
-                    self._inflight_objs.discard(obj)
+                if not did_resubmit:
+                    # Normal completion — we still own in_flight and _inflight_objs
+                    obj.in_flight = False
+                    with self._inflight_objs_lock:
+                        self._inflight_objs.discard(obj)
+                # If did_resubmit: in_flight was already cleared before submit(), and
+                # _inflight_objs will be managed by whichever worker picks up the chunk next.
         
         # Worker loop ended - cleanup thread-local HTTP session
         try:
@@ -3655,6 +3673,9 @@ class BackgroundDDSBuilder:
                 bump('prebuilt_dds_skip_closed')
                 return
             self._build_tile_dds(tile)
+        except _NativeBuildBusy:
+            bump('background_build_yielded')
+            self.submit(tile)
         finally:
             try:
                 tile._clear_mm0_promotion_pin()
@@ -3855,7 +3876,7 @@ class BackgroundDDSBuilder:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
                 if not staging_path:
                     return False
-                with _native_build_context():
+                with _native_build_context(timeout=0):
                     success, bytes_written = builder.finalize_to_file(
                         staging_path, max_threads=_compute_thread_budget()
                     )
@@ -3879,6 +3900,8 @@ class BackgroundDDSBuilder:
             log.debug(f"BackgroundDDSBuilder: Streaming finalize failed for {tile_id}")
             return False
             
+        except _NativeBuildBusy:
+            raise
         except Exception as e:
             log.debug(f"BackgroundDDSBuilder: Streaming build failed for {tile_id}: {e}")
             return False
@@ -3999,7 +4022,7 @@ class BackgroundDDSBuilder:
                                     if not staging_path:
                                         return
                                     
-                                    with _native_build_context():
+                                    with _native_build_context(timeout=0):
                                         result = native_dds.build_from_jpegs_to_file(
                                             jpeg_datas,
                                             staging_path,
@@ -4022,6 +4045,8 @@ class BackgroundDDSBuilder:
                                     else:
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for "
                                                   f"{tile_id}: {result.error}, trying buffer path")
+                            except _NativeBuildBusy:
+                                raise
                             except Exception as e:
                                 log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for {tile_id}: "
                                           f"{e}, trying buffer path")
