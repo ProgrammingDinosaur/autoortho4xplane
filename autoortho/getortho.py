@@ -5,6 +5,7 @@ import ctypes
 import gc
 import glob as glob_mod
 import heapq
+import itertools
 import os
 import re
 import sys
@@ -18,7 +19,7 @@ from typing import Optional, Dict, Tuple, List
 
 from io import BytesIO
 from urllib.request import urlopen, Request
-from queue import Queue, PriorityQueue, Empty, Full
+from queue import PriorityQueue, Empty, Full
 from functools import wraps, lru_cache
 from pathlib import Path
 from collections import OrderedDict
@@ -396,6 +397,9 @@ _tile_queue_initialized = False
 # Import from AoDDS when available, or use local fallbacks
 PRIORITY_LIVE = 0       # Live tiles requested by X-Plane (premium, front of queue)
 PRIORITY_PREFETCH = 100 # Prefetch/pre-built tiles (low priority, back of queue)
+PRIORITY_BACKGROUND_DDS = PRIORITY_PREFETCH
+PRIORITY_CACHE_REPAIR = 500
+PRIORITY_NETWORK_HEALING = 600
 
 
 def reset_dds_buffer_pool():
@@ -631,7 +635,9 @@ def _get_tile_queue_max_size() -> int:
 
 
 def _build_dds_hybrid(chunks: list, dxt_format: str,
-                      missing_color: tuple) -> bytes:
+                      missing_color: tuple,
+                      buffer_priority: int = PRIORITY_LIVE,
+                      native_timeout: float = 5.0) -> bytes:
     """
     Build DDS using HYBRID approach: chunks already in memory + native decode.
     
@@ -681,16 +687,15 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
             return None
         
         try:
-            # Blocking acquire with LIVE priority (front of queue)
-            # No fallback to allocation - wait for buffer to be available
-            buffer, buffer_id = pool.acquire(timeout=30.0, priority=PRIORITY_LIVE)
+            # No fallback to allocation - wait for buffer to be available.
+            buffer, buffer_id = pool.acquire(timeout=30.0, priority=buffer_priority)
         except TimeoutError:
             log.debug("Hybrid DDS build: buffer pool timeout (queue full)")
             bump('hybrid_buffer_pool_timeout')
             return None
         
         try:
-            with _native_build_context():
+            with _native_build_context(timeout=native_timeout):
                 result = native.build_from_jpegs_to_buffer(
                     buffer,
                     jpeg_datas,
@@ -710,6 +715,8 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
         finally:
             pool.release(buffer_id)
             
+    except _NativeBuildBusy:
+        raise
     except Exception as e:
         log.debug(f"Hybrid DDS build exception: {e}")
         return None
@@ -884,6 +891,10 @@ class _NativeBuildBusy(Exception):
     """Raised when the native build semaphore cannot be acquired within the timeout."""
 
 
+class _BackgroundBuildDeferred(Exception):
+    """Raised when speculative DDS work should yield to live X-Plane requests."""
+
+
 class _native_build_context:
     """Serialize native DDS builds to prevent concurrent OpenMP crashes.
 
@@ -909,6 +920,11 @@ class _native_build_context:
             _active_native_builds -= 1
         _native_build_semaphore.release()
         return False
+
+
+def _defer_background_build_if_live(tile=None):
+    if is_live_building() and not getattr(tile, '_is_live', False):
+        raise _BackgroundBuildDeferred("live read active")
 
 
 def _get_progressive_executor(max_workers=None):
@@ -1464,6 +1480,12 @@ class Getter(object):
 
             #STATS.setdefault('count', 0) + 1
 
+            if getattr(obj, 'prefetch', False) and is_live_building():
+                self.queue.put((obj, args, kwargs))
+                bump('background_chunk_deferred_live')
+                time.sleep(0.05)
+                continue
+
             did_resubmit = False
             try:
                 # Mark chunk as in-flight (Chunk always has these attributes)
@@ -1546,8 +1568,18 @@ class Getter(object):
 class ChunkGetter(Getter):
     # Track in-progress chunk_ids GLOBALLY to prevent queueing duplicates
     _queued_chunk_ids = set()
+    _queued_chunk_objs = {}
     _queued_chunk_waiters = {}
     _queued_lock = threading.Lock()
+
+    def reprioritize_queue(self) -> None:
+        """Rebuild the heap after a queued chunk's priority changes."""
+        try:
+            with self.queue.mutex:
+                heapq.heapify(self.queue.queue)
+                self.queue.not_empty.notify_all()
+        except Exception:
+            pass
 
     def _cancel_work(self, reason="", prefetch_only=True,
                      include_inflight=False) -> int:
@@ -1582,6 +1614,7 @@ class ChunkGetter(Getter):
                 if chunk_id:
                     with self._queued_lock:
                         self._queued_chunk_ids.discard(chunk_id)
+                        self._queued_chunk_objs.pop(chunk_id, None)
                         waiters = self._queued_chunk_waiters.pop(
                             chunk_id, [])
                 obj.cancel()
@@ -1626,8 +1659,10 @@ class ChunkGetter(Getter):
 
     def submit(self, obj, *args, **kwargs):
         """Submit chunk for download with duplicate prevention."""
-        if getattr(obj, 'prefetch', False) and getattr(obj, 'priority', 0) < 100:
+        became_foreground = False
+        if getattr(obj, 'prefetch', False) and getattr(obj, 'priority', 0) < PRIORITY_PREFETCH:
             obj.prefetch = False
+            became_foreground = True
         if obj.permanent_failure:
             bump('submit_skip_permanent_failure')
             return False
@@ -1640,6 +1675,8 @@ class ChunkGetter(Getter):
             bump('submit_skip_already_ready')
             return False
         if obj.in_queue:
+            if became_foreground:
+                self.reprioritize_queue()
             bump('submit_skip_already_queued')
             return False
         if obj.in_flight:
@@ -1652,12 +1689,28 @@ class ChunkGetter(Getter):
         # chunk as a waiter so it receives the downloaded bytes and completion
         # notification instead of waiting forever on a skipped duplicate.
         if chunk_id:
+            reprioritize = False
+            duplicate_queued = False
             with self._queued_lock:
                 if chunk_id in self._queued_chunk_ids:
+                    duplicate_queued = True
+                    queued_obj = self._queued_chunk_objs.get(chunk_id)
+                    if queued_obj is not None:
+                        incoming_priority = getattr(obj, 'priority', PRIORITY_PREFETCH)
+                        if incoming_priority < getattr(queued_obj, 'priority', incoming_priority):
+                            queued_obj.priority = incoming_priority
+                            reprioritize = True
+                        if not getattr(obj, 'prefetch', False) and getattr(queued_obj, 'prefetch', False):
+                            queued_obj.prefetch = False
+                            reprioritize = True
+                            bump('background_chunk_promoted_live')
                     obj.in_queue = True
                     self._queued_chunk_waiters.setdefault(chunk_id, []).append(obj)
                     bump('submit_skip_id_already_queued')
-                    return True
+            if duplicate_queued:
+                if reprioritize:
+                    self.reprioritize_queue()
+                return True
         
         obj.in_queue = True
         
@@ -1665,6 +1718,7 @@ class ChunkGetter(Getter):
         if chunk_id:
             with self._queued_lock:
                 self._queued_chunk_ids.add(chunk_id)
+                self._queued_chunk_objs[chunk_id] = obj
         
         self.queue.put((obj, args, kwargs))
         return True
@@ -1711,6 +1765,8 @@ class ChunkGetter(Getter):
         if chunk_id:
             with self._queued_lock:
                 self._queued_chunk_ids.discard(chunk_id)
+                if self._queued_chunk_objs.get(chunk_id) is obj:
+                    self._queued_chunk_objs.pop(chunk_id, None)
                 if result:
                     waiters = self._queued_chunk_waiters.pop(chunk_id, [])
                     bump('chunk_download_completed')
@@ -3496,7 +3552,8 @@ class BackgroundDDSBuilder:
             build_interval_sec: Minimum time between submissions (rate limiting)
             max_workers: Number of parallel build workers
         """
-        self._queue = Queue(maxsize=self.MAX_QUEUE_SIZE)
+        self._queue = PriorityQueue(maxsize=self.MAX_QUEUE_SIZE)
+        self._queue_sequence = itertools.count()
         self._dds_cache = dds_cache
         self._build_interval = build_interval_sec
         self._max_workers = max_workers
@@ -3553,7 +3610,7 @@ class BackgroundDDSBuilder:
         # Stop coordinator
         if self._coordinator_thread is not None:
             try:
-                self._queue.put_nowait(None)  # Sentinel
+                self._queue.put_nowait((float('inf'), next(self._queue_sequence), None))  # Sentinel
             except Full:
                 pass
             self._coordinator_thread.join(timeout=2.0)
@@ -3570,13 +3627,14 @@ class BackgroundDDSBuilder:
         log.info(f"BackgroundDDSBuilder stopped "
                 f"(built={self._builds_completed}, failed={self._builds_failed})")
     
-    def submit(self, tile, priority: float = 0) -> bool:
+    def submit(self, tile, priority: float = PRIORITY_BACKGROUND_DDS) -> bool:
         """
         Submit a tile for background DDS building.
         
         Args:
             tile: Tile with all chunks downloaded
-            priority: Not used currently (FIFO order), reserved for future
+            priority: Queue priority (lower runs first; values here are
+                background priority and yield to live builds)
             
         Returns:
             True if queued, False if queue is full or tile already cached
@@ -3592,7 +3650,7 @@ class BackgroundDDSBuilder:
             log.debug(f"BackgroundDDSBuilder: healing tile {tile.id} passed through")
         
         try:
-            self._queue.put_nowait((priority, tile))
+            self._queue.put_nowait((priority, next(self._queue_sequence), tile))
             self._work_event.set()  # Wake coordinator immediately
             log.debug(f"BackgroundDDSBuilder: Queued {tile.id} "
                      f"(queue size: {self._queue.qsize()})")
@@ -3641,7 +3699,9 @@ class BackgroundDDSBuilder:
                 if item is None:
                     continue
 
-                priority, tile = item
+                priority, _seq, tile = item
+                if tile is None:
+                    continue
 
                 # Drop evicted tiles early to avoid holding
                 # references longer than necessary
@@ -3653,12 +3713,13 @@ class BackgroundDDSBuilder:
                     with self._active_lock:
                         self._active_builds += 1
                     self._executor.submit(
-                        self._build_tile_wrapper, tile
+                        self._build_tile_wrapper, priority, tile
                     )
                     batch_submitted += 1
     
-    def _build_tile_wrapper(self, tile) -> None:
+    def _build_tile_wrapper(self, priority, tile) -> None:
         """Wrapper for _build_tile_dds that handles exceptions and stats."""
+        deferred = False
         try:
             if is_shutdown_requested():
                 bump('prebuilt_dds_skip_shutdown')
@@ -3672,15 +3733,20 @@ class BackgroundDDSBuilder:
                 )
                 bump('prebuilt_dds_skip_closed')
                 return
+            _defer_background_build_if_live(tile)
             self._build_tile_dds(tile)
+        except _BackgroundBuildDeferred:
+            bump('background_build_deferred_live')
+            deferred = self.submit(tile, priority=priority)
         except _NativeBuildBusy:
             bump('background_build_yielded')
-            self.submit(tile)
+            deferred = self.submit(tile, priority=priority)
         finally:
-            try:
-                tile._clear_mm0_promotion_pin()
-            except Exception:
-                pass
+            if not deferred:
+                try:
+                    tile._clear_mm0_promotion_pin()
+                except Exception:
+                    pass
             with self._active_lock:
                 self._active_builds -= 1
             self._work_event.set()  # Signal coordinator a slot freed up
@@ -3774,6 +3840,8 @@ class BackgroundDDSBuilder:
         jpeg_refs_for_nocopy = []
 
         try:
+            _defer_background_build_if_live(tile)
+
             # Get chunks for max zoom
             chunks = tile.chunks.get(tile.max_zoom, [])
             if not chunks:
@@ -3807,6 +3875,7 @@ class BackgroundDDSBuilder:
             # Key difference from live: NO initial time budget, but may get one on transition
             for i in pending_indices:
                 chunk = chunks[i]
+                _defer_background_build_if_live(tile)
                 
                 # === TRANSITION CHECK ===
                 # If tile became live, use its time budget for remaining work
@@ -3821,6 +3890,7 @@ class BackgroundDDSBuilder:
                 while not chunk.ready.is_set():
                     # Short wait to allow transition detection
                     chunk.ready.wait(timeout=0.1)
+                    _defer_background_build_if_live(tile)
                     
                     # Check for live transition
                     if tile._is_live:
@@ -3873,6 +3943,7 @@ class BackgroundDDSBuilder:
             
             # Finalize directly to disk via DynamicDDSCache staging path
             if self._dds_cache is not None:
+                _defer_background_build_if_live(tile)
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
                 if not staging_path:
                     return False
@@ -3901,6 +3972,8 @@ class BackgroundDDSBuilder:
             return False
             
         except _NativeBuildBusy:
+            raise
+        except _BackgroundBuildDeferred:
             raise
         except Exception as e:
             log.debug(f"BackgroundDDSBuilder: Streaming build failed for {tile_id}: {e}")
@@ -3939,6 +4012,7 @@ class BackgroundDDSBuilder:
         build_start = time.monotonic()
         mipmap_images = []  # Track images for cleanup
         lock_acquired = False
+        _defer_background_build_if_live(tile)
         
         # ═══════════════════════════════════════════════════════════════════════
         # TRY STREAMING BUILDER FIRST (if enabled)
@@ -3951,6 +4025,7 @@ class BackgroundDDSBuilder:
         if getattr(CFG.autoortho, 'streaming_builder_enabled', True):
             if self._try_streaming_prefetch_build(tile, tile_id, build_start):
                 return
+            _defer_background_build_if_live(tile)
         
         # ═══════════════════════════════════════════════════════════════════════
         # TRY OPTIMAL HYBRID DDS BUILDING FIRST
@@ -3966,6 +4041,7 @@ class BackgroundDDSBuilder:
         # - python: Pure Python fallback (most compatible)
         # ═══════════════════════════════════════════════════════════════════════
         pipeline_mode = get_pipeline_mode()
+        _defer_background_build_if_live(tile)
         
         # Skip native attempts if explicitly in python mode
         if pipeline_mode != PIPELINE_MODE_PYTHON:
@@ -4015,8 +4091,9 @@ class BackgroundDDSBuilder:
                                         valid_count += 1
                                     else:
                                         jpeg_datas.append(None)
-                                
+
                                 if valid_count > 0:
+                                    _defer_background_build_if_live(tile)
                                     staging_path = self._dds_cache.get_staging_path(
                                         tile_id, tile.max_zoom, tile)
                                     if not staging_path:
@@ -4047,6 +4124,8 @@ class BackgroundDDSBuilder:
                                                   f"{tile_id}: {result.error}, trying buffer path")
                             except _NativeBuildBusy:
                                 raise
+                            except _BackgroundBuildDeferred:
+                                raise
                             except Exception as e:
                                 log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for {tile_id}: "
                                           f"{e}, trying buffer path")
@@ -4059,7 +4138,9 @@ class BackgroundDDSBuilder:
                             dds_bytes = _build_dds_hybrid(
                                 chunks=chunks_for_hybrid,
                                 dxt_format=dxt_format,
-                                missing_color=missing_color
+                                missing_color=missing_color,
+                                buffer_priority=PRIORITY_PREFETCH,
+                                native_timeout=0
                             )
                             
                             if dds_bytes and len(dds_bytes) >= 128:
@@ -4081,6 +4162,8 @@ class BackgroundDDSBuilder:
                             else:
                                 log.debug(f"BackgroundDDSBuilder: Hybrid build returned no data "
                                           f"for {tile_id}, trying native file I/O")
+                        except _NativeBuildBusy:
+                            raise
                         except Exception as e:
                             log.debug(f"BackgroundDDSBuilder: Hybrid build failed for {tile_id}: "
                                       f"{e}, trying native file I/O")
@@ -4100,23 +4183,25 @@ class BackgroundDDSBuilder:
                 if (self._dds_cache is not None and
                     hasattr(native_dds, 'build_tile_to_file')):
                     try:
+                        _defer_background_build_if_live(tile)
                         staging_path = self._dds_cache.get_staging_path(
                             tile_id, tile.max_zoom, tile)
                         if not staging_path:
                             return
-                        
-                        result = native_dds.build_tile_to_file(
-                            cache_dir=tile.cache_dir,
-                            row=tile.row,
-                            col=tile.col,
-                            maptype=tile.maptype,
-                            zoom=tile.max_zoom,
-                            output_path=staging_path,
-                            chunks_per_side=tile.chunks_per_row,
-                            format=dxt_format,
-                            missing_color=missing_color
-                        )
-                        
+
+                        with _native_build_context(timeout=0):
+                            result = native_dds.build_tile_to_file(
+                                cache_dir=tile.cache_dir,
+                                row=tile.row,
+                                col=tile.col,
+                                maptype=tile.maptype,
+                                zoom=tile.max_zoom,
+                                output_path=staging_path,
+                                chunks_per_side=tile.chunks_per_row,
+                                format=dxt_format,
+                                missing_color=missing_color
+                            )
+
                         if result.success and result.bytes_written >= 128:
                             # Check which chunks were missing from cache (filled with missing_color by native build)
                             native_mm0_missing = None
@@ -4134,11 +4219,15 @@ class BackgroundDDSBuilder:
                             log.debug(f"BackgroundDDSBuilder: Native direct-to-disk built {tile_id} "
                                       f"in {build_time:.0f}ms ({result.bytes_written} bytes)")
                             bump('prebuilt_dds_builds_native_direct')
-                            
+
                             return
                         else:
                             log.debug(f"BackgroundDDSBuilder: Native direct-to-disk failed for "
                                       f"{tile_id}: {result.error}, trying buffer path")
+                    except _NativeBuildBusy:
+                        raise
+                    except _BackgroundBuildDeferred:
+                        raise
                     except Exception as e:
                         log.debug(f"BackgroundDDSBuilder: Native direct-to-disk failed for {tile_id}: "
                                   f"{e}, trying buffer path")
@@ -4156,6 +4245,7 @@ class BackgroundDDSBuilder:
                     log.debug(f"BackgroundDDSBuilder: Buffer pool not available for {tile_id}")
                     bump('prefetch_pool_unavailable')
                     return
+                _defer_background_build_if_live(tile)
                 
                 # BLOCKING ACQUIRE: Wait for buffer (low priority - back of queue)
                 # Prefetch tiles yield to live tiles automatically via priority queue
@@ -4171,17 +4261,19 @@ class BackgroundDDSBuilder:
                     return
                 
                 try:
-                    result = native_dds.build_tile_to_buffer(
-                        buffer,
-                        cache_dir=tile.cache_dir,
-                        row=tile.row,
-                        col=tile.col,
-                        maptype=tile.maptype,
-                        zoom=tile.max_zoom,
-                        chunks_per_side=tile.chunks_per_row,
-                        format=dxt_format,
-                        missing_color=missing_color
-                    )
+                    _defer_background_build_if_live(tile)
+                    with _native_build_context(timeout=0):
+                        result = native_dds.build_tile_to_buffer(
+                            buffer,
+                            cache_dir=tile.cache_dir,
+                            row=tile.row,
+                            col=tile.col,
+                            maptype=tile.maptype,
+                            zoom=tile.max_zoom,
+                            chunks_per_side=tile.chunks_per_row,
+                            format=dxt_format,
+                            missing_color=missing_color
+                        )
                     
                     if result.success and result.bytes_written >= 128:
                         dds_bytes = result.to_bytes()
@@ -4217,6 +4309,7 @@ class BackgroundDDSBuilder:
         # ═══════════════════════════════════════════════════════════════════════
         
         try:
+            _defer_background_build_if_live(tile)
             # ═══════════════════════════════════════════════════════════════════
             # LOCK CONTENTION AVOIDANCE
             # ═══════════════════════════════════════════════════════════════════
@@ -4300,6 +4393,7 @@ class BackgroundDDSBuilder:
                              f"will use missing color (fallbacks disabled)")
             
             # Step 2: Get mipmap 0 image to determine DDS dimensions
+            _defer_background_build_if_live(tile)
             img0 = tile.get_img(0, startrow=0, endrow=None, maxwait=30,
                                fallback_level_override=fallback_override)
             
@@ -4324,6 +4418,7 @@ class BackgroundDDSBuilder:
             # This matches on-demand behavior where X-Plane might request
             # any mipmap first and get native-resolution chunks
             for mipmap in range(1, tile.max_mipmap + 1):
+                _defer_background_build_if_live(tile)
                 mipmap_zoom = tile.max_zoom - mipmap
                 if mipmap_zoom < tile.min_zoom:
                     break
@@ -4346,6 +4441,7 @@ class BackgroundDDSBuilder:
                 temp_dds.gen_mipmaps(img, startmipmap=mipmap, maxmipmaps=1)
             
             # Step 5: Read out the complete DDS as bytes
+            _defer_background_build_if_live(tile)
             dds_bytes = temp_dds.read(temp_dds.total_size)
             
             if not dds_bytes or len(dds_bytes) < 128:
@@ -4371,6 +4467,8 @@ class BackgroundDDSBuilder:
                      f"({len(dds_bytes)} bytes, {len(mipmap_images)} native mipmaps)")
             bump('prebuilt_dds_builds')
             
+        except _BackgroundBuildDeferred:
+            raise
         except Exception as e:
             log.warning(f"BackgroundDDSBuilder: Failed to build {tile_id}: {e}")
             self._builds_failed += 1
@@ -4534,6 +4632,10 @@ def _do_network_healing(tile, indices_to_heal):
         return
 
     try:
+        if is_live_building():
+            bump('network_healing_deferred_live')
+            return
+
         if getattr(tile, '_closed', False):
             return
 
@@ -4554,9 +4656,10 @@ def _do_network_healing(tile, indices_to_heal):
             col = tile.col + cx
             row = tile.row + cy
             chunk = Chunk(col, row, tile.maptype, max_zoom,
-                          priority=5,  # Lower than live (0), higher than prefetch
+                          priority=PRIORITY_NETWORK_HEALING,
                           cache_dir=tile.cache_dir,
                           tile_id=None)  # No completion tracking for healing chunks
+            chunk.prefetch = True
             heal_chunks[idx] = chunk
 
         # Submit chunks that aren't already cached
@@ -4959,7 +5062,7 @@ class Chunk(object):
 
     serverlist=['a','b','c','d']
 
-    def __init__(self, col, row, maptype, zoom, priority=0, cache_dir='.cache', tile_id=None,
+    def __init__(self, col, row, maptype, zoom, priority=None, cache_dir='.cache', tile_id=None,
                  skip_cache_check=False):
         self.col = col
         self.row = row
@@ -4971,8 +5074,9 @@ class Chunk(object):
         # Hack override maptype
         #self.maptype = "BI"
 
-        # Set priority: use provided value or default to zoom level
-        self.priority = priority if priority else zoom
+        # Set priority: use provided value or default to zoom level.
+        # Priority 0 is valid and means live/foreground work.
+        self.priority = zoom if priority is None else priority
         self.chunk_id = f"{col}_{row}_{zoom}_{maptype}"
         self.ready = threading.Event()
         self.ready.clear()
@@ -6528,12 +6632,18 @@ class Tile(object):
         if time_budget is not None:
             self._tile_time_budget = time_budget
         
-        # Boost priority of any in-flight chunk downloads
+        # Boost priority of any queued/in-flight background downloads.
         chunks = self.chunks.get(self.max_zoom, [])
+        reprioritize = False
         for chunk in chunks:
             if hasattr(chunk, 'priority') and (hasattr(chunk, 'in_flight') or hasattr(chunk, 'in_queue')):
                 if getattr(chunk, 'in_flight', False) or getattr(chunk, 'in_queue', False):
-                    chunk.priority = 0  # Highest priority
+                    chunk.priority = PRIORITY_LIVE
+                    chunk.prefetch = False
+                    reprioritize = True
+
+        if reprioritize and chunk_getter is not None:
+            chunk_getter.reprioritize_queue()
         
         # Signal transition to any waiting prefetch thread
         if self._live_transition_event is not None:
@@ -6835,7 +6945,7 @@ class Tile(object):
 
             if not not_ready:
                 self._pin_mm0_promotion()
-                if background_dds_builder.submit(self, priority=-10):
+                if background_dds_builder.submit(self, priority=PRIORITY_CACHE_REPAIR):
                     bump('partial_mm0_promote_builder_ready')
                     log.info(
                         f"PARTIAL_MM0_PROMOTE: {self.id} queued DDS build "
@@ -6857,9 +6967,11 @@ class Tile(object):
                 if chunk.ready.is_set():
                     continue
                 if not getattr(chunk, 'in_queue', False) and not getattr(chunk, 'in_flight', False):
-                    chunk.priority = _calculate_spatial_priority(
-                        chunk.row, chunk.col, chunk.zoom, 0
+                    chunk.priority = (
+                        PRIORITY_CACHE_REPAIR +
+                        _calculate_spatial_priority(chunk.row, chunk.col, chunk.zoom, 0)
                     )
+                    chunk.prefetch = True
                     chunk_getter.submit(chunk)
                     submitted += 1
 
