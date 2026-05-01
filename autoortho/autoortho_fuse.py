@@ -334,9 +334,8 @@ class AutoOrtho(Operations):
         self._tile_locks = defaultdict(threading.Lock)
         self._size_cache = OrderedDict()  # LRU cache for DDS sizes
         self._size_cache_max = 5000  # Max entries before LRU eviction
-        self._negative_getattr_cache = OrderedDict()
-        self._negative_getattr_cache_max = 16384
-        self._negative_getattr_cache_ttl = 30.0
+        self._negative_getattr_cache = OrderedDict()  # LRU cache for avoiding getattr probes for files that don't exist
+        self._negative_getattr_cache_max = 16384  # Max entries before LRU eviction
         self._negative_getattr_cache_lock = threading.Lock()
         self._ft_started = False
         self._ft_start_lock = threading.Lock()
@@ -734,15 +733,12 @@ class AutoOrtho(Operations):
         """
         full_path = self._full_path(path)
         cache_key = os.path.normcase(full_path)
-        now = time.monotonic()
 
         with self._negative_getattr_cache_lock:
-            cached_at = self._negative_getattr_cache.get(cache_key)
-            if cached_at is not None:
-                if now - cached_at < self._negative_getattr_cache_ttl:
-                    self._negative_getattr_cache.move_to_end(cache_key)
-                    raise FuseOSError(errno.ENOENT)
-                del self._negative_getattr_cache[cache_key]
+            if cache_key in self._negative_getattr_cache:
+                # Cache Hit:  We already know file does not exist.
+                self._negative_getattr_cache.move_to_end(cache_key)  # LRU
+                raise FuseOSError(errno.ENOENT)
 
         log.debug(f"GETATTR FULLPATH {full_path}")
         try:
@@ -751,9 +747,10 @@ class AutoOrtho(Operations):
             log.debug(f"GETATTR: lstat failed for {full_path}: {e}")
             if getattr(e, "errno", None) in (errno.ENOENT, errno.ENOTDIR):
                 with self._negative_getattr_cache_lock:
+                    # Cache Miss + Missing File: We just found out file does not exist
                     while len(self._negative_getattr_cache) >= self._negative_getattr_cache_max:
                         self._negative_getattr_cache.popitem(last=False)
-                    self._negative_getattr_cache[cache_key] = now
+                    self._negative_getattr_cache[cache_key] = None
             raise FuseOSError(errno.ENOENT)
         log.debug(f"GETATTR: Orig stat: {st}")
         attrs = {k: getattr(st, k) for k in (
