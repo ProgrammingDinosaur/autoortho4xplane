@@ -306,6 +306,7 @@ class AutoOrtho(Operations):
         self.root = os.path.abspath(root)
         self.cache_dir = cache_dir
 
+        getortho.clear_shutdown_request()
         self.tc = getortho.TileCacher(cache_dir)
         
         # Register terrain index for this scenery
@@ -333,9 +334,8 @@ class AutoOrtho(Operations):
         self._tile_locks = defaultdict(threading.Lock)
         self._size_cache = OrderedDict()  # LRU cache for DDS sizes
         self._size_cache_max = 5000  # Max entries before LRU eviction
-        self._negative_getattr_cache = OrderedDict()
-        self._negative_getattr_cache_max = 16384
-        self._negative_getattr_cache_ttl = 30.0
+        self._negative_getattr_cache = OrderedDict()  # LRU cache for avoiding getattr probes for files that don't exist
+        self._negative_getattr_cache_max = 16384  # Max entries before LRU eviction
         self._negative_getattr_cache_lock = threading.Lock()
         self._ft_started = False
         self._ft_start_lock = threading.Lock()
@@ -510,9 +510,10 @@ class AutoOrtho(Operations):
         """Calculate the actual DDS file size based on tile parameters and current configuration.
         
         IMPORTANT: In dynamic zoom mode, the actual tile zoom can vary based on altitude prediction.
-        To avoid truncated texture issues, we calculate size for the MAXIMUM possible zoom level
-        that a tile could use, which is zoom + 1 (the X-Plane limit for tile imagery).
-        This ensures FUSE always reports a size >= the actual DDS size.
+        To avoid truncated texture issues, we calculate size for the maximum configured
+        zoom level this tile type can use, still capped to the X-Plane limit of
+        tile zoom + 1.  This ensures FUSE reports a size >= the actual DDS size
+        without inflating X-Plane's VRAM budget beyond what the config can produce.
         """
         try:
             # Convert parameters to the format expected by the tile system
@@ -522,10 +523,16 @@ class AutoOrtho(Operations):
             max_zoom_mode = str(CFG.autoortho.max_zoom_mode).lower()
             
             if max_zoom_mode == "dynamic":
-                # In dynamic zoom mode, the actual zoom can be up to zoom + 1
-                # We MUST use the maximum possible size to avoid X-Plane seeing truncated textures
-                # (the DDS header declares the full size, so the file must be at least that big)
-                max_zoom = zoom + 1
+                # Dynamic mode chooses the tile's real zoom later, during open(),
+                # based on predicted altitude.  During getattr(), report the
+                # maximum zoom the configured quality steps can actually return
+                # for this tile type, not the theoretical zoom + 1 for every tile.
+                max_regular, max_airport = self.tc.dynamic_zoom_manager.get_max_zoom_levels()
+                if zoom == 18 and not CFG.autoortho.using_custom_tiles:
+                    uncapped_target_zoom = max_airport
+                else:
+                    uncapped_target_zoom = max_regular
+                max_zoom = min(zoom + 1, uncapped_target_zoom)
             else:
                 # Fixed mode - use the configured target zoom levels
                 if CFG.autoortho.using_custom_tiles:
@@ -681,6 +688,10 @@ class AutoOrtho(Operations):
     def _getattr_poison(self, now):
         """Handle poison pill for shutdown."""
         log.info("Poison pill.  Exiting!")
+        try:
+            getortho.begin_shutdown("poison pill")
+        except Exception:
+            pass
         fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
         do_fuse_exit(fuse_ptr=fuse_ptr)
         
@@ -722,15 +733,12 @@ class AutoOrtho(Operations):
         """
         full_path = self._full_path(path)
         cache_key = os.path.normcase(full_path)
-        now = time.monotonic()
 
         with self._negative_getattr_cache_lock:
-            cached_at = self._negative_getattr_cache.get(cache_key)
-            if cached_at is not None:
-                if now - cached_at < self._negative_getattr_cache_ttl:
-                    self._negative_getattr_cache.move_to_end(cache_key)
-                    raise FuseOSError(errno.ENOENT)
-                del self._negative_getattr_cache[cache_key]
+            if cache_key in self._negative_getattr_cache:
+                # Cache Hit:  We already know file does not exist.
+                self._negative_getattr_cache.move_to_end(cache_key)  # LRU
+                raise FuseOSError(errno.ENOENT)
 
         log.debug(f"GETATTR FULLPATH {full_path}")
         try:
@@ -739,9 +747,10 @@ class AutoOrtho(Operations):
             log.debug(f"GETATTR: lstat failed for {full_path}: {e}")
             if getattr(e, "errno", None) in (errno.ENOENT, errno.ENOTDIR):
                 with self._negative_getattr_cache_lock:
+                    # Cache Miss + Missing File: We just found out file does not exist
                     while len(self._negative_getattr_cache) >= self._negative_getattr_cache_max:
                         self._negative_getattr_cache.popitem(last=False)
-                    self._negative_getattr_cache[cache_key] = now
+                    self._negative_getattr_cache[cache_key] = None
             raise FuseOSError(errno.ENOENT)
         log.debug(f"GETATTR: Orig stat: {st}")
         attrs = {k: getattr(st, k) for k in (
@@ -961,6 +970,9 @@ class AutoOrtho(Operations):
             col = int(col)
             zoom = int(zoom)
             maptype = self._resolve_dds_maptype(maptype)
+            if getortho.is_shutdown_requested():
+                log.info(f"Shutdown in progress, returning fallback data for {path}")
+                return _generate_fallback_dds_bytes(offset, length)
             key = self._tile_key(row, col, maptype, zoom)
             lock = self._tile_locks[key]
             

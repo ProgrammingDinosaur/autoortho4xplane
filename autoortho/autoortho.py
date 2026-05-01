@@ -4,7 +4,6 @@ import os
 import subprocess
 import sys
 import time
-import ctypes
 import shutil
 import signal
 import tempfile
@@ -15,7 +14,6 @@ import socketserver
 import logging.handlers
 import pickle
 import struct
-from pathlib import Path
 
 
 from contextlib import contextmanager
@@ -46,18 +44,12 @@ try:
     from autoortho.utils.mount_utils import (
         cleanup_mountpoint,
         cleanup_stale_mount_folders,
-        _is_frozen,
-        is_only_ao_placeholder,
-        clear_ao_placeholder,
         safe_ismount,
     )
 except ImportError:
     from utils.mount_utils import (
         cleanup_mountpoint,
         cleanup_stale_mount_folders,
-        _is_frozen,
-        is_only_ao_placeholder,
-        clear_ao_placeholder,
         safe_ismount,
     )
 
@@ -65,6 +57,14 @@ try:
     from autoortho.utils.constants import MAPTYPES, system_type
 except ImportError:
     from utils.constants import MAPTYPES, system_type
+
+try:
+    from autoortho.process_supervisor import (
+        AOProcessSupervisor,
+        DEFAULT_WORKER_STOP_TIMEOUT,
+    )
+except ImportError:
+    from process_supervisor import AOProcessSupervisor, DEFAULT_WORKER_STOP_TIMEOUT
 
 try:
     from autoortho.version import __version__
@@ -348,7 +348,10 @@ class AOMount:
     def __init__(self, cfg):
         self.cfg = cfg
         self.mount_threads = []
+        self.mount_workers = []
         self.mac_os_procs = []
+        self._active_mountpoints = []
+        self.mount_worker_supervisor = AOProcessSupervisor()
 
         # Start shared stats manager and reporter/log servers
         self.start_stats_manager()
@@ -357,8 +360,7 @@ class AOMount:
         self._reporter_thread = None
         self.start_reporter()
 
-        if system_type == "darwin":
-            self.start_log_server()
+        self.start_log_server()
 
     def start_log_server(self):
         """Start once in the parent. Returns (host, port) bound on 127.0.0.1."""
@@ -434,6 +436,32 @@ class AOMount:
         self.stats_addr = None
         return
 
+    def launch_mount_worker(
+            self, root: str,
+            mountpoint: str,
+            volname: str,
+            nothreads: bool,
+            stats_addr=None,
+            stats_auth=None,
+            log_addr=None,
+    ):
+        log.info(f"AutoOrtho:  root: {root}  mountpoint: {mountpoint}")
+        loglevel = getattr(self.cfg.general, 'file_log_level', 'INFO').upper()
+        handle = self.mount_worker_supervisor.start_mount_worker(
+            root,
+            mountpoint,
+            volname,
+            nothreads,
+            stats_addr=stats_addr,
+            stats_auth=stats_auth,
+            log_addr=log_addr,
+            loglevel=loglevel,
+        )
+        self.mount_workers.append(handle)
+        # Backward-compatible process list used by maptype/custom-map reload code.
+        self.mac_os_procs.append(handle.process)
+        return handle
+
     def launch_macfuse_worker(
             self, root: str,
             mountpoint: str,
@@ -443,65 +471,27 @@ class AOMount:
             stats_auth=None,
             log_addr=None,
     ) -> subprocess.Popen:
-        log.info(f"AutoOrtho:  root: {root}  mountpoint: {mountpoint}")
+        handle = self.launch_mount_worker(
+            root,
+            mountpoint,
+            volname,
+            nothreads,
+            stats_addr=stats_addr,
+            stats_auth=stats_auth,
+            log_addr=log_addr,
+        )
+        return handle.process
 
-        env = os.environ.copy()
-        if stats_addr:
-            env['AO_STATS_ADDR'] = stats_addr
-            env['AO_STATS_AUTH'] = stats_auth.decode('utf-8')
-
-        if log_addr:
-            env['AO_LOG_ADDR'] = log_addr
-
-        env['AO_RUN_MODE'] = 'macfuse_worker'
-
-        # Build the argv. When frozen (PyInstaller), re-exec the app binary. In dev, run the module.
-        if _is_frozen():
-            cmd = [sys.executable]
-        else:
-            cmd = [sys.executable, "-m", "autoortho"]
-        # Worker arguments (parsed by macfuse_worker.main via the early-dispatch)
-        loglevel = getattr(self.cfg.general, 'file_log_level', 'INFO').upper()
-        cmd += ["--root", root, "--mountpoint", mountpoint, "--loglevel", loglevel]
-        if volname:
-            cmd += ["--volname", volname]
-        if nothreads:
-            cmd.append("--nothreads")
-
-        log.debug("Launching worker: frozen=%s exe=%s cmd=%s", _is_frozen(), sys.executable, cmd)
-
-        log_dir = Path.home() / ".autoortho-data" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        std_file = open(log_dir / f"worker-{volname}.log", "ab", buffering=0)
-
-        p = subprocess.Popen(cmd, env=env, stdout=std_file, stderr=std_file)
-        log.info(f"FUSE process for mount {volname} started with pid: {p.pid}")
-        p._ao_std_file = std_file
-        return p
-
-    def stop_macfuse_workers(self, timeout: float = 10.0):
-        log.info("Send SIGTERM to macOS processes...")
-        for p in self.mac_os_procs:
-            if p.poll() is None:
-                p.terminate()
-
-        log.info("Wait on macOS processes...")
-        try:
-            for p in self.mac_os_procs:
-                p.wait(timeout=timeout)
-        except Exception as e:
-            log.error(f"Error waiting on macOS processes: {e}")
-            pass
-
-        for p in self.mac_os_procs:
-            if p.poll() is None:
-                log.warning("Process %s still alive; sending SIGKILL", p.pid)
-                try:
-                    p.kill()
-                except Exception as e:
-                    log.error(f"Error killing macOS process: {e}")
-                    pass
+    def stop_mount_workers(self, timeout: float = DEFAULT_WORKER_STOP_TIMEOUT):
+        log.info("Stopping mount workers...")
+        self.mount_worker_supervisor.stop_all(timeout=timeout)
+        self.mount_workers = []
         self.mac_os_procs = []
+        self.mount_threads = []
+        return
+
+    def stop_macfuse_workers(self, timeout: float = DEFAULT_WORKER_STOP_TIMEOUT):
+        self.stop_mount_workers(timeout=timeout)
         return
 
     def reporter(self):
@@ -649,7 +639,74 @@ class AOMount:
             self._reporter_thread.join(timeout=join_timeout)
         self._reporter_thread = None
 
+    def _ensure_parent_services(self):
+        if not getattr(self, "stats_manager", None):
+            self.start_stats_manager()
+        if not getattr(self, "log_server", None):
+            self.start_log_server()
+        self.start_reporter()
+
+    def _launch_scenery_worker(self, root, mountpoint, threading_enabled=True):
+        if threading_enabled:
+            log.info("Running %s in multi-threaded mode.", mountpoint)
+            nothreads = False
+        else:
+            log.info("Running %s in single-threaded mode.", mountpoint)
+            nothreads = True
+
+        root = os.path.expanduser(root)
+        mountpoint = os.path.expanduser(mountpoint)
+        volname = os.path.basename(os.path.normpath(mountpoint)) or mountpoint
+
+        self._active_mountpoints.append(mountpoint)
+        return self.launch_mount_worker(
+            root,
+            mountpoint,
+            volname,
+            nothreads,
+            self.stats_addr,
+            self.stats_auth,
+            self.log_addr,
+        )
+
+    def _monitor_mount_workers(self):
+        while self.mounts_running:
+            for handle in list(self.mount_workers):
+                ret = handle.process.poll()
+                if ret is not None:
+                    log.error(
+                        "Mount worker pid %s for %s exited with code %s; failing all mounts.",
+                        handle.pid,
+                        handle.mountpoint,
+                        ret,
+                    )
+                    self.mounts_running = False
+                    break
+            time.sleep(0.5)
+
+    def mount_single(self, root, mountpoint, threading_enabled=True, blocking=True):
+        self._ensure_parent_services()
+        self.mounts_running = True
+        self._active_mountpoints = []
+        self.mount_workers = []
+        self.mac_os_procs = []
+        handle = self._launch_scenery_worker(root, mountpoint, threading_enabled)
+        if not blocking:
+            return handle
+
+        try:
+            self._monitor_mount_workers()
+        except (KeyboardInterrupt, SystemExit) as err:
+            self.mounts_running = False
+            log.info(f"Exiting due to {err}")
+        finally:
+            log.info("Shutting down ...")
+            self.unmount_sceneries()
+        return handle
+
     def mount_sceneries(self, blocking=True):
+        self._ensure_parent_services()
+
         # Clean up any stale mount folders left behind from a crash
         try:
             custom_scenery_path = getattr(self.cfg, 'xplane_custom_scenery_path', None)
@@ -663,25 +720,15 @@ class AOMount:
             return
 
         self.mounts_running = True
+        self._active_mountpoints = []
+        self.mount_workers = []
+        self.mac_os_procs = []
         for scenery in self.cfg.scenery_mounts:
-            if system_type == "darwin":
-                self.domount(
-                    scenery.get('root'),
-                    scenery.get('mount'),
-                    self.cfg.fuse.threading
-                )
-            else:
-                t = threading.Thread(
-                    target=self.domount,
-                    daemon=False,
-                    args=(
-                        scenery.get('root'),
-                        scenery.get('mount'),
-                        self.cfg.fuse.threading
-                    )
-                )
-                t.start()
-                self.mount_threads.append(t)
+            self._launch_scenery_worker(
+                scenery.get('root'),
+                scenery.get('mount'),
+                self.cfg.fuse.threading,
+            )
 
         if not blocking:
             log.info("Running mounts in non-blocking mode.")
@@ -699,23 +746,7 @@ class AOMount:
             # Check things out
             diagnose(self.cfg)
 
-            while self.mounts_running:
-
-                if system_type == "darwin": 
-                    for p in self.mac_os_procs:
-                        if p.poll() is not None:   # process has exited
-                            log.error(f"FUSE process {p.pid} exited; failing all mounts.")
-                            self.mounts_running = False
-                            break
-
-                else:
-                    for t in list(self.mount_threads):
-                        if not t.is_alive():
-                            log.error(f"Mount thread {t.name or t.ident} died; failing all mounts.")
-                            self.mounts_running = False
-                            break
-  
-                time.sleep(0.5)
+            self._monitor_mount_workers()
 
         except (KeyboardInterrupt, SystemExit) as err:
             self.mounts_running = False
@@ -727,16 +758,7 @@ class AOMount:
     def unmount_sceneries(self, force=False):
         log.info("Unmounting ...")
         self.mounts_running = False
-        
-        # Stop spatial prefetcher, predictive DDS, and clear terrain indices
-        try:
-            import getortho
-            getortho.stop_predictive_dds()
-            getortho.stop_prefetcher()
-            getortho.clear_terrain_indices()
-        except Exception as e:
-            log.debug(f"Error stopping prefetcher/predictive_dds/terrain_indices: {e}")
-        
+
         # Stop TimeExclusionManager
         try:
             try:
@@ -746,108 +768,37 @@ class AOMount:
             time_exclusion_manager.stop()
         except Exception as e:
             log.debug(f"Error stopping time_exclusion_manager: {e}")
-        
-        for scenery in self.cfg.scenery_mounts:
-            self.unmount(scenery.get('mount'), force)
+
+        mountpoints = list(dict.fromkeys(self._active_mountpoints))
+        if not mountpoints:
+            mountpoints = [
+                os.path.expanduser(scenery.get('mount'))
+                for scenery in self.cfg.scenery_mounts
+                if scenery.get('mount')
+            ]
+
+        for mountpoint in mountpoints:
+            self.unmount(
+                mountpoint,
+                force=force,
+                wait_timeout=DEFAULT_WORKER_STOP_TIMEOUT,
+            )
+
+        self.stop_mount_workers(timeout=DEFAULT_WORKER_STOP_TIMEOUT)
 
         self.stop_reporter()
-
-        log.info("Wait on mount threads...")
-        for t in self.mount_threads:
-            t.join(5)
-            log.info(f"Thread {t.ident} exited.")
-
-        if system_type == "darwin":
-            self.stop_macfuse_workers()
 
         self.stop_stats_manager()
 
         self.stop_log_server()
 
+        self._active_mountpoints = []
         log.info("Unmount complete")
 
     def domount(self, root, mountpoint, threading=True):
+        return self._launch_scenery_worker(root, mountpoint, threading)
 
-        if threading:
-            log.info("Running in multi-threaded mode.")
-            nothreads = False
-        else:
-            log.info("Running in single-threaded mode.")
-            nothreads = True
-
-        root = os.path.expanduser(root)
-
-        # Cleanup: remove any stale poison file in the root to prevent
-        # accidental FUSE self-termination if touched after mount
-        try:
-            poison_root = os.path.join(root, ".poison")
-            if os.path.exists(poison_root):
-                os.remove(poison_root)
-        except Exception as exc:
-            log.debug(f"Ignoring failure to remove root poison file: {exc}")
-
-        try:
-            if system_type == 'windows':
-                systemtype, libpath = winsetup.find_win_libs()
-                with setupmount(mountpoint, systemtype) as mount:
-                    log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
-                    import mfusepy
-                    import autoortho_fuse
-                    mfusepy._libfuse = ctypes.CDLL(libpath)
-                    autoortho_fuse.run(
-                            autoortho_fuse.AutoOrtho(root),
-                            mount,
-                            mount.split('/')[-1],
-                            nothreads
-                    )
-            elif system_type == 'darwin':
-                # If the directory only has our placeholder, clear it first so the preflight accepts it.
-                try:
-                    if os.path.isdir(mountpoint) and is_only_ao_placeholder(mountpoint):
-                        clear_ao_placeholder(mountpoint)
-                except Exception as _e:
-                    log.debug(f"Placeholder pre-clear failed (ignored): {_e}")
-
-                if not macsetup.setup_macfuse_mount(mountpoint):
-                    # Second chance: if it's only our placeholder but we didn't clear earlier, clear now and retry.
-                    try:
-                        if os.path.isdir(mountpoint) and is_only_ao_placeholder(mountpoint):
-                            clear_ao_placeholder(mountpoint)
-                            if not macsetup.setup_macfuse_mount(mountpoint):
-                                raise MountError(f"Failed to setup mount point {mountpoint}!")
-                        else:
-                            raise MountError(f"Failed to setup mount point {mountpoint}!")
-                    except MountError:
-                        raise
-                    except Exception as e:
-                        log.debug(f"Retry after placeholder clear failed: {e}")
-                        raise MountError(f"Failed to setup mount point {mountpoint}!")
-                volname = mountpoint.split('/')[-1]
-                process = self.launch_macfuse_worker(
-                    root, mountpoint, volname, nothreads,
-                    self.stats_addr, self.stats_auth, self.log_addr
-                )
-                self.mac_os_procs.append(process)
-            else:
-                # Linux
-                with setupmount(mountpoint, "Linux-FUSE") as mount:
-                    log.info("Running in FUSE mode.")
-                    log.info(f"AutoOrtho:  root: {root}  mountpoint: {mount}")
-                    import autoortho_fuse
-                    autoortho_fuse.run(
-                            autoortho_fuse.AutoOrtho(root),
-                            mount,
-                            mount.split('/')[-1],
-                            nothreads
-                    )
-
-        except Exception as err:
-            log.exception(f"Exception in FUSE mount: {err}")
-            # Per your spec, a failure while X-Plane is running should terminate everything.
-            time.sleep(5)
-            os._exit(2)
-
-    def unmount(self, mountpoint, force=False):
+    def unmount(self, mountpoint, force=False, wait_timeout=10.0):
         log.info(f"Shutting down {mountpoint}")
         poison_path = os.path.join(mountpoint, ".poison")
 
@@ -859,7 +810,7 @@ class AOMount:
             log.debug(f"Poison trigger stat failed: {exc}")
 
         if not force:
-            deadline = time.time() + 10
+            deadline = time.time() + wait_timeout
             while time.time() < deadline:
                 if not safe_ismount(mountpoint):
                     break
@@ -966,10 +917,11 @@ def main():
         log.info("root: %s", root)
         log.info("mountpoint: %s", mountpoint)
         aom = AOMount(CFG)
-        aom.domount(
+        aom.mount_single(
             root,
             mountpoint,
-            CFG.fuse.threading
+            CFG.fuse.threading,
+            blocking=True,
         )
     elif run_headless:
         log.info("Running headless")

@@ -68,7 +68,11 @@ class TestQualityStep:
         """Test serialization to dictionary."""
         step = QualityStep(altitude_ft=25000, zoom_level=15)
         d = step.to_dict()
-        assert d == {"altitude_ft": 25000, "zoom_level": 15}
+        assert d == {
+            "altitude_ft": 25000,
+            "zoom_level": 15,
+            "zoom_level_airports": 18,
+        }
 
     def test_from_dict(self):
         """Test deserialization from dictionary."""
@@ -366,7 +370,11 @@ class TestDynamicZoomManagerConfig:
         manager.set_base_zoom(17)
         result = manager.save_to_config()
         assert len(result) == 1
-        assert result[0] == {"altitude_ft": BASE_ALTITUDE_FT, "zoom_level": 17}
+        assert result[0] == {
+            "altitude_ft": BASE_ALTITUDE_FT,
+            "zoom_level": 17,
+            "zoom_level_airports": 18,
+        }
 
     def test_save_to_config_multiple_steps(self):
         """Test saving multiple steps."""
@@ -446,6 +454,32 @@ class TestDynamicZoomManagerConfig:
 class TestDynamicZoomManagerUtility:
     """Tests for utility methods."""
 
+    def test_get_max_zoom_levels_empty_uses_defaults(self):
+        """Empty manager returns runtime fallback zoom limits."""
+        manager = DynamicZoomManager()
+        assert manager.get_max_zoom_levels() == (DEFAULT_ZOOM_LEVEL, 18)
+
+    def test_get_max_zoom_levels_uses_highest_configured_values(self):
+        """Maxima are computed independently for regular and airport zooms."""
+        manager = DynamicZoomManager()
+        manager.set_base_zoom(16, 18)
+        manager.add_step(15000, 15, 16)
+        manager.add_step(30000, 14, 17)
+        assert manager.get_max_zoom_levels() == (16, 18)
+
+    def test_get_max_zoom_levels_includes_missing_base_fallbacks(self):
+        """Missing base step still includes runtime fallback defaults."""
+        manager = DynamicZoomManager()
+        manager.add_step(20000, 14, 15)
+        assert manager.get_max_zoom_levels() == (DEFAULT_ZOOM_LEVEL, 18)
+
+    def test_get_max_zoom_levels_tracks_airport_zoom_independently(self):
+        """Airport max can exceed regular max without changing regular max."""
+        manager = DynamicZoomManager()
+        manager.set_base_zoom(15, 18)
+        manager.add_step(25000, 14, 19)
+        assert manager.get_max_zoom_levels() == (15, 19)
+
     def test_get_summary_empty(self):
         """Test summary for empty manager."""
         manager = DynamicZoomManager()
@@ -457,7 +491,7 @@ class TestDynamicZoomManagerUtility:
         manager.set_base_zoom(17)
         summary = manager.get_summary()
         assert "ZL17" in summary
-        assert "-1000" in summary
+        assert f"{BASE_ALTITUDE_FT:+}" in summary
 
     def test_get_summary_multiple_steps(self):
         """Test summary for multiple steps."""
@@ -601,4 +635,3 @@ class TestDynamicZoomIntegration:
         assert manager2.get_zoom_for_altitude(0) == 17
         assert manager2.get_zoom_for_altitude(25000) == 15
         assert manager2.get_zoom_for_altitude(45000) == 13
-
