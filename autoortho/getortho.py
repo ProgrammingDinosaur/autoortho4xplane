@@ -5222,6 +5222,8 @@ class Chunk(object):
             os.replace(temp_filename, target_path)
             if target_dir == self.lt_cache_dir:
                 bump('chunk_lt_write')
+            elif target_dir == self.cache_dir and disk_budget_manager is not None:
+                disk_budget_manager.account_jpeg(len(data))
         except OSError as e:
             log.debug(f"Failed to save to {target_dir} for {self}: {e}")
             try:
