@@ -1436,6 +1436,32 @@ class ConfigUI(QMainWindow):
         cache_layout.addWidget(browse_btn)
         paths_layout.addLayout(cache_layout)
 
+        # Long-term cache dir
+        lt_cache_layout = QHBoxLayout()
+        lt_cache_label = QLabel("Long-term cache dir:")
+        lt_cache_label.setToolTip(
+            "Optional permanent cache directory (e.g. large slow disk or\n"
+            "network share). Leave empty to disable.\n"
+            "Chunks are stored here permanently and promoted to local\n"
+            "cache on access, avoiding re-downloads across reinstalls."
+        )
+        lt_cache_layout.addWidget(lt_cache_label)
+        self.lt_cache_dir_edit = QLineEdit(
+            str(getattr(self.cfg.paths, 'long_term_cache_dir', '') or '')
+        )
+        self.lt_cache_dir_edit.setObjectName('long_term_cache_dir')
+        self.lt_cache_dir_edit.setPlaceholderText("Optional — leave empty to disable")
+        self.lt_cache_dir_edit.setToolTip(
+            "Full path to long-term cache directory"
+        )
+        lt_cache_layout.addWidget(self.lt_cache_dir_edit)
+        browse_btn = StyledButton("Browse")
+        browse_btn.clicked.connect(
+            lambda: self.browse_folder(self.lt_cache_dir_edit)
+        )
+        lt_cache_layout.addWidget(browse_btn)
+        paths_layout.addLayout(lt_cache_layout)
+
         # Download dir
         download_layout = QHBoxLayout()
         download_label = QLabel("Temp download dir:")
@@ -5677,6 +5703,7 @@ class ConfigUI(QMainWindow):
         self.cfg.paths.scenery_path = self.scenery_path_edit.text()
         self.cfg.paths.xplane_path = self.xplane_path_edit.text()
         self.cfg.paths.cache_dir = self.cache_dir_edit.text()
+        self.cfg.paths.long_term_cache_dir = self.lt_cache_dir_edit.text()
         self.cfg.paths.download_dir = self.download_dir_edit.text()
 
         # Save options

@@ -130,6 +130,7 @@ class LogRecordStreamHandler(socketserver.StreamRequestHandler):
 
 class LogServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 
 _SERVER_STATS_STORE = None

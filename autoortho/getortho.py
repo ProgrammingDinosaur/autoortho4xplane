@@ -1876,6 +1876,11 @@ _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="cache_writer"
 )
 
+_lt_cache_write_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="lt_cache_writer"
+)
+
 
 def _async_cache_write(chunk):
     """Fire-and-forget cache write. Errors are logged but don't affect processing."""
@@ -1896,14 +1901,16 @@ def _async_cache_write(chunk):
 
 def shutdown_cache_writer():
     """Shutdown the cache writer executor gracefully. Called during module cleanup.
-    
+
     Uses wait=True with a timeout to ensure pending writes complete before shutdown,
     preventing potential file corruption or lost cache writes.
     """
     try:
-        # Use wait=True to ensure pending writes complete
-        # Python 3.9+ supports cancel_futures parameter for forceful cancellation
         _cache_write_executor.shutdown(wait=True)
+    except Exception:
+        pass
+    try:
+        _lt_cache_write_executor.shutdown(wait=False)
     except Exception:
         pass
 
@@ -5101,6 +5108,10 @@ class Chunk(object):
         self.prefetch = False
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
+
+        _lt = str(getattr(CFG.paths, 'long_term_cache_dir', '') or '').strip()
+        self.lt_cache_dir = _lt if _lt else None
+        self.lt_cache_path = os.path.join(_lt, f"{self.chunk_id}.jpg") if _lt else None
         
         # Check cache during initialization and set ready if found
         # skip_cache_check=True allows batch cache reading optimization
@@ -5180,7 +5191,44 @@ class Chunk(object):
                 return False  # FIXED: Explicitly return False for corrupted cache
         else:
             bump('chunk_miss')
+            if self.lt_cache_path and os.path.isfile(self.lt_cache_path):
+                try:
+                    data = Path(self.lt_cache_path).read_bytes()
+                    if data and _is_jpeg(data[:3]):
+                        self.data = data
+                        bump('chunk_lt_hit')
+                        log.debug(f"LT cache hit for {self}")
+                        _lt_cache_write_executor.submit(self._save_to_dir, self.cache_dir)
+                        return True
+                except OSError as e:
+                    log.debug(f"LT cache read failed for {self}: {e}")
             return False
+
+    def _save_to_dir(self, target_dir):
+        data = self.data
+        if not data:
+            return
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError:
+            return
+        target_path = os.path.join(target_dir, f"{self.chunk_id}.jpg")
+        if os.path.exists(target_path):
+            return
+        temp_filename = os.path.join(target_dir, f"{self.chunk_id}_{uuid.uuid4().hex}.tmp")
+        try:
+            with open(temp_filename, 'wb') as h:
+                h.write(data)
+            os.replace(temp_filename, target_path)
+            if target_dir == self.lt_cache_dir:
+                bump('chunk_lt_write')
+        except OSError as e:
+            log.debug(f"Failed to save to {target_dir} for {self}: {e}")
+            try:
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+            except Exception:
+                pass
 
     def save_cache(self):
         # Snapshot data to avoid races with close() mutating self.data
@@ -5236,6 +5284,8 @@ class Chunk(object):
                 os.replace(temp_filename, self.cache_path)
                 if disk_budget_manager is not None:
                     disk_budget_manager.account_jpeg(len(data))
+                if self.lt_cache_dir:
+                    _lt_cache_write_executor.submit(self._save_to_dir, self.lt_cache_dir)
                 return
             except FileExistsError:
                 try:
@@ -9747,7 +9797,7 @@ class TileCacher(object):
             # Windows doesn't handle FS cache the same way so enable here.
             self.enable_cache = True
             self.cache_tile_lim = 50
-    
+
     def _compute_dynamic_zoom(self, row: int, col: int, tile_zoom: int) -> int:
         """
         Compute dynamic zoom level based on predicted altitude at tile.
