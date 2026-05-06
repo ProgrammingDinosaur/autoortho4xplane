@@ -3970,14 +3970,14 @@ AODDS_API int32_t aodds_builder_finalize(
     #pragma omp parallel for num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
     for (int32_t i = 0; i < builder->chunk_count; i++) {
         if (builder->chunk_status[i] != CHUNK_STATUS_PENDING_DECODE) continue;
-        
+
         /* Defensive null check (zero-copy mode safety) */
         if (!builder->jpeg_buffers[i] || builder->jpeg_sizes[i] == 0) {
             builder->chunk_status[i] = CHUNK_STATUS_MISSING;
             decode_fail_count++;
             continue;
         }
-        
+
         aodecode_image_t decoded = {0};
         int32_t success = aodecode_single(
             builder->jpeg_buffers[i],
@@ -3985,7 +3985,7 @@ AODDS_API int32_t aodds_builder_finalize(
             &decoded,
             builder->pool  /* Pool is thread-safe */
         );
-        
+
         if (success && decoded.data) {
             builder->chunks[i] = decoded;
             builder->chunk_status[i] = CHUNK_STATUS_JPEG;
@@ -3994,7 +3994,7 @@ AODDS_API int32_t aodds_builder_finalize(
             builder->chunk_status[i] = CHUNK_STATUS_MISSING;
             decode_fail_count++;
         }
-        
+
         /* Free JPEG buffer after decode - ONLY if C owns it (not zero-copy) */
         if (builder->jpeg_owned[i]) {
             free(builder->jpeg_buffers[i]);
@@ -4003,7 +4003,8 @@ AODDS_API int32_t aodds_builder_finalize(
         builder->jpeg_sizes[i] = 0;
         builder->jpeg_owned[i] = 0;
     }
-    
+#endif
+
     /* Update stats after parallel region */
     builder->status.chunks_decoded += decode_success_count;
     builder->status.chunks_failed += decode_fail_count;
@@ -4144,14 +4145,14 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     #pragma omp parallel for num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
     for (int32_t i = 0; i < builder->chunk_count; i++) {
         if (builder->chunk_status[i] != CHUNK_STATUS_PENDING_DECODE) continue;
-        
+
         /* Defensive null check (zero-copy mode safety) */
         if (!builder->jpeg_buffers[i] || builder->jpeg_sizes[i] == 0) {
             builder->chunk_status[i] = CHUNK_STATUS_MISSING;
             decode_fail_count++;
             continue;
         }
-        
+
         aodecode_image_t decoded = {0};
         int32_t success = aodecode_single(
             builder->jpeg_buffers[i],
@@ -4159,7 +4160,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
             &decoded,
             builder->pool
         );
-        
+
         if (success && decoded.data) {
             builder->chunks[i] = decoded;
             builder->chunk_status[i] = CHUNK_STATUS_JPEG;
@@ -4168,7 +4169,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
             builder->chunk_status[i] = CHUNK_STATUS_MISSING;
             decode_fail_count++;
         }
-        
+
         /* Free JPEG buffer after decode - ONLY if C owns it (not zero-copy) */
         if (builder->jpeg_owned[i]) {
             free(builder->jpeg_buffers[i]);
@@ -4177,7 +4178,8 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
         builder->jpeg_sizes[i] = 0;
         builder->jpeg_owned[i] = 0;
     }
-    
+#endif
+
     /* Update stats after parallel region */
     builder->status.chunks_decoded += decode_success_count;
     builder->status.chunks_failed += decode_fail_count;
