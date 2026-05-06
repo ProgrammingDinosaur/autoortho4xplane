@@ -1871,8 +1871,9 @@ _lt_cache_write_executor = concurrent.futures.ThreadPoolExecutor(
 
 _lt_cache_available = True
 _lt_cache_retry_after = 0.0
-_LT_CACHE_TIMEOUT = 1.0
+_LT_CACHE_TIMEOUT = 3.0
 _LT_CACHE_RETRY_INTERVAL = 30.0
+_lt_cache_lock = threading.Semaphore(1)
 
 
 def _lt_available() -> bool:
@@ -1893,16 +1894,21 @@ def _lt_mark_unavailable():
 
 
 def _lt_isfile(path) -> bool:
-    result = [False]
-    event = threading.Event()
-    def _check():
-        result[0] = os.path.isfile(path)
-        event.set()
-    threading.Thread(target=_check, daemon=True).start()
-    if not event.wait(_LT_CACHE_TIMEOUT):
-        _lt_mark_unavailable()
+    if not _lt_cache_lock.acquire(blocking=False):
         return False
-    return result[0]
+    try:
+        result = [False]
+        event = threading.Event()
+        def _check():
+            result[0] = os.path.isfile(path)
+            event.set()
+        threading.Thread(target=_check, daemon=True).start()
+        if not event.wait(_LT_CACHE_TIMEOUT):
+            _lt_mark_unavailable()
+            return False
+        return result[0]
+    finally:
+        _lt_cache_lock.release()
 
 
 def _async_cache_write(chunk):
