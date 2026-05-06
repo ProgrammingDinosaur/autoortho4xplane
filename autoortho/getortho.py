@@ -1881,6 +1881,41 @@ _lt_cache_write_executor = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="lt_cache_writer"
 )
 
+_lt_cache_available = True
+_lt_cache_retry_after = 0.0
+_LT_CACHE_TIMEOUT = 1.0
+_LT_CACHE_RETRY_INTERVAL = 30.0
+
+
+def _lt_available() -> bool:
+    global _lt_cache_available, _lt_cache_retry_after
+    if not _lt_cache_available:
+        if time.monotonic() >= _lt_cache_retry_after:
+            _lt_cache_available = True
+        else:
+            return False
+    return True
+
+
+def _lt_mark_unavailable():
+    global _lt_cache_available, _lt_cache_retry_after
+    _lt_cache_available = False
+    _lt_cache_retry_after = time.monotonic() + _LT_CACHE_RETRY_INTERVAL
+    log.warning("LT cache unresponsive, skipping for 30s")
+
+
+def _lt_isfile(path) -> bool:
+    result = [False]
+    event = threading.Event()
+    def _check():
+        result[0] = os.path.isfile(path)
+        event.set()
+    threading.Thread(target=_check, daemon=True).start()
+    if not event.wait(_LT_CACHE_TIMEOUT):
+        _lt_mark_unavailable()
+        return False
+    return result[0]
+
 
 def _async_cache_write(chunk):
     """Fire-and-forget cache write. Errors are logged but don't affect processing."""
@@ -5191,7 +5226,7 @@ class Chunk(object):
                 return False  # FIXED: Explicitly return False for corrupted cache
         else:
             bump('chunk_miss')
-            if self.lt_cache_path and os.path.isfile(self.lt_cache_path):
+            if self.lt_cache_path and _lt_available() and _lt_isfile(self.lt_cache_path):
                 try:
                     data = Path(self.lt_cache_path).read_bytes()
                     if data and _is_jpeg(data[:3]):
@@ -5201,6 +5236,7 @@ class Chunk(object):
                         _lt_cache_write_executor.submit(self._save_to_dir, self.cache_dir)
                         return True
                 except OSError as e:
+                    _lt_mark_unavailable()
                     log.debug(f"LT cache read failed for {self}: {e}")
             return False
 
