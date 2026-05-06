@@ -884,11 +884,8 @@ def _compute_thread_budget() -> int:
     return max(2, CURRENT_CPU_COUNT // active)
 
 
-_native_build_semaphore = threading.Semaphore(1)
-
-
 class _NativeBuildBusy(Exception):
-    """Raised when the native build semaphore cannot be acquired within the timeout."""
+    """Raised when a native build cannot proceed (e.g. timeout waiting for resources)."""
 
 
 class _BackgroundBuildDeferred(Exception):
@@ -896,20 +893,12 @@ class _BackgroundBuildDeferred(Exception):
 
 
 class _native_build_context:
-    """Serialize native DDS builds to prevent concurrent OpenMP crashes.
-
-    The ISPC/OpenMP runtime is not safe when multiple threads enter
-    ``omp_set_num_threads`` or parallel regions simultaneously.  Using a
-    semaphore (count=1) ensures only one ``finalize_to_file`` executes at
-    a time while still tracking active builds for thread budget math.
-    """
+    """Track entry/exit of native DDS builds for thread budget coordination."""
     def __init__(self, timeout=5.0):
         self._timeout = timeout
 
     def __enter__(self):
         global _active_native_builds
-        if not _native_build_semaphore.acquire(timeout=self._timeout):
-            raise _NativeBuildBusy(f"native build semaphore not acquired within {self._timeout}s")
         with _active_native_builds_lock:
             _active_native_builds += 1
         return self
@@ -918,7 +907,6 @@ class _native_build_context:
         global _active_native_builds
         with _active_native_builds_lock:
             _active_native_builds -= 1
-        _native_build_semaphore.release()
         return False
 
 
