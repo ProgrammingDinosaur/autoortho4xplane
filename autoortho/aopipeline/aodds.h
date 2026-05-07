@@ -448,7 +448,8 @@ AODDS_API int32_t aodds_build_mipmap_chain(
     uint32_t* mipmap_offsets,
     uint32_t* mipmap_sizes,
     int32_t max_mipmaps,
-    aodecode_pool_t* pool
+    aodecode_pool_t* pool,
+    int32_t max_threads
 );
 
 /**
@@ -493,7 +494,8 @@ AODDS_API int32_t aodds_build_all_mipmaps_native(
     uint8_t* output,
     uint32_t output_size,
     uint32_t* bytes_written,
-    aodecode_pool_t* pool
+    aodecode_pool_t* pool,
+    int32_t max_threads
 );
 
 /**

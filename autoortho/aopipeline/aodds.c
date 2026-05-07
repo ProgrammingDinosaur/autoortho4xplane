@@ -2312,7 +2312,8 @@ AODDS_API int32_t aodds_build_mipmap_chain(
     uint32_t* mipmap_offsets,
     uint32_t* mipmap_sizes,
     int32_t max_mipmaps,
-    aodecode_pool_t* pool
+    aodecode_pool_t* pool,
+    int32_t max_threads
 ) {
     if (!jpeg_data || !jpeg_sizes || !output || !bytes_written || 
         !mipmap_count_out || !mipmap_offsets || !mipmap_sizes || chunk_count <= 0) {
@@ -2364,30 +2365,30 @@ AODDS_API int32_t aodds_build_mipmap_chain(
     
     /* Parallel decode all JPEGs - using thread-safe pooled decoders */
     int32_t decoded = 0;
-    
+
 #if AOPIPELINE_HAS_OPENMP
-    #pragma omp parallel reduction(+:decoded)
+    #pragma omp parallel num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) reduction(+:decoded)
     {
         int decoder_from_pool = 0;
         tjhandle tjh = acquire_pooled_decoder(&decoder_from_pool);
-        
+
         if (tjh) {
             #pragma omp for schedule(static)
             for (int32_t i = 0; i < chunk_count; i++) {
                 if (!jpeg_data[i] || jpeg_sizes[i] == 0) {
                     continue;
                 }
-                
+
                 int width, height, subsamp, colorspace;
                 if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                         &width, &height, &subsamp, &colorspace) < 0) {
                     continue;
                 }
-                
+
                 if (width != CHUNK_SIZE || height != CHUNK_SIZE) {
                     continue;
                 }
-                
+
                 uint8_t* buffer;
                 int from_pool = 0;
                 if (pool) {
@@ -2396,7 +2397,7 @@ AODDS_API int32_t aodds_build_mipmap_chain(
                 } else {
                     buffer = (uint8_t*)malloc(CHUNK_SIZE * CHUNK_SIZE * 4);
                 }
-                
+
                 if (!buffer) continue;
                 
                 if (tjDecompress2(tjh, jpeg_data[i], jpeg_sizes[i],
@@ -2586,7 +2587,8 @@ AODDS_API int32_t aodds_build_all_mipmaps_native(
     uint8_t* output,
     uint32_t output_size,
     uint32_t* bytes_written,
-    aodecode_pool_t* pool
+    aodecode_pool_t* pool,
+    int32_t max_threads
 ) {
     if (!jpeg_data_per_zoom || !jpeg_sizes_per_zoom || !chunk_counts_per_zoom ||
         !output || !bytes_written || zoom_count <= 0) {
@@ -2657,9 +2659,9 @@ AODDS_API int32_t aodds_build_all_mipmaps_native(
                 if (chunks) {
                     /* Decode all JPEGs for this zoom level */
                     int32_t decoded = 0;
-                    
+
 #if AOPIPELINE_HAS_OPENMP
-                    #pragma omp parallel reduction(+:decoded)
+                    #pragma omp parallel num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) reduction(+:decoded)
                     {
                         int decoder_from_pool = 0;
                         tjhandle tjh = acquire_pooled_decoder(&decoder_from_pool);
