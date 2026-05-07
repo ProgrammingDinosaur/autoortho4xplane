@@ -8998,6 +8998,7 @@ class Tile(object):
         try:
             native_build_start = time.monotonic()
             threads = _compute_thread_budget()
+            active = 0
 
             # Get compression format and missing color
             dxt_format = CFG.pydds.format.upper()
@@ -9050,18 +9051,9 @@ class Tile(object):
                             jpeg_datas_per_zoom.append([])
                             chain_truncated = True
                 
-                # Use thread budget coordination for mipmap 0 (256 chunks,
-                # significant CPU).  Mipmaps 1-4 have <=64 chunks and don't
-                # need it.
-                if mipmap == 0:
-                    with _native_build_context():
-                        result = native_dds.build_all_mipmaps_native(
-                            jpeg_datas_per_zoom,
-                            format=dxt_format,
-                            missing_color=missing_color,
-                            max_threads=threads
-                        )
-                else:
+                with _native_build_context():
+                    with _active_native_builds_lock:
+                        active = _active_native_builds
                     result = native_dds.build_all_mipmaps_native(
                         jpeg_datas_per_zoom,
                         format=dxt_format,
@@ -9069,16 +9061,9 @@ class Tile(object):
                         max_threads=threads
                     )
             elif hasattr(native_dds, 'build_mipmap_chain'):
-                if mipmap == 0:
-                    with _native_build_context():
-                        result = native_dds.build_mipmap_chain(
-                            jpeg_datas,
-                            format=dxt_format,
-                            missing_color=missing_color,
-                            max_mipmaps=max_mipmaps,
-                            max_threads=threads
-                        )
-                else:
+                with _native_build_context():
+                    with _active_native_builds_lock:
+                        active = _active_native_builds
                     result = native_dds.build_mipmap_chain(
                         jpeg_datas,
                         format=dxt_format,
@@ -9087,15 +9072,9 @@ class Tile(object):
                         max_threads=threads
                     )
             else:
-                if mipmap == 0:
-                    with _native_build_context():
-                        result = native_dds.build_single_mipmap(
-                            jpeg_datas,
-                            format=dxt_format,
-                            missing_color=missing_color,
-                            max_threads=threads
-                        )
-                else:
+                with _native_build_context():
+                    with _active_native_builds_lock:
+                        active = _active_native_builds
                     result = native_dds.build_single_mipmap(
                         jpeg_datas,
                         format=dxt_format,
@@ -9155,8 +9134,6 @@ class Tile(object):
             tile_creation_stats.set(mipmap, total_time)
             
             mipmaps_built = getattr(result, 'mipmap_count', 1)
-            with _active_native_builds_lock:
-                active = _active_native_builds
             log.debug(f"_try_native_mipmap_build: SUCCESS mipmap {mipmap} - "
                      f"{len(result.data)} bytes ({mipmaps_built} mipmaps) in {total_time*1000:.0f}ms "
                      f"(native: {native_time*1000:.0f}ms, {ready_count}/{total_chunks} chunks, "
