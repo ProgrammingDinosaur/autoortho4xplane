@@ -4,6 +4,7 @@ import atexit
 import ctypes
 import gc
 import glob as glob_mod
+import hashlib
 import heapq
 import itertools
 import os
@@ -1869,6 +1870,15 @@ _lt_cache_retry_after = 0.0
 _LT_CACHE_TIMEOUT = 3.0
 _LT_CACHE_RETRY_INTERVAL = 30.0
 _lt_cache_lock = threading.Semaphore(1)
+
+
+def _lt_chunk_shard(chunk_id: str) -> str:
+    """1-byte shard key (256 buckets) for LT cache fan-out."""
+    return hashlib.blake2b(chunk_id.encode(), digest_size=1).hexdigest()
+
+
+def _lt_chunk_path(lt_dir: str, chunk_id: str) -> str:
+    return os.path.join(lt_dir, _lt_chunk_shard(chunk_id), f"{chunk_id}.jpg")
 
 
 def _lt_probe_dir(dir_path: str) -> bool:
@@ -5145,7 +5155,7 @@ class Chunk(object):
 
         _lt = str(getattr(CFG.paths, 'long_term_cache_dir', '') or '').strip()
         self.lt_cache_dir = _lt if _lt else None
-        self.lt_cache_path = os.path.join(_lt, f"{self.chunk_id}.jpg") if _lt else None
+        self.lt_cache_path = _lt_chunk_path(_lt, self.chunk_id) if _lt else None
         
         # Check cache during initialization and set ready if found
         # skip_cache_check=True allows batch cache reading optimization
@@ -5243,14 +5253,22 @@ class Chunk(object):
         data = self.data
         if not data:
             return
+
+        # LT cache uses sharded layout; local cache is flat.
+        if target_dir == self.lt_cache_dir:
+            target_path = self.lt_cache_path
+            write_dir = os.path.dirname(target_path)
+        else:
+            target_path = os.path.join(target_dir, f"{self.chunk_id}.jpg")
+            write_dir = target_dir
+
         try:
-            os.makedirs(target_dir, exist_ok=True)
+            os.makedirs(write_dir, exist_ok=True)
         except OSError:
             return
-        target_path = os.path.join(target_dir, f"{self.chunk_id}.jpg")
         if os.path.exists(target_path):
             return
-        temp_filename = os.path.join(target_dir, f"{self.chunk_id}_{uuid.uuid4().hex}.tmp")
+        temp_filename = os.path.join(write_dir, f"{self.chunk_id}_{uuid.uuid4().hex}.tmp")
         try:
             with open(temp_filename, 'wb') as h:
                 h.write(data)
