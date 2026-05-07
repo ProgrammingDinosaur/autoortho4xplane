@@ -3970,6 +3970,7 @@ AODDS_API int32_t aodds_builder_finalize(
 #if AOPIPELINE_HAS_OPENMP
     /* Parallel decode all pending JPEGs - OpenMP handles empty iterations efficiently */
     #pragma omp parallel for num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
+#endif
     for (int32_t i = 0; i < builder->chunk_count; i++) {
         if (builder->chunk_status[i] != CHUNK_STATUS_PENDING_DECODE) continue;
 
@@ -4005,13 +4006,12 @@ AODDS_API int32_t aodds_builder_finalize(
         builder->jpeg_sizes[i] = 0;
         builder->jpeg_owned[i] = 0;
     }
-#endif
 
     /* Update stats after parallel region */
     builder->status.chunks_decoded += decode_success_count;
     builder->status.chunks_failed += decode_fail_count;
     builder->status.chunks_missing += decode_fail_count;
-    
+
     /* Fill and compose in a single pass */
     aodds_fill_and_compose(builder->chunks, chunks_per_side, &builder->tile_image,
                            builder->config.missing_r, builder->config.missing_g, builder->config.missing_b);
@@ -4145,6 +4145,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
 #if AOPIPELINE_HAS_OPENMP
     /* Parallel decode all pending JPEGs - OpenMP handles empty iterations efficiently */
     #pragma omp parallel for num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
+#endif
     for (int32_t i = 0; i < builder->chunk_count; i++) {
         if (builder->chunk_status[i] != CHUNK_STATUS_PENDING_DECODE) continue;
 
@@ -4180,7 +4181,6 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
         builder->jpeg_sizes[i] = 0;
         builder->jpeg_owned[i] = 0;
     }
-#endif
 
     /* Update stats after parallel region */
     builder->status.chunks_decoded += decode_success_count;
