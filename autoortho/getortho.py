@@ -1876,10 +1876,32 @@ _LT_CACHE_RETRY_INTERVAL = 30.0
 _lt_cache_lock = threading.Semaphore(1)
 
 
-def _lt_available() -> bool:
+def _lt_probe_dir(dir_path: str) -> bool:
+    """Return True if dir_path is accessible within _LT_CACHE_TIMEOUT seconds."""
+    if not _lt_cache_lock.acquire(blocking=False):
+        return False
+    try:
+        result = [False]
+        event = threading.Event()
+        def _check():
+            result[0] = os.path.isdir(dir_path)
+            event.set()
+        threading.Thread(target=_check, daemon=True).start()
+        if not event.wait(_LT_CACHE_TIMEOUT):
+            return False
+        return result[0]
+    finally:
+        _lt_cache_lock.release()
+
+
+def _lt_available(dir_path: str | None = None) -> bool:
     global _lt_cache_available, _lt_cache_retry_after
     if not _lt_cache_available:
         if time.monotonic() >= _lt_cache_retry_after:
+            if dir_path and not _lt_probe_dir(dir_path):
+                _lt_cache_retry_after = time.monotonic() + _LT_CACHE_RETRY_INTERVAL
+                log.debug("LT cache dir still unreachable, retrying in 30s")
+                return False
             _lt_cache_available = True
         else:
             return False
@@ -5220,7 +5242,7 @@ class Chunk(object):
                 return False  # FIXED: Explicitly return False for corrupted cache
         else:
             bump('chunk_miss')
-            if self.lt_cache_path and _lt_available() and _lt_isfile(self.lt_cache_path):
+            if self.lt_cache_path and _lt_available(self.lt_cache_dir) and _lt_isfile(self.lt_cache_path):
                 try:
                     data = Path(self.lt_cache_path).read_bytes()
                     if data and _is_jpeg(data[:3]):
