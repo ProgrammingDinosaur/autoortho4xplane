@@ -695,19 +695,22 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
             return None
         
         try:
+            threads = _compute_thread_budget()
             with _native_build_context(timeout=native_timeout):
                 result = native.build_from_jpegs_to_buffer(
                     buffer,
                     jpeg_datas,
                     format=dxt_format,
                     missing_color=missing_color,
-                    max_threads=_compute_thread_budget()
+                    max_threads=threads
                 )
 
             if result.success and result.bytes_written >= 128:
                 dds_bytes = result.to_bytes()
+                with _active_native_builds_lock:
+                    active = _active_native_builds
                 log.debug(f"Hybrid DDS build: {valid_count}/{len(chunks)} chunks, "
-                          f"{len(dds_bytes)} bytes")
+                          f"{len(dds_bytes)} bytes, {threads} threads ({active} concurrent)")
                 return dds_bytes
             else:
                 log.debug("Hybrid DDS build: compression failed")
@@ -764,8 +767,10 @@ def _build_dds_native(cache_dir: str, tile_row: int, tile_col: int,
         )
         
         if result.success:
+            with _active_native_builds_lock:
+                active = _active_native_builds
             log.debug(f"Native DDS build: {result.chunks_decoded}/{result.chunks_found} chunks, "
-                      f"{result.mipmaps} mipmaps, {result.elapsed_ms:.1f}ms")
+                      f"{result.mipmaps} mipmaps, {result.elapsed_ms:.1f}ms ({active} concurrent)")
             return result.data
         else:
             log.debug(f"Native DDS build failed: {result.error}")
