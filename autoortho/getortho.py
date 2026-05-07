@@ -636,8 +636,7 @@ def _get_tile_queue_max_size() -> int:
 
 def _build_dds_hybrid(chunks: list, dxt_format: str,
                       missing_color: tuple,
-                      buffer_priority: int = PRIORITY_LIVE,
-                      native_timeout: float = 5.0) -> bytes:
+                      buffer_priority: int = PRIORITY_LIVE) -> bytes:
     """
     Build DDS using HYBRID approach: chunks already in memory + native decode.
     
@@ -696,7 +695,7 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
         
         try:
             threads = _compute_thread_budget()
-            with _native_build_context(timeout=native_timeout):
+            with _native_build_context():
                 result = native.build_from_jpegs_to_buffer(
                     buffer,
                     jpeg_datas,
@@ -717,9 +716,7 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
                 return None
         finally:
             pool.release(buffer_id)
-            
-    except _NativeBuildBusy:
-        raise
+
     except Exception as e:
         log.debug(f"Hybrid DDS build exception: {e}")
         return None
@@ -889,19 +886,12 @@ def _compute_thread_budget() -> int:
     return max(2, CURRENT_CPU_COUNT // active)
 
 
-class _NativeBuildBusy(Exception):
-    """Raised when a native build cannot proceed (e.g. timeout waiting for resources)."""
-
-
 class _BackgroundBuildDeferred(Exception):
     """Raised when speculative DDS work should yield to live X-Plane requests."""
 
 
 class _native_build_context:
     """Track entry/exit of native DDS builds for thread budget coordination."""
-    def __init__(self, timeout=5.0):
-        self._timeout = timeout
-
     def __enter__(self):
         global _active_native_builds
         with _active_native_builds_lock:
@@ -3801,9 +3791,6 @@ class BackgroundDDSBuilder:
         except _BackgroundBuildDeferred:
             bump('background_build_deferred_live')
             deferred = self.submit(tile, priority=priority)
-        except _NativeBuildBusy:
-            bump('background_build_yielded')
-            deferred = self.submit(tile, priority=priority)
         finally:
             if not deferred:
                 try:
@@ -4010,7 +3997,7 @@ class BackgroundDDSBuilder:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
                 if not staging_path:
                     return False
-                with _native_build_context(timeout=0):
+                with _native_build_context():
                     success, bytes_written = builder.finalize_to_file(
                         staging_path, max_threads=_compute_thread_budget()
                     )
@@ -4033,9 +4020,7 @@ class BackgroundDDSBuilder:
             
             log.debug(f"BackgroundDDSBuilder: Streaming finalize failed for {tile_id}")
             return False
-            
-        except _NativeBuildBusy:
-            raise
+
         except _BackgroundBuildDeferred:
             raise
         except Exception as e:
@@ -4162,7 +4147,7 @@ class BackgroundDDSBuilder:
                                     if not staging_path:
                                         return
                                     
-                                    with _native_build_context(timeout=0):
+                                    with _native_build_context():
                                         result = native_dds.build_from_jpegs_to_file(
                                             jpeg_datas,
                                             staging_path,
@@ -4180,19 +4165,17 @@ class BackgroundDDSBuilder:
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk built {tile_id} "
                                                   f"in {build_time:.0f}ms ({result.bytes_written} bytes)")
                                         bump('prebuilt_dds_builds_direct')
-                                        
+
                                         return
                                     else:
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for "
                                                   f"{tile_id}: {result.error}, trying buffer path")
-                            except _NativeBuildBusy:
-                                raise
                             except _BackgroundBuildDeferred:
                                 raise
                             except Exception as e:
                                 log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for {tile_id}: "
                                           f"{e}, trying buffer path")
-                        
+
                         # ═══════════════════════════════════════════════════════════════
                         # BUFFER PATH FALLBACK
                         # Used when direct-to-disk unavailable or fails
@@ -4203,9 +4186,8 @@ class BackgroundDDSBuilder:
                                 dxt_format=dxt_format,
                                 missing_color=missing_color,
                                 buffer_priority=PRIORITY_PREFETCH,
-                                native_timeout=0
                             )
-                            
+
                             if dds_bytes and len(dds_bytes) >= 128:
                                 # Hybrid build succeeded - store in DDS cache
                                 if self._dds_cache is not None:
@@ -4220,13 +4202,11 @@ class BackgroundDDSBuilder:
                                 log.debug(f"BackgroundDDSBuilder: Hybrid built {tile_id} in "
                                           f"{build_time:.0f}ms ({len(dds_bytes)} bytes)")
                                 bump('prebuilt_dds_builds_hybrid')
-                                
+
                                 return
                             else:
                                 log.debug(f"BackgroundDDSBuilder: Hybrid build returned no data "
                                           f"for {tile_id}, trying native file I/O")
-                        except _NativeBuildBusy:
-                            raise
                         except Exception as e:
                             log.debug(f"BackgroundDDSBuilder: Hybrid build failed for {tile_id}: "
                                       f"{e}, trying native file I/O")
@@ -4252,7 +4232,7 @@ class BackgroundDDSBuilder:
                         if not staging_path:
                             return
 
-                        with _native_build_context(timeout=0):
+                        with _native_build_context():
                             result = native_dds.build_tile_to_file(
                                 cache_dir=tile.cache_dir,
                                 row=tile.row,
@@ -4287,8 +4267,6 @@ class BackgroundDDSBuilder:
                         else:
                             log.debug(f"BackgroundDDSBuilder: Native direct-to-disk failed for "
                                       f"{tile_id}: {result.error}, trying buffer path")
-                    except _NativeBuildBusy:
-                        raise
                     except _BackgroundBuildDeferred:
                         raise
                     except Exception as e:
@@ -4325,7 +4303,7 @@ class BackgroundDDSBuilder:
                 
                 try:
                     _defer_background_build_if_live(tile)
-                    with _native_build_context(timeout=0):
+                    with _native_build_context():
                         result = native_dds.build_tile_to_buffer(
                             buffer,
                             cache_dir=tile.cache_dir,
