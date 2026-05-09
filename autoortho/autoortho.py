@@ -268,24 +268,33 @@ def diagnose(CFG):
 
     location = geocoder.ip("me")
 
+    def _check_mount(mount):
+        try:
+            if system_type == 'darwin':
+                return macsetup.is_macfuse_mount(mount)
+            else:
+                return os.path.isdir(os.path.join(mount, 'textures'))
+        except Exception:
+            return False
+
+    def _wait_for_mount(mount, attempts=40, interval=0.25):
+        for _ in range(attempts):
+            if _check_mount(mount):
+                return True
+            time.sleep(interval)
+        return False
+
     log.info("Waiting for mounts...")
-    for scenery in CFG.scenery_mounts:
-        mount = scenery.get('mount')
-        ret = False
-        # Use shorter sleeps with more attempts to avoid long pauses
-        for i in range(40):
-            time.sleep(0.25)
-            try:
-                if system_type == 'darwin':
-                    # Require an actual FUSE mount on macOS; placeholders can mask failures
-                    ret = macsetup.is_macfuse_mount(mount)
-                else:
-                    ret = os.path.isdir(os.path.join(mount, 'textures'))
-            except Exception:
-                ret = False
-            if ret:
-                break
-            log.info('.')
+    log.info("Checking %d mount(s) in parallel (up to 10s)...", len(CFG.scenery_mounts))
+    # Check all mounts in parallel so large regions don't delay smaller ones
+    wait_threads = [
+        threading.Thread(target=_wait_for_mount, args=(s.get('mount'),), daemon=True)
+        for s in CFG.scenery_mounts
+    ]
+    for t in wait_threads:
+        t.start()
+    for t in wait_threads:
+        t.join()
 
     failed = False
     log.info("\n\n")
@@ -299,13 +308,8 @@ def diagnose(CFG):
         root = scenery.get('root')
         mount = scenery.get('mount')
         log.info(f"    {root}")
-        try:
-            if system_type == 'darwin':
-                ret = macsetup.is_macfuse_mount(mount)
-            else:
-                ret = os.path.isdir(os.path.join(mount, 'textures'))
-        except Exception:
-            ret = False
+        # Retry for mounts that are slow to appear (e.g. large regions still initialising)
+        ret = _wait_for_mount(mount, attempts=12, interval=5.0)
         log.info(f"        Mounted? {ret}")
         if not ret:
             failed = True
