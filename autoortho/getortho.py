@@ -706,10 +706,10 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
 
             if result.success and result.bytes_written >= 128:
                 dds_bytes = result.to_bytes()
-                with _active_native_builds_lock:
-                    active = _active_native_builds
+                active, total_threads = _native_thread_load()
                 log.debug(f"Hybrid DDS build: {valid_count}/{len(chunks)} chunks, "
-                          f"{len(dds_bytes)} bytes, {threads} threads ({active} concurrent)")
+                          f"{len(dds_bytes)} bytes, {threads} threads "
+                          f"({active} concurrent, {total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
                 return dds_bytes
             else:
                 log.debug("Hybrid DDS build: compression failed")
@@ -764,10 +764,10 @@ def _build_dds_native(cache_dir: str, tile_row: int, tile_col: int,
         )
         
         if result.success:
-            with _active_native_builds_lock:
-                active = _active_native_builds
+            active, total_threads = _native_thread_load()
             log.debug(f"Native DDS build: {result.chunks_decoded}/{result.chunks_found} chunks, "
-                      f"{result.mipmaps} mipmaps, {result.elapsed_ms:.1f}ms ({active} concurrent)")
+                      f"{result.mipmaps} mipmaps, {result.elapsed_ms:.1f}ms "
+                      f"({active} concurrent, {total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
             return result.data
         else:
             log.debug(f"Native DDS build failed: {result.error}")
@@ -813,8 +813,32 @@ _progressive_executor_lock = threading.Lock()
 
 # Track concurrent native builds for OpenMP thread budget coordination.
 # Shared across background builder, live builder, and streaming builder.
+# `_active_native_thread_count` is the SUM of per-build OpenMP thread budgets
+# currently in flight; comparing it against CURRENT_CPU_COUNT measures actual
+# CPU oversubscription (peak captured separately for periodic reporting).
 _active_native_builds = 0
+_active_native_thread_count = 0
+_peak_native_thread_count = 0
 _active_native_builds_lock = threading.Lock()
+
+
+def _native_thread_load() -> tuple:
+    """Snapshot of (active_builds, total_threads_in_flight) under the lock."""
+    with _active_native_builds_lock:
+        return (_active_native_builds, _active_native_thread_count)
+
+
+def native_thread_load_peak_and_reset() -> tuple:
+    """Return ``(active_builds, total_threads, peak_threads)`` and reset peak.
+
+    Intended for periodic reporting (e.g. stats loop). Resetting on read gives
+    a windowed peak between calls.
+    """
+    global _peak_native_thread_count
+    with _active_native_builds_lock:
+        snap = (_active_native_builds, _active_native_thread_count, _peak_native_thread_count)
+        _peak_native_thread_count = _active_native_thread_count
+    return snap
 
 # Track live (FUSE-requested) tile reads in progress.
 # When > 0, prefetching and background DDS building pause to give
@@ -894,18 +918,26 @@ class _native_build_context:
     The increment and budget computation share the same lock so a build always sees
     itself in the active count — closing the race where a second build started while
     a first was in flight and both asked for full-CPU thread counts.
+
+    ``_active_native_thread_count`` accumulates the per-build budgets so callers can
+    observe the true OS-thread-in-flight load; the peak is tracked for windowed
+    reporting via :func:`native_thread_load_peak_and_reset`.
     """
     def __enter__(self):
-        global _active_native_builds
+        global _active_native_builds, _active_native_thread_count, _peak_native_thread_count
         with _active_native_builds_lock:
             _active_native_builds += 1
-            active = _active_native_builds
-        return _thread_budget_for(active)
+            self._threads = _thread_budget_for(_active_native_builds)
+            _active_native_thread_count += self._threads
+            if _active_native_thread_count > _peak_native_thread_count:
+                _peak_native_thread_count = _active_native_thread_count
+        return self._threads
 
     def __exit__(self, *exc):
-        global _active_native_builds
+        global _active_native_builds, _active_native_thread_count
         with _active_native_builds_lock:
             _active_native_builds -= 1
+            _active_native_thread_count -= self._threads
         return False
 
 
@@ -8997,7 +9029,6 @@ class Tile(object):
         try:
             native_build_start = time.monotonic()
             threads = 0
-            active = 0
 
             # Get compression format and missing color
             dxt_format = CFG.pydds.format.upper()
@@ -9051,8 +9082,6 @@ class Tile(object):
                             chain_truncated = True
                 
                 with _native_build_context() as threads:
-                    with _active_native_builds_lock:
-                        active = _active_native_builds
                     result = native_dds.build_all_mipmaps_native(
                         jpeg_datas_per_zoom,
                         format=dxt_format,
@@ -9061,8 +9090,6 @@ class Tile(object):
                     )
             elif hasattr(native_dds, 'build_mipmap_chain'):
                 with _native_build_context() as threads:
-                    with _active_native_builds_lock:
-                        active = _active_native_builds
                     result = native_dds.build_mipmap_chain(
                         jpeg_datas,
                         format=dxt_format,
@@ -9072,8 +9099,6 @@ class Tile(object):
                     )
             else:
                 with _native_build_context() as threads:
-                    with _active_native_builds_lock:
-                        active = _active_native_builds
                     result = native_dds.build_single_mipmap(
                         jpeg_datas,
                         format=dxt_format,
@@ -9133,10 +9158,12 @@ class Tile(object):
             tile_creation_stats.set(mipmap, total_time)
             
             mipmaps_built = getattr(result, 'mipmap_count', 1)
+            active, total_threads = _native_thread_load()
             log.debug(f"_try_native_mipmap_build: SUCCESS mipmap {mipmap} - "
                      f"{len(result.data)} bytes ({mipmaps_built} mipmaps) in {total_time*1000:.0f}ms "
                      f"(native: {native_time*1000:.0f}ms, {ready_count}/{total_chunks} chunks, "
-                     f"{threads} threads, {active} concurrent)")
+                     f"{threads} threads, {active} concurrent, "
+                     f"{total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
             
             return True
             
@@ -10126,6 +10153,11 @@ class TileCacher(object):
             #set_stat('tile_mem_hits', self.hits)
             log.debug(f"TILE CACHE:  MISS: {self.misses}  HIT: {self.hits}")
         log.debug(f"NUM OPEN TILES: {len(self.tiles)}.  TOTAL MEM: {cur_mem//1048576} MB")
+        active_now, total_now, peak_threads = native_thread_load_peak_and_reset()
+        if peak_threads > 0:
+            over = "OVERSUBSCRIBED" if peak_threads > CURRENT_CPU_COUNT else "ok"
+            log.debug(f"NATIVE BUILDS: now={active_now} ({total_now} threads), "
+                      f"peak_threads_since_last={peak_threads}/{CURRENT_CPU_COUNT} [{over}]")
 
     # -----------------------------
     # LRU helpers and leader logic
