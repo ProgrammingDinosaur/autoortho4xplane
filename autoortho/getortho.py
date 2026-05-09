@@ -706,10 +706,11 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
 
             if result.success and result.bytes_written >= 128:
                 dds_bytes = result.to_bytes()
-                active, total_threads = _native_thread_load()
-                log.debug(f"Hybrid DDS build: {valid_count}/{len(chunks)} chunks, "
-                          f"{len(dds_bytes)} bytes, {threads} threads "
-                          f"({active} concurrent, {total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
+                if log.isEnabledFor(logging.DEBUG):
+                    active, total_threads = _native_thread_load()
+                    log.debug(f"Hybrid DDS build: {valid_count}/{len(chunks)} chunks, "
+                              f"{len(dds_bytes)} bytes, {threads} threads "
+                              f"({active} concurrent, {total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
                 return dds_bytes
             else:
                 log.debug("Hybrid DDS build: compression failed")
@@ -764,10 +765,11 @@ def _build_dds_native(cache_dir: str, tile_row: int, tile_col: int,
         )
         
         if result.success:
-            active, total_threads = _native_thread_load()
-            log.debug(f"Native DDS build: {result.chunks_decoded}/{result.chunks_found} chunks, "
-                      f"{result.mipmaps} mipmaps, {result.elapsed_ms:.1f}ms "
-                      f"({active} concurrent, {total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
+            if log.isEnabledFor(logging.DEBUG):
+                active, total_threads = _native_thread_load()
+                log.debug(f"Native DDS build: {result.chunks_decoded}/{result.chunks_found} chunks, "
+                          f"{result.mipmaps} mipmaps, {result.elapsed_ms:.1f}ms "
+                          f"({active} concurrent, {total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
             return result.data
         else:
             log.debug(f"Native DDS build failed: {result.error}")
@@ -913,16 +915,8 @@ class _BackgroundBuildDeferred(Exception):
 
 
 class _native_build_context:
-    """Track entry/exit of native DDS builds; ``__enter__`` returns the per-build thread budget.
-
-    The increment and budget computation share the same lock so a build always sees
-    itself in the active count — closing the race where a second build started while
-    a first was in flight and both asked for full-CPU thread counts.
-
-    ``_active_native_thread_count`` accumulates the per-build budgets so callers can
-    observe the true OS-thread-in-flight load; the peak is tracked for windowed
-    reporting via :func:`native_thread_load_peak_and_reset`.
-    """
+    """``__enter__`` returns the per-build OpenMP thread budget under the same lock
+    that increments the active-build counter, so each build sees itself in the count."""
     def __enter__(self):
         global _active_native_builds, _active_native_thread_count, _peak_native_thread_count
         with _active_native_builds_lock:
@@ -1900,11 +1894,18 @@ _lt_cache_write_executor = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="lt_cache_writer"
 )
 
+# LT cache I/O is offloaded to a small bounded pool so a hung backing FS
+# (e.g. NFS) can't block FUSE threads or stack up unbounded probe threads.
+_lt_io_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="lt_io"
+)
+
 _lt_cache_available = True
 _lt_cache_retry_after = 0.0
+_lt_cache_state_lock = threading.Lock()
 _LT_CACHE_TIMEOUT = 3.0
 _LT_CACHE_RETRY_INTERVAL = 30.0
-_lt_cache_lock = threading.Semaphore(1)
 
 
 def _lt_chunk_shard(chunk_id: str) -> str:
@@ -1916,61 +1917,134 @@ def _lt_chunk_path(lt_dir: str, chunk_id: str) -> str:
     return os.path.join(lt_dir, _lt_chunk_shard(chunk_id), f"{chunk_id}.jpg")
 
 
-def _lt_probe_dir(dir_path: str) -> bool:
-    """Return True if dir_path is accessible within _LT_CACHE_TIMEOUT seconds."""
-    if not _lt_cache_lock.acquire(blocking=False):
-        return False
+_LT_CACHE_DIR_RESOLVED: tuple = (False, None)  # (initialized, value)
+
+
+def _resolve_lt_cache_dir() -> str | None:
+    """Read ``CFG.paths.long_term_cache_dir`` once and cache the normalized value.
+
+    Per-chunk Chunk.__init__ used to repeat this getattr+str+strip; cache it so
+    chunk creation stays cheap when LT cache is disabled (the common case).
+    """
+    global _LT_CACHE_DIR_RESOLVED
+    initialized, value = _LT_CACHE_DIR_RESOLVED
+    if initialized:
+        return value
+    raw = str(getattr(CFG.paths, 'long_term_cache_dir', '') or '').strip()
+    value = raw if raw else None
+    _LT_CACHE_DIR_RESOLVED = (True, value)
+    return value
+
+
+def _lt_call_with_timeout(fn, *args, on_timeout=None, default=False):
+    """Run ``fn(*args)`` on the LT executor and return its result, or ``default``
+    on timeout/error. Calls ``on_timeout()`` (if given) when the deadline fires."""
     try:
-        result = [False]
-        event = threading.Event()
-        def _check():
-            result[0] = os.path.isdir(dir_path)
-            event.set()
-        threading.Thread(target=_check, daemon=True).start()
-        if not event.wait(_LT_CACHE_TIMEOUT):
-            return False
-        return result[0]
-    finally:
-        _lt_cache_lock.release()
+        return _lt_io_executor.submit(fn, *args).result(timeout=_LT_CACHE_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        if on_timeout:
+            on_timeout()
+        return default
+    except Exception:
+        return default
+
+
+def _lt_probe_dir(dir_path: str) -> bool:
+    return _lt_call_with_timeout(os.path.isdir, dir_path)
 
 
 def _lt_available(dir_path: str | None = None) -> bool:
     global _lt_cache_available, _lt_cache_retry_after
-    if not _lt_cache_available:
-        if time.monotonic() >= _lt_cache_retry_after:
-            if dir_path and not _lt_probe_dir(dir_path):
-                _lt_cache_retry_after = time.monotonic() + _LT_CACHE_RETRY_INTERVAL
-                log.debug("LT cache dir still unreachable, retrying in 30s")
-                return False
-            _lt_cache_available = True
-        else:
+    with _lt_cache_state_lock:
+        if _lt_cache_available:
+            return True
+        if time.monotonic() < _lt_cache_retry_after:
             return False
+    # Probe outside the lock — _lt_probe_dir blocks on the executor.
+    if dir_path and not _lt_probe_dir(dir_path):
+        with _lt_cache_state_lock:
+            _lt_cache_retry_after = time.monotonic() + _LT_CACHE_RETRY_INTERVAL
+        log.debug("LT cache dir still unreachable, retrying in 30s")
+        return False
+    with _lt_cache_state_lock:
+        _lt_cache_available = True
     return True
 
 
 def _lt_mark_unavailable():
     global _lt_cache_available, _lt_cache_retry_after
-    _lt_cache_available = False
-    _lt_cache_retry_after = time.monotonic() + _LT_CACHE_RETRY_INTERVAL
+    with _lt_cache_state_lock:
+        _lt_cache_available = False
+        _lt_cache_retry_after = time.monotonic() + _LT_CACHE_RETRY_INTERVAL
     log.warning("LT cache unresponsive, skipping for 30s")
 
 
-def _lt_isfile(path) -> bool:
-    if not _lt_cache_lock.acquire(blocking=False):
-        return False
+def _lt_read_bytes(path: str):
+    """Read a file via the LT executor with timeout. Returns bytes or None."""
+    return _lt_call_with_timeout(
+        Path(path).read_bytes,
+        on_timeout=_lt_mark_unavailable,
+        default=None,
+    )
+
+
+def _cleanup_temp(path: str):
     try:
-        result = [False]
-        event = threading.Event()
-        def _check():
-            result[0] = os.path.isfile(path)
-            event.set()
-        threading.Thread(target=_check, daemon=True).start()
-        if not event.wait(_LT_CACHE_TIMEOUT):
-            _lt_mark_unavailable()
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        log.debug(f"_cleanup_temp({path}): {e}")
+
+
+def _atomic_write(target_path: str, data: bytes) -> bool:
+    """Atomically write ``data`` to ``target_path`` via tempfile + ``os.replace``.
+
+    Creates the parent dir, retries on transient Windows file-lock errors
+    (WinError 5/32/33). Returns True on success or already-exists; False on
+    failure. Bookkeeping (disk budget, stats) is the caller's responsibility.
+    """
+    write_dir = os.path.dirname(target_path)
+    try:
+        os.makedirs(write_dir, exist_ok=True)
+    except OSError as e:
+        log.debug(f"_atomic_write: makedirs failed for {write_dir}: {e}")
+        return False
+
+    if os.path.exists(target_path):
+        return True
+
+    temp_filename = os.path.join(
+        write_dir, f".{os.path.basename(target_path)}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with open(temp_filename, 'wb') as h:
+            h.write(data)
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        _cleanup_temp(temp_filename)
+        log.warning(f"_atomic_write: failed to write temp for {target_path}: {e}")
+        return False
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if os.path.exists(target_path):
+                _cleanup_temp(temp_filename)
+                return True
+            os.replace(temp_filename, target_path)
+            return True
+        except FileExistsError:
+            _cleanup_temp(temp_filename)
+            return True
+        except OSError as e:
+            if getattr(e, 'winerror', None) in (5, 32, 33) and attempt < max_attempts:
+                time.sleep(0.05 * attempt)
+                continue
+            _cleanup_temp(temp_filename)
+            log.warning(f"_atomic_write: failed to replace {target_path}: {e}")
             return False
-        return result[0]
-    finally:
-        _lt_cache_lock.release()
+    return False
 
 
 def _async_cache_write(chunk):
@@ -1991,19 +2065,20 @@ def _async_cache_write(chunk):
 
 
 def shutdown_cache_writer():
-    """Shutdown the cache writer executor gracefully. Called during module cleanup.
-
-    Uses wait=True with a timeout to ensure pending writes complete before shutdown,
-    preventing potential file corruption or lost cache writes.
-    """
+    """Shut down the cache write executors. Local writes block to flush; LT writes
+    drop in flight (the LT path may be on a slow/hung backing FS at exit time)."""
     try:
         _cache_write_executor.shutdown(wait=True)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"shutdown_cache_writer: local executor shutdown failed: {e}")
     try:
         _lt_cache_write_executor.shutdown(wait=False)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"shutdown_cache_writer: LT executor shutdown failed: {e}")
+    try:
+        _lt_io_executor.shutdown(wait=False)
+    except Exception as e:
+        log.debug(f"shutdown_cache_writer: LT IO executor shutdown failed: {e}")
 
 
 def flush_cache_writer(timeout=30.0):
@@ -5188,9 +5263,11 @@ class Chunk(object):
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
 
-        _lt = str(getattr(CFG.paths, 'long_term_cache_dir', '') or '').strip()
-        self.lt_cache_dir = _lt if _lt else None
-        self.lt_cache_path = _lt_chunk_path(_lt, self.chunk_id) if _lt else None
+        self.lt_cache_dir = _resolve_lt_cache_dir()
+        self.lt_cache_path = (
+            _lt_chunk_path(self.lt_cache_dir, self.chunk_id)
+            if self.lt_cache_dir else None
+        )
         
         # Check cache during initialization and set ready if found
         # skip_cache_check=True allows batch cache reading optimization
@@ -5270,18 +5347,14 @@ class Chunk(object):
                 return False  # FIXED: Explicitly return False for corrupted cache
         else:
             bump('chunk_miss')
-            if self.lt_cache_path and _lt_available(self.lt_cache_dir) and _lt_isfile(self.lt_cache_path):
-                try:
-                    data = Path(self.lt_cache_path).read_bytes()
-                    if data and _is_jpeg(data[:3]):
-                        self.data = data
-                        bump('chunk_lt_hit')
-                        log.debug(f"LT cache hit for {self}")
-                        _lt_cache_write_executor.submit(self._save_to_dir, self.cache_dir)
-                        return True
-                except OSError as e:
-                    _lt_mark_unavailable()
-                    log.debug(f"LT cache read failed for {self}: {e}")
+            if self.lt_cache_path and _lt_available(self.lt_cache_dir):
+                data = _lt_read_bytes(self.lt_cache_path)
+                if data and _is_jpeg(data[:3]):
+                    self.data = data
+                    bump('chunk_lt_hit')
+                    log.debug(f"LT cache hit for {self}")
+                    _lt_cache_write_executor.submit(self._save_to_dir, self.cache_dir)
+                    return True
             return False
 
     def _save_to_dir(self, target_dir):
@@ -5289,36 +5362,20 @@ class Chunk(object):
         if not data:
             return
 
-        # LT cache uses sharded layout; local cache is flat.
         if target_dir == self.lt_cache_dir:
             target_path = self.lt_cache_path
-            write_dir = os.path.dirname(target_path)
+            if not target_path:
+                return
         else:
             target_path = os.path.join(target_dir, f"{self.chunk_id}.jpg")
-            write_dir = target_dir
 
-        try:
-            os.makedirs(write_dir, exist_ok=True)
-        except OSError:
+        if not _atomic_write(target_path, data):
             return
-        if os.path.exists(target_path):
-            return
-        temp_filename = os.path.join(write_dir, f"{self.chunk_id}_{uuid.uuid4().hex}.tmp")
-        try:
-            with open(temp_filename, 'wb') as h:
-                h.write(data)
-            os.replace(temp_filename, target_path)
-            if target_dir == self.lt_cache_dir:
-                bump('chunk_lt_write')
-            elif target_dir == self.cache_dir and disk_budget_manager is not None:
-                disk_budget_manager.account_jpeg(len(data))
-        except OSError as e:
-            log.debug(f"Failed to save to {target_dir} for {self}: {e}")
-            try:
-                if os.path.exists(temp_filename):
-                    os.remove(temp_filename)
-            except Exception:
-                pass
+
+        if target_dir == self.lt_cache_dir:
+            bump('chunk_lt_write')
+        elif target_dir == self.cache_dir and disk_budget_manager is not None:
+            disk_budget_manager.account_jpeg(len(data))
 
     def save_cache(self):
         # Snapshot data to avoid races with close() mutating self.data
@@ -5326,82 +5383,18 @@ class Chunk(object):
         if not data:
             return
 
-        # Check if cache directory still exists (may have been deleted by temp cleanup)
+        # Skip if the parent cache dir was nuked (e.g. diagnose temp cleanup).
         if not os.path.exists(self.cache_dir):
             log.debug(f"Cache directory gone for {self}, skipping save")
             return
 
-        # Ensure cache directory exists
-        try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-        except (FileNotFoundError, OSError):
-            # Directory path is invalid or was deleted
-            log.debug(f"Cannot create cache directory for {self}, skipping save")
-            return
-        except Exception:
-            pass
-
-        # Unique temp filename per writer to avoid collisions between threads/tiles
-        temp_filename = os.path.join(self.cache_dir, f"{self.chunk_id}_{uuid.uuid4().hex}.tmp")
-
-        # Write data to the unique temp file first
-        try:
-            with open(temp_filename, 'wb') as h:
-                h.write(data)
-        except FileNotFoundError as e:
-            # Directory was deleted between check and write (race with temp cleanup)
-            log.debug(f"Cache directory deleted during save for {self}: {e}")
-            return
-        except Exception as e:
-            # Could not write temp file
-            try:
-                if os.path.exists(temp_filename):
-                    os.remove(temp_filename)
-            except Exception:
-                pass
-            log.warning(f"Failed to save cache for {self}: {e}")
+        if not _atomic_write(self.cache_path, data):
             return
 
-        # Try to move into place atomically with a few retries for WinError 32
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                if os.path.exists(self.cache_path):
-                    # Another writer got there first; clean up our temp
-                    os.remove(temp_filename)
-                    log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
-                    return
-                os.replace(temp_filename, self.cache_path)
-                if disk_budget_manager is not None:
-                    disk_budget_manager.account_jpeg(len(data))
-                if self.lt_cache_dir:
-                    _lt_cache_write_executor.submit(self._save_to_dir, self.lt_cache_dir)
-                return
-            except FileExistsError:
-                try:
-                    os.remove(temp_filename)
-                except Exception:
-                    pass
-                log.debug(f"Another thread saved cache for {self}, removed temp file")
-                return
-            except OSError as e:
-                if getattr(e, 'winerror', None) in (5, 32, 33) and attempt < max_attempts:
-                    time.sleep(0.05 * attempt)
-                    if os.path.exists(self.cache_path):
-                        try:
-                            if os.path.exists(temp_filename):
-                                os.remove(temp_filename)
-                        except Exception:
-                            pass
-                        return
-                    continue
-                try:
-                    if os.path.exists(temp_filename):
-                        os.remove(temp_filename)
-                except Exception:
-                    pass
-                log.warning(f"Failed to save cache for {self}: {e}")
-                return
+        if disk_budget_manager is not None:
+            disk_budget_manager.account_jpeg(len(data))
+        if self.lt_cache_dir:
+            _lt_cache_write_executor.submit(self._save_to_dir, self.lt_cache_dir)
 
     def get(self, idx=0, session=requests, timeout=None, max_attempts=None):
         log.debug(f"Getting {self}")
@@ -9028,7 +9021,6 @@ class Tile(object):
         
         try:
             native_build_start = time.monotonic()
-            threads = 0
 
             # Get compression format and missing color
             dxt_format = CFG.pydds.format.upper()
@@ -9081,30 +9073,21 @@ class Tile(object):
                             jpeg_datas_per_zoom.append([])
                             chain_truncated = True
                 
-                with _native_build_context() as threads:
-                    result = native_dds.build_all_mipmaps_native(
-                        jpeg_datas_per_zoom,
-                        format=dxt_format,
-                        missing_color=missing_color,
-                        max_threads=threads
-                    )
+                build_fn = native_dds.build_all_mipmaps_native
+                build_args = (jpeg_datas_per_zoom,)
+                build_kwargs = {'format': dxt_format, 'missing_color': missing_color}
             elif hasattr(native_dds, 'build_mipmap_chain'):
-                with _native_build_context() as threads:
-                    result = native_dds.build_mipmap_chain(
-                        jpeg_datas,
-                        format=dxt_format,
-                        missing_color=missing_color,
-                        max_mipmaps=max_mipmaps,
-                        max_threads=threads
-                    )
+                build_fn = native_dds.build_mipmap_chain
+                build_args = (jpeg_datas,)
+                build_kwargs = {'format': dxt_format, 'missing_color': missing_color,
+                                'max_mipmaps': max_mipmaps}
             else:
-                with _native_build_context() as threads:
-                    result = native_dds.build_single_mipmap(
-                        jpeg_datas,
-                        format=dxt_format,
-                        missing_color=missing_color,
-                        max_threads=threads
-                    )
+                build_fn = native_dds.build_single_mipmap
+                build_args = (jpeg_datas,)
+                build_kwargs = {'format': dxt_format, 'missing_color': missing_color}
+
+            with _native_build_context() as threads:
+                result = build_fn(*build_args, max_threads=threads, **build_kwargs)
             
             if not result.success:
                 log.debug(f"_try_native_mipmap_build: Build failed for mipmap {mipmap}: {result.error}")
@@ -9157,13 +9140,14 @@ class Tile(object):
             mm_stats.set(mipmap, total_time)
             tile_creation_stats.set(mipmap, total_time)
             
-            mipmaps_built = getattr(result, 'mipmap_count', 1)
-            active, total_threads = _native_thread_load()
-            log.debug(f"_try_native_mipmap_build: SUCCESS mipmap {mipmap} - "
-                     f"{len(result.data)} bytes ({mipmaps_built} mipmaps) in {total_time*1000:.0f}ms "
-                     f"(native: {native_time*1000:.0f}ms, {ready_count}/{total_chunks} chunks, "
-                     f"{threads} threads, {active} concurrent, "
-                     f"{total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
+            if log.isEnabledFor(logging.DEBUG):
+                mipmaps_built = getattr(result, 'mipmap_count', 1)
+                active, total_threads = _native_thread_load()
+                log.debug(f"_try_native_mipmap_build: SUCCESS mipmap {mipmap} - "
+                         f"{len(result.data)} bytes ({mipmaps_built} mipmaps) in {total_time*1000:.0f}ms "
+                         f"(native: {native_time*1000:.0f}ms, {ready_count}/{total_chunks} chunks, "
+                         f"{threads} threads, {active} concurrent, "
+                         f"{total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
             
             return True
             

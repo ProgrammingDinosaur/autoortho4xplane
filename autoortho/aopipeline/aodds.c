@@ -1617,7 +1617,7 @@ AODDS_API int32_t aodds_build_from_jpegs(
      * - JPEG decoding happens OUTSIDE the lock (full parallelism)
      * - Decoders are reused across calls (no repeated init/destroy)
      * ======================================================================== */
-    #pragma omp parallel num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) reduction(+:decoded)
+    #pragma omp parallel num_threads(AODDS_OMP_THREADS(max_threads)) reduction(+:decoded)
     {
         /* Acquire a decoder from the thread-safe pool */
         int decoder_from_pool = 0;
@@ -1875,7 +1875,7 @@ AODDS_API int32_t aodds_build_single_mipmap(
     int32_t decoded = 0;
 
 #if AOPIPELINE_HAS_OPENMP
-    #pragma omp parallel num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) reduction(+:decoded)
+    #pragma omp parallel num_threads(AODDS_OMP_THREADS(max_threads)) reduction(+:decoded)
     {
         /* Acquire decoder from thread-safe pool */
         int decoder_from_pool = 0;
@@ -2367,7 +2367,7 @@ AODDS_API int32_t aodds_build_mipmap_chain(
     int32_t decoded = 0;
 
 #if AOPIPELINE_HAS_OPENMP
-    #pragma omp parallel num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) reduction(+:decoded)
+    #pragma omp parallel num_threads(AODDS_OMP_THREADS(max_threads)) reduction(+:decoded)
     {
         int decoder_from_pool = 0;
         tjhandle tjh = acquire_pooled_decoder(&decoder_from_pool);
@@ -2661,7 +2661,7 @@ AODDS_API int32_t aodds_build_all_mipmaps_native(
                     int32_t decoded = 0;
 
 #if AOPIPELINE_HAS_OPENMP
-                    #pragma omp parallel num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) reduction(+:decoded)
+                    #pragma omp parallel num_threads(AODDS_OMP_THREADS(max_threads)) reduction(+:decoded)
                     {
                         int decoder_from_pool = 0;
                         tjhandle tjh = acquire_pooled_decoder(&decoder_from_pool);
@@ -2892,7 +2892,7 @@ AODDS_API int32_t aodds_build_from_jpegs_to_file(
     int32_t decoded = 0;
 
 #if AOPIPELINE_HAS_OPENMP
-    #pragma omp parallel num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) reduction(+:decoded)
+    #pragma omp parallel num_threads(AODDS_OMP_THREADS(max_threads)) reduction(+:decoded)
     {
         /* Acquire decoder from thread-safe pool */
         int decoder_from_pool = 0;
@@ -3969,7 +3969,7 @@ AODDS_API int32_t aodds_builder_finalize(
 
 #if AOPIPELINE_HAS_OPENMP
     /* Parallel decode all pending JPEGs - OpenMP handles empty iterations efficiently */
-    #pragma omp parallel for num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
+    #pragma omp parallel for num_threads(AODDS_OMP_THREADS(max_threads)) schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
 #endif
     for (int32_t i = 0; i < builder->chunk_count; i++) {
         if (builder->chunk_status[i] != CHUNK_STATUS_PENDING_DECODE) continue;
@@ -4144,7 +4144,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
 
 #if AOPIPELINE_HAS_OPENMP
     /* Parallel decode all pending JPEGs - OpenMP handles empty iterations efficiently */
-    #pragma omp parallel for num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
+    #pragma omp parallel for num_threads(AODDS_OMP_THREADS(max_threads)) schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
 #endif
     for (int32_t i = 0; i < builder->chunk_count; i++) {
         if (builder->chunk_status[i] != CHUNK_STATUS_PENDING_DECODE) continue;
