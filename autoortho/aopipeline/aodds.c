@@ -41,7 +41,7 @@
 #endif
 
 /* Version string */
-#define AODDS_VERSION "1.0.0"
+#define AODDS_VERSION "1.1.0"
 
 /* DDS file constants */
 #define DDS_MAGIC 0x20534444  /* "DDS " */

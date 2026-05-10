@@ -5071,8 +5071,8 @@ class ConfigUI(QMainWindow):
         self.update_status_bar("Mounting sceneries...")
         self.run_button.setEnabled(False)
         self.run_button.setText("Running")
-        self.mount_sceneries(blocking=False)
         self.verify()
+        self.mount_sceneries(blocking=False)
         self.running = True  # Set running state
         self.update_status_bar("Running")
         # Minimize window if hide setting is enabled
