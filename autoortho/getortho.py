@@ -5817,6 +5817,11 @@ class Tile(object):
         # evicted tiles and skip stale work.
         self._closed = False
 
+        # Timestamp (monotonic) when refs last dropped to zero.
+        # Used by _evict_batch() to protect recently-released tiles
+        # from eviction during DSF burst windows.
+        self._last_released: float = 0.0
+
         # Bounded repair state for partial DDS cache entries missing mipmap 0.
         self._mm0_promotion_queued = False
         self._mm0_promotion_pin_until = 0.0
@@ -9832,6 +9837,15 @@ class TileCacher(object):
         # Eviction behavior controls
         self.evict_hysteresis_frac = 0.10  # keep ~10% headroom below limit
         self.evict_headroom_min_bytes = 256 * 1048576  # at least 256MB headroom
+        # Grace period: protect recently-released tiles from eviction.
+        # Prevents thrashing during DSF texture bursts where XP releases a tile
+        # and immediately re-requests it on the next render frame.
+        try:
+            self.evict_grace_seconds = float(
+                getattr(CFG.cache, 'evict_grace_seconds', 30.0)
+            )
+        except Exception:
+            self.evict_grace_seconds = 30.0
         # Track last tile access time for activity-aware proportional eviction.
         # On macOS multi-process, "cold" workers (no recent access) evict
         # more aggressively than "hot" workers with fresh tiles.
@@ -10252,6 +10266,11 @@ class TileCacher(object):
                         continue
                     if t.refs > 0:
                         continue
+                    grace = getattr(self, 'evict_grace_seconds', 30.0)
+                    if grace > 0 and t._last_released > 0:
+                        if (now - t._last_released) < grace:
+                            bump('evict_grace_skip')
+                            continue
                     if (
                         hasattr(t, '_mm0_promotion_is_pinned') and
                         t._mm0_promotion_is_pinned(now)
@@ -10593,6 +10612,8 @@ class TileCacher(object):
                 return False
 
             t.refs -= 1
+            if t.refs == 0:
+                t._last_released = time.monotonic()
 
             if self.enable_cache: # and not t.should_close():
                 log.debug(f"Cache enabled.  Delay tile close for {tile_id}")
