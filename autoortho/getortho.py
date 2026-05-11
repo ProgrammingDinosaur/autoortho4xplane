@@ -10270,6 +10270,7 @@ class TileCacher(object):
                     if grace > 0 and t._last_released > 0:
                         if (now - t._last_released) < grace:
                             bump('evict_grace_skip')
+                            log.debug(f"Evict grace: skipping {idx}, released {now - t._last_released:.1f}s ago")
                             continue
                     if (
                         hasattr(t, '_mm0_promotion_is_pinned') and
