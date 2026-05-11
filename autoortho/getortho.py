@@ -7,6 +7,7 @@ import glob as glob_mod
 import hashlib
 import heapq
 import itertools
+import errno
 import os
 import re
 import sys
@@ -1971,12 +1972,12 @@ def _lt_available(dir_path: str | None = None) -> bool:
     return True
 
 
-def _lt_mark_unavailable():
+def _lt_mark_unavailable(retry_interval: float = _LT_CACHE_RETRY_INTERVAL):
     global _lt_cache_available, _lt_cache_retry_after
     with _lt_cache_state_lock:
         _lt_cache_available = False
-        _lt_cache_retry_after = time.monotonic() + _LT_CACHE_RETRY_INTERVAL
-    log.warning("LT cache unresponsive, skipping for 30s")
+        _lt_cache_retry_after = time.monotonic() + retry_interval
+    log.warning(f"LT cache unavailable, skipping for {retry_interval:.0f}s")
 
 
 def _lt_read_bytes(path: str):
@@ -1994,6 +1995,12 @@ def _cleanup_temp(path: str):
             os.remove(path)
     except Exception as e:
         log.debug(f"_cleanup_temp({path}): {e}")
+
+
+# Tracks the errno from the most recent failed _atomic_write per write directory.
+# Keyed by parent dir (not full path) to bound size to O(dirs) not O(chunks).
+# Consulted by _save_to_dir to choose the right LT cache backoff interval.
+_atomic_write_last_errno: dict[str, int] = {}
 
 
 def _atomic_write(target_path: str, data: bytes) -> bool:
@@ -2020,6 +2027,11 @@ def _atomic_write(target_path: str, data: bytes) -> bool:
         with open(temp_filename, 'wb') as h:
             h.write(data)
     except FileNotFoundError:
+        return False
+    except OSError as e:
+        _atomic_write_last_errno[write_dir] = e.errno
+        _cleanup_temp(temp_filename)
+        log.warning(f"_atomic_write: failed to write temp for {target_path}: {e}")
         return False
     except Exception as e:
         _cleanup_temp(temp_filename)
@@ -5370,6 +5382,18 @@ class Chunk(object):
             target_path = os.path.join(target_dir, f"{self.chunk_id}.jpg")
 
         if not _atomic_write(target_path, data):
+            if target_dir == self.lt_cache_dir:
+                # EPERM = mount is read-only (NFS, NTFS, TCC). Back off 5 min.
+                # Other failures = transient; use standard 30s interval.
+                last_err = _atomic_write_last_errno.get(os.path.dirname(target_path))
+                retry = 300.0 if last_err == errno.EPERM else _LT_CACHE_RETRY_INTERVAL
+                if last_err == errno.EPERM:
+                    log.error(
+                        f"LT cache write denied (EPERM) at {target_dir} — "
+                        "check NFS export options or filesystem permissions. "
+                        f"Disabling LT writes for {retry:.0f}s."
+                    )
+                _lt_mark_unavailable(retry)
             return
 
         if target_dir == self.lt_cache_dir:
