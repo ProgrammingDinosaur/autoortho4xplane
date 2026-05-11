@@ -5589,7 +5589,6 @@ class Chunk(object):
                 
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout) as err:
-            self.attempt += 1
             backoff = min(10.0, 0.5 * (2 ** min(self.attempt, 5)))
             log.warning(f"{self} connection/timeout error (attempt {self.attempt}), "
                         f"backoff {backoff:.1f}s: {err}")
