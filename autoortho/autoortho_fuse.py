@@ -901,10 +901,11 @@ class AutoOrtho(Operations):
 
         # Handle DSF files with time exclusion redirect
         if self.dsf_re.match(path):
+            _uid, _gid, _pid = fuse_get_context()
             # Check if DSF should be redirected to global scenery
             redirect_path = time_exclusion_manager.get_redirect_path(path)
             if redirect_path:
-                log.info(f"OPEN: DSF [{path}] opened in GLOBAL SCENERY mode (time exclusion active) -> {redirect_path}")
+                log.info(f"OPEN: DSF [{path}] by pid={_pid} opened in GLOBAL SCENERY mode (time exclusion active) -> {redirect_path}")
                 try:
                     if system_type == 'windows':
                         fh = os.open(redirect_path, flags | os.O_BINARY)
@@ -920,7 +921,7 @@ class AutoOrtho(Operations):
                     # Fall through to open the original file
             
             # Normal mode - serve AutoOrtho ortho scenery
-            log.info(f"OPEN: DSF [{path}] opened in ORTHO mode (AutoOrtho scenery)")
+            log.info(f"OPEN: DSF [{path}] by pid={_pid} opened in ORTHO mode (AutoOrtho scenery)")
             # Register this DSF as being in use (prevents redirect during active use)
             time_exclusion_manager.register_dsf_open(path)
         
