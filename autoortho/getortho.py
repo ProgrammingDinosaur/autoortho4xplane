@@ -9838,14 +9838,13 @@ class TileCacher(object):
         self.evict_hysteresis_frac = 0.10  # keep ~10% headroom below limit
         self.evict_headroom_min_bytes = 256 * 1048576  # at least 256MB headroom
         # Grace period: protect recently-released tiles from eviction.
-        # Prevents thrashing during DSF texture bursts where XP releases a tile
-        # and immediately re-requests it on the next render frame.
+        # 10s covers DSF burst re-requests without holding memory too long.
         try:
             self.evict_grace_seconds = float(
-                getattr(CFG.cache, 'evict_grace_seconds', 30.0)
+                getattr(CFG.cache, 'evict_grace_seconds', 10.0)
             )
         except Exception:
-            self.evict_grace_seconds = 30.0
+            self.evict_grace_seconds = 10.0
         # Track last tile access time for activity-aware proportional eviction.
         # On macOS multi-process, "cold" workers (no recent access) evict
         # more aggressively than "hot" workers with fresh tiles.
@@ -10266,7 +10265,7 @@ class TileCacher(object):
                         continue
                     if t.refs > 0:
                         continue
-                    grace = getattr(self, 'evict_grace_seconds', 30.0)
+                    grace = getattr(self, 'evict_grace_seconds', 10.0)
                     if grace > 0 and t._last_released > 0:
                         if (now - t._last_released) < grace:
                             bump('evict_grace_skip')

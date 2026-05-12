@@ -5896,14 +5896,31 @@ class ConfigUI(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return False
 
-            # Attempt unmount via AOMount implementation if available
+            import subprocess as _sp
             for scenery in self.cfg.scenery_mounts:
-                try:
-                    mount = scenery.get('mount')
-                    cleanup_mountpoint(mount)
-                    log.info(f"Cleaned up mountpoint: {mount}")
-                except Exception:
-                    log.error(f"Failed to cleanup mountpoint: {mount}")
+                mount = scenery.get('mount')
+                if not mount:
+                    continue
+                if safe_ismount(mount):
+                    try:
+                        if system_type == 'darwin':
+                            _sp.run(["diskutil", "unmount", "force", mount],
+                                    check=False, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                        elif system_type == 'linux':
+                            if shutil.which("fusermount"):
+                                _sp.run(["fusermount", "-u", "-z", mount],
+                                        check=False, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                            else:
+                                _sp.run(["umount", "-l", mount],
+                                        check=False, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                    except Exception as exc:
+                        log.warning(f"Force unmount attempt failed for {mount}: {exc}")
+                if not safe_ismount(mount):
+                    try:
+                        cleanup_mountpoint(mount)
+                        log.info(f"Cleaned up mountpoint: {mount}")
+                    except Exception as exc:
+                        log.error(f"Failed to cleanup mountpoint: {mount}: {exc}")
 
             # Brief wait loop for unmount completion
             import time as _time
