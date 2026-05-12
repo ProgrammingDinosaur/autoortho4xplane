@@ -9849,6 +9849,9 @@ class TileCacher(object):
         # On macOS multi-process, "cold" workers (no recent access) evict
         # more aggressively than "hot" workers with fresh tiles.
         self._last_access_ts = time.monotonic()
+        # Bounded ring of recently-evicted tile ids for thrash detection.
+        # Maps idx -> eviction monotonic time; capped at 500 entries (OrderedDict FIFO).
+        self._recently_evicted: dict = OrderedDict()
         
         self.cache_dir = CFG.paths.cache_dir
         log.info(f"Cache dir: {self.cache_dir}")
@@ -10280,6 +10283,9 @@ class TileCacher(object):
                     # Pop from dict immediately - tile is now "orphaned"
                     try:
                         batch.append((idx, self.tiles.pop(idx)))
+                        self._recently_evicted[idx] = now
+                        if len(self._recently_evicted) > 500:
+                            self._recently_evicted.popitem(last=False)
                     except KeyError:
                         continue
             
@@ -10570,6 +10576,10 @@ class TileCacher(object):
             if not tile:
                 self.misses += 1
                 bump('tile_mem_miss')
+                evicted_at = self._recently_evicted.pop(idx, None)
+                if evicted_at is not None:
+                    bump('evict_reload_after_evict')
+                    log.debug(f"Thrash: {idx} reloaded {time.monotonic() - evicted_at:.1f}s after eviction")
                 # Use target zoom level - supports both fixed and dynamic modes
                 # Pass row/col for dynamic zoom computation based on predicted altitude
                 tile = Tile(
