@@ -773,10 +773,16 @@ class StreamingBuilder:
     def release(self) -> None:
         """
         Return builder to pool for reuse.
-        
+
         Must be called when done with the builder (use try/finally).
         """
         if not self._released and self._pool_ref is not None:
+            # Reset before returning to the pool so decoded chunk buffers are
+            # released now instead of sitting on this builder until reuse.
+            try:
+                self._pool_ref._lib.aodds_builder_reset(self._handle, byref(self._config))
+            except Exception as e:
+                log.warning(f"aodds_builder_reset failed on release, buffers may not be freed: {e}")
             self._pool_ref._return_builder(self._handle)
             self._released = True
             self._handle = None
@@ -1055,17 +1061,17 @@ _default_decode_pool_lock = threading.Lock()
 def _calculate_decode_pool_size() -> int:
     """
     Calculate optimal fixed pool size for JPEG decode buffers.
-    
-    Uses 2 * cpu_count to allow concurrent decoding across all OpenMP threads
-    while having headroom for burst requests.
+
+    Uses 8 * cpu_count to cover bursty live/prefetch decode demand with a
+    bounded fixed pool instead of spilling immediately into overflow mallocs.
     
     Returns:
         Optimal fixed pool size (minimum 8, maximum 256)
     """
     import os
     cpu_count = os.cpu_count() or 4
-    # 2x CPU count for headroom during burst loads
-    pool_size = cpu_count * 2
+    # Each buffer is roughly 256KB, so 80 buffers is about 20MB.
+    pool_size = cpu_count * 8
     # Clamp to valid range
     pool_size = max(8, min(256, pool_size))
     log.debug(f"Decode pool size: {pool_size} (based on cpu_count={cpu_count})")
@@ -1074,35 +1080,16 @@ def _calculate_decode_pool_size() -> int:
 
 def _calculate_decode_memory_limit() -> int:
     """
-    Calculate memory limit for decode pool based on cache_mem_limit.
-    
-    Decode buffers are transient (used only during DDS build), so we allocate
-    25% of the total cache_mem_limit for them. This is conservative since
-    most buffers are recycled quickly.
-    
-    Each 256x256 RGBA buffer = 256KB, so 1GB limit = ~4000 potential buffers.
-    
+    Calculate memory limit for overflow decode buffers.
+
+    The fixed pool handles normal bursts. Overflow exists for short spikes but
+    is capped tightly so prefetch/decode work cannot consume a large fraction
+    of the process memory budget.
+
     Returns:
-        Memory limit in bytes (0 if config unavailable)
+        Memory limit in bytes
     """
-    try:
-        try:
-            from autoortho.aoconfig import CFG
-        except ImportError:
-            from aoconfig import CFG
-        
-        # cache_mem_limit is in GB
-        cache_limit_gb = float(getattr(CFG.autoortho, 'cache_mem_lim', 4))
-        # Use 25% for decode buffers (they're transient and recycle fast)
-        decode_limit_gb = cache_limit_gb * 0.25
-        decode_limit_bytes = int(decode_limit_gb * 1024 * 1024 * 1024)
-        
-        log.debug(f"Decode pool memory limit: {decode_limit_bytes // (1024*1024)} MB "
-                 f"(25% of cache_mem_limit={cache_limit_gb} GB)")
-        return decode_limit_bytes
-    except Exception as e:
-        log.warning(f"Failed to get cache_mem_limit for decode pool: {e}, using 512MB default")
-        return 512 * 1024 * 1024  # 512 MB default
+    return 128 * 1024 * 1024
 
 
 def get_default_decode_pool() -> Optional[AoDecode.BufferPool]:
@@ -1115,8 +1102,8 @@ def get_default_decode_pool() -> Optional[AoDecode.BufferPool]:
     - Provide wait-queue for burst load handling (stability)
     
     Pool Configuration:
-    - Fixed pool size: 2 * cpu_count
-    - Memory limit: 25% of cache_mem_limit
+    - Fixed pool size: 8 * cpu_count
+    - Overflow memory cap: 128 MB
     - Auto-shrink: Overflow buffers freed on release
     
     Returns:
@@ -3439,4 +3426,3 @@ try:
     _load_library()
 except Exception:
     pass  # Will raise on first use if not available
-

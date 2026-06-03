@@ -210,6 +210,29 @@ class DynamicZoomManager:
         """
         return sorted(self._steps, key=lambda s: s.altitude_ft, reverse=True)
 
+    def get_max_zoom_levels(self) -> tuple[int, int]:
+        """
+        Get the highest regular and airport zoom levels this config can return.
+
+        This is used for conservative sizing when the exact altitude-based zoom
+        for a tile is not known yet.  If the base step is missing, include the
+        runtime fallback defaults so callers do not under-report possible output.
+
+        Returns:
+            Tuple of (max_regular_zoom, max_airport_zoom).
+        """
+        if not self._steps:
+            return DEFAULT_ZOOM_LEVEL, 18
+
+        max_regular = max(step.zoom_level for step in self._steps)
+        max_airport = max(step.zoom_level_airports for step in self._steps)
+
+        if not self.has_base_step():
+            max_regular = max(max_regular, DEFAULT_ZOOM_LEVEL)
+            max_airport = max(max_airport, 18)
+
+        return max_regular, max_airport
+
     def add_step(self, altitude_ft: int, zoom_level: int, 
                  zoom_level_airports: int = 18) -> bool:
         """
@@ -468,4 +491,3 @@ class DynamicZoomManager:
 
     def __repr__(self) -> str:
         return f"DynamicZoomManager(steps={len(self._steps)}, summary='{self.get_summary()}')"
-

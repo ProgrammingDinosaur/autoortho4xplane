@@ -337,11 +337,10 @@ def update_decode_pool_stats():
         
         stats = AoDDS.get_decode_pool_stats()
         if stats:
-            # Only publish overflow when it's nonzero (indicates pool exhaustion)
+            overflow_mb = stats['overflow_bytes'] // (1024 * 1024)
+            set_stat('decode_pool_overflow', stats['overflow_count'])
+            set_stat('decode_pool_overflow_mb', overflow_mb)
             if stats['overflow_count'] > 0:
-                overflow_mb = stats['overflow_bytes'] // (1024 * 1024)
-                set_stat('decode_pool_overflow', stats['overflow_count'])
-                set_stat('decode_pool_overflow_mb', overflow_mb)
                 log.debug(f"Decode pool overflow: {stats['overflow_count']} "
                           f"buffers, {overflow_mb} MB")
     except Exception as e:
@@ -367,10 +366,48 @@ class AOStats(object):
             time.sleep(10)
             try:
                 snap = _store.snapshot() if _store else dict(STATS.items())
-                log.info(f"STATS: {snap}")
+                log.info(f"STATS: {filter_stats_snapshot(snap)}")
                         
             except Exception as e:
                 log.debug(f"aostats.show error: {e}")
+
+
+def filter_stats_snapshot(snap: dict) -> dict:
+    """Filter noisy internal keys from a stats snapshot before logging."""
+    def _is_internal(k):
+        return (
+            isinstance(k, str)
+            and (
+                k.startswith('proc_mem_rss_bytes')
+                or k.startswith('proc_alive_ts')
+                or k.startswith('proc_threads')
+                or k.startswith('last_tile_access_ts')
+                or k.startswith('mm_count:')
+                or k.startswith('mm_time_total_ms:')
+                or k.startswith('partial_mm_count:')
+                or k.startswith('partial_mm_time_total_ms:')
+                or k.startswith('lock:')
+            )
+        ) or k in ('proc_count', 'cur_mem_mb_ts')
+
+    filtered = {}
+    active_tile_counts = {}
+    for k, v in snap.items():
+        if isinstance(k, str) and k.startswith('active_tiles_'):
+            pid = k.split('_', 2)[2]
+            try:
+                active_tile_counts[pid] = len(v) if isinstance(v, dict) else 0
+            except Exception:
+                active_tile_counts[pid] = 0
+            continue
+        if _is_internal(k):
+            continue
+        filtered[k] = v
+
+    for pid, count in active_tile_counts.items():
+        filtered[f'active_tiles_count:{pid}'] = count
+
+    return filtered
 
 
 class StatTracker(object):

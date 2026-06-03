@@ -7,11 +7,16 @@ import multiprocessing
 if getattr(sys, 'frozen', False):
     multiprocessing.freeze_support()
 
-if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
+try:
+    from autoortho.worker_modes import is_mount_worker_mode
+except ImportError:
+    from worker_modes import is_mount_worker_mode
+
+if is_mount_worker_mode():
     try:
-        from autoortho.macfuse_worker import main as _ao_worker_main
+        from autoortho.mount_worker import main as _ao_worker_main
     except ImportError:
-        from macfuse_worker import main as _ao_worker_main
+        from mount_worker import main as _ao_worker_main
     _ao_worker_main()
     os._exit(0)
 

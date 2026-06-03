@@ -39,7 +39,8 @@ DDM_VERSION = 3
 
 def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
                          tilename_zoom: int, max_zoom: int, min_zoom: int,
-                         width: int, height: int, maptype: str) -> int:
+                         width: int, height: int, maptype: str,
+                         budget_manager=None) -> int:
     """Delete source JPEG chunks after a complete DDS is stored.
 
     Enumerates chunk files at every zoom level used by the tile's mipmaps
@@ -49,6 +50,7 @@ def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
     Returns the number of files successfully deleted.
     """
     deleted = 0
+    bytes_freed = 0
     for zoom in range(max_zoom, min_zoom - 1, -1):
         zoom_diff = tilename_zoom - zoom
         if zoom_diff >= 0:
@@ -68,8 +70,10 @@ def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
                 jpeg_path = os.path.join(cache_dir, f"{c}_{r}_{zoom}_{maptype}.jpg")
                 for attempt in range(3):
                     try:
+                        file_size = os.path.getsize(jpeg_path)
                         os.remove(jpeg_path)
                         deleted += 1
+                        bytes_freed += file_size
                         break
                     except FileNotFoundError:
                         break
@@ -82,6 +86,11 @@ def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
     if deleted > 0:
         log.debug(f"Cleaned up {deleted} source JPEGs for "
                   f"{col}_{row}_{maptype} z{max_zoom}")
+        if budget_manager is not None and bytes_freed > 0:
+            try:
+                budget_manager.account_jpeg(-bytes_freed)
+            except Exception:
+                pass
     return deleted
 
 
@@ -120,6 +129,9 @@ class DynamicDDSCache:
 
         # In-flight healing guard (prevents duplicate patch work)
         self._healing_in_progress: set = set()
+
+        # Optional DiskBudgetManager reference, set by getortho after startup.
+        self._budget_manager = None
 
         # Network healing callback: set by getortho.py to dispatch network
         # downloads for chunks that can't be healed from disk cache alone.
@@ -681,6 +693,19 @@ class DynamicDDSCache:
                 pass
             raise
 
+    @staticmethod
+    def _filter_healable_missing(missing_indices, tile, max_zoom):
+        """Drop permanently unavailable chunks from the healing-needed list."""
+        if not missing_indices:
+            return missing_indices
+        chunks = getattr(tile, 'chunks', {}).get(max_zoom, [])
+        if not chunks:
+            return missing_indices
+        return [
+            i for i in missing_indices
+            if i >= len(chunks) or not getattr(chunks[i], 'permanent_failure', False)
+        ]
+
     def store(self, tile_id: str, max_zoom: int, dds_bytes: bytes,
               tile,
               mm0_missing_indices: Optional[List[int]] = None,
@@ -734,6 +759,8 @@ class DynamicDDSCache:
             os.replace(tmp_dds, dds_path)
 
             # Build and write DDM metadata atomically
+            mm0_missing_indices = self._filter_healable_missing(
+                mm0_missing_indices, tile, max_zoom)
             meta = self._build_ddm(tile, max_zoom,
                                    dds_format, compressor,
                                    mm0_missing_indices=mm0_missing_indices,
@@ -1013,6 +1040,8 @@ class DynamicDDSCache:
 
             # Write DDM metadata
             dds_format, compressor = self._get_format_and_compressor()
+            mm0_missing_indices = self._filter_healable_missing(
+                mm0_missing_indices, tile, max_zoom)
             meta = self._build_ddm(tile, max_zoom,
                                    dds_format, compressor,
                                    mm0_missing_indices=mm0_missing_indices,
@@ -1996,6 +2025,7 @@ class DynamicDDSCache:
                   getattr(tile, 'min_zoom', 12),
                   getattr(tile, 'width', 1), getattr(tile, 'height', 1),
                   tile.maptype),
+            kwargs={'budget_manager': self._budget_manager},
             daemon=True)
         t.start()
 

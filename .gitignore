@@ -18,3 +18,7 @@ dist/
 docs/internal/
 logs/
 .claude/
+*.o
+autoortho/aopipeline/libaopipeline.dylib
+ao_*.txt
+xp_*.txt

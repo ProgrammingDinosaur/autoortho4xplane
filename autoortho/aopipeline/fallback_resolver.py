@@ -30,6 +30,7 @@ Usage:
 """
 
 import logging
+import math
 import os
 import time
 from typing import Optional, Dict, Any, TYPE_CHECKING
@@ -364,20 +365,28 @@ class FallbackResolver:
                 if chunk_offset_y + crop_size > higher_height:
                     continue
                 
-                # Crop and downscale
-                cropped = higher_img.crop((
-                    chunk_offset_x, chunk_offset_y,
-                    chunk_offset_x + crop_size, chunk_offset_y + crop_size
-                ))
-                
-                if crop_size != 256:
-                    cropped = cropped.resize((256, 256), resample=1)  # BILINEAR
-                
-                if cropped.mode != 'RGBA':
-                    cropped = cropped.convert('RGBA')
-                
-                log.debug(f"FallbackResolver: mipmap scale hit from mipmap {higher_mipmap}")
-                return cropped.tobytes()
+                temp_crop = AoImage.new('RGBA', (crop_size, crop_size), (0, 0, 0, 255))
+                if not temp_crop:
+                    continue
+
+                try:
+                    higher_img.crop(temp_crop, (chunk_offset_x, chunk_offset_y))
+
+                    if scale_factor > 1:
+                        final_img = temp_crop.reduce_2(int(math.log2(scale_factor)))
+                        if not final_img:
+                            continue
+                    else:
+                        final_img = temp_crop
+
+                    try:
+                        log.debug(f"FallbackResolver: mipmap scale hit from mipmap {higher_mipmap}")
+                        return final_img.tobytes()
+                    finally:
+                        if final_img is not temp_crop:
+                            final_img.close()
+                finally:
+                    temp_crop.close()
                 
             except Exception as e:
                 log.debug(f"FallbackResolver: mipmap scale failed: {e}")
@@ -467,4 +476,3 @@ class FallbackResolver:
         """Reset resolver statistics."""
         for key in self.stats:
             self.stats[key] = 0
-

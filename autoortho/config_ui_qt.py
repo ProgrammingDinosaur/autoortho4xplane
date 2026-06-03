@@ -5068,19 +5068,34 @@ class ConfigUI(QMainWindow):
         self.cfg.autoortho.maptype_override = new_maptype
         self.cfg.save()
 
-        if platform.system() == "Darwin" and hasattr(self, 'mac_os_procs'):
-            # macOS: TileCachers live in separate worker processes.
-            # Send SIGUSR1 to tell them to reload maptype from config.
-            import signal
-            for p in self.mac_os_procs:
+        if hasattr(self, 'mac_os_procs') and self.mac_os_procs:
+            # TileCachers live in mount worker processes on all platforms.
+            # Stats provides the cross-platform reload signal; SIGUSR1 is an
+            # immediate POSIX nudge when available.
+            try:
                 try:
-                    if p.poll() is None:
-                        p.send_signal(signal.SIGUSR1)
-                        log.info(f"Sent SIGUSR1 to worker pid {p.pid}")
-                except Exception as e:
-                    log.warning(f"Failed to signal worker pid {p.pid}: {e}")
+                    from autoortho import aostats
+                    from autoortho.mount_worker import RELOAD_GENERATION_STAT
+                except ImportError:
+                    import aostats
+                    from mount_worker import RELOAD_GENERATION_STAT
+                import time
+                aostats.set_stat(RELOAD_GENERATION_STAT, int(time.time() * 1000))
+            except Exception as e:
+                log.warning(f"Failed to publish worker reload signal: {e}")
+
+            import signal
+            sigusr1 = getattr(signal, "SIGUSR1", None)
+            if sigusr1 is not None:
+                for p in self.mac_os_procs:
+                    try:
+                        if p.poll() is None:
+                            p.send_signal(sigusr1)
+                            log.info(f"Sent SIGUSR1 to worker pid {p.pid}")
+                    except Exception as e:
+                        log.warning(f"Failed to signal worker pid {p.pid}: {e}")
         else:
-            # Linux/Windows: TileCachers are in-process, update directly.
+            # Legacy in-process direct mount path.
             import gc
             import getortho
             for obj in gc.get_objects():
