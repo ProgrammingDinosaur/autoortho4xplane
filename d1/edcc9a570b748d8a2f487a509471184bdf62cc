@@ -1,0 +1,21 @@
+autoortho/tests/test_dds_size_estimation.py
+  s_b2f0ff7f959374::t_b6f263efb1a03f 5,150-178
+autoortho/autoortho_fuse.py
+  s_b2f0ff7f959374::t_c130c8ada3dfc3 159-168,914-915,919,935
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d1edcc9a570b748d8a2f487a509471184bdf62cc",
+  "prompts": {},
+  "sessions": {
+    "s_b2f0ff7f959374": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e8ec3-8e1e-7902-aa56-1763403714ca",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Andres Hernandez <andres.hernandezarvizu@mercadolibre.com.mx>"
+    }
+  }
+}
