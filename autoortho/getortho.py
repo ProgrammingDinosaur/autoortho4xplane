@@ -9800,7 +9800,7 @@ def _get_process_mem_bytes(process):
             swap = 0
             with open(f"/proc/{process.pid}/status", "rb") as fh:
                 for line in fh:
-                    i
+                    if line.startswith(b"VmRSS:"):
                         rss = int(line.split()[1]) * 1024
                     elif line.startswith(b"VmSwap:"):
                         swap = int(line.split()[1]) * 1024
