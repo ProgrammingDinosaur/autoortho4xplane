@@ -262,19 +262,19 @@ You have to start X-Plane separately from this tool.  It's also best to start X-
 ## Linux Issues
 
 ### IOError: [Errno 24] Too Many Open Files
-On some Linux distrubtions they set the minimum open files limits. This is 1024. Since AutoOrtho is modifying and creating a large number of files at the same time, it can easily hit this limit.
+On some Linux distributions they set the minimum open files limits. This is 1024. Since AutoOrtho is modifying and creating a large number of files at the same time, it can easily hit this limit.
 
 *To confirm*
-Run the following command and see if the result is in the 4,096 at a minumum.
+Run the following command and see if the result is in the 4,096 at a minimum.
 'ulimit -n'
 
 While doing this you can also check the hard limit thats system wide. This should be in the 100,000s or millions in most cases.
 'ulimit -Hn'
 
-*Fixing by setting a higher limit temporarely*
+*Fixing by setting a higher limit temporarily*
 Open a new terminal window.
 
-This command will set a filesystem max file lmit just in case we are accidently hitting into that limit too...
+This command will set a filesystem max file limit just in case we are accidentally hitting  that limit too...
 'sudo sysctl -w fs.inotify.max_user_watches=100000'
 
 Now we will set our user/process limit to something more workable with generating ortho dynamically...
@@ -283,10 +283,48 @@ Now we will set our user/process limit to something more workable with generatin
 When you check your 'ulimit -n' you should now see it at 8k (8192). Now, in the same terminal window, we can launch our autoortho binary:
 './autoortho_lin_1.4.2.bin'
 
-Note: when you close your terminal window that you entered these commands into (or start another) it will no longer have this raised limit. This is a python safegaurd, not a flaw. It helps protect you against scenerios where touching a large number of files can indicate issues (e.g. resource exhaustion, ransomeware attacks, bad code, etc).
+Note: when you close your terminal window that you entered these commands into (or start another) it will no longer have this raised limit. This is a python safeguard, not a flaw. It helps protect you against scenarios where touching a large number of files can indicate issues (e.g. resource exhaustion, ransomware attacks, bad code, etc).
 
 ### On Linux this does not start/gives a FUSE error
 Make sure that your `/etc/fuse.conf` files is set to `user_allow_other`.  You may need to uncomment a line.
+
+### WARNING - FallbackResolver: Could not import AoImage for disk cache fallback
+This can happen when the prebuilt AoImage shared library provided in the installation package is incompatible with your Linux distribution.
+The most likely incompatibility is the C runtime library and the easiest fix is to install autoortho from source and rebuild the AoImage library on your system.
+
+You'll need to install basic tools like a C compiler and `make`.
+On Debian-based systems, this may be something like:
+```bash
+sudo apt install build-essential make
+```
+On Arch/CachyOS:
+```bash
+sudo pacman -S --needed base-devel
+```
+Then:
+```bash
+git clone https://github.com/ProgrammingDinosaur/autoortho4xplane.git
+cd autoortho4xplane
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+make aopipeline
+```
+
+Quick sanity check:
+```bash
+python -c "from autoortho.aoimage import AoImage; print('OK')"
+```
+Suggested start script:
+```bash
+#!/usr/bin/env bash
+ulimit -n 524288
+cd your_autoortho4xplane_directory
+source .venv/bin/activate
+PYTHONPATH=/your_autoortho4xplane_directory/autoortho python -m autoortho &
+```
+
+Thanks to "clumsynick" for this fix!
 
 ### The program crashed and now I get an error when AutoOrtho attempts to mount
 You can clear mounts manually with the command `sudo umount -f AutoOrtho`.
