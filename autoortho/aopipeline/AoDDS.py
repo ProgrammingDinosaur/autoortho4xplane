@@ -2711,7 +2711,8 @@ def build_mipmap_chain(
     format: str = "BC1",
     missing_color: Tuple[int, int, int] = (66, 77, 55),
     max_mipmaps: int = 0,
-    pool: Optional[c_void_p] = None
+    pool: Optional[c_void_p] = None,
+    max_threads: int = 0
 ) -> MipmapChainResult:
     """
     Build a mipmap chain from JPEG data: starting level + all smaller mipmaps.
@@ -2828,11 +2829,12 @@ def build_mipmap_chain(
             POINTER(c_uint32),          # mipmap_offsets
             POINTER(c_uint32),          # mipmap_sizes
             c_int32,                    # max_mipmaps
-            c_void_p                    # pool
+            c_void_p,                   # pool
+            c_int32                     # max_threads
         ]
         lib.aodds_build_mipmap_chain.restype = c_int32
         lib._mipmap_chain_setup_done = True
-    
+
     # Call native function
     success = lib.aodds_build_mipmap_chain(
         jpeg_ptrs,
@@ -2849,7 +2851,8 @@ def build_mipmap_chain(
         mipmap_offsets_arr,
         mipmap_sizes_arr,
         max_mipmaps if max_mipmaps > 0 else 0,
-        pool_handle
+        pool_handle,
+        c_int32(max_threads)
     )
     
     elapsed_ms = (time.monotonic() - start_time) * 1000
@@ -2920,7 +2923,8 @@ def build_all_mipmaps_native(
     jpeg_datas_per_zoom: List[List[Optional[bytes]]],
     format: str = "BC1",
     missing_color: Tuple[int, int, int] = (66, 77, 55),
-    pool: Optional[c_void_p] = None
+    pool: Optional[c_void_p] = None,
+    max_threads: int = 0
 ) -> NativeMipmapResult:
     """
     Build ALL mipmaps from native zoom level chunks.
@@ -3108,11 +3112,12 @@ def build_all_mipmaps_native(
             POINTER(c_uint8),                    # output
             c_uint32,                            # output_size
             POINTER(c_uint32),                   # bytes_written
-            c_void_p                             # pool
+            c_void_p,                            # pool
+            c_int32                              # max_threads
         ]
         lib.aodds_build_all_mipmaps_native.restype = c_int32
         lib._all_mipmaps_native_setup_done = True
-    
+
     # Call native function
     success = lib.aodds_build_all_mipmaps_native(
         cast(jpeg_data_per_zoom_ptrs, POINTER(POINTER(POINTER(c_uint8)))),
@@ -3126,7 +3131,8 @@ def build_all_mipmaps_native(
         output_buffer.ctypes.data_as(POINTER(c_uint8)),
         output_size,
         byref(bytes_written),
-        pool_handle
+        pool_handle,
+        c_int32(max_threads)
     )
     
     elapsed_ms = (time.monotonic() - start_time) * 1000

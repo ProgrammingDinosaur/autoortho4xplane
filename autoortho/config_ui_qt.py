@@ -1436,6 +1436,32 @@ class ConfigUI(QMainWindow):
         cache_layout.addWidget(browse_btn)
         paths_layout.addLayout(cache_layout)
 
+        # Long-term cache dir
+        lt_cache_layout = QHBoxLayout()
+        lt_cache_label = QLabel("Long-term cache dir:")
+        lt_cache_label.setToolTip(
+            "Optional permanent cache directory (e.g. large slow disk or\n"
+            "network share). Leave empty to disable.\n"
+            "Chunks are stored here permanently and promoted to local\n"
+            "cache on access, avoiding re-downloads across reinstalls."
+        )
+        lt_cache_layout.addWidget(lt_cache_label)
+        self.lt_cache_dir_edit = QLineEdit(
+            str(getattr(self.cfg.paths, 'long_term_cache_dir', '') or '')
+        )
+        self.lt_cache_dir_edit.setObjectName('long_term_cache_dir')
+        self.lt_cache_dir_edit.setPlaceholderText("Optional — leave empty to disable")
+        self.lt_cache_dir_edit.setToolTip(
+            "Full path to long-term cache directory"
+        )
+        lt_cache_layout.addWidget(self.lt_cache_dir_edit)
+        browse_btn = StyledButton("Browse")
+        browse_btn.clicked.connect(
+            lambda: self.browse_folder(self.lt_cache_dir_edit)
+        )
+        lt_cache_layout.addWidget(browse_btn)
+        paths_layout.addLayout(lt_cache_layout)
+
         # Download dir
         download_layout = QHBoxLayout()
         download_label = QLabel("Temp download dir:")
@@ -5045,8 +5071,8 @@ class ConfigUI(QMainWindow):
         self.update_status_bar("Mounting sceneries...")
         self.run_button.setEnabled(False)
         self.run_button.setText("Running")
-        self.mount_sceneries(blocking=False)
         self.verify()
+        self.mount_sceneries(blocking=False)
         self.running = True  # Set running state
         self.update_status_bar("Running")
         # Minimize window if hide setting is enabled
@@ -5677,6 +5703,7 @@ class ConfigUI(QMainWindow):
         self.cfg.paths.scenery_path = self.scenery_path_edit.text()
         self.cfg.paths.xplane_path = self.xplane_path_edit.text()
         self.cfg.paths.cache_dir = self.cache_dir_edit.text()
+        self.cfg.paths.long_term_cache_dir = self.lt_cache_dir_edit.text()
         self.cfg.paths.download_dir = self.download_dir_edit.text()
 
         # Save options
@@ -5869,14 +5896,31 @@ class ConfigUI(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return False
 
-            # Attempt unmount via AOMount implementation if available
+            import subprocess as _sp
             for scenery in self.cfg.scenery_mounts:
-                try:
-                    mount = scenery.get('mount')
-                    cleanup_mountpoint(mount)
-                    log.info(f"Cleaned up mountpoint: {mount}")
-                except Exception:
-                    log.error(f"Failed to cleanup mountpoint: {mount}")
+                mount = scenery.get('mount')
+                if not mount:
+                    continue
+                if safe_ismount(mount):
+                    try:
+                        if system_type == 'darwin':
+                            _sp.run(["diskutil", "unmount", "force", mount],
+                                    check=False, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                        elif system_type == 'linux':
+                            if shutil.which("fusermount"):
+                                _sp.run(["fusermount", "-u", "-z", mount],
+                                        check=False, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                            else:
+                                _sp.run(["umount", "-l", mount],
+                                        check=False, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                    except Exception as exc:
+                        log.warning(f"Force unmount attempt failed for {mount}: {exc}")
+                if not safe_ismount(mount):
+                    try:
+                        cleanup_mountpoint(mount)
+                        log.info(f"Cleaned up mountpoint: {mount}")
+                    except Exception as exc:
+                        log.error(f"Failed to cleanup mountpoint: {mount}: {exc}")
 
             # Brief wait loop for unmount completion
             import time as _time

@@ -280,7 +280,28 @@ def update_process_memory_stat():
         if sys.platform == 'darwin':
             mem_bytes = _get_macos_phys_footprint()
 
-        # 2) USS via psutil (unique set size, excludes shared libs)
+        # 2) Linux: VmRSS + VmSwap. Swap MUST be counted — otherwise once the
+        #    kernel swaps out cold pages, the reported memory drops and the
+        #    eviction loop (which consumes this aggregate via cur_mem_mb) stops
+        #    firing while the real footprint balloons into swap. /proc status
+        #    is a fast fixed-size read, unlike smaps-based USS.
+        if mem_bytes <= 0 and sys.platform == 'linux':
+            try:
+                rss = 0
+                swap = 0
+                with open(f"/proc/{pid}/status", "rb") as fh:
+                    for line in fh:
+                        if line.startswith(b"VmRSS:"):
+                            rss = int(line.split()[1]) * 1024
+                        elif line.startswith(b"VmSwap:"):
+                            swap = int(line.split()[1]) * 1024
+                            break
+                if rss:
+                    mem_bytes = rss + swap
+            except Exception:
+                pass
+
+        # 3) USS via psutil (unique set size, excludes shared libs)
         if mem_bytes <= 0:
             try:
                 full_info = proc.memory_full_info()
@@ -290,7 +311,7 @@ def update_process_memory_stat():
                     NotImplementedError, psutil.NoSuchProcess):
                 pass
 
-        # 3) RSS fallback
+        # 4) RSS fallback
         if mem_bytes <= 0:
             mem_bytes = proc.memory_info().rss
 

@@ -4,8 +4,10 @@ import atexit
 import ctypes
 import gc
 import glob as glob_mod
+import hashlib
 import heapq
 import itertools
+import errno
 import os
 import re
 import sys
@@ -636,8 +638,7 @@ def _get_tile_queue_max_size() -> int:
 
 def _build_dds_hybrid(chunks: list, dxt_format: str,
                       missing_color: tuple,
-                      buffer_priority: int = PRIORITY_LIVE,
-                      native_timeout: float = 5.0) -> bytes:
+                      buffer_priority: int = PRIORITY_LIVE) -> bytes:
     """
     Build DDS using HYBRID approach: chunks already in memory + native decode.
     
@@ -695,28 +696,29 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
             return None
         
         try:
-            with _native_build_context(timeout=native_timeout):
+            with _native_build_context() as threads:
                 result = native.build_from_jpegs_to_buffer(
                     buffer,
                     jpeg_datas,
                     format=dxt_format,
                     missing_color=missing_color,
-                    max_threads=_compute_thread_budget()
+                    max_threads=threads
                 )
 
             if result.success and result.bytes_written >= 128:
                 dds_bytes = result.to_bytes()
-                log.debug(f"Hybrid DDS build: {valid_count}/{len(chunks)} chunks, "
-                          f"{len(dds_bytes)} bytes")
+                if log.isEnabledFor(logging.DEBUG):
+                    active, total_threads = _native_thread_load()
+                    log.debug(f"Hybrid DDS build: {valid_count}/{len(chunks)} chunks, "
+                              f"{len(dds_bytes)} bytes, {threads} threads "
+                              f"({active} concurrent, {total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
                 return dds_bytes
             else:
                 log.debug("Hybrid DDS build: compression failed")
                 return None
         finally:
             pool.release(buffer_id)
-            
-    except _NativeBuildBusy:
-        raise
+
     except Exception as e:
         log.debug(f"Hybrid DDS build exception: {e}")
         return None
@@ -764,8 +766,11 @@ def _build_dds_native(cache_dir: str, tile_row: int, tile_col: int,
         )
         
         if result.success:
-            log.debug(f"Native DDS build: {result.chunks_decoded}/{result.chunks_found} chunks, "
-                      f"{result.mipmaps} mipmaps, {result.elapsed_ms:.1f}ms")
+            if log.isEnabledFor(logging.DEBUG):
+                active, total_threads = _native_thread_load()
+                log.debug(f"Native DDS build: {result.chunks_decoded}/{result.chunks_found} chunks, "
+                          f"{result.mipmaps} mipmaps, {result.elapsed_ms:.1f}ms "
+                          f"({active} concurrent, {total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
             return result.data
         else:
             log.debug(f"Native DDS build failed: {result.error}")
@@ -811,12 +816,39 @@ _progressive_executor_lock = threading.Lock()
 
 # Track concurrent native builds for OpenMP thread budget coordination.
 # Shared across background builder, live builder, and streaming builder.
+# `_active_native_thread_count` is the SUM of per-build OpenMP thread budgets
+# currently in flight; comparing it against CURRENT_CPU_COUNT measures actual
+# CPU oversubscription (peak captured separately for periodic reporting).
 _active_native_builds = 0
+_active_native_thread_count = 0
+_peak_native_thread_count = 0
 _active_native_builds_lock = threading.Lock()
 
+
+def _native_thread_load() -> tuple:
+    """Snapshot of (active_builds, total_threads_in_flight) under the lock."""
+    with _active_native_builds_lock:
+        return (_active_native_builds, _active_native_thread_count)
+
+
+def native_thread_load_peak_and_reset() -> tuple:
+    """Return ``(active_builds, total_threads, peak_threads)`` and reset peak.
+
+    Intended for periodic reporting (e.g. stats loop). Resetting on read gives
+    a windowed peak between calls.
+    """
+    global _peak_native_thread_count
+    with _active_native_builds_lock:
+        snap = (_active_native_builds, _active_native_thread_count, _peak_native_thread_count)
+        _peak_native_thread_count = _active_native_thread_count
+    return snap
+
 # Track live (FUSE-requested) tile reads in progress.
-# When > 0, prefetching and background DDS building pause to give
-# all chunk download and tile building resources to live requests.
+# When threshold exceeded, prefetching pauses to give network resources
+# to live requests. Background DDS building does NOT pause — instrumentation
+# (native_semaphore_wait_ms_live) confirmed zero contention; gating the
+# builder leaves it idle for the entire flight (the symptom in the bug logs:
+# `BackgroundDDSBuilder: 0 tiles built`).
 _live_reads_in_progress = 0
 _live_reads_lock = threading.Lock()
 
@@ -860,13 +892,13 @@ def _live_read_end():
 
 
 def is_live_building() -> bool:
-    """Return True if any live tile reads are in progress."""
+    """Return True if live read pressure is high enough to pause prefetching."""
     with _live_reads_lock:
-        return _live_reads_in_progress > 0
+        return _live_reads_in_progress >= 6
 
 
-def _compute_thread_budget() -> int:
-    """Compute per-build OpenMP thread count to avoid oversubscription.
+def _thread_budget_for(active: int) -> int:
+    """Per-build OpenMP thread count given the number of active builds (including self).
 
     Divides CPU cores across active concurrent builds so total threads ~ cpu_count.
     Returns at least 2 to ensure each build makes progress.
@@ -879,16 +911,7 @@ def _compute_thread_budget() -> int:
     except (ValueError, TypeError, AttributeError):
         pass
 
-    with _active_native_builds_lock:
-        active = max(1, _active_native_builds)
-    return max(2, CURRENT_CPU_COUNT // active)
-
-
-_native_build_semaphore = threading.Semaphore(1)
-
-
-class _NativeBuildBusy(Exception):
-    """Raised when the native build semaphore cannot be acquired within the timeout."""
+    return max(2, CURRENT_CPU_COUNT // max(1, active))
 
 
 class _BackgroundBuildDeferred(Exception):
@@ -896,29 +919,23 @@ class _BackgroundBuildDeferred(Exception):
 
 
 class _native_build_context:
-    """Serialize native DDS builds to prevent concurrent OpenMP crashes.
-
-    The ISPC/OpenMP runtime is not safe when multiple threads enter
-    ``omp_set_num_threads`` or parallel regions simultaneously.  Using a
-    semaphore (count=1) ensures only one ``finalize_to_file`` executes at
-    a time while still tracking active builds for thread budget math.
-    """
-    def __init__(self, timeout=5.0):
-        self._timeout = timeout
-
+    """``__enter__`` returns the per-build OpenMP thread budget under the same lock
+    that increments the active-build counter, so each build sees itself in the count."""
     def __enter__(self):
-        global _active_native_builds
-        if not _native_build_semaphore.acquire(timeout=self._timeout):
-            raise _NativeBuildBusy(f"native build semaphore not acquired within {self._timeout}s")
+        global _active_native_builds, _active_native_thread_count, _peak_native_thread_count
         with _active_native_builds_lock:
             _active_native_builds += 1
-        return self
+            self._threads = _thread_budget_for(_active_native_builds)
+            _active_native_thread_count += self._threads
+            if _active_native_thread_count > _peak_native_thread_count:
+                _peak_native_thread_count = _active_native_thread_count
+        return self._threads
 
     def __exit__(self, *exc):
-        global _active_native_builds
+        global _active_native_builds, _active_native_thread_count
         with _active_native_builds_lock:
             _active_native_builds -= 1
-        _native_build_semaphore.release()
+            _active_native_thread_count -= self._threads
         return False
 
 
@@ -1876,6 +1893,174 @@ _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="cache_writer"
 )
 
+_lt_cache_write_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="lt_cache_writer"
+)
+
+# LT cache I/O is offloaded to a small bounded pool so a hung backing FS
+# (e.g. NFS) can't block FUSE threads or stack up unbounded probe threads.
+_lt_io_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="lt_io"
+)
+
+_lt_cache_available = True
+_lt_cache_retry_after = 0.0
+_lt_cache_state_lock = threading.Lock()
+_LT_CACHE_TIMEOUT = 3.0
+_LT_CACHE_RETRY_INTERVAL = 30.0
+
+
+def _lt_chunk_shard(chunk_id: str) -> str:
+    """1-byte shard key (256 buckets) for LT cache fan-out."""
+    return hashlib.blake2b(chunk_id.encode(), digest_size=1).hexdigest()
+
+
+def _lt_chunk_path(lt_dir: str, chunk_id: str) -> str:
+    return os.path.join(lt_dir, _lt_chunk_shard(chunk_id), f"{chunk_id}.jpg")
+
+
+_LT_CACHE_DIR_RESOLVED: tuple = (False, None)  # (initialized, value)
+
+
+def _resolve_lt_cache_dir() -> str | None:
+    """Read ``CFG.paths.long_term_cache_dir`` once and cache the normalized value.
+
+    Per-chunk Chunk.__init__ used to repeat this getattr+str+strip; cache it so
+    chunk creation stays cheap when LT cache is disabled (the common case).
+    """
+    global _LT_CACHE_DIR_RESOLVED
+    initialized, value = _LT_CACHE_DIR_RESOLVED
+    if initialized:
+        return value
+    raw = str(getattr(CFG.paths, 'long_term_cache_dir', '') or '').strip()
+    value = raw if raw else None
+    _LT_CACHE_DIR_RESOLVED = (True, value)
+    return value
+
+
+def _lt_call_with_timeout(fn, *args, on_timeout=None, default=False):
+    """Run ``fn(*args)`` on the LT executor and return its result, or ``default``
+    on timeout/error. Calls ``on_timeout()`` (if given) when the deadline fires."""
+    try:
+        return _lt_io_executor.submit(fn, *args).result(timeout=_LT_CACHE_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        if on_timeout:
+            on_timeout()
+        return default
+    except Exception:
+        return default
+
+
+def _lt_probe_dir(dir_path: str) -> bool:
+    return _lt_call_with_timeout(os.path.isdir, dir_path)
+
+
+def _lt_available(dir_path: str | None = None) -> bool:
+    global _lt_cache_available, _lt_cache_retry_after
+    with _lt_cache_state_lock:
+        if _lt_cache_available:
+            return True
+        if time.monotonic() < _lt_cache_retry_after:
+            return False
+    # Probe outside the lock — _lt_probe_dir blocks on the executor.
+    if dir_path and not _lt_probe_dir(dir_path):
+        with _lt_cache_state_lock:
+            _lt_cache_retry_after = time.monotonic() + _LT_CACHE_RETRY_INTERVAL
+        log.debug("LT cache dir still unreachable, retrying in 30s")
+        return False
+    with _lt_cache_state_lock:
+        _lt_cache_available = True
+    return True
+
+
+def _lt_mark_unavailable(retry_interval: float = _LT_CACHE_RETRY_INTERVAL):
+    global _lt_cache_available, _lt_cache_retry_after
+    with _lt_cache_state_lock:
+        _lt_cache_available = False
+        _lt_cache_retry_after = time.monotonic() + retry_interval
+    log.warning(f"LT cache unavailable, skipping for {retry_interval:.0f}s")
+
+
+def _lt_read_bytes(path: str):
+    """Read a file via the LT executor with timeout. Returns bytes or None."""
+    return _lt_call_with_timeout(
+        Path(path).read_bytes,
+        on_timeout=_lt_mark_unavailable,
+        default=None,
+    )
+
+
+def _cleanup_temp(path: str):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        log.debug(f"_cleanup_temp({path}): {e}")
+
+
+# Tracks the errno from the most recent failed _atomic_write per write directory.
+# Keyed by parent dir (not full path) to bound size to O(dirs) not O(chunks).
+# Consulted by _save_to_dir to choose the right LT cache backoff interval.
+_atomic_write_last_errno: dict[str, int] = {}
+
+
+def _atomic_write(target_path: str, data: bytes) -> bool:
+    """Atomically write ``data`` to ``target_path`` via tempfile + ``os.replace``.
+
+    Creates the parent dir, retries on transient Windows file-lock errors
+    (WinError 5/32/33). Returns True on success or already-exists; False on
+    failure. Bookkeeping (disk budget, stats) is the caller's responsibility.
+    """
+    write_dir = os.path.dirname(target_path)
+    try:
+        os.makedirs(write_dir, exist_ok=True)
+    except OSError as e:
+        log.debug(f"_atomic_write: makedirs failed for {write_dir}: {e}")
+        return False
+
+    if os.path.exists(target_path):
+        return True
+
+    temp_filename = os.path.join(
+        write_dir, f".{os.path.basename(target_path)}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with open(temp_filename, 'wb') as h:
+            h.write(data)
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        _atomic_write_last_errno[write_dir] = e.errno
+        _cleanup_temp(temp_filename)
+        log.warning(f"_atomic_write: failed to write temp for {target_path}: {e}")
+        return False
+    except Exception as e:
+        _cleanup_temp(temp_filename)
+        log.warning(f"_atomic_write: failed to write temp for {target_path}: {e}")
+        return False
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if os.path.exists(target_path):
+                _cleanup_temp(temp_filename)
+                return True
+            os.replace(temp_filename, target_path)
+            return True
+        except FileExistsError:
+            _cleanup_temp(temp_filename)
+            return True
+        except OSError as e:
+            if getattr(e, 'winerror', None) in (5, 32, 33) and attempt < max_attempts:
+                time.sleep(0.05 * attempt)
+                continue
+            _cleanup_temp(temp_filename)
+            log.warning(f"_atomic_write: failed to replace {target_path}: {e}")
+            return False
+    return False
+
 
 def _async_cache_write(chunk):
     """Fire-and-forget cache write. Errors are logged but don't affect processing."""
@@ -1895,17 +2080,20 @@ def _async_cache_write(chunk):
 
 
 def shutdown_cache_writer():
-    """Shutdown the cache writer executor gracefully. Called during module cleanup.
-    
-    Uses wait=True with a timeout to ensure pending writes complete before shutdown,
-    preventing potential file corruption or lost cache writes.
-    """
+    """Shut down the cache write executors. Local writes block to flush; LT writes
+    drop in flight (the LT path may be on a slow/hung backing FS at exit time)."""
     try:
-        # Use wait=True to ensure pending writes complete
-        # Python 3.9+ supports cancel_futures parameter for forceful cancellation
         _cache_write_executor.shutdown(wait=True)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"shutdown_cache_writer: local executor shutdown failed: {e}")
+    try:
+        _lt_cache_write_executor.shutdown(wait=False)
+    except Exception as e:
+        log.debug(f"shutdown_cache_writer: LT executor shutdown failed: {e}")
+    try:
+        _lt_io_executor.shutdown(wait=False)
+    except Exception as e:
+        log.debug(f"shutdown_cache_writer: LT IO executor shutdown failed: {e}")
 
 
 def flush_cache_writer(timeout=30.0):
@@ -3541,7 +3729,7 @@ class TileCompletionTracker:
 class BackgroundDDSBuilder:
     
     # Maximum queue depth (prevents unbounded memory growth)
-    MAX_QUEUE_SIZE = 100
+    MAX_QUEUE_SIZE = 500
     
     def __init__(self, dds_cache,
                  build_interval_sec: float = 0.5,
@@ -3678,10 +3866,6 @@ class BackgroundDDSBuilder:
             if self._stop_event.is_set() or is_shutdown_requested():
                 break
 
-            # Yield all resources to live tile reads when X-Plane is active
-            if is_live_building():
-                continue
-
             # Fill all available worker slots
             with self._active_lock:
                 available = self._max_workers - self._active_builds
@@ -3737,9 +3921,6 @@ class BackgroundDDSBuilder:
             self._build_tile_dds(tile)
         except _BackgroundBuildDeferred:
             bump('background_build_deferred_live')
-            deferred = self.submit(tile, priority=priority)
-        except _NativeBuildBusy:
-            bump('background_build_yielded')
             deferred = self.submit(tile, priority=priority)
         finally:
             if not deferred:
@@ -3947,9 +4128,9 @@ class BackgroundDDSBuilder:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
                 if not staging_path:
                     return False
-                with _native_build_context(timeout=0):
+                with _native_build_context() as threads:
                     success, bytes_written = builder.finalize_to_file(
-                        staging_path, max_threads=_compute_thread_budget()
+                        staging_path, max_threads=threads
                     )
                 
                 if success and bytes_written >= 128:
@@ -3970,9 +4151,7 @@ class BackgroundDDSBuilder:
             
             log.debug(f"BackgroundDDSBuilder: Streaming finalize failed for {tile_id}")
             return False
-            
-        except _NativeBuildBusy:
-            raise
+
         except _BackgroundBuildDeferred:
             raise
         except Exception as e:
@@ -4099,13 +4278,13 @@ class BackgroundDDSBuilder:
                                     if not staging_path:
                                         return
                                     
-                                    with _native_build_context(timeout=0):
+                                    with _native_build_context() as threads:
                                         result = native_dds.build_from_jpegs_to_file(
                                             jpeg_datas,
                                             staging_path,
                                             format=dxt_format,
                                             missing_color=missing_color,
-                                            max_threads=_compute_thread_budget()
+                                            max_threads=threads
                                         )
 
                                     if result.success and result.bytes_written >= 128:
@@ -4117,19 +4296,17 @@ class BackgroundDDSBuilder:
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk built {tile_id} "
                                                   f"in {build_time:.0f}ms ({result.bytes_written} bytes)")
                                         bump('prebuilt_dds_builds_direct')
-                                        
+
                                         return
                                     else:
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for "
                                                   f"{tile_id}: {result.error}, trying buffer path")
-                            except _NativeBuildBusy:
-                                raise
                             except _BackgroundBuildDeferred:
                                 raise
                             except Exception as e:
                                 log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for {tile_id}: "
                                           f"{e}, trying buffer path")
-                        
+
                         # ═══════════════════════════════════════════════════════════════
                         # BUFFER PATH FALLBACK
                         # Used when direct-to-disk unavailable or fails
@@ -4140,9 +4317,8 @@ class BackgroundDDSBuilder:
                                 dxt_format=dxt_format,
                                 missing_color=missing_color,
                                 buffer_priority=PRIORITY_PREFETCH,
-                                native_timeout=0
                             )
-                            
+
                             if dds_bytes and len(dds_bytes) >= 128:
                                 # Hybrid build succeeded - store in DDS cache
                                 if self._dds_cache is not None:
@@ -4157,13 +4333,11 @@ class BackgroundDDSBuilder:
                                 log.debug(f"BackgroundDDSBuilder: Hybrid built {tile_id} in "
                                           f"{build_time:.0f}ms ({len(dds_bytes)} bytes)")
                                 bump('prebuilt_dds_builds_hybrid')
-                                
+
                                 return
                             else:
                                 log.debug(f"BackgroundDDSBuilder: Hybrid build returned no data "
                                           f"for {tile_id}, trying native file I/O")
-                        except _NativeBuildBusy:
-                            raise
                         except Exception as e:
                             log.debug(f"BackgroundDDSBuilder: Hybrid build failed for {tile_id}: "
                                       f"{e}, trying native file I/O")
@@ -4189,7 +4363,7 @@ class BackgroundDDSBuilder:
                         if not staging_path:
                             return
 
-                        with _native_build_context(timeout=0):
+                        with _native_build_context():
                             result = native_dds.build_tile_to_file(
                                 cache_dir=tile.cache_dir,
                                 row=tile.row,
@@ -4224,8 +4398,6 @@ class BackgroundDDSBuilder:
                         else:
                             log.debug(f"BackgroundDDSBuilder: Native direct-to-disk failed for "
                                       f"{tile_id}: {result.error}, trying buffer path")
-                    except _NativeBuildBusy:
-                        raise
                     except _BackgroundBuildDeferred:
                         raise
                     except Exception as e:
@@ -4262,7 +4434,7 @@ class BackgroundDDSBuilder:
                 
                 try:
                     _defer_background_build_if_live(tile)
-                    with _native_build_context(timeout=0):
+                    with _native_build_context():
                         result = native_dds.build_tile_to_buffer(
                             buffer,
                             cache_dir=tile.cache_dir,
@@ -5101,6 +5273,12 @@ class Chunk(object):
         self.prefetch = False
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
+
+        self.lt_cache_dir = _resolve_lt_cache_dir()
+        self.lt_cache_path = (
+            _lt_chunk_path(self.lt_cache_dir, self.chunk_id)
+            if self.lt_cache_dir else None
+        )
         
         # Check cache during initialization and set ready if found
         # skip_cache_check=True allows batch cache reading optimization
@@ -5180,7 +5358,47 @@ class Chunk(object):
                 return False  # FIXED: Explicitly return False for corrupted cache
         else:
             bump('chunk_miss')
+            if self.lt_cache_path and _lt_available(self.lt_cache_dir):
+                data = _lt_read_bytes(self.lt_cache_path)
+                if data and _is_jpeg(data[:3]):
+                    self.data = data
+                    bump('chunk_lt_hit')
+                    log.debug(f"LT cache hit for {self}")
+                    _lt_cache_write_executor.submit(self._save_to_dir, self.cache_dir)
+                    return True
             return False
+
+    def _save_to_dir(self, target_dir):
+        data = self.data
+        if not data:
+            return
+
+        if target_dir == self.lt_cache_dir:
+            target_path = self.lt_cache_path
+            if not target_path:
+                return
+        else:
+            target_path = os.path.join(target_dir, f"{self.chunk_id}.jpg")
+
+        if not _atomic_write(target_path, data):
+            if target_dir == self.lt_cache_dir:
+                # EPERM = mount is read-only (NFS, NTFS, TCC). Back off 5 min.
+                # Other failures = transient; use standard 30s interval.
+                last_err = _atomic_write_last_errno.get(os.path.dirname(target_path))
+                retry = 300.0 if last_err == errno.EPERM else _LT_CACHE_RETRY_INTERVAL
+                if last_err == errno.EPERM:
+                    log.error(
+                        f"LT cache write denied (EPERM) at {target_dir} — "
+                        "check NFS export options or filesystem permissions. "
+                        f"Disabling LT writes for {retry:.0f}s."
+                    )
+                _lt_mark_unavailable(retry)
+            return
+
+        if target_dir == self.lt_cache_dir:
+            bump('chunk_lt_write')
+        elif target_dir == self.cache_dir and disk_budget_manager is not None:
+            disk_budget_manager.account_jpeg(len(data))
 
     def save_cache(self):
         # Snapshot data to avoid races with close() mutating self.data
@@ -5188,80 +5406,18 @@ class Chunk(object):
         if not data:
             return
 
-        # Check if cache directory still exists (may have been deleted by temp cleanup)
+        # Skip if the parent cache dir was nuked (e.g. diagnose temp cleanup).
         if not os.path.exists(self.cache_dir):
             log.debug(f"Cache directory gone for {self}, skipping save")
             return
 
-        # Ensure cache directory exists
-        try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-        except (FileNotFoundError, OSError):
-            # Directory path is invalid or was deleted
-            log.debug(f"Cannot create cache directory for {self}, skipping save")
-            return
-        except Exception:
-            pass
-
-        # Unique temp filename per writer to avoid collisions between threads/tiles
-        temp_filename = os.path.join(self.cache_dir, f"{self.chunk_id}_{uuid.uuid4().hex}.tmp")
-
-        # Write data to the unique temp file first
-        try:
-            with open(temp_filename, 'wb') as h:
-                h.write(data)
-        except FileNotFoundError as e:
-            # Directory was deleted between check and write (race with temp cleanup)
-            log.debug(f"Cache directory deleted during save for {self}: {e}")
-            return
-        except Exception as e:
-            # Could not write temp file
-            try:
-                if os.path.exists(temp_filename):
-                    os.remove(temp_filename)
-            except Exception:
-                pass
-            log.warning(f"Failed to save cache for {self}: {e}")
+        if not _atomic_write(self.cache_path, data):
             return
 
-        # Try to move into place atomically with a few retries for WinError 32
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            try:
-                if os.path.exists(self.cache_path):
-                    # Another writer got there first; clean up our temp
-                    os.remove(temp_filename)
-                    log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
-                    return
-                os.replace(temp_filename, self.cache_path)
-                if disk_budget_manager is not None:
-                    disk_budget_manager.account_jpeg(len(data))
-                return
-            except FileExistsError:
-                try:
-                    os.remove(temp_filename)
-                except Exception:
-                    pass
-                log.debug(f"Another thread saved cache for {self}, removed temp file")
-                return
-            except OSError as e:
-                if getattr(e, 'winerror', None) in (5, 32, 33) and attempt < max_attempts:
-                    time.sleep(0.05 * attempt)
-                    if os.path.exists(self.cache_path):
-                        try:
-                            if os.path.exists(temp_filename):
-                                os.remove(temp_filename)
-                        except Exception:
-                            pass
-                        return
-                    continue
-                try:
-                    if os.path.exists(temp_filename):
-                        os.remove(temp_filename)
-                except Exception:
-                    pass
-                log.warning(f"Failed to save cache for {self}: {e}")
-                return
+        if disk_budget_manager is not None:
+            disk_budget_manager.account_jpeg(len(data))
+        if self.lt_cache_dir:
+            _lt_cache_write_executor.submit(self._save_to_dir, self.lt_cache_dir)
 
     def get(self, idx=0, session=requests, timeout=None, max_attempts=None):
         log.debug(f"Getting {self}")
@@ -5456,7 +5612,6 @@ class Chunk(object):
                 
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout) as err:
-            self.attempt += 1
             backoff = min(10.0, 0.5 * (2 ** min(self.attempt, 5)))
             log.warning(f"{self} connection/timeout error (attempt {self.attempt}), "
                         f"backoff {backoff:.1f}s: {err}")
@@ -6215,13 +6370,13 @@ class Tile(object):
             # ═══════════════════════════════════════════════════════════════
             # STEP 4: Build DDS with native aopipeline
             # ═══════════════════════════════════════════════════════════════
-            with _native_build_context():
+            with _native_build_context() as threads:
                 result = native_dds.build_from_jpegs_to_buffer(
                     buffer,
                     jpeg_datas,
                     format=dxt_format,
                     missing_color=missing_color,
-                    max_threads=_compute_thread_budget()
+                    max_threads=threads
                 )
 
             if not result.success:
@@ -6545,8 +6700,8 @@ class Tile(object):
                 return False
             
             try:
-                with _native_build_context():
-                    result = builder.finalize(buffer, max_threads=_compute_thread_budget())
+                with _native_build_context() as threads:
+                    result = builder.finalize(buffer, max_threads=threads)
                 if result.success and result.bytes_written >= 128:
                     dds_bytes = bytes(buffer[:result.bytes_written])
                     if self._populate_dds_from_prebuilt(dds_bytes):
@@ -6871,9 +7026,9 @@ class Tile(object):
         radius_nm = max(1.0, min(80.0, radius_nm))
 
         try:
-            max_promotions = int(getattr(CFG.autoortho, 'partial_cache_promote_max_tiles', 160))
+            max_promotions = int(getattr(CFG.autoortho, 'partial_cache_promote_max_tiles', 500))
         except Exception:
-            max_promotions = 160
+            max_promotions = 500
         max_promotions = max(0, min(1000, max_promotions))
         if max_promotions <= 0:
             bump('partial_mm0_promote_cap_zero')
@@ -6906,7 +7061,7 @@ class Tile(object):
                 return False
         else:
             try:
-                startup_cap = int(getattr(CFG.autoortho, 'partial_cache_promote_startup_max_tiles', 96))
+                startup_cap = int(getattr(CFG.autoortho, 'partial_cache_promote_startup_max_tiles', 500))
             except Exception:
                 startup_cap = 96
             startup_cap = max(0, min(max_promotions, startup_cap))
@@ -8888,7 +9043,7 @@ class Tile(object):
         
         try:
             native_build_start = time.monotonic()
-            
+
             # Get compression format and missing color
             dxt_format = CFG.pydds.format.upper()
             missing_color = (
@@ -8940,52 +9095,21 @@ class Tile(object):
                             jpeg_datas_per_zoom.append([])
                             chain_truncated = True
                 
-                # Use thread budget coordination for mipmap 0 (256 chunks,
-                # significant CPU).  Mipmaps 1-4 have <=64 chunks and don't
-                # need it.
-                if mipmap == 0:
-                    with _native_build_context():
-                        result = native_dds.build_all_mipmaps_native(
-                            jpeg_datas_per_zoom,
-                            format=dxt_format,
-                            missing_color=missing_color
-                        )
-                else:
-                    result = native_dds.build_all_mipmaps_native(
-                        jpeg_datas_per_zoom,
-                        format=dxt_format,
-                        missing_color=missing_color
-                    )
+                build_fn = native_dds.build_all_mipmaps_native
+                build_args = (jpeg_datas_per_zoom,)
+                build_kwargs = {'format': dxt_format, 'missing_color': missing_color}
             elif hasattr(native_dds, 'build_mipmap_chain'):
-                if mipmap == 0:
-                    with _native_build_context():
-                        result = native_dds.build_mipmap_chain(
-                            jpeg_datas,
-                            format=dxt_format,
-                            missing_color=missing_color,
-                            max_mipmaps=max_mipmaps
-                        )
-                else:
-                    result = native_dds.build_mipmap_chain(
-                        jpeg_datas,
-                        format=dxt_format,
-                        missing_color=missing_color,
-                        max_mipmaps=max_mipmaps
-                    )
+                build_fn = native_dds.build_mipmap_chain
+                build_args = (jpeg_datas,)
+                build_kwargs = {'format': dxt_format, 'missing_color': missing_color,
+                                'max_mipmaps': max_mipmaps}
             else:
-                if mipmap == 0:
-                    with _native_build_context():
-                        result = native_dds.build_single_mipmap(
-                            jpeg_datas,
-                            format=dxt_format,
-                            missing_color=missing_color
-                        )
-                else:
-                    result = native_dds.build_single_mipmap(
-                        jpeg_datas,
-                        format=dxt_format,
-                        missing_color=missing_color
-                    )
+                build_fn = native_dds.build_single_mipmap
+                build_args = (jpeg_datas,)
+                build_kwargs = {'format': dxt_format, 'missing_color': missing_color}
+
+            with _native_build_context() as threads:
+                result = build_fn(*build_args, max_threads=threads, **build_kwargs)
             
             if not result.success:
                 log.debug(f"_try_native_mipmap_build: Build failed for mipmap {mipmap}: {result.error}")
@@ -9038,10 +9162,14 @@ class Tile(object):
             mm_stats.set(mipmap, total_time)
             tile_creation_stats.set(mipmap, total_time)
             
-            mipmaps_built = getattr(result, 'mipmap_count', 1)
-            log.debug(f"_try_native_mipmap_build: SUCCESS mipmap {mipmap} - "
-                     f"{len(result.data)} bytes ({mipmaps_built} mipmaps) in {total_time*1000:.0f}ms "
-                     f"(native: {native_time*1000:.0f}ms, {ready_count}/{total_chunks} chunks)")
+            if log.isEnabledFor(logging.DEBUG):
+                mipmaps_built = getattr(result, 'mipmap_count', 1)
+                active, total_threads = _native_thread_load()
+                log.debug(f"_try_native_mipmap_build: SUCCESS mipmap {mipmap} - "
+                         f"{len(result.data)} bytes ({mipmaps_built} mipmaps) in {total_time*1000:.0f}ms "
+                         f"(native: {native_time*1000:.0f}ms, {ready_count}/{total_chunks} chunks, "
+                         f"{threads} threads, {active} concurrent, "
+                         f"{total_threads}/{CURRENT_CPU_COUNT} threads in flight)")
             
             return True
             
@@ -9666,6 +9794,21 @@ def _get_process_mem_bytes(process):
         fp = _get_macos_phys_footprint()
         if fp > 0:
             return fp
+    if sys.platform == 'linux':
+        try:
+            rss = 0
+            swap = 0
+            with open(f"/proc/{process.pid}/status", "rb") as fh:
+                for line in fh:
+                    if line.startswith(b"VmRSS:"):
+                        rss = int(line.split()[1]) * 1024
+                    elif line.startswith(b"VmSwap:"):
+                        swap = int(line.split()[1]) * 1024
+                        break  # VmSwap follows VmRSS in /proc status
+            if rss:
+                return rss + swap
+        except Exception:
+            pass
     return process.memory_info().rss
 
 
@@ -9708,6 +9851,9 @@ class TileCacher(object):
         # On macOS multi-process, "cold" workers (no recent access) evict
         # more aggressively than "hot" workers with fresh tiles.
         self._last_access_ts = time.monotonic()
+        # Bounded ring of recently-evicted tile ids for thrash detection.
+        # Maps idx -> eviction monotonic time; capped at 500 entries (OrderedDict FIFO).
+        self._recently_evicted: dict = OrderedDict()
         
         self.cache_dir = CFG.paths.cache_dir
         log.info(f"Cache dir: {self.cache_dir}")
@@ -9747,7 +9893,7 @@ class TileCacher(object):
             # Windows doesn't handle FS cache the same way so enable here.
             self.enable_cache = True
             self.cache_tile_lim = 50
-    
+
     def _compute_dynamic_zoom(self, row: int, col: int, tile_zoom: int) -> int:
         """
         Compute dynamic zoom level based on predicted altitude at tile.
@@ -10031,6 +10177,11 @@ class TileCacher(object):
             #set_stat('tile_mem_hits', self.hits)
             log.debug(f"TILE CACHE:  MISS: {self.misses}  HIT: {self.hits}")
         log.debug(f"NUM OPEN TILES: {len(self.tiles)}.  TOTAL MEM: {cur_mem//1048576} MB")
+        active_now, total_now, peak_threads = native_thread_load_peak_and_reset()
+        if peak_threads > 0:
+            over = "OVERSUBSCRIBED" if peak_threads > CURRENT_CPU_COUNT else "ok"
+            log.debug(f"NATIVE BUILDS: now={active_now} ({total_now} threads), "
+                      f"peak_threads_since_last={peak_threads}/{CURRENT_CPU_COUNT} [{over}]")
 
     # -----------------------------
     # LRU helpers and leader logic
@@ -10128,6 +10279,9 @@ class TileCacher(object):
                     # Pop from dict immediately - tile is now "orphaned"
                     try:
                         batch.append((idx, self.tiles.pop(idx)))
+                        self._recently_evicted[idx] = now
+                        if len(self._recently_evicted) > 500:
+                            self._recently_evicted.popitem(last=False)
                     except KeyError:
                         continue
             
@@ -10418,6 +10572,10 @@ class TileCacher(object):
             if not tile:
                 self.misses += 1
                 bump('tile_mem_miss')
+                evicted_at = self._recently_evicted.pop(idx, None)
+                if evicted_at is not None:
+                    bump('evict_reload_after_evict')
+                    log.debug(f"Thrash: {idx} reloaded {time.monotonic() - evicted_at:.1f}s after eviction")
                 # Use target zoom level - supports both fixed and dynamic modes
                 # Pass row/col for dynamic zoom computation based on predicted altitude
                 tile = Tile(

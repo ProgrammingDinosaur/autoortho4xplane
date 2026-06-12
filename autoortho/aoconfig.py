@@ -113,6 +113,10 @@ xplane_path =
 scenery_path =
 # Directory where satellite images are cached
 cache_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "cache")}
+# Optional long-term cache directory (e.g. large slow disk or network share).
+# Leave empty to disable. Chunks are stored here permanently and promoted to
+# local cache on access, avoiding re-downloads across reinstalls or machines.
+long_term_cache_dir =
 # Set directory for temporary downloading of scenery and other support files
 download_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "downloads")}
 # Changing log_file dir is currently not supported
