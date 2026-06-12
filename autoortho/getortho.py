@@ -9794,6 +9794,21 @@ def _get_process_mem_bytes(process):
         fp = _get_macos_phys_footprint()
         if fp > 0:
             return fp
+    if sys.platform == 'linux':
+        try:
+            rss = 0
+            swap = 0
+            with open(f"/proc/{process.pid}/status", "rb") as fh:
+                for line in fh:
+                    if line.startswith(b"VmRSS:"):
+                        rss = int(line.split()[1]) * 1024
+                    elif line.startswith(b"VmSwap:"):
+                        swap = int(line.split()[1]) * 1024
+                        break  # VmSwap follows VmRSS in /proc status
+            if rss:
+                return rss + swap
+        except Exception:
+            pass
     return process.memory_info().rss
 
 
