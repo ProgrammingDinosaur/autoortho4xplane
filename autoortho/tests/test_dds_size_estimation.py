@@ -2,6 +2,7 @@
 """Tests for virtual DDS size estimates reported through FUSE metadata."""
 
 import importlib
+import os
 import sys
 import types
 from pathlib import Path
@@ -146,3 +147,32 @@ def test_fixed_mode_size_behavior_is_unchanged(monkeypatch):
     high_zoom_fake_ao.tc.target_zoom_level_near_airports = 19
     assert _calculate_size(module, high_zoom_fake_ao, 16) == SIZE_8K_BC1
     assert _calculate_size(module, high_zoom_fake_ao, 18) == SIZE_8K_BC1
+
+
+def test_dsf_open_continues_when_fuse_context_unavailable(monkeypatch, tmp_path):
+    module = _load_autoortho_fuse(monkeypatch)
+
+    def broken_fuse_context():
+        raise AttributeError("'int' object has no attribute 'contents'")
+
+    monkeypatch.setattr(module, "fuse_get_context", broken_fuse_context)
+    monkeypatch.setattr(module.time_exclusion_manager, "get_redirect_path", lambda path: None)
+    opened_dsfs = []
+    monkeypatch.setattr(module.time_exclusion_manager, "register_dsf_open", opened_dsfs.append)
+
+    root = tmp_path / "scenery"
+    dsf_rel = Path("Earth nav data") / "+10-020" / "+10-020.dsf"
+    dsf_path = root / dsf_rel
+    dsf_path.parent.mkdir(parents=True)
+    dsf_path.write_bytes(b"XPLNEDSF")
+
+    ao = module.AutoOrtho(str(root), cache_dir=str(tmp_path / "cache"))
+    fuse_path = "/" + dsf_rel.as_posix()
+
+    fh = ao.open(fuse_path, os.O_RDONLY)
+    try:
+        assert os.read(fh, 8) == b"XPLNEDSF"
+    finally:
+        os.close(fh)
+
+    assert opened_dsfs == [fuse_path]

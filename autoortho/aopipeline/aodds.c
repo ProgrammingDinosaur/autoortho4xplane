@@ -41,7 +41,7 @@
 #endif
 
 /* Version string */
-#define AODDS_VERSION "1.0.0"
+#define AODDS_VERSION "1.1.0"
 
 /* DDS file constants */
 #define DDS_MAGIC 0x20534444  /* "DDS " */
@@ -1606,9 +1606,6 @@ AODDS_API int32_t aodds_build_from_jpegs(
     int32_t decoded = 0;
 
 #if AOPIPELINE_HAS_OPENMP
-    if (max_threads > 0) {
-        omp_set_num_threads(max_threads);
-    }
     /* ========================================================================
      * THREAD-SAFE POOLED DECODERS
      *
@@ -1620,7 +1617,7 @@ AODDS_API int32_t aodds_build_from_jpegs(
      * - JPEG decoding happens OUTSIDE the lock (full parallelism)
      * - Decoders are reused across calls (no repeated init/destroy)
      * ======================================================================== */
-    #pragma omp parallel reduction(+:decoded)
+    #pragma omp parallel num_threads(AODDS_OMP_THREADS(max_threads)) reduction(+:decoded)
     {
         /* Acquire a decoder from the thread-safe pool */
         int decoder_from_pool = 0;
@@ -1878,15 +1875,12 @@ AODDS_API int32_t aodds_build_single_mipmap(
     int32_t decoded = 0;
 
 #if AOPIPELINE_HAS_OPENMP
-    if (max_threads > 0) {
-        omp_set_num_threads(max_threads);
-    }
-    #pragma omp parallel reduction(+:decoded)
+    #pragma omp parallel num_threads(AODDS_OMP_THREADS(max_threads)) reduction(+:decoded)
     {
         /* Acquire decoder from thread-safe pool */
         int decoder_from_pool = 0;
         tjhandle tjh = acquire_pooled_decoder(&decoder_from_pool);
-        
+
         if (tjh) {
             #pragma omp for schedule(static)
             for (int32_t i = 0; i < chunk_count; i++) {
@@ -2318,7 +2312,8 @@ AODDS_API int32_t aodds_build_mipmap_chain(
     uint32_t* mipmap_offsets,
     uint32_t* mipmap_sizes,
     int32_t max_mipmaps,
-    aodecode_pool_t* pool
+    aodecode_pool_t* pool,
+    int32_t max_threads
 ) {
     if (!jpeg_data || !jpeg_sizes || !output || !bytes_written || 
         !mipmap_count_out || !mipmap_offsets || !mipmap_sizes || chunk_count <= 0) {
@@ -2370,30 +2365,30 @@ AODDS_API int32_t aodds_build_mipmap_chain(
     
     /* Parallel decode all JPEGs - using thread-safe pooled decoders */
     int32_t decoded = 0;
-    
+
 #if AOPIPELINE_HAS_OPENMP
-    #pragma omp parallel reduction(+:decoded)
+    #pragma omp parallel num_threads(AODDS_OMP_THREADS(max_threads)) reduction(+:decoded)
     {
         int decoder_from_pool = 0;
         tjhandle tjh = acquire_pooled_decoder(&decoder_from_pool);
-        
+
         if (tjh) {
             #pragma omp for schedule(static)
             for (int32_t i = 0; i < chunk_count; i++) {
                 if (!jpeg_data[i] || jpeg_sizes[i] == 0) {
                     continue;
                 }
-                
+
                 int width, height, subsamp, colorspace;
                 if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                         &width, &height, &subsamp, &colorspace) < 0) {
                     continue;
                 }
-                
+
                 if (width != CHUNK_SIZE || height != CHUNK_SIZE) {
                     continue;
                 }
-                
+
                 uint8_t* buffer;
                 int from_pool = 0;
                 if (pool) {
@@ -2402,7 +2397,7 @@ AODDS_API int32_t aodds_build_mipmap_chain(
                 } else {
                     buffer = (uint8_t*)malloc(CHUNK_SIZE * CHUNK_SIZE * 4);
                 }
-                
+
                 if (!buffer) continue;
                 
                 if (tjDecompress2(tjh, jpeg_data[i], jpeg_sizes[i],
@@ -2592,7 +2587,8 @@ AODDS_API int32_t aodds_build_all_mipmaps_native(
     uint8_t* output,
     uint32_t output_size,
     uint32_t* bytes_written,
-    aodecode_pool_t* pool
+    aodecode_pool_t* pool,
+    int32_t max_threads
 ) {
     if (!jpeg_data_per_zoom || !jpeg_sizes_per_zoom || !chunk_counts_per_zoom ||
         !output || !bytes_written || zoom_count <= 0) {
@@ -2663,9 +2659,9 @@ AODDS_API int32_t aodds_build_all_mipmaps_native(
                 if (chunks) {
                     /* Decode all JPEGs for this zoom level */
                     int32_t decoded = 0;
-                    
+
 #if AOPIPELINE_HAS_OPENMP
-                    #pragma omp parallel reduction(+:decoded)
+                    #pragma omp parallel num_threads(AODDS_OMP_THREADS(max_threads)) reduction(+:decoded)
                     {
                         int decoder_from_pool = 0;
                         tjhandle tjh = acquire_pooled_decoder(&decoder_from_pool);
@@ -2896,15 +2892,12 @@ AODDS_API int32_t aodds_build_from_jpegs_to_file(
     int32_t decoded = 0;
 
 #if AOPIPELINE_HAS_OPENMP
-    if (max_threads > 0) {
-        omp_set_num_threads(max_threads);
-    }
-    #pragma omp parallel reduction(+:decoded)
+    #pragma omp parallel num_threads(AODDS_OMP_THREADS(max_threads)) reduction(+:decoded)
     {
         /* Acquire decoder from thread-safe pool */
         int decoder_from_pool = 0;
         tjhandle tjh = acquire_pooled_decoder(&decoder_from_pool);
-        
+
         if (tjh) {
             #pragma omp for schedule(static)
             for (int32_t i = 0; i < chunk_count; i++) {
@@ -3975,22 +3968,19 @@ AODDS_API int32_t aodds_builder_finalize(
     int32_t decode_fail_count = 0;
 
 #if AOPIPELINE_HAS_OPENMP
-    if (max_threads > 0) {
-        omp_set_num_threads(max_threads);
-    }
-#endif
     /* Parallel decode all pending JPEGs - OpenMP handles empty iterations efficiently */
-    #pragma omp parallel for schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
+    #pragma omp parallel for num_threads(AODDS_OMP_THREADS(max_threads)) schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
+#endif
     for (int32_t i = 0; i < builder->chunk_count; i++) {
         if (builder->chunk_status[i] != CHUNK_STATUS_PENDING_DECODE) continue;
-        
+
         /* Defensive null check (zero-copy mode safety) */
         if (!builder->jpeg_buffers[i] || builder->jpeg_sizes[i] == 0) {
             builder->chunk_status[i] = CHUNK_STATUS_MISSING;
             decode_fail_count++;
             continue;
         }
-        
+
         aodecode_image_t decoded = {0};
         int32_t success = aodecode_single(
             builder->jpeg_buffers[i],
@@ -3998,7 +3988,7 @@ AODDS_API int32_t aodds_builder_finalize(
             &decoded,
             builder->pool  /* Pool is thread-safe */
         );
-        
+
         if (success && decoded.data) {
             builder->chunks[i] = decoded;
             builder->chunk_status[i] = CHUNK_STATUS_JPEG;
@@ -4007,7 +3997,7 @@ AODDS_API int32_t aodds_builder_finalize(
             builder->chunk_status[i] = CHUNK_STATUS_MISSING;
             decode_fail_count++;
         }
-        
+
         /* Free JPEG buffer after decode - ONLY if C owns it (not zero-copy) */
         if (builder->jpeg_owned[i]) {
             free(builder->jpeg_buffers[i]);
@@ -4016,12 +4006,12 @@ AODDS_API int32_t aodds_builder_finalize(
         builder->jpeg_sizes[i] = 0;
         builder->jpeg_owned[i] = 0;
     }
-    
+
     /* Update stats after parallel region */
     builder->status.chunks_decoded += decode_success_count;
     builder->status.chunks_failed += decode_fail_count;
     builder->status.chunks_missing += decode_fail_count;
-    
+
     /* Fill and compose in a single pass */
     aodds_fill_and_compose(builder->chunks, chunks_per_side, &builder->tile_image,
                            builder->config.missing_r, builder->config.missing_g, builder->config.missing_b);
@@ -4153,22 +4143,19 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     int32_t decode_fail_count = 0;
 
 #if AOPIPELINE_HAS_OPENMP
-    if (max_threads > 0) {
-        omp_set_num_threads(max_threads);
-    }
-#endif
     /* Parallel decode all pending JPEGs - OpenMP handles empty iterations efficiently */
-    #pragma omp parallel for schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
+    #pragma omp parallel for num_threads(AODDS_OMP_THREADS(max_threads)) schedule(dynamic, 4) reduction(+:decode_success_count, decode_fail_count)
+#endif
     for (int32_t i = 0; i < builder->chunk_count; i++) {
         if (builder->chunk_status[i] != CHUNK_STATUS_PENDING_DECODE) continue;
-        
+
         /* Defensive null check (zero-copy mode safety) */
         if (!builder->jpeg_buffers[i] || builder->jpeg_sizes[i] == 0) {
             builder->chunk_status[i] = CHUNK_STATUS_MISSING;
             decode_fail_count++;
             continue;
         }
-        
+
         aodecode_image_t decoded = {0};
         int32_t success = aodecode_single(
             builder->jpeg_buffers[i],
@@ -4176,7 +4163,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
             &decoded,
             builder->pool
         );
-        
+
         if (success && decoded.data) {
             builder->chunks[i] = decoded;
             builder->chunk_status[i] = CHUNK_STATUS_JPEG;
@@ -4185,7 +4172,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
             builder->chunk_status[i] = CHUNK_STATUS_MISSING;
             decode_fail_count++;
         }
-        
+
         /* Free JPEG buffer after decode - ONLY if C owns it (not zero-copy) */
         if (builder->jpeg_owned[i]) {
             free(builder->jpeg_buffers[i]);
@@ -4194,7 +4181,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
         builder->jpeg_sizes[i] = 0;
         builder->jpeg_owned[i] = 0;
     }
-    
+
     /* Update stats after parallel region */
     builder->status.chunks_decoded += decode_success_count;
     builder->status.chunks_failed += decode_fail_count;

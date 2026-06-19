@@ -9,6 +9,7 @@ import signal
 import tempfile
 import platform
 import argparse
+import concurrent.futures
 import threading
 import socketserver
 import logging.handlers
@@ -130,6 +131,7 @@ class LogRecordStreamHandler(socketserver.StreamRequestHandler):
 
 class LogServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 
 _SERVER_STATS_STORE = None
@@ -267,65 +269,74 @@ def diagnose(CFG):
 
     location = geocoder.ip("me")
 
-    log.info("Waiting for mounts...")
-    for scenery in CFG.scenery_mounts:
-        mount = scenery.get('mount')
-        ret = False
-        # Use shorter sleeps with more attempts to avoid long pauses
-        for i in range(40):
-            time.sleep(0.25)
-            try:
-                if system_type == 'darwin':
-                    # Require an actual FUSE mount on macOS; placeholders can mask failures
-                    ret = macsetup.is_macfuse_mount(mount)
-                else:
-                    ret = os.path.isdir(os.path.join(mount, 'textures'))
-            except Exception:
-                ret = False
-            if ret:
-                break
-            log.info('.')
-
-    failed = False
-    log.info("\n\n")
-    log.info("------------------------------------")
-    log.info(" Diagnostic check ...")
-    log.info("------------------------------------")
-    log.info(f"Detected system: {platform.uname()}")
-    log.info(f"Detected location {location.address}")
-    log.info(f"Detected installed scenery:")
-    for scenery in CFG.scenery_mounts:
-        root = scenery.get('root')
-        mount = scenery.get('mount')
-        log.info(f"    {root}")
+    def _check_mount(mount):
         try:
             if system_type == 'darwin':
-                ret = macsetup.is_macfuse_mount(mount)
+                return macsetup.is_macfuse_mount(mount)
             else:
-                ret = os.path.isdir(os.path.join(mount, 'textures'))
+                return os.path.isdir(os.path.join(mount, 'textures'))
         except Exception:
-            ret = False
-        log.info(f"        Mounted? {ret}")
-        if not ret:
-            failed = True
+            return False
 
-    log.info(f"Checking maptypes:")
-    import getortho
-    for maptype in MAPTYPES:
-        if maptype in ("Use tile default", "Custom Map"):
-            continue
-        # Use ignore_cleanup_errors=True to handle race with async cache writes
-        # The async cache writer may still be writing when the temp dir is cleaned up
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
-            c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
-            ret = c.get()
-            # Give async cache writer a moment to complete or detect deleted dir
-            time.sleep(0.1)
-            if ret:
-                log.info(f"    Maptype: {maptype} OK!")
-            else:
-                log.warning(f"    Maptype: {maptype} FAILED!")
+    # Use a small executor so a hung filesystem call (e.g. unresponsive macFUSE
+    # or stale NFS) can be timed out per-attempt instead of blocking forever.
+    pool_size = max(2, len(CFG.scenery_mounts))
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=pool_size, thread_name_prefix="diag_mount"
+    ) as mount_pool:
+
+        def _check_mount_with_timeout(mount, timeout):
+            try:
+                return mount_pool.submit(_check_mount, mount).result(timeout=timeout)
+            except (concurrent.futures.TimeoutError, Exception):
+                return False
+
+        def _wait_for_mount(mount, attempts=40, interval=0.25):
+            for _ in range(attempts):
+                if _check_mount_with_timeout(mount, timeout=max(1.0, interval * 4)):
+                    return True
+                time.sleep(interval)
+            return False
+
+        log.info("Waiting for mounts...")
+        log.info("Checking %d mount(s) in parallel (up to 10s)...", len(CFG.scenery_mounts))
+        # Check all mounts in parallel so large regions don't delay smaller ones
+        list(mount_pool.map(_wait_for_mount, [s.get('mount') for s in CFG.scenery_mounts]))
+
+        failed = False
+        log.info("\n\n")
+        log.info("------------------------------------")
+        log.info(" Diagnostic check ...")
+        log.info("------------------------------------")
+        log.info(f"Detected system: {platform.uname()}")
+        log.info(f"Detected location {location.address}")
+        log.info(f"Detected installed scenery:")
+        for scenery in CFG.scenery_mounts:
+            root = scenery.get('root')
+            mount = scenery.get('mount')
+            log.info(f"    {root}")
+            # Retry for mounts that are slow to appear (e.g. large regions still initialising)
+            ret = _wait_for_mount(mount, attempts=12, interval=5.0)
+            log.info(f"        Mounted? {ret}")
+            if not ret:
                 failed = True
+
+        log.info(f"Checking maptypes:")
+        import getortho
+        for maptype in MAPTYPES:
+            if maptype in ("Use tile default", "Custom Map"):
+                continue
+            # Use ignore_cleanup_errors=True to handle race with async cache writes
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
+                ret = c.get()
+                # Give async cache writer a moment to complete or detect deleted dir
+                time.sleep(0.1)
+                if ret:
+                    log.info(f"    Maptype: {maptype} OK!")
+                else:
+                    log.warning(f"    Maptype: {maptype} FAILED!")
+                    failed = True
 
     log.info("------------------------------------")
     if failed:
@@ -336,10 +347,8 @@ def diagnose(CFG):
         log.warning("***************")
         log.warning("***************")
         return False
-    else:
-        log.info(" Diagnostics done.  All checks passed")
-        return True
-    log.info("------------------------------------\n\n")
+    log.info(" Diagnostics done.  All checks passed")
+    return True
 
 
 class AOMount:

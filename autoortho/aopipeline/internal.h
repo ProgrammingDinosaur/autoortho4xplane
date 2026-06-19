@@ -41,8 +41,14 @@
   /* Stub macros for when OpenMP is not available */
   #define omp_get_thread_num() 0
   #define omp_get_num_threads() 1
+  #define omp_get_max_threads() 1
   #define omp_set_num_threads(n) ((void)0)
 #endif
+
+/* Per-region OpenMP thread count: honour caller's max_threads if positive,
+ * otherwise fall back to the runtime default. */
+#define AODDS_OMP_THREADS(max_threads) \
+    ((max_threads) > 0 ? (max_threads) : omp_get_max_threads())
 
 /* Export macros */
 #ifdef _WIN32

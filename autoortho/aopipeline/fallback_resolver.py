@@ -214,10 +214,13 @@ class FallbackResolver:
         """
         try:
             # Import AoImage here to avoid circular imports
-            from autoortho.aoimage.AoImage import AoImage
+            from autoortho.aoimage import AoImage
         except ImportError:
-            log.warning("FallbackResolver: Could not import AoImage for disk cache fallback")
-            return None
+            try:
+                from aoimage import AoImage
+            except ImportError:
+                log.warning("FallbackResolver: Could not import AoImage for disk cache fallback")
+                return None
         
         max_search_zoom = self.tile_zoom
         
@@ -325,10 +328,13 @@ class FallbackResolver:
             return None
         
         try:
-            from autoortho.aoimage.AoImage import AoImage
+            from autoortho.aoimage import AoImage
         except ImportError:
-            return None
-        
+            try:
+                from aoimage import AoImage
+            except ImportError:
+                return None
+
         # Check higher-detail mipmaps (lower mipmap numbers = higher detail)
         for higher_mipmap in range(target_mipmap):
             if higher_mipmap not in self._mipmap_images:
@@ -407,10 +413,13 @@ class FallbackResolver:
             return None
         
         try:
-            from autoortho.aoimage.AoImage import AoImage
+            from autoortho.aoimage import AoImage
         except ImportError:
-            return None
-        
+            try:
+                from aoimage import AoImage
+            except ImportError:
+                return None
+
         # Try progressively lower-detail zoom levels
         for mipmap_diff in range(1, self.max_mipmap + 1 - target_mipmap):
             if time_budget and time_budget.exhausted:
