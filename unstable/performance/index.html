@@ -1,0 +1,4183 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../info/">
+      
+      
+        <link rel="next" href="../scenery/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>Performance Tuning Guide - AutoOrtho Continued</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#performance-tuning-guide" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="AutoOrtho Continued" class="md-header__button md-logo" aria-label="AutoOrtho Continued" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AutoOrtho Continued
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Performance Tuning Guide
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/ProgrammingDinosaur/autoortho4xplane" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Instructions
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../config/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Configuration
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../details/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Approach
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../faq/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  FAQ and Troubleshooting
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../info/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Info Attributions and Other Projects
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    <li class="md-tabs__item md-tabs__item--active">
+      <a href="./" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Performance Tuning Guide
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../scenery/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Scenery Setup
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="AutoOrtho Continued" class="md-nav__button md-logo" aria-label="AutoOrtho Continued" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    AutoOrtho Continued
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/ProgrammingDinosaur/autoortho4xplane" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Instructions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../details/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Approach
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../faq/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    FAQ and Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../info/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Info Attributions and Other Projects
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Tuning Guide
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Tuning Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#quick-start-performance-presets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quick Start: Performance Presets
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#detailed-settings-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Detailed Settings Reference
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Detailed Settings Reference">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#zoom-level-critical-performance-factor" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Zoom Level (Critical Performance Factor)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Zoom Level (Critical Performance Factor)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#how-zoom-levels-work" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How Zoom Levels Work
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#impact-on-performance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Impact on Performance
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#recommendations-by-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recommendations by System
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#example-loading-time-impact" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example: Loading Time Impact
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#config-file-setting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Config File Setting
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#time-budget-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Time Budget System
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Time Budget System">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#enable-time-budget-use_time_budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enable Time Budget (use_time_budget)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tile-time-budget-tile_time_budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tile Time Budget (tile_time_budget)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallback-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback System
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Fallback System">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fallback-level-fallback_level" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback Level (fallback_level)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallback-extends-budget-fallback_extends_budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback Extends Budget (fallback_extends_budget)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#extended-fallback-timeout-fallback_timeout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Extended Fallback Timeout (fallback_timeout)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#startup-loading-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Startup Loading Behavior
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Startup Loading Behavior">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#suspend-maxwait-suspend_maxwait" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Suspend Maxwait (suspend_maxwait)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dynamic-zoom-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dynamic Zoom Levels
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Dynamic Zoom Levels">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#why-agl-instead-of-msl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why AGL Instead of MSL?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#enable-dynamic-zoom-max_zoom_mode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enable Dynamic Zoom (max_zoom_mode)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuring-quality-steps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuring Quality Steps
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallback-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback Behavior
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#spatial-prefetching" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Spatial Prefetching
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Spatial Prefetching">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#enable-prefetching-prefetch_enabled" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enable Prefetching (prefetch_enabled)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#lookahead-time-prefetch_lookahead" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lookahead Time (prefetch_lookahead)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#per-chunk-timeout-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-Chunk Timeout Settings
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Per-Chunk Timeout Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#per-chunk-max-wait-maxwait" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-Chunk Max Wait (maxwait)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#extended-loading-at-startup-suspend_maxwait" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Extended Loading at Startup (suspend_maxwait)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#recommended-configurations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recommended Configurations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Recommended Configurations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#stutter-free-flying-prioritize-performance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stutter-Free Flying (Prioritize Performance)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#maximum-quality-prioritize-imagery" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Maximum Quality (Prioritize Imagery)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#slow-internet-connection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Slow Internet Connection
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#weak-cpu-limited-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Weak CPU / Limited System
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#understanding-the-statistics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Understanding the Statistics
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Understanding the Statistics">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#key-statistics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key Statistics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#breaking-down-tile-creation-time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Breaking Down Tile Creation Time
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#time-based-exclusion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Time-Based Exclusion
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Time-Based Exclusion">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#how-it-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How It Works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#safety-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Safety Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuration
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#enable-time-exclusion-enabled" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enable Time Exclusion (enabled)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#start-time-start_time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Start Time (start_time)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#end-time-end_time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        End Time (end_time)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#default-to-exclusion-default_to_exclusion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Default to Exclusion (default_to_exclusion)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#decision-preservation-during-scenery-reload" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decision Preservation During Scenery Reload
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#example-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#overnight-ranges" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overnight Ranges
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ui-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        UI Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#use-cases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Use Cases
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#simbrief-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SimBrief Integration
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="SimBrief Integration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#setting-up-simbrief-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setting Up SimBrief Integration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-it-works_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How It Works
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="How It Works">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#dynamic-zoom-with-simbrief" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dynamic Zoom with SimBrief
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#prefetching-with-simbrief" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prefetching with SimBrief
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuration Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallback-behavior_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback Behavior
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#example-workflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example Workflows
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Example Workflows">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#option-a-load-flight-plan-before-starting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Option A: Load flight plan before starting
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#option-b-load-flight-plan-after-starting-mid-session" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Option B: Load flight plan after starting (mid-session)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#known-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Known Limitations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Known Limitations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#zoom-level-transitions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Zoom Level Transitions
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#simbrief-integration-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SimBrief Integration Limitations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dataref-based-prediction-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DataRef-Based Prediction Limitations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#prefetching-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prefetching Limitations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#general-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        General Limitations
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#native-pipeline-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native Pipeline Architecture
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Native Pipeline Architecture">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#why-native-code" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why Native Code?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#components" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Components
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-it-works_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How It Works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#performance-impact" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance Impact
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuration
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#thread-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Thread Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#early-build-threshold-live_aopipeline_min_chunk_ratio" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Early-Build Threshold (live_aopipeline_min_chunk_ratio)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ephemeral-dds-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ephemeral DDS Cache
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#native-http-client" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native HTTP Client
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#important-caveats" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Important Caveats
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Important Caveats">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#apple-maps-fallback" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Apple Maps Fallback
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#platform-support" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Platform Support
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallback-behavior_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback Behavior
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#troubleshooting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Troubleshooting
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#long-x-plane-loading-times" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Long X-Plane Loading Times
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#other-common-issues" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Other Common Issues
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../scenery/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scenery Setup
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#quick-start-performance-presets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quick Start: Performance Presets
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#detailed-settings-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Detailed Settings Reference
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Detailed Settings Reference">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#zoom-level-critical-performance-factor" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Zoom Level (Critical Performance Factor)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Zoom Level (Critical Performance Factor)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#how-zoom-levels-work" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How Zoom Levels Work
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#impact-on-performance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Impact on Performance
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#recommendations-by-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recommendations by System
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#example-loading-time-impact" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example: Loading Time Impact
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#config-file-setting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Config File Setting
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#time-budget-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Time Budget System
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Time Budget System">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#enable-time-budget-use_time_budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enable Time Budget (use_time_budget)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tile-time-budget-tile_time_budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tile Time Budget (tile_time_budget)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallback-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback System
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Fallback System">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fallback-level-fallback_level" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback Level (fallback_level)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallback-extends-budget-fallback_extends_budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback Extends Budget (fallback_extends_budget)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#extended-fallback-timeout-fallback_timeout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Extended Fallback Timeout (fallback_timeout)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#startup-loading-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Startup Loading Behavior
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Startup Loading Behavior">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#suspend-maxwait-suspend_maxwait" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Suspend Maxwait (suspend_maxwait)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dynamic-zoom-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dynamic Zoom Levels
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Dynamic Zoom Levels">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#why-agl-instead-of-msl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why AGL Instead of MSL?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#enable-dynamic-zoom-max_zoom_mode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enable Dynamic Zoom (max_zoom_mode)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuring-quality-steps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuring Quality Steps
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallback-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback Behavior
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#spatial-prefetching" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Spatial Prefetching
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Spatial Prefetching">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#enable-prefetching-prefetch_enabled" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enable Prefetching (prefetch_enabled)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#lookahead-time-prefetch_lookahead" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lookahead Time (prefetch_lookahead)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#per-chunk-timeout-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-Chunk Timeout Settings
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Per-Chunk Timeout Settings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#per-chunk-max-wait-maxwait" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-Chunk Max Wait (maxwait)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#extended-loading-at-startup-suspend_maxwait" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Extended Loading at Startup (suspend_maxwait)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#recommended-configurations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recommended Configurations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Recommended Configurations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#stutter-free-flying-prioritize-performance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stutter-Free Flying (Prioritize Performance)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#maximum-quality-prioritize-imagery" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Maximum Quality (Prioritize Imagery)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#slow-internet-connection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Slow Internet Connection
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#weak-cpu-limited-system" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Weak CPU / Limited System
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#understanding-the-statistics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Understanding the Statistics
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Understanding the Statistics">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#key-statistics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Key Statistics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#breaking-down-tile-creation-time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Breaking Down Tile Creation Time
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#time-based-exclusion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Time-Based Exclusion
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Time-Based Exclusion">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#how-it-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How It Works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#safety-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Safety Features
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuration
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#enable-time-exclusion-enabled" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Enable Time Exclusion (enabled)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#start-time-start_time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Start Time (start_time)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#end-time-end_time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        End Time (end_time)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#default-to-exclusion-default_to_exclusion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Default to Exclusion (default_to_exclusion)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#decision-preservation-during-scenery-reload" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decision Preservation During Scenery Reload
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#example-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#overnight-ranges" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overnight Ranges
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ui-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        UI Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#use-cases" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Use Cases
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#simbrief-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SimBrief Integration
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="SimBrief Integration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#setting-up-simbrief-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setting Up SimBrief Integration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-it-works_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How It Works
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="How It Works">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#dynamic-zoom-with-simbrief" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dynamic Zoom with SimBrief
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#prefetching-with-simbrief" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prefetching with SimBrief
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuration Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallback-behavior_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback Behavior
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#example-workflows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example Workflows
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Example Workflows">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#option-a-load-flight-plan-before-starting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Option A: Load flight plan before starting
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#option-b-load-flight-plan-after-starting-mid-session" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Option B: Load flight plan after starting (mid-session)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#known-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Known Limitations
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Known Limitations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#zoom-level-transitions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Zoom Level Transitions
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#simbrief-integration-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SimBrief Integration Limitations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#dataref-based-prediction-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        DataRef-Based Prediction Limitations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#prefetching-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prefetching Limitations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#general-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        General Limitations
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#native-pipeline-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native Pipeline Architecture
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Native Pipeline Architecture">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#why-native-code" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why Native Code?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#components" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Components
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#how-it-works_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How It Works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#performance-impact" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Performance Impact
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#configuration_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Configuration
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Configuration">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#thread-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Thread Configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#early-build-threshold-live_aopipeline_min_chunk_ratio" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Early-Build Threshold (live_aopipeline_min_chunk_ratio)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ephemeral-dds-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ephemeral DDS Cache
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#native-http-client" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native HTTP Client
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#important-caveats" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Important Caveats
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Important Caveats">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#apple-maps-fallback" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Apple Maps Fallback
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#platform-support" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Platform Support
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallback-behavior_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fallback Behavior
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#troubleshooting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Troubleshooting
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Troubleshooting">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#long-x-plane-loading-times" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Long X-Plane Loading Times
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#other-common-issues" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Other Common Issues
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="performance-tuning-guide">Performance Tuning Guide</h1>
+<p>AutoOrtho includes advanced performance tuning options that allow you to balance image quality against loading times and in-flight stuttering. This guide explains each setting and provides recommendations for different use cases.</p>
+<h2 id="quick-start-performance-presets">Quick Start: Performance Presets</h2>
+<p>For most users, the easiest way to configure performance is using the <strong>Performance Preset</strong> dropdown in Settings → Performance Tuning:</p>
+<table>
+<thead>
+<tr>
+<th>Preset</th>
+<th>Best For</th>
+<th>Trade-off</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Fast</strong></td>
+<td>Weak CPUs, slow internet, stutter-free experience</td>
+<td>May have occasional missing/low-res tiles</td>
+</tr>
+<tr>
+<td><strong>Balanced</strong></td>
+<td>Most users</td>
+<td>Good balance of quality and performance</td>
+</tr>
+<tr>
+<td><strong>Quality</strong></td>
+<td>Fast CPUs, fast internet, maximum image quality</td>
+<td>May have longer loading times</td>
+</tr>
+<tr>
+<td><strong>Custom</strong></td>
+<td>Advanced users who want fine-grained control</td>
+<td>Manual configuration required</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="detailed-settings-reference">Detailed Settings Reference</h2>
+<h3 id="zoom-level-critical-performance-factor">Zoom Level (Critical Performance Factor)</h3>
+<p>The <strong>Max Zoom Level</strong> setting has the most significant impact on loading times and resource usage. Understanding this is crucial for optimizing performance.</p>
+<h4 id="how-zoom-levels-work">How Zoom Levels Work</h4>
+<p>Each zoom level doubles the resolution in both dimensions, meaning <strong>each zoom level increase requires 4× the resources</strong> of the previous level:</p>
+<table>
+<thead>
+<tr>
+<th>Zoom Level</th>
+<th>Chunks per Tile</th>
+<th>Relative Resources</th>
+<th>Typical Use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ZL14</td>
+<td>16 (4×4)</td>
+<td>1× (baseline)</td>
+<td>Low detail, fast loading</td>
+</tr>
+<tr>
+<td>ZL15</td>
+<td>64 (8×8)</td>
+<td>4×</td>
+<td>Medium detail</td>
+</tr>
+<tr>
+<td>ZL16</td>
+<td>256 (16×16)</td>
+<td>16×</td>
+<td>High detail (default)</td>
+</tr>
+<tr>
+<td>ZL17</td>
+<td>1024 (32×32)</td>
+<td>64×</td>
+<td>Very high detail</td>
+</tr>
+<tr>
+<td>ZL18</td>
+<td>4096 (64×64)</td>
+<td>256×</td>
+<td>Maximum detail, slowest</td>
+</tr>
+</tbody>
+</table>
+<h4 id="impact-on-performance">Impact on Performance</h4>
+<p><strong>Downloads:</strong> At ZL17, you need to download 4× more image chunks than ZL16. At ZL18, that's 16× more than ZL16.</p>
+<p><strong>Processing:</strong> Each chunk must be decoded (JPEG→RGB) and compressed (RGB→DDS). More chunks = more CPU time.</p>
+<p><strong>Memory:</strong> Higher zoom levels require more RAM to hold all the image data during processing.</p>
+<p><strong>Storage:</strong> Cache size grows exponentially with zoom level.</p>
+<h4 id="recommendations-by-system">Recommendations by System</h4>
+<table>
+<thead>
+<tr>
+<th>System Type</th>
+<th>Recommended Max Zoom</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Low-end / Slow internet</td>
+<td>ZL15</td>
+<td>Fastest loading, acceptable quality</td>
+</tr>
+<tr>
+<td>Mid-range</td>
+<td>ZL16</td>
+<td>Good balance (default)</td>
+</tr>
+<tr>
+<td>High-end / Fast internet</td>
+<td>ZL17</td>
+<td>High quality, longer loading</td>
+</tr>
+<tr>
+<td>Enthusiast</td>
+<td>ZL18</td>
+<td>Maximum quality, expect long loads</td>
+</tr>
+</tbody>
+</table>
+<h4 id="example-loading-time-impact">Example: Loading Time Impact</h4>
+<p>Assuming 50ms average per chunk download:</p>
+<table>
+<thead>
+<tr>
+<th>Zoom Level</th>
+<th>Chunks</th>
+<th>Theoretical Min Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ZL15</td>
+<td>64</td>
+<td>~3.2 seconds</td>
+</tr>
+<tr>
+<td>ZL16</td>
+<td>256</td>
+<td>~12.8 seconds</td>
+</tr>
+<tr>
+<td>ZL17</td>
+<td>1024</td>
+<td>~51.2 seconds</td>
+</tr>
+<tr>
+<td>ZL18</td>
+<td>4096</td>
+<td>~3.4 minutes</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Note:</strong> Actual times vary based on parallelism, caching, and network conditions. These are theoretical minimums to illustrate the exponential scaling.</p>
+<h4 id="config-file-setting">Config File Setting</h4>
+<pre><code class="language-ini"># Maximum zoom level for imagery (14-18)
+# Higher = better quality but exponentially longer loading times
+# Each level increase = 4× more resources needed
+maptype_override_zoom = 16
+</code></pre>
+<p><strong>Tip:</strong> If you're experiencing long loading times or frequent missing tiles, consider lowering your max zoom level before adjusting other settings.</p>
+<hr />
+<h3 id="time-budget-system">Time Budget System</h3>
+<p>The Time Budget system controls how long AutoOrtho spends loading each tile before returning a result to X-Plane.</p>
+<h4 id="enable-time-budget-use_time_budget">Enable Time Budget (<code>use_time_budget</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Boolean (True/False)</li>
+<li><strong>Default:</strong> True</li>
+<li><strong>Config file:</strong> <code>use_time_budget = True</code></li>
+</ul>
+<p>When enabled, AutoOrtho uses a wall-clock time limit for tile requests instead of the legacy per-chunk timeout system. This provides more predictable performance and reduces stuttering.</p>
+<p><strong>Recommendation:</strong> Keep enabled unless you experience issues.</p>
+<hr />
+<h4 id="tile-time-budget-tile_time_budget">Tile Time Budget (<code>tile_time_budget</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Float (seconds)</li>
+<li><strong>Default:</strong> 180</li>
+<li><strong>Range:</strong> 60 - 600 seconds</li>
+<li><strong>Config file:</strong> <code>tile_time_budget = 180.0</code></li>
+</ul>
+<p>The maximum wall-clock time for a <strong>complete tile</strong> (all mipmap levels combined). This budget measures <strong>active processing time only</strong> - queue wait time doesn't count. The budget starts when AutoOrtho actually begins processing the tile's chunks, not when the tile is first requested.</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Use Case</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>60 - 120.0s</td>
+<td>Fast/smooth experience</td>
+<td>Quicker loading, but more partial tiles</td>
+</tr>
+<tr>
+<td>120.0 - 300.0s</td>
+<td>Balanced</td>
+<td>Good quality with reasonable loading times</td>
+</tr>
+<tr>
+<td>300 - 600.0s</td>
+<td>Maximum quality</td>
+<td>Complete tiles, but longer loading times</td>
+</tr>
+</tbody>
+</table>
+<p><strong>How it works:</strong>
+1. X-Plane requests a tile from AutoOrtho (tile enters processing queue)
+2. <strong>Budget timer starts</strong> when AutoOrtho actually begins downloading/processing chunks for this tile
+3. AutoOrtho builds all mipmaps (4 → 3 → 2 → 1 → 0) sharing this budget
+4. After <code>tile_time_budget</code> seconds of active processing, AutoOrtho builds the DDS with whatever is complete
+5. Any incomplete areas use the configured <code>missing_color</code></p>
+<p><strong>Note:</strong> Queue wait time (when other tiles are being processed first) does NOT count against the budget. This ensures fair time allocation even when many tiles are requested simultaneously.</p>
+<p><strong>Note:</strong> Each tile covers a large geographic area (approximately 1 square degree of latitude/longitude at zoom 16). Higher budgets allow more time for all chunks to download and process.</p>
+<p><strong>Note:</strong> The effectiveness of this setting will also depend on your configured max zoom level. Higher zoom levels with lower budget times will result in faster loading but lots of missing tiles.</p>
+<hr />
+<h3 id="fallback-system">Fallback System</h3>
+<p>When chunks fail to download in time, the fallback system provides alternative imagery to prevent missing tiles.</p>
+<h4 id="fallback-level-fallback_level">Fallback Level (<code>fallback_level</code>)</h4>
+<ul>
+<li><strong>Type:</strong> String (none, cache, full)</li>
+<li><strong>Default:</strong> cache</li>
+<li><strong>Config file:</strong> <code>fallback_level = cache</code></li>
+</ul>
+<p>Controls which fallback mechanisms are enabled:</p>
+<table>
+<thead>
+<tr>
+<th>Level</th>
+<th>Fallback 1 (Disk Cache)</th>
+<th>Fallback 2 (Scale Mipmaps)</th>
+<th>Fallback 3 (Network)</th>
+<th>Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>none</strong></td>
+<td>❌ Disabled</td>
+<td>❌ Disabled</td>
+<td>❌ Disabled</td>
+<td>Fastest, may have green/missing tiles</td>
+</tr>
+<tr>
+<td><strong>cache</strong></td>
+<td>✅ Enabled</td>
+<td>✅ Enabled</td>
+<td>❌ Disabled</td>
+<td>Balanced - uses cached data only</td>
+</tr>
+<tr>
+<td><strong>full</strong></td>
+<td>✅ Enabled</td>
+<td>✅ Enabled</td>
+<td>✅ Enabled</td>
+<td>Best quality - can download lower-detail alternatives</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Fallback Chain Explained:</strong></p>
+<ol>
+<li>
+<p><strong>Fallback 1 - Disk Cache:</strong> Searches your local cache for a lower-zoom version of the same imagery. Fast and free.</p>
+</li>
+<li>
+<p><strong>Fallback 2 - Scale from Mipmaps:</strong> Scales imagery from already-built lower-detail mipmap levels. Very fast.</p>
+</li>
+<li>
+<p><strong>Fallback 3 - Network Download:</strong> Downloads lower-detail imagery on-demand from the server. Slowest but provides the best fill-in quality.</p>
+</li>
+</ol>
+<p><strong>Recommendation:</strong> Use <code>cache</code> for most users. Use <code>full</code> if you have fast internet and prefer complete imagery over speed.</p>
+<hr />
+<h4 id="fallback-extends-budget-fallback_extends_budget">Fallback Extends Budget (<code>fallback_extends_budget</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Boolean (True/False)</li>
+<li><strong>Default:</strong> False</li>
+<li><strong>Config file:</strong> <code>fallback_extends_budget = False</code></li>
+</ul>
+<p><strong>Only applies when <code>fallback_level = full</code>.</strong></p>
+<p>When enabled, network fallbacks (Fallback 3) will continue even after the tile time budget is exhausted. This prioritizes image quality over strict timing.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Behavior</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>False</strong> (default)</td>
+<td>Fallbacks respect budget</td>
+<td>Faster loading, may have some missing tiles</td>
+</tr>
+<tr>
+<td><strong>True</strong></td>
+<td>Fallbacks ignore budget</td>
+<td>Better quality, may cause longer load times</td>
+</tr>
+</tbody>
+</table>
+<p><strong>When to enable:</strong>
+- You prioritize having complete imagery over loading speed
+- You have a fast, reliable internet connection
+- You don't mind occasional longer loading times</p>
+<p><strong>When to keep disabled:</strong>
+- You want predictable, stutter-free performance
+- Your internet is slow or unreliable
+- Loading speed is more important than perfect imagery</p>
+<hr />
+<h4 id="extended-fallback-timeout-fallback_timeout">Extended Fallback Timeout (<code>fallback_timeout</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Float (seconds)</li>
+<li><strong>Default:</strong> 3.0</li>
+<li><strong>Range:</strong> 1.0 - 10.0 seconds</li>
+<li><strong>Config file:</strong> <code>fallback_timeout = 3.0</code></li>
+</ul>
+<p><strong>Only applies when <code>fallback_extends_budget = True</code>.</strong></p>
+<p>When extended fallbacks are enabled, this controls how long each lower-detail mipmap level waits for its chunks to download. The total additional time is this value multiplied by the number of mipmap levels tried (typically 3-4 levels).</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Per-Level Wait</th>
+<th>Total Extra Time (4 levels)</th>
+<th>Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1.5s</td>
+<td>1.5 seconds</td>
+<td>~6 seconds</td>
+<td>Fast - minimize extra wait</td>
+</tr>
+<tr>
+<td>3.0s</td>
+<td>3.0 seconds</td>
+<td>~12 seconds</td>
+<td>Balanced (default)</td>
+</tr>
+<tr>
+<td>5.0s</td>
+<td>5.0 seconds</td>
+<td>~20 seconds</td>
+<td>Quality - more time for slow connections</td>
+</tr>
+<tr>
+<td>10.0s</td>
+<td>10.0 seconds</td>
+<td>~40 seconds</td>
+<td>Maximum - ensure fallbacks succeed</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Example calculation:</strong>
+- <code>tile_time_budget = 10s</code> (exhausted after 10 seconds)
+- <code>fallback_timeout = 3.0s</code>
+- Fallback tries mipmap levels 1, 2, 3, 4 → 4 levels × 3.0s = 12 seconds max
+- <strong>Total worst-case time:</strong> 10s + 12s = <strong>22 seconds</strong></p>
+<p><strong>Recommendation:</strong> Start with 3.0s. If you see fallbacks timing out (check logs), increase to 5.0s. If loading is too slow, decrease to 1.5s.</p>
+<hr />
+<h3 id="startup-loading-behavior">Startup Loading Behavior</h3>
+<h4 id="suspend-maxwait-suspend_maxwait">Suspend Maxwait (<code>suspend_maxwait</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Boolean (True/False)</li>
+<li><strong>Default:</strong> True</li>
+<li><strong>Config file:</strong> <code>suspend_maxwait = True</code></li>
+</ul>
+<p>When enabled, AutoOrtho extends timeout values during initial scenery loading (before the first flight begins). This allows more time for downloads to complete during the initial load, resulting in fewer missing tiles when the flight starts.</p>
+<p><strong>How it works:</strong>
+- AutoOrtho detects the "loading" phase by tracking if X-Plane has <strong>ever</strong> sent flight data via UDP
+- During initial loading (before first connection), the tile time budget is multiplied by 10×
+- Once the flight begins (X-Plane starts sending position data), normal timeouts resume permanently
+- <strong>Important:</strong> Temporary disconnects (e.g., from stuttering) do NOT re-enable extended timeouts</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Time Budget Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Initial loading (never connected)</td>
+<td><code>tile_time_budget × 10</code></td>
+</tr>
+<tr>
+<td>Flying (UDP connected)</td>
+<td><code>tile_time_budget</code> (normal)</td>
+</tr>
+<tr>
+<td>Temporary disconnect (stutter)</td>
+<td><code>tile_time_budget</code> (normal - no penalty)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Stall Detection:</strong>
+AutoOrtho monitors download progress and will log warnings if downloads appear stalled:
+- After 60 seconds with no successful downloads: <code>"Downloads appear slow..."</code> warning
+- After 180 seconds with no successful downloads: <code>"⚠️ DOWNLOADS STALLED..."</code> warning</p>
+<p>These warnings help identify server-side throttling vs client-side issues.</p>
+<p><strong>Note:</strong> If you experience very long loading times (&gt;5 minutes stuck at "Reading scenery files"), this may indicate:
+- Server throttling (especially with BI/Bing imagery during high-traffic periods)
+- Network connectivity issues
+- Very high zoom level with slow internet connection</p>
+<p><strong>Troubleshooting Long Loading Times:</strong>
+1. Check AutoOrtho logs for "Downloads appear slow" or "DOWNLOADS STALLED" warnings - these indicate server throttling
+2. Try a different imagery source (GO2, EOX) to rule out server-specific issues
+3. Lower your max zoom level temporarily to reduce download volume
+4. Ensure your file cache is enabled - subsequent flights load much faster
+5. If issues persist, set <code>suspend_maxwait = False</code> for stricter timeouts during loading (may result in more missing tiles initially)</p>
+<hr />
+<h3 id="dynamic-zoom-levels">Dynamic Zoom Levels</h3>
+<p>The Dynamic Zoom system automatically adjusts imagery quality based on your altitude Above Ground Level (AGL). This provides higher detail when flying low and saves resources at high altitudes where detail matters less.</p>
+<h4 id="why-agl-instead-of-msl">Why AGL Instead of MSL?</h4>
+<p>AutoOrtho uses <strong>AGL (Above Ground Level)</strong> altitude from X-Plane's <code>y_agl</code> dataref rather than MSL (Mean Sea Level) pressure altitude. This provides more accurate terrain-aware imagery quality:</p>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>MSL Altitude</th>
+<th>Terrain Elevation</th>
+<th>AGL Altitude</th>
+<th>Zoom Decision</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Flying over ocean</td>
+<td>10,000ft</td>
+<td>0ft</td>
+<td>10,000ft AGL</td>
+<td>Lower zoom OK</td>
+</tr>
+<tr>
+<td>Flying over mountains</td>
+<td>10,000ft</td>
+<td>5,000ft</td>
+<td>5,000ft AGL</td>
+<td>Higher zoom needed</td>
+</tr>
+<tr>
+<td>Approaching mountain airport</td>
+<td>8,000ft</td>
+<td>7,000ft</td>
+<td>1,000ft AGL</td>
+<td>Maximum zoom</td>
+</tr>
+</tbody>
+</table>
+<p>With AGL, you automatically get higher quality imagery when flying low over terrain, regardless of the terrain's MSL elevation.</p>
+<h4 id="enable-dynamic-zoom-max_zoom_mode">Enable Dynamic Zoom (<code>max_zoom_mode</code>)</h4>
+<ul>
+<li><strong>Type:</strong> String (fixed, dynamic)</li>
+<li><strong>Default:</strong> fixed</li>
+<li><strong>Config file:</strong> <code>max_zoom_mode = fixed</code></li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>fixed</strong></td>
+<td>Use the same zoom level everywhere (traditional behavior)</td>
+</tr>
+<tr>
+<td><strong>dynamic</strong></td>
+<td>Automatically adjust zoom based on AGL altitude</td>
+</tr>
+</tbody>
+</table>
+<h4 id="configuring-quality-steps">Configuring Quality Steps</h4>
+<p>Quality Steps define zoom levels for different altitude ranges. Each step specifies:
+- <strong>Altitude (AGL)</strong>: The altitude threshold in feet above ground
+- <strong>Zoom Level</strong>: The maximum zoom level for normal tiles
+- <strong>Airports Zoom Level</strong>: The maximum zoom level near airports (can be higher for detail)</p>
+<p><strong>Example configuration:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Altitude (AGL)</th>
+<th>Normal ZL</th>
+<th>Airports ZL</th>
+<th>Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0ft+</td>
+<td>ZL17</td>
+<td>ZL18</td>
+<td>On ground / very low</td>
+</tr>
+<tr>
+<td>5,000ft+</td>
+<td>ZL16</td>
+<td>ZL17</td>
+<td>Low altitude flight</td>
+</tr>
+<tr>
+<td>15,000ft+</td>
+<td>ZL15</td>
+<td>ZL16</td>
+<td>Medium altitude</td>
+</tr>
+<tr>
+<td>30,000ft+</td>
+<td>ZL14</td>
+<td>ZL15</td>
+<td>High altitude cruise</td>
+</tr>
+</tbody>
+</table>
+<p><strong>How altitude prediction works:</strong></p>
+<p>When a tile is requested, AutoOrtho predicts your altitude when you'll be closest to that tile:</p>
+<ol>
+<li>Gets your current position, heading, speed, and vertical speed</li>
+<li>Calculates when you'll be closest to the tile</li>
+<li>Predicts your AGL altitude at that time</li>
+<li>Selects the appropriate zoom level for that predicted altitude</li>
+</ol>
+<p>This means tiles ahead of you during a descent will load at higher detail than tiles behind you.</p>
+<h4 id="fallback-behavior">Fallback Behavior</h4>
+<p>When X-Plane DataRefs are not available (before flight starts, loading screens):
+- Dynamic zoom falls back to the <strong>base step</strong> (0ft AGL quality level)
+- This ensures tiles load at maximum configured quality during scenery loading</p>
+<hr />
+<h3 id="spatial-prefetching">Spatial Prefetching</h3>
+<p>The prefetching system proactively downloads tiles ahead of your aircraft to reduce in-flight stuttering.</p>
+<h4 id="enable-prefetching-prefetch_enabled">Enable Prefetching (<code>prefetch_enabled</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Boolean (True/False)</li>
+<li><strong>Default:</strong> True</li>
+<li><strong>Config file:</strong> <code>prefetch_enabled = True</code></li>
+</ul>
+<p>When enabled, AutoOrtho monitors your aircraft's position, heading, and speed to predict which tiles you'll need next and downloads them in advance.</p>
+<p><strong>How it works:</strong></p>
+<p><em>With SimBrief flight data loaded:</em>
+1. AutoOrtho follows your actual flight plan, interpolating between waypoints
+2. Uses SimBrief's calculated times (accounting for winds and climb/descent)
+3. Prioritizes tiles by time-to-encounter (closest tiles first)
+4. Downloads tiles uniformly along your entire route</p>
+<p><em>Without SimBrief (velocity-based):</em>
+1. AutoOrtho tracks your aircraft's heading and ground speed
+2. It calculates which tiles are in your flight path ahead
+3. It downloads those tiles in the background before you reach them</p>
+<p><strong>Prefetching with Dynamic Zoom:</strong></p>
+<p>When Dynamic Zoom is enabled, the prefetcher uses your predicted AGL altitude at each prefetch location to determine the appropriate zoom level. This means:
+- Tiles prefetched for a descent will be at higher zoom levels
+- Tiles prefetched for cruise will be at lower zoom levels
+- Each prefetched tile matches what you'll actually need when you get there</p>
+<p><strong>Recommendation:</strong> Keep enabled for the smoothest in-flight experience.</p>
+<hr />
+<h4 id="lookahead-time-prefetch_lookahead">Lookahead Time (<code>prefetch_lookahead</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Integer (minutes)</li>
+<li><strong>Default:</strong> 10</li>
+<li><strong>Range:</strong> 1 - 60 minutes</li>
+<li><strong>Config file:</strong> <code>prefetch_lookahead = 10</code></li>
+</ul>
+<p>How far ahead (in minutes of flight time) to prefetch tiles.</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>At 150 kts</th>
+<th>At 300 kts</th>
+<th>At 500 kts</th>
+<th>Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>5 min</td>
+<td>~12nm</td>
+<td>~25nm</td>
+<td>~42nm</td>
+<td>Conservative, less bandwidth</td>
+</tr>
+<tr>
+<td>10 min</td>
+<td>~25nm</td>
+<td>~50nm</td>
+<td>~83nm</td>
+<td>Balanced (default)</td>
+</tr>
+<tr>
+<td>20 min</td>
+<td>~50nm</td>
+<td>~100nm</td>
+<td>~166nm</td>
+<td>Longer flights, faster aircraft</td>
+</tr>
+<tr>
+<td>30 min</td>
+<td>~75nm</td>
+<td>~150nm</td>
+<td>~250nm</td>
+<td>Cross-country flights</td>
+</tr>
+<tr>
+<td>60 min</td>
+<td>~150nm</td>
+<td>~300nm</td>
+<td>~500nm</td>
+<td>Maximum prefetch coverage</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Example:</strong> At 300 knots ground speed with 10 minute lookahead:
+- Distance: 300 kts × 10 min = 50 nautical miles ahead
+- AutoOrtho will prefetch tiles up to 50nm in front of you</p>
+<p><strong>Recommendation:</strong> 
+- Short flights / GA: 5-10 minutes
+- Medium flights / Jets: 10-20 minutes<br />
+- Long haul / Fast jets: 20-30 minutes</p>
+<hr />
+<h3 id="per-chunk-timeout-settings">Per-Chunk Timeout Settings</h3>
+<p>These settings work <strong>alongside</strong> the tile time budget to control individual chunk download behavior.</p>
+<h4 id="per-chunk-max-wait-maxwait">Per-Chunk Max Wait (<code>maxwait</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Float (seconds)</li>
+<li><strong>Default:</strong> 5.0</li>
+<li><strong>Range:</strong> 0.1 - 10.0</li>
+<li><strong>Config file:</strong> <code>maxwait = 5.0</code></li>
+<li><strong>UI:</strong> Settings → Advanced Settings → Per-chunk max wait</li>
+</ul>
+<p>Maximum time to wait for a <strong>single chunk</strong> to download. This works in combination with the tile time budget:</p>
+<ul>
+<li><strong>Tile Time Budget:</strong> Total time for the entire tile (all 256 chunks)</li>
+<li><strong>Per-Chunk Max Wait:</strong> Maximum time for each individual chunk download</li>
+</ul>
+<p>A chunk will stop waiting when <strong>either</strong> limit is reached, whichever comes first. This prevents a single slow chunk from consuming the entire tile budget.</p>
+<p><strong>How it works:</strong></p>
+<pre><code>For each chunk:
+  wait_time = min(remaining_tile_budget, maxwait)
+  wait for chunk up to wait_time
+</code></pre>
+<p><strong>Recommended values:</strong>
+| Network Speed | Recommended <code>maxwait</code> |
+|--------------|----------------------|
+| Fast (fiber) | 2.0 seconds |
+| Normal (cable/DSL) | 5.0 seconds (default) |
+| Slow/unreliable | 10.0 seconds |</p>
+<p><strong>When time budget is disabled:</strong> This becomes the sole timeout mechanism — each chunk waits up to <code>maxwait</code> seconds independently, which can result in much longer total tile times (up to 256 × maxwait for a full tile).</p>
+<h4 id="extended-loading-at-startup-suspend_maxwait">Extended Loading at Startup (<code>suspend_maxwait</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Boolean</li>
+<li><strong>Default:</strong> True</li>
+<li><strong>Config file:</strong> <code>suspend_maxwait = True</code></li>
+<li><strong>UI:</strong> Settings → Advanced Settings → "Allow extra loading time during startup"</li>
+</ul>
+<p>When enabled, AutoOrtho uses significantly longer timeouts during X-Plane's initial scenery load (before the flight starts). This ensures tiles load at full quality before you begin flying.</p>
+<p><strong>Startup behavior when enabled:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Normal Flight</th>
+<th>During Startup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tile Time Budget</td>
+<td>As configured</td>
+<td><strong>10× the configured value</strong></td>
+</tr>
+<tr>
+<td>Per-Chunk Max Wait</td>
+<td>As configured</td>
+<td><strong>20 seconds</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Example:</strong> With <code>tile_time_budget = 180</code> and <code>maxwait = 5.0</code>:
+- During startup: 1800s tile budget, 20s per-chunk wait
+- During flight: 180s tile budget, 5s per-chunk wait</p>
+<p><strong>How startup is detected:</strong> AutoOrtho considers you to be in "startup mode" until X-Plane's DataRef connection is established, which happens when the flight becomes active (after the "Reading new scenery files" splash screen).</p>
+<p><strong>Trade-offs:</strong>
+- ✅ Better initial scenery quality (fewer blurry/missing tiles at flight start)
+- ✅ Reduces low-resolution and placeholder tiles
+- ⚠️ May increase initial scenery loading time</p>
+<blockquote>
+<p><strong>⚠️ Tip: Long X-Plane Loading Times?</strong><br />
+If you're experiencing significantly longer X-Plane loading times, try setting <strong>"Allow extra loading time during startup"</strong> to <strong>Off</strong>. This option can dramatically increase scenery loading times, especially when combined with higher zoom levels or slower internet connections. Disabling it will use the normal time budgets during startup, resulting in faster loads at the cost of potentially lower initial scenery quality.</p>
+</blockquote>
+<hr />
+<h2 id="recommended-configurations">Recommended Configurations</h2>
+<h3 id="stutter-free-flying-prioritize-performance">Stutter-Free Flying (Prioritize Performance)</h3>
+<pre><code class="language-ini">use_time_budget = True
+tile_time_budget = 120.0
+fallback_level = cache
+fallback_extends_budget = False
+prefetch_enabled = True
+prefetch_lookahead = 30
+max_zoom_level = 16
+</code></pre>
+<h3 id="maximum-quality-prioritize-imagery">Maximum Quality (Prioritize Imagery)</h3>
+<pre><code class="language-ini">use_time_budget = True
+tile_time_budget = 300
+fallback_level = full
+fallback_extends_budget = True
+prefetch_enabled = True
+prefetch_lookahead = 60
+max_zoom_level = 17
+</code></pre>
+<h3 id="slow-internet-connection">Slow Internet Connection</h3>
+<pre><code class="language-ini">use_time_budget = True
+tile_time_budget = 180
+fallback_level = cache
+fallback_extends_budget = False
+prefetch_enabled = True
+prefetch_lookahead = 90
+max_zoom_level = 16
+</code></pre>
+<h3 id="weak-cpu-limited-system">Weak CPU / Limited System</h3>
+<pre><code class="language-ini">use_time_budget = True
+tile_time_budget = 180
+fallback_level = none
+fallback_extends_budget = False
+prefetch_enabled = False
+max_zoom_level = 15
+</code></pre>
+<hr />
+<h2 id="understanding-the-statistics">Understanding the Statistics</h2>
+<p>AutoOrtho logs performance statistics that can help you tune your settings:</p>
+<pre><code>STATS: {'mm_count:0': 12, 'mm_count:1': 26, 'chunk_budget_skipped': 8782, 'chunk_missing_count': 394}
+</code></pre>
+<h3 id="key-statistics">Key Statistics</h3>
+<table>
+<thead>
+<tr>
+<th>Statistic</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mm_count:N</code></td>
+<td>Successful mipmap builds at level N (0=highest detail)</td>
+</tr>
+<tr>
+<td><code>chunk_budget_skipped</code></td>
+<td>Chunks skipped because time budget ran out</td>
+</tr>
+<tr>
+<td><code>chunk_missing_count</code></td>
+<td>Chunks that ended up with missing color (no fallback worked)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Healthy indicators:</strong>
+- High <code>mm_count:0</code> values = high-detail tiles completing successfully
+- Low <code>chunk_missing_count</code> = fallbacks working well</p>
+<p><strong>Warning signs:</strong>
+- High <code>chunk_budget_skipped</code> = many chunks timing out, increase <code>tile_time_budget</code>
+- High <code>chunk_missing_count</code> = fallbacks not covering gaps, enable more fallbacks</p>
+<h3 id="breaking-down-tile-creation-time">Breaking Down Tile Creation Time</h3>
+<p>Each tile creation has two main phases:</p>
+<ol>
+<li><strong>Download + Compose</strong> (typically 60-80% of time)</li>
+<li>Downloading 64-4096 image chunks (depending on zoom level)</li>
+<li>Decoding JPEG data</li>
+<li>
+<p>Compositing into a single image</p>
+</li>
+<li>
+<p><strong>Compression</strong> (typically 20-40% of time)</p>
+</li>
+<li>Converting RGBA to DDS format</li>
+<li>Generating mipmaps</li>
+</ol>
+<p>The stats show both the total time and compression-only time, letting you identify bottlenecks:
+- If compression time is high → CPU-bound, consider lowering zoom level
+- If download time is high → Network-bound, check internet speed</p>
+<hr />
+<h2 id="time-based-exclusion">Time-Based Exclusion</h2>
+<p>AutoOrtho includes a time-based exclusion feature that allows you to automatically disable AutoOrtho scenery during specific time ranges in the simulator. This is useful for night flying when satellite imagery provides little benefit.</p>
+<h3 id="how-it-works">How It Works</h3>
+<p>When time exclusion is active:</p>
+<ol>
+<li>AutoOrtho monitors the simulator's local time via the <code>sim/time/local_time_sec</code> dataref</li>
+<li>During the exclusion period, DSF file reads are <strong>redirected</strong> to X-Plane's global scenery</li>
+<li>X-Plane uses its default scenery (which often has better night lighting)</li>
+<li>When the exclusion period ends, AutoOrtho scenery becomes available again</li>
+</ol>
+<p><strong>Important:</strong> DSF files are never hidden from X-Plane. X-Plane indexes DSF files at flight load time, so hiding them would cause missing terrain. Instead, AutoOrtho redirects reads to the corresponding global scenery DSF files, ensuring terrain data is always available.</p>
+<h3 id="safety-features">Safety Features</h3>
+<p>The time exclusion system includes important safety features:</p>
+<ul>
+<li><strong>Active DSF Protection:</strong> DSF files that are currently in use by X-Plane will NOT be redirected, even if the exclusion period starts. This prevents crashes or graphical glitches.</li>
+<li><strong>Gradual Transition:</strong> Only new DSF requests are redirected during exclusion. Previously loaded scenery continues to work until X-Plane naturally releases it.</li>
+<li><strong>Global Scenery Fallback:</strong> When redirecting, AutoOrtho looks for the equivalent DSF in X-Plane's Global Scenery folder. If not found, the original AutoOrtho file is served.</li>
+</ul>
+<h3 id="configuration">Configuration</h3>
+<h4 id="enable-time-exclusion-enabled">Enable Time Exclusion (<code>enabled</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Boolean (True/False)</li>
+<li><strong>Default:</strong> False</li>
+<li><strong>Config file:</strong> <code>[time_exclusion]</code> section, <code>enabled = True</code></li>
+</ul>
+<p>Enable or disable the time-based exclusion feature.</p>
+<h4 id="start-time-start_time">Start Time (<code>start_time</code>)</h4>
+<ul>
+<li><strong>Type:</strong> String (HH:MM format)</li>
+<li><strong>Default:</strong> 22:00</li>
+<li><strong>Config file:</strong> <code>start_time = 22:00</code></li>
+</ul>
+<p>The time when the exclusion period begins (24-hour format). For example, "22:00" for 10 PM.</p>
+<h4 id="end-time-end_time">End Time (<code>end_time</code>)</h4>
+<ul>
+<li><strong>Type:</strong> String (HH:MM format)</li>
+<li><strong>Default:</strong> 06:00</li>
+<li><strong>Config file:</strong> <code>end_time = 06:00</code></li>
+</ul>
+<p>The time when the exclusion period ends (24-hour format). For example, "06:00" for 6 AM.</p>
+<h4 id="default-to-exclusion-default_to_exclusion">Default to Exclusion (<code>default_to_exclusion</code>)</h4>
+<ul>
+<li><strong>Type:</strong> Boolean (True/False)</li>
+<li><strong>Default:</strong> False</li>
+<li><strong>Config file:</strong> <code>default_to_exclusion = False</code></li>
+</ul>
+<p>Controls behavior when sim time is not yet available (before flight starts):</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>False</strong> (default)</td>
+<td>AutoOrtho works normally until sim time confirms exclusion</td>
+</tr>
+<tr>
+<td><strong>True</strong></td>
+<td>Assume exclusion is active until sim time proves otherwise</td>
+</tr>
+</tbody>
+</table>
+<p><strong>When to enable:</strong>
+- You want night flights to start with default scenery from the very beginning
+- You don't want any AutoOrtho scenery loaded before sim time is available</p>
+<p><strong>When to keep disabled:</strong>
+- You prefer AutoOrtho to work normally during loading screens
+- You only want exclusion to apply when sim time is confirmed</p>
+<h3 id="decision-preservation-during-scenery-reload">Decision Preservation During Scenery Reload</h3>
+<p>Once the simulator time becomes available and AutoOrtho determines the correct exclusion state, this decision is <strong>preserved</strong> during temporary disconnections such as when you trigger "Reload Scenery" in X-Plane.</p>
+<p><strong>Why this matters:</strong></p>
+<p>Without decision preservation, the following problem would occur:
+1. You start a flight with "Default to Exclusion" enabled
+2. Time exclusion activates initially (no sim time available yet)
+3. Sim time becomes available (e.g., 15:00 / 3 PM) → exclusion deactivates correctly
+4. You trigger "Reload Scenery" in X-Plane
+5. During reload, sim time temporarily becomes unavailable
+6. ❌ Without preservation: exclusion would incorrectly re-activate
+7. ✅ With preservation: exclusion stays inactive (correct behavior)</p>
+<p><strong>How it works:</strong></p>
+<ul>
+<li>When sim time is received, AutoOrtho records both the time and the exclusion decision</li>
+<li>If sim time becomes temporarily unavailable (during reload), the last decision is preserved</li>
+<li>The preserved decision is updated whenever new sim time data is received</li>
+<li>Normal time-based transitions still work (crossing into/out of exclusion hours)</li>
+</ul>
+<p><strong>Limitations:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Limitation</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Persists until restart</strong></td>
+<td>The preserved decision remains until AutoOrtho is fully restarted</td>
+</tr>
+<tr>
+<td><strong>To reset behavior</strong></td>
+<td>Quit and restart AutoOrtho to return to the <code>default_to_exclusion</code> initial behavior</td>
+</tr>
+<tr>
+<td><strong>Updates on new time</strong></td>
+<td>If sim time indicates a state change (e.g., crossing into night), it will update when time becomes available again</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>💡 Tip:</strong> If you notice the exclusion state is "stuck" after multiple scenery reloads, simply restart AutoOrtho to reset to the configured default behavior.</p>
+</blockquote>
+<h3 id="example-configuration">Example Configuration</h3>
+<p>To disable AutoOrtho between 10 PM and 6 AM (night hours):</p>
+<pre><code class="language-ini">[time_exclusion]
+enabled = True
+start_time = 22:00
+end_time = 06:00
+default_to_exclusion = False
+</code></pre>
+<p>To ensure exclusion is active from the moment AutoOrtho starts (before sim time is available):</p>
+<pre><code class="language-ini">[time_exclusion]
+enabled = True
+start_time = 22:00
+end_time = 06:00
+default_to_exclusion = True
+</code></pre>
+<h3 id="overnight-ranges">Overnight Ranges</h3>
+<p>The system correctly handles overnight time ranges. For example, if you set:
+- Start: 22:00 (10 PM)
+- End: 06:00 (6 AM)</p>
+<p>AutoOrtho will be disabled from 10 PM until 6 AM the next morning.</p>
+<h3 id="ui-configuration">UI Configuration</h3>
+<p>You can configure time exclusion in the AutoOrtho Settings tab:</p>
+<ol>
+<li>Go to <strong>Settings</strong> tab</li>
+<li>Find the <strong>Time Exclusion Settings</strong> group</li>
+<li>Check <strong>Enable time-based exclusion</strong></li>
+<li>Set the <strong>Start time</strong> and <strong>End time</strong> in HH:MM format</li>
+</ol>
+<h3 id="use-cases">Use Cases</h3>
+<ul>
+<li><strong>Night Flying:</strong> Satellite imagery is often dark or less useful at night. Default X-Plane scenery may have better night lighting.</li>
+<li><strong>Performance Optimization:</strong> Reduce network usage and CPU load during night hours when visual quality matters less.</li>
+<li><strong>Dawn/Dusk Flying:</strong> Exclude twilight hours when satellite imagery transitions may look unrealistic.</li>
+</ul>
+<hr />
+<hr />
+<h2 id="simbrief-integration">SimBrief Integration</h2>
+<p>AutoOrtho can integrate with SimBrief to enhance Dynamic Zoom and Prefetching using your actual flight plan data. This provides more accurate predictions than velocity-based calculations alone.</p>
+<h3 id="setting-up-simbrief-integration">Setting Up SimBrief Integration</h3>
+<ol>
+<li>Go to <strong>Settings</strong> → <strong>Setup</strong> tab</li>
+<li>Find the <strong>SimBrief Integration</strong> section</li>
+<li>Enter your <strong>SimBrief User ID</strong> (found in your SimBrief account settings)</li>
+<li>Click <strong>Fetch Flight Data</strong> after filing your flight plan in SimBrief</li>
+<li>Enable <strong>Use Flight Data for Dynamic Zoom Level and Pre-fetching Calculations</strong></li>
+</ol>
+<blockquote>
+<p><strong>Note:</strong> You can load SimBrief flight data at any time — before or after pressing "Run". The toggle takes effect immediately, so you don't need to restart AutoOrtho or save the config when loading a flight plan mid-session.</p>
+</blockquote>
+<h3 id="how-it-works_1">How It Works</h3>
+<p>When SimBrief integration is enabled and flight data is loaded:</p>
+<h4 id="dynamic-zoom-with-simbrief">Dynamic Zoom with SimBrief</h4>
+<p>Instead of predicting altitude based on current vertical speed, AutoOrtho uses your planned altitudes from SimBrief:</p>
+<ol>
+<li>For each tile, finds the closest waypoint(s) in your flight plan</li>
+<li>Uses the planned AGL altitude at those waypoints</li>
+<li>If multiple waypoints are within the consideration radius (default 50nm), uses the <strong>lowest AGL altitude</strong> for conservative quality</li>
+</ol>
+<p><strong>Conservative AGL Calculation:</strong>
+- Uses the <strong>lowest</strong> flight altitude (MSL) among nearby waypoints — accounts for descents
+- Uses the <strong>highest</strong> ground elevation — accounts for mountains
+- AGL = lowest_MSL - highest_ground = most conservative (highest quality) result</p>
+<h4 id="prefetching-with-simbrief">Prefetching with SimBrief</h4>
+<p>Instead of prefetching based on velocity vector prediction, AutoOrtho follows your actual flight path with time-based prioritization:</p>
+<ol>
+<li><strong>Projects your position onto the route</strong> — finds exactly where you are on the flight plan</li>
+<li><strong>Calculates your "current time"</strong> — interpolates between waypoint times based on position</li>
+<li><strong>Walks forward along the entire path</strong> — interpolating between waypoints at regular intervals (not just around waypoints)</li>
+<li><strong>Uses SimBrief's planned times</strong> — accounts for winds, climb/descent speeds, and holds</li>
+<li><strong>Calculates time-to-encounter</strong> for each point along the path</li>
+<li><strong>Prioritizes tiles by time</strong> — tiles you'll reach sooner are prefetched first</li>
+<li><strong>Stops at the configured lookahead time</strong> — doesn't waste bandwidth on distant tiles</li>
+</ol>
+<p><strong>Key advantage:</strong> The path is uniformly sampled between waypoints, so even long oceanic legs or direct routes with distant waypoints get full coverage. Tiles are downloaded in the order you'll actually encounter them.</p>
+<p><strong>Example:</strong> If your next waypoint is 200nm away but you'll pass near a tile in 5 minutes, that tile is prefetched before tiles near the waypoint itself.</p>
+<h3 id="configuration-options">Configuration Options</h3>
+<p>These settings are available in <strong>Settings</strong> → <strong>Setup</strong> → <strong>SimBrief Integration</strong> when flight data is loaded and the "Use Flight Data" toggle is enabled.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Default</th>
+<th>Range</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Route Consideration Radius</td>
+<td>50 nm</td>
+<td>10-200 nm</td>
+<td>Radius around a tile to consider waypoints for altitude calculation. Uses the lowest altitude among nearby waypoints for conservative zoom level selection.</td>
+</tr>
+<tr>
+<td>Route Deviation Threshold</td>
+<td>40 nm</td>
+<td>5-100 nm</td>
+<td>Maximum distance off-route before falling back to DataRef-based calculations. Accounts for ATC vectors or weather avoidance.</td>
+</tr>
+<tr>
+<td>Route Prefetch Radius</td>
+<td>40 nm</td>
+<td>10-150 nm</td>
+<td>Radius around path points for pre-fetching tiles. Larger values prefetch more tiles perpendicular to your route.</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>ℹ Real-time Changes:</strong> All route settings take effect immediately when modified — no restart required. However, use <strong>Save Config</strong> to persist your values for future AutoOrtho sessions.</p>
+</blockquote>
+<h3 id="fallback-behavior_1">Fallback Behavior</h3>
+<p>SimBrief integration gracefully falls back to DataRef-based calculations when:</p>
+<ol>
+<li><strong>No flight data loaded</strong>: Use velocity-based prediction from X-Plane DataRefs</li>
+<li><strong>Aircraft off-route</strong>: If you deviate more than 40nm from the planned route, AutoOrtho assumes you're no longer following the plan and falls back to DataRef calculations</li>
+<li><strong>DataRefs unavailable</strong>: If X-Plane isn't sending data yet, uses the base quality step (0ft AGL = maximum quality)</li>
+</ol>
+<h3 id="example-workflows">Example Workflows</h3>
+<h4 id="option-a-load-flight-plan-before-starting">Option A: Load flight plan before starting</h4>
+<ol>
+<li><strong>File flight plan</strong> in SimBrief (e.g., KJFK → KLAX)</li>
+<li><strong>Start AutoOrtho</strong> and go to Settings → Setup</li>
+<li><strong>Enter SimBrief User ID</strong> and click "Fetch Flight Data"</li>
+<li><strong>Verify flight info</strong> displays correctly (route, cruise altitude, aircraft)</li>
+<li><strong>Enable toggle</strong> "Use Flight Data for Dynamic Zoom..."</li>
+<li><strong>Press Run</strong> — AutoOrtho starts and begins prefetching along your route</li>
+<li><strong>Start X-Plane</strong> and fly your route</li>
+</ol>
+<h4 id="option-b-load-flight-plan-after-starting-mid-session">Option B: Load flight plan after starting (mid-session)</h4>
+<ol>
+<li><strong>Start AutoOrtho</strong> and press Run (with your SimBrief User ID already saved)</li>
+<li><strong>Start X-Plane</strong> and begin your flight</li>
+<li><strong>File flight plan</strong> in SimBrief when ready</li>
+<li><strong>Go to Settings → Setup</strong> and click "Fetch Flight Data"</li>
+<li><strong>Enable toggle</strong> — takes effect immediately, no restart needed</li>
+<li>AutoOrtho will immediately start using your flight plan for prefetching and dynamic zoom</li>
+</ol>
+<hr />
+<h2 id="known-limitations">Known Limitations</h2>
+<h3 id="zoom-level-transitions">Zoom Level Transitions</h3>
+<p>When flying through areas where the zoom level changes (e.g., from ZL16 to ZL15 during climb), you may notice:</p>
+<ul>
+<li><strong>Hard visual transitions</strong>: Adjacent tiles at different zoom levels may have visible seams due to:</li>
+<li>Different imagery capture dates</li>
+<li>Different color processing/calibration</li>
+<li>
+<p>Resolution differences at tile boundaries</p>
+</li>
+<li>
+<p><strong>Color mismatches</strong>: Satellite imagery from different zoom levels is often captured at different times, so colors, seasons, and lighting may not match perfectly.</p>
+</li>
+</ul>
+<p><strong>Mitigation strategies:</strong>
+- Configure fewer, larger altitude steps to reduce the number of transitions
+- Accept some quality variation for the performance benefits
+- Use similar zoom levels for adjacent altitude ranges (e.g., ZL16/ZL16 instead of ZL16/ZL14)</p>
+<h3 id="simbrief-integration-limitations">SimBrief Integration Limitations</h3>
+<table>
+<thead>
+<tr>
+<th>Limitation</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Single flight plan</strong></td>
+<td>Only the most recently fetched SimBrief flight plan is used. Multi-leg flights require re-fetching between legs.</td>
+</tr>
+<tr>
+<td><strong>Static ground heights</strong></td>
+<td>Ground elevation data comes from SimBrief's database, which may differ slightly from X-Plane's terrain.</td>
+</tr>
+<tr>
+<td><strong>Route deviation detection</strong></td>
+<td>The 40nm off-route threshold is a straight-line distance, not a cross-track distance. Complex routes near waypoints may trigger false positives.</td>
+</tr>
+<tr>
+<td><strong>No automatic refresh</strong></td>
+<td>Flight data is fetched once when you click the button. Changes to your SimBrief flight plan require manual re-fetch.</td>
+</tr>
+<tr>
+<td><strong>Holding patterns</strong></td>
+<td>SimBrief fixes don't include holding patterns. If you hold, AutoOrtho may use incorrect altitude predictions.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="dataref-based-prediction-limitations">DataRef-Based Prediction Limitations</h3>
+<p>When not using SimBrief (or when off-route), altitude prediction uses X-Plane DataRefs:</p>
+<table>
+<thead>
+<tr>
+<th>Limitation</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Vertical speed extrapolation</strong></td>
+<td>Assumes current vertical speed will continue, which may not be accurate for complex climb/descent profiles.</td>
+</tr>
+<tr>
+<td><strong>60-second averaging window</strong></td>
+<td>Predictions are based on a 60-second rolling average, so rapid changes in flight path take time to reflect.</td>
+</tr>
+<tr>
+<td><strong>No terrain awareness</strong></td>
+<td>DataRef-based predictions use current AGL but don't know about upcoming terrain changes.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="prefetching-limitations">Prefetching Limitations</h3>
+<table>
+<thead>
+<tr>
+<th>Limitation</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Priority system</strong></td>
+<td>Prefetched tiles are always lower priority than tiles X-Plane directly requests. During rapid maneuvering, prefetching pauses.</td>
+</tr>
+<tr>
+<td><strong>Network-dependent</strong></td>
+<td>Prefetching requires available network bandwidth. On slow connections, prefetching may not keep up with fast aircraft.</td>
+</tr>
+<tr>
+<td><strong>Cache eviction</strong></td>
+<td>Prefetched tiles can be evicted from cache if memory limits are reached before you reach those tiles.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="general-limitations">General Limitations</h3>
+<table>
+<thead>
+<tr>
+<th>Limitation</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Imagery availability</strong></td>
+<td>Not all zoom levels are available in all areas. Some regions only have imagery up to ZL15 or ZL16.</td>
+</tr>
+<tr>
+<td><strong>Server-side rate limiting</strong></td>
+<td>Excessive requests may be throttled by imagery providers, affecting both real-time and prefetch downloads.</td>
+</tr>
+<tr>
+<td><strong>Memory usage</strong></td>
+<td>Higher zoom levels and extensive prefetching increase memory usage. Monitor system RAM on limited systems.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="native-pipeline-architecture">Native Pipeline Architecture</h2>
+<p>AutoOrtho includes a high-performance native pipeline (<code>aopipeline</code>) written in C that bypasses Python's Global Interpreter Lock (GIL) for CPU-intensive operations. This provides <strong>10-20x faster DDS texture building</strong> compared to the Python-only path.</p>
+<h3 id="why-native-code">Why Native Code?</h3>
+<p>Python's GIL (Global Interpreter Lock) prevents true multi-threading for CPU-bound work. Even with multiple Python threads, only one can execute Python bytecode at a time. This caused stutters when multiple DDS textures needed to be built simultaneously.</p>
+<p>The native pipeline solves this by:
+1. Moving CPU-intensive work entirely to C code
+2. Using <strong>OpenMP</strong> for true parallel execution across all CPU cores
+3. Calling into Python only for orchestration, not computation</p>
+<h3 id="components">Components</h3>
+<p>The native pipeline consists of four modules:</p>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Purpose</th>
+<th>Parallelism</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>AoCache</strong></td>
+<td>Batch file I/O for cached JPEGs</td>
+<td>OpenMP parallel reads</td>
+</tr>
+<tr>
+<td><strong>AoDecode</strong></td>
+<td>JPEG decoding via TurboJPEG</td>
+<td>OpenMP parallel decodes</td>
+</tr>
+<tr>
+<td><strong>AoDDS</strong></td>
+<td>DDS texture building with ISPC compression</td>
+<td>OpenMP parallel compression</td>
+</tr>
+<tr>
+<td><strong>AoHttp</strong></td>
+<td>HTTP downloads via libcurl</td>
+<td>Connection pooling, HTTP/2</td>
+</tr>
+</tbody>
+</table>
+<h3 id="how-it-works_2">How It Works</h3>
+<p>When X-Plane requests a tile, AutoOrtho's native pipeline:</p>
+<ol>
+<li><strong>Batch reads</strong> all cached JPEG chunks in parallel (256 files for ZL16)</li>
+<li><strong>Batch decodes</strong> all JPEGs using thread-local TurboJPEG handles</li>
+<li><strong>Composes</strong> the full tile image using SIMD-optimized operations</li>
+<li><strong>Compresses</strong> each DDS mipmap level in parallel using ISPC</li>
+<li>Returns the complete DDS to Python for serving to X-Plane</li>
+</ol>
+<p>All steps happen in native C threads, completely bypassing the Python GIL.</p>
+<h3 id="performance-impact">Performance Impact</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Python-Only</th>
+<th>Native Pipeline</th>
+<th>Improvement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cache read (256 files)</td>
+<td>500ms</td>
+<td>50ms</td>
+<td><strong>10x</strong></td>
+</tr>
+<tr>
+<td>JPEG decode (256 chunks)</td>
+<td>800ms</td>
+<td>100ms</td>
+<td><strong>8x</strong></td>
+</tr>
+<tr>
+<td>DDS compression</td>
+<td>1000ms</td>
+<td>80ms</td>
+<td><strong>12x</strong></td>
+</tr>
+<tr>
+<td><strong>Total tile build</strong></td>
+<td><strong>2.5s</strong></td>
+<td><strong>~260ms</strong></td>
+<td><strong>~10x</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="configuration_1">Configuration</h3>
+<pre><code class="language-ini">[autoortho]
+# Maximum threads per native build (0 = auto, divided across concurrent builds)
+# Set to 1 for single-threaded mode (lowest CPU, slowest builds)
+native_pipeline_threads = 0
+
+# Early-build threshold: start DDS build when this fraction of chunks are ready (0.5-1.0)
+# 1.0 = wait for all chunks (single build, no placeholders)
+# 0.9 = build at 90%, automatically rebuild when remaining 10% arrive
+live_aopipeline_min_chunk_ratio = 1.0
+
+# Disk-based DDS cache size in MB (0 = disabled)
+# Uses temp directory, auto-cleaned on session end
+ephemeral_dds_cache_mb = 4096
+</code></pre>
+<h4 id="thread-configuration">Thread Configuration</h4>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>0</strong> (default)</td>
+<td>Auto: divides CPU cores across concurrent builds to avoid oversubscription</td>
+</tr>
+<tr>
+<td><strong>1</strong></td>
+<td>Single-threaded (useful for debugging or very low-end CPUs)</td>
+</tr>
+<tr>
+<td><strong>N</strong></td>
+<td>Fixed N threads per build (regardless of concurrent build count)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="early-build-threshold-live_aopipeline_min_chunk_ratio">Early-Build Threshold (<code>live_aopipeline_min_chunk_ratio</code>)</h4>
+<p>Controls a <strong>two-phase build strategy</strong> that trades brief placeholder artifacts for faster first texture appearance:</p>
+<p><strong>Phase 1 — Early build</strong>: fires as soon as this ratio of chunks is available. Any missing chunks are filled with the missing color.</p>
+<p><strong>Phase 2 — Healing pass</strong>: fires automatically when the remaining chunks arrive, replacing placeholder areas with real imagery.</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>1.0</strong> (default)</td>
+<td>Wait for all chunks — single build, no placeholders, no healing needed</td>
+</tr>
+<tr>
+<td><strong>0.9</strong></td>
+<td>Build at 90% — texture appears ~10% sooner, healed silently after</td>
+</tr>
+<tr>
+<td><strong>0.8</strong></td>
+<td>Build at 80% — texture appears earlier, more placeholder area to heal</td>
+</tr>
+</tbody>
+</table>
+<p>At <code>1.0</code> there is no behavioral difference from before — the tile only builds once all chunks are present. Values below <code>1.0</code> are useful on slow connections where waiting for the last few chunks causes noticeable delay before a tile becomes visible.</p>
+<h3 id="ephemeral-dds-cache">Ephemeral DDS Cache</h3>
+<p>The native pipeline includes an <strong>ephemeral disk cache</strong> for pre-built DDS textures:</p>
+<ul>
+<li><strong>Memory tier</strong>: Fast access for recently used tiles (configurable, default 512MB)</li>
+<li><strong>Disk tier</strong>: Overflow storage in temp directory (configurable, default 4GB)</li>
+<li><strong>Auto-cleanup</strong>: Disk cache is deleted when AutoOrtho exits</li>
+</ul>
+<p>This hybrid approach provides:
+- ✅ Large cache capacity without permanent disk usage
+- ✅ Fresh tiles every session (no stale/corrupted cache)
+- ✅ Settings changes take effect immediately (no cache invalidation needed)</p>
+<h3 id="native-http-client">Native HTTP Client</h3>
+<p>The native HTTP client uses <strong>libcurl's multi-interface</strong> for high-performance chunk downloads:</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Benefit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Connection pooling</strong></td>
+<td>Reuses TCP connections across requests</td>
+</tr>
+<tr>
+<td><strong>HTTP/2 multiplexing</strong></td>
+<td>Multiple requests over single connection</td>
+</tr>
+<tr>
+<td><strong>Batch processing</strong></td>
+<td>Amortizes Python overhead across 64 chunks</td>
+</tr>
+<tr>
+<td><strong>Parallel downloads</strong></td>
+<td>True concurrent I/O, not GIL-limited</td>
+</tr>
+</tbody>
+</table>
+<p>This is especially impactful during <strong>initial loading</strong> when 100,000+ chunk requests are queued.</p>
+<h3 id="important-caveats">Important Caveats</h3>
+<h4 id="apple-maps-fallback">Apple Maps Fallback</h4>
+<p><strong>Apple Maps (<code>APPLE</code> imagery source) always uses the Python HTTP client</strong>, not the native client. This is intentional because:</p>
+<ol>
+<li><strong>Dynamic token</strong>: Apple requires a session-specific access token obtained via DuckDuckGo proxy</li>
+<li><strong>Token rotation</strong>: On 403/410 errors, the token must be refreshed and the request retried</li>
+<li><strong>Complex logic</strong>: The Python path handles all this special authentication flow</li>
+</ol>
+<p><strong>Impact</strong>: Apple Maps downloads may be slightly slower than other sources, but all retry logic and token handling works correctly.</p>
+<pre><code># Native HTTP path (fast):
+BI, EOX, ARC, NAIP, USGS, FIREFLY, YNDX, GO2 → libcurl → parallel downloads
+
+# Python fallback path (full features):
+APPLE → requests library → token rotation on 403/410
+</code></pre>
+<h4 id="platform-support">Platform Support</h4>
+<p>The native pipeline requires compiled libraries for each platform:</p>
+<table>
+<thead>
+<tr>
+<th>Platform</th>
+<th>Library</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>macOS (ARM64)</td>
+<td><code>libaopipeline.dylib</code></td>
+<td>✅ Included</td>
+</tr>
+<tr>
+<td>macOS (x86_64)</td>
+<td><code>libaopipeline.dylib</code></td>
+<td>Build from source</td>
+</tr>
+<tr>
+<td>Linux (x64)</td>
+<td><code>libaopipeline.so</code></td>
+<td>Build from source</td>
+</tr>
+<tr>
+<td>Windows (x64)</td>
+<td><code>aopipeline.dll</code></td>
+<td>Build from source</td>
+</tr>
+</tbody>
+</table>
+<p>If the native library is not available for your platform, AutoOrtho automatically falls back to the Python implementation.</p>
+<h4 id="fallback-behavior_2">Fallback Behavior</h4>
+<p>The native pipeline gracefully falls back to Python when:
+- Native library is not available or fails to load
+- Apple Maps source is used (token handling)
+- Transient HTTP errors need sophisticated retry logic
+- Chunk downloads fail and need server rotation</p>
+<p>You'll see log messages indicating which path is used:</p>
+<pre><code>INFO: Using NativeChunkGetter (32 connections)
+INFO: Native HTTP client available: 1.0.0
+</code></pre>
+<p>Or for fallback:</p>
+<pre><code>INFO: Using Python ChunkGetter (32 workers)
+DEBUG: Native HTTP client library not available, using Python requests fallback
+</code></pre>
+<hr />
+<h2 id="troubleshooting">Troubleshooting</h2>
+<h3 id="long-x-plane-loading-times">Long X-Plane Loading Times</h3>
+<p>If X-Plane takes significantly longer to load scenery with AutoOrtho enabled, the most common cause is the <strong>"Allow extra loading time during startup"</strong> setting (<code>suspend_maxwait</code>). This option extends timeout values by 10× during initial scenery loading, which can add substantial time to X-Plane's startup.</p>
+<p><strong>To reduce loading times:</strong></p>
+<ol>
+<li>Go to <strong>Settings</strong> → <strong>Advanced Settings</strong></li>
+<li>Set <strong>"Allow extra loading time during startup"</strong> to <strong>Off</strong></li>
+<li>This will use normal time budgets during startup, resulting in faster loads</li>
+</ol>
+<p><strong>Note:</strong> Disabling this may result in some tiles loading at lower quality initially, but they will reload at full quality as you fly.</p>
+<h3 id="other-common-issues">Other Common Issues</h3>
+<p>See the <a href="../faq/#missing-color-tiles">FAQ</a> for common issues related to:
+- Missing color (green) tiles
+- Long loading times
+- In-flight stuttering</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>
