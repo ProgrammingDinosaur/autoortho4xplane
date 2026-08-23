@@ -36,6 +36,16 @@ import requests
 import psutil
 
 try:
+    from autoortho.diagnostics import (
+        profiled_stage,
+        profile_gauge,
+        profile_span,
+        record_stage,
+    )
+except ImportError:
+    from diagnostics import profiled_stage, profile_gauge, profile_span, record_stage
+
+try:
     from autoortho.aoimage import AoImage
 except ImportError:
     from aoimage import AoImage
@@ -135,6 +145,7 @@ def _get_native_cache():
         log.warning(f"Native cache initialization failed: {e}")
     return _native_cache
 
+@profiled_stage("cache.jpeg_batch_read")
 def _batch_read_cache_files(paths: list) -> dict:
     """
     Read multiple cache files in parallel.
@@ -802,6 +813,29 @@ def create_http_session(pool_size=10):
     session.mount('http://', adapter)
     log.debug(f"Created requests session (pool_size={pool_size})")
     return session
+
+
+def _profiled_http_get(session, url, headers, timeout, chunk):
+    tile_id = getattr(chunk, "tile_id", None) or getattr(chunk, "chunk_id", None)
+    details = {
+        "maptype": getattr(chunk, "maptype", None),
+        "zoom": getattr(chunk, "zoom", None),
+        "attempt": getattr(chunk, "attempt", None),
+        "prefetch": bool(getattr(chunk, "prefetch", False)),
+    }
+    with profile_span(
+        "network.http_request",
+        tile_id=tile_id,
+        details=details,
+    ) as span:
+        response = session.get(url, headers=headers, timeout=timeout)
+        span.annotate(
+            status_code=response.status_code,
+            response_bytes=len(response.content or b""),
+        )
+        if response.status_code >= 400:
+            span.outcome = "failed"
+        return response
 
 
 # JPEG decode concurrency: auto-tuned for optimal performance
@@ -1503,6 +1537,19 @@ class Getter(object):
                 time.sleep(0.05)
                 continue
 
+            queued_at = getattr(obj, '_profile_queued_at', None)
+            if queued_at is not None:
+                record_stage(
+                    "chunk.queue_wait",
+                    (time.monotonic() - queued_at) * 1000.0,
+                    tile_id=getattr(obj, 'tile_id', None) or getattr(obj, 'chunk_id', None),
+                    details={
+                        "priority": getattr(obj, 'priority', None),
+                        "prefetch": bool(getattr(obj, 'prefetch', False)),
+                    },
+                )
+                obj._profile_queued_at = None
+
             did_resubmit = False
             try:
                 # Mark chunk as in-flight (Chunk always has these attributes)
@@ -1737,6 +1784,7 @@ class ChunkGetter(Getter):
                 self._queued_chunk_ids.add(chunk_id)
                 self._queued_chunk_objs[chunk_id] = obj
         
+        obj._profile_queued_at = time.monotonic()
         self.queue.put((obj, args, kwargs))
         return True
 
@@ -5419,6 +5467,7 @@ class Chunk(object):
         if self.lt_cache_dir:
             _lt_cache_write_executor.submit(self._save_to_dir, self.lt_cache_dir)
 
+    @profiled_stage("chunk.resolve")
     def get(self, idx=0, session=requests, timeout=None, max_attempts=None):
         log.debug(f"Getting {self}")
 
@@ -5521,7 +5570,9 @@ class Chunk(object):
         resp = None
         try:
 
-            resp = session.get(self.url, headers=header, timeout=_http_timeout)
+            resp = _profiled_http_get(
+                session, self.url, header, _http_timeout, self
+            )
             status_code = resp.status_code
 
             if self.maptype.upper() == "APPLE" and status_code in (403, 410):
@@ -5531,7 +5582,9 @@ class Chunk(object):
                 self.url = MAPTYPES[self.maptype.upper()]
                 if resp is not None:
                     resp.close()
-                resp = session.get(self.url, headers=header, timeout=_http_timeout)
+                resp = _profiled_http_get(
+                    session, self.url, header, _http_timeout, self
+                )
                 status_code = resp.status_code
 
             if status_code != 200:
@@ -6032,6 +6085,7 @@ class Tile(object):
 
         return available_count / total_chunks
 
+    @profiled_stage("tile.collect_chunks")
     def _collect_chunk_jpegs(self, zoom: int, time_budget=None,
                               min_available_ratio: float = 0.9,
                               return_partial: bool = False):
@@ -6236,6 +6290,7 @@ class Tile(object):
         
         return None
 
+    @profiled_stage("dds.batch_build")
     def _try_aopipeline_build(self, time_budget=None, force_build_partial: bool = False) -> bool:
         """
         Attempt to build entire DDS using optimized aopipeline.
@@ -6343,12 +6398,25 @@ class Tile(object):
             
             # Track queue wait time
             wait_time_ms = (time.monotonic() - wait_start) * 1000
+            record_stage(
+                "dds.buffer_pool_wait",
+                wait_time_ms,
+                tile_id=self.id,
+                details={"path": "batch"},
+            )
             if wait_time_ms > 10:  # Only track significant waits
                 bump('live_queue_wait_count')
                 log.debug(f"_try_aopipeline_build: Waited {wait_time_ms:.0f}ms for buffer for {self.id}")
             
         except TimeoutError:
             wait_time_ms = (time.monotonic() - wait_start) * 1000
+            record_stage(
+                "dds.buffer_pool_wait",
+                wait_time_ms,
+                tile_id=self.id,
+                outcome="timeout",
+                details={"path": "batch"},
+            )
             log.debug(f"_try_aopipeline_build: Queue timeout after {wait_time_ms:.0f}ms for {self.id}")
             bump('live_queue_timeout')
             return False
@@ -6370,6 +6438,7 @@ class Tile(object):
             # ═══════════════════════════════════════════════════════════════
             # STEP 4: Build DDS with native aopipeline
             # ═══════════════════════════════════════════════════════════════
+            native_start = time.monotonic()
             with _native_build_context() as threads:
                 result = native_dds.build_from_jpegs_to_buffer(
                     buffer,
@@ -6378,6 +6447,13 @@ class Tile(object):
                     missing_color=missing_color,
                     max_threads=threads
                 )
+            record_stage(
+                "dds.native_compute",
+                (time.monotonic() - native_start) * 1000.0,
+                tile_id=self.id,
+                outcome="ok" if result.success else "failed",
+                details={"path": "batch", "threads": threads},
+            )
 
             if not result.success:
                 log.debug(f"_try_aopipeline_build: Native build failed for {self.id}: {result.error}")
@@ -6427,6 +6503,7 @@ class Tile(object):
         
         return build_success
 
+    @profiled_stage("dds.streaming_build")
     def _try_streaming_aopipeline_build(self, time_budget=None) -> bool:
         """
         Build DDS using streaming aopipeline with fallback integration.
@@ -6618,11 +6695,21 @@ class Tile(object):
                     chunk_col = self.col + (idx % self.chunks_per_row)
                     chunk_row = self.row + (idx // self.chunks_per_row)
                     try:
-                        rgba = resolver.resolve(
-                            chunk_col, chunk_row, self.max_zoom,
-                            target_mipmap=0,
-                            time_budget=shared_fb_budget
-                        )
+                        with profile_span(
+                            "image.fallback_resolve",
+                            tile_id=self.id,
+                            details={
+                                "chunk_index": idx,
+                                "zoom": self.max_zoom,
+                            },
+                        ) as fallback_span:
+                            rgba = resolver.resolve(
+                                chunk_col, chunk_row, self.max_zoom,
+                                target_mipmap=0,
+                                time_budget=shared_fb_budget
+                            )
+                            if rgba is None:
+                                fallback_span.outcome = "miss"
                         fallback_results.append((idx, rgba))
                     except Exception as e:
                         log.debug(f"_try_streaming_aopipeline_build: Fallback failed for {self.id} chunk {idx}: {e}")
@@ -6643,11 +6730,22 @@ class Tile(object):
             builder = builder_pool.acquire(config=config, timeout=builder_timeout)
             if not builder:
                 wait_time_ms = (time.monotonic() - wait_start) * 1000
+                record_stage(
+                    "dds.builder_pool_wait",
+                    wait_time_ms,
+                    tile_id=self.id,
+                    outcome="timeout",
+                )
                 log.debug(f"_try_streaming_aopipeline_build: Builder pool timeout after {wait_time_ms:.0f}ms")
                 bump('streaming_builder_queue_timeout')
                 return False
 
             wait_time_ms = (time.monotonic() - wait_start) * 1000
+            record_stage(
+                "dds.builder_pool_wait",
+                wait_time_ms,
+                tile_id=self.id,
+            )
             if wait_time_ms > 10:
                 bump('streaming_builder_queue_wait_count')
 
@@ -6691,17 +6789,38 @@ class Tile(object):
                 buffer, buffer_id = pool.acquire(timeout=acquire_timeout, priority=PRIORITY_LIVE)
                 
                 wait_time_ms = (time.monotonic() - wait_start) * 1000
+                record_stage(
+                    "dds.buffer_pool_wait",
+                    wait_time_ms,
+                    tile_id=self.id,
+                    details={"path": "streaming"},
+                )
                 if wait_time_ms > 10:
                     bump('streaming_queue_wait_count')
             
             except TimeoutError:
+                record_stage(
+                    "dds.buffer_pool_wait",
+                    (time.monotonic() - wait_start) * 1000.0,
+                    tile_id=self.id,
+                    outcome="timeout",
+                    details={"path": "streaming"},
+                )
                 log.debug(f"_try_streaming_aopipeline_build: Queue timeout for {self.id}")
                 bump('streaming_queue_timeout')
                 return False
             
             try:
+                native_start = time.monotonic()
                 with _native_build_context() as threads:
                     result = builder.finalize(buffer, max_threads=threads)
+                record_stage(
+                    "dds.native_compute",
+                    (time.monotonic() - native_start) * 1000.0,
+                    tile_id=self.id,
+                    outcome="ok" if result.success else "failed",
+                    details={"path": "streaming", "threads": threads},
+                )
                 if result.success and result.bytes_written >= 128:
                     dds_bytes = bytes(buffer[:result.bytes_written])
                     if self._populate_dds_from_prebuilt(dds_bytes):
@@ -7533,6 +7652,7 @@ class Tile(object):
         finally:
             _live_read_end()
 
+    @profiled_stage("tile.dds_read")
     def _read_dds_bytes_inner(self, offset, length):
         # ═══════════════════════════════════════════════════════════════════════
         # PER-REQUEST TIME BUDGET
@@ -7614,6 +7734,7 @@ class Tile(object):
         self.ready.set()
         return outfile
 
+    @profiled_stage("image.compose")
     def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None,
                 fallback_level_override=None):
         #
@@ -8857,6 +8978,7 @@ class Tile(object):
         except Exception as e:
             log.warning(f"Incremental DDS cache store failed for {self.id} mm{mipmap}: {e}")
 
+    @profiled_stage("dds.native_mipmap_build")
     def _try_native_mipmap_build(self, mipmap: int, time_budget=None) -> bool:
         """
         Try to build a single mipmap level using native aopipeline.
@@ -9158,6 +9280,16 @@ class Tile(object):
             # Record timing stats
             total_time = time.monotonic() - build_start
             native_time = time.monotonic() - native_build_start
+            record_stage(
+                "dds.native_compute",
+                native_time * 1000.0,
+                tile_id=self.id,
+                details={
+                    "path": "mipmap",
+                    "mipmap": mipmap,
+                    "threads": threads,
+                },
+            )
             
             mm_stats.set(mipmap, total_time)
             tile_creation_stats.set(mipmap, total_time)
@@ -9324,6 +9456,7 @@ class Tile(object):
         
         return jpeg_datas, chunks_width, chunks_height
 
+    @profiled_stage("dds.native_partial_build")
     def _try_native_partial_mipmap_build(
         self,
         mipmap: int,
@@ -9504,6 +9637,7 @@ class Tile(object):
 
         return self._get_mipmap_inner(mipmap, time_budget)
 
+    @profiled_stage("tile.mipmap_build")
     def _get_mipmap_inner(self, mipmap, time_budget):
         """Inner mipmap build logic.  No per-mipmap lock is held here."""
         # Start timing FULL tile creation (download + compose + compress)
@@ -9572,6 +9706,12 @@ class Tile(object):
         # Calculate timing metrics
         compress_time = compress_end_time - compress_start_time
         total_creation_time = compress_end_time - tile_creation_start
+        record_stage(
+            "dds.python_compress",
+            compress_time * 1000.0,
+            tile_id=self.id,
+            details={"mipmap": mipmap},
+        )
 
         mm_stats.set(mipmap, compress_time)
         tile_creation_stats.set(mipmap, total_creation_time)
@@ -10164,6 +10304,21 @@ class TileCacher(object):
         update_process_memory_stat()
         # Report decode pool stats for native buffer monitoring
         update_decode_pool_stats()
+        with self.tc_lock:
+            profiled_tiles = list(self.tiles.values())
+        profile_gauge("tile_cache.tiles", len(profiled_tiles))
+        profile_gauge(
+            "tile_cache.open_references",
+            sum(max(0, getattr(tile, "refs", 0)) for tile in profiled_tiles),
+        )
+        if chunk_getter is not None:
+            profile_gauge("chunk_queue.depth", chunk_getter.queue.qsize())
+        if _dds_buffer_pool is not None:
+            try:
+                for name, value in _dds_buffer_pool.get_stats().items():
+                    profile_gauge(f"dds_buffer_pool.{name}", value)
+            except Exception:
+                pass
         # Publish activity stats for proportional eviction (macOS multi-process only)
         if self._has_shared_store():
             try:

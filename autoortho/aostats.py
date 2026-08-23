@@ -8,6 +8,11 @@ from collections.abc import MutableMapping
 from multiprocessing.managers import BaseManager
 import psutil
 
+try:
+    from autoortho.diagnostics import profile_gauge
+except ImportError:
+    from diagnostics import profile_gauge
+
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
     from autoortho.aoconfig import CFG
@@ -318,6 +323,9 @@ def update_process_memory_stat():
         set_stat(f"proc_mem_rss_bytes:{pid}", int(mem_bytes))
         set_stat(f"proc_alive_ts:{pid}", now_ts)
         set_stat(f"proc_mem_mb:{pid}", int(mem_bytes // (1024 * 1024)))
+        set_stat(f"proc_threads:{pid}", proc.num_threads())
+        profile_gauge("process.memory_bytes", mem_bytes)
+        profile_gauge("process.threads", proc.num_threads())
 
         return int(mem_bytes)
 
@@ -331,6 +339,8 @@ def clear_process_memory_stat():
     pid = os.getpid()
     delete_stat(f"proc_mem_rss_bytes:{pid}")
     delete_stat(f"proc_alive_ts:{pid}")
+    delete_stat(f"proc_mem_mb:{pid}")
+    delete_stat(f"proc_threads:{pid}")
 
 
 def update_decode_pool_stats():
@@ -361,12 +371,24 @@ def update_decode_pool_stats():
             overflow_mb = stats['overflow_bytes'] // (1024 * 1024)
             set_stat('decode_pool_overflow', stats['overflow_count'])
             set_stat('decode_pool_overflow_mb', overflow_mb)
+            for name in (
+                'fixed_count',
+                'available',
+                'acquired',
+                'overflow_count',
+                'overflow_bytes',
+                'memory_limit',
+            ):
+                if name in stats:
+                    profile_gauge(f"decode_pool.{name}", stats[name])
             if stats['overflow_count'] > 0:
                 log.debug(f"Decode pool overflow: {stats['overflow_count']} "
                           f"buffers, {overflow_mb} MB")
+        return stats
     except Exception as e:
         # Best-effort; ignore failures
         log.debug(f"update_decode_pool_stats: {e}")
+        return None
 
 
 class AOStats(object):

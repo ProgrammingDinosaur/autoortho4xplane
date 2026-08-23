@@ -46,6 +46,11 @@ try:
 except ImportError:
     import getortho
 
+try:
+    from autoortho.diagnostics import profile_span, record_stage
+except ImportError:
+    from diagnostics import profile_span, record_stage
+
 def _rgb_to_rgb565(r: int, g: int, b: int) -> int:
     """Convert RGB888 to RGB565 format used by BC1/DXT1 compression."""
     # RGB565: 5 bits red (high), 6 bits green (mid), 5 bits blue (low)
@@ -949,7 +954,13 @@ class AutoOrtho(Operations):
             if maptype != "BI":
                 getortho.register_discovered_maptype(maptype)
 
-            t = self.tc._open_tile(row, col, maptype, zoom)
+            tile_id = f"{row}_{col}_{maptype}_{zoom}"
+            with profile_span(
+                "fuse.dds_open",
+                tile_id=tile_id,
+                details={"path": path},
+            ):
+                t = self.tc._open_tile(row, col, maptype, zoom)
             try:
                 self._set_dds_size_cached(row, col, maptype, zoom, t.dds.total_size)
             except Exception:
@@ -986,6 +997,8 @@ class AutoOrtho(Operations):
                 log.info(f"Shutdown in progress, returning fallback data for {path}")
                 return _generate_fallback_dds_bytes(offset, length)
             key = self._tile_key(row, col, maptype, zoom)
+            tile_id = f"{row}_{col}_{maptype}_{zoom}"
+            request_started = time.monotonic()
             lock = self._tile_locks[key]
             
             # Calculate build_timeout dynamically based on tile_time_budget
@@ -998,7 +1011,26 @@ class AutoOrtho(Operations):
             # - Margin of safety to prevent premature lock timeout
             build_timeout = self._calculate_build_timeout()
 
+            lock_started = time.monotonic()
             if not lock.acquire(timeout=build_timeout):
+                lock_wait_ms = (time.monotonic() - lock_started) * 1000.0
+                record_stage(
+                    "fuse.tile_lock_wait",
+                    lock_wait_ms,
+                    tile_id=tile_id,
+                    outcome="timeout",
+                )
+                record_stage(
+                    "fuse.dds_read",
+                    (time.monotonic() - request_started) * 1000.0,
+                    tile_id=tile_id,
+                    outcome="fallback",
+                    details={
+                        "reason": "tile_lock_timeout",
+                        "offset": offset,
+                        "length": length,
+                    },
+                )
                 # CRITICAL FIX: Instead of raising EIO (which causes CTD on Windows
                 # due to EXCEPTION_IN_PAGE_ERROR), return fallback placeholder data.
                 # X-Plane will show a gray/missing texture, but won't crash.
@@ -1029,22 +1061,45 @@ class AutoOrtho(Operations):
 
                 return _generate_fallback_dds_bytes(offset, length)
 
+            record_stage(
+                "fuse.tile_lock_wait",
+                (time.monotonic() - lock_started) * 1000.0,
+                tile_id=tile_id,
+            )
+            read_outcome = "ok"
             try:
-                t = self.tc._get_tile(row, col, maptype, zoom)
+                with profile_span(
+                    "tile.cache_lookup",
+                    tile_id=tile_id,
+                ):
+                    t = self.tc._get_tile(row, col, maptype, zoom)
                 data = t.read_dds_bytes(offset, length)
                 if data is None:
+                    read_outcome = "fallback"
                     log.error(f"Tile read returned None for {key} - returning fallback data")
                     return _generate_fallback_dds_bytes(offset, length)
                 return data
             except FuseOSError:
+                read_outcome = "fallback"
                 log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
                 return _generate_fallback_dds_bytes(offset, length)
             except Exception as e:
+                read_outcome = "fallback"
                 log.error(f"Tile read/build failed for {key} - returning fallback data to prevent CTD")
                 log.exception("cause:", exc_info=e)
                 return _generate_fallback_dds_bytes(offset, length)
             finally:
                 lock.release()
+                record_stage(
+                    "fuse.dds_read",
+                    (time.monotonic() - request_started) * 1000.0,
+                    tile_id=tile_id,
+                    outcome=read_outcome,
+                    details={
+                        "offset": offset,
+                        "length": length,
+                    },
+                )
 
         # Regular file passthrough
         with self.fh_locks.setdefault(fh, threading.Lock()):

@@ -15,6 +15,98 @@ For most users, the easiest way to configure performance is using the **Performa
 
 ---
 
+## Flight Performance Reports
+
+AutoOrtho creates a profiling report for every mounted flight session. Profiling
+starts immediately before the first scenery worker launches and finishes after
+all scenery workers stop, so the report covers X-Plane-visible tile requests,
+background prefetch work, and shutdown.
+
+Reports are written to:
+
+```text
+~/.autoortho-data/reports/performance-<timestamp>-<session-id>/
+├── report.md
+├── report.json
+└── process-<pid>-<role>.json
+```
+
+`report.md` is the human-readable starting point. `report.json` contains the
+complete one-second resource timeline, latency histograms, slow-operation
+records, final counters, relevant configuration, gauges, and individual process
+profiles.
+
+### What is measured
+
+| Stage | What it identifies |
+|-------|--------------------|
+| `fuse.dds_read` | Total time from an X-Plane DDS read until bytes are returned |
+| `fuse.tile_lock_wait` | Concurrent reads blocked behind work on the same tile |
+| `tile.cache_lookup` | In-memory tile lookup/open overhead |
+| `cache.dds_load` | Persistent compiled DDS disk read and decompression |
+| `cache.jpeg_batch_read` | Source JPEG cache I/O |
+| `chunk.queue_wait` | Time a download waits for a fetch worker |
+| `network.http_request` | Map provider/network request latency |
+| `tile.collect_chunks` | Cache collection plus waiting for missing chunks |
+| `image.fallback_resolve` | Disk/mipmap fallback work for missing chunks |
+| `image.compose` | Progressive image assembly and fallback processing |
+| `dds.builder_pool_wait` | Wait for a streaming DDS builder |
+| `dds.buffer_pool_wait` | Wait for a preallocated DDS output buffer |
+| `dds.native_compute` | Native JPEG decode and DDS compression |
+| `dds.python_compress` | Python-path DDS compression |
+| `tile.mipmap_build` | Complete mipmap construction |
+
+Stage durations are **inclusive**. Nested stages overlap, so totals must not be
+added together. Start with `fuse.dds_read`, then use the nested stage with the
+largest p95/max latency to locate the bottleneck.
+
+Every AutoOrtho process samples RSS, USS, virtual memory, CPU, thread count, and
+I/O once per second. On macOS, each worker also records physical footprint so
+compressed/swapped native memory is visible. The report ranks processes by peak
+physical footprint on macOS or RSS elsewhere, and shows retained RSS growth.
+Native decode/buffer pools, tile counts,
+open references, and queue depth are tracked as resource gauges. Long or
+sub-second sessions use peak-preserving adaptive downsampling, keeping report
+memory bounded while retaining spikes and full-session coverage.
+
+### Configuration
+
+The **Settings → Performance Diagnostics** section controls the normal profiling
+options:
+
+```ini
+[diagnostics]
+performance_profiling = True
+sample_interval_seconds = 1.0
+slow_operation_ms = 250.0
+max_slow_operations = 200
+python_allocation_tracing = False
+report_dir = ~/.autoortho-data/reports
+max_reports = 20
+```
+
+Normal profiling uses bounded histograms and slow-operation heaps to avoid
+growing with the number of tile requests. `python_allocation_tracing` is
+different: it adds file-and-line Python allocation growth, but materially
+changes performance and cannot see native C image/DDS buffers. Enable it only
+for a dedicated memory diagnostic flight, then disable it before comparing
+normal latency.
+
+### Reading a report
+
+1. Check **Diagnostic flags** for queue saturation, network latency, pool
+   contention, native build cost, or retained memory.
+2. In **Memory by process**, identify the worker with the largest peak and RSS
+   growth. Correlate its peak with tile/cache/pool gauges and the raw timeline.
+3. In **Slowest stages**, compare p95 and max, not only averages. A low average
+   with a very high p99 is a stutter source.
+4. In **Slowest individual operations**, follow repeated tile IDs and outcomes
+   to distinguish a single bad provider response from systemic contention.
+5. Use `report.json` for plotting or comparing sessions after changing one
+   tuning parameter.
+
+---
+
 ## Detailed Settings Reference
 
 ### Zoom Level (Critical Performance Factor)
@@ -1005,4 +1097,3 @@ See the [FAQ](faq.md#missing-color-tiles) for common issues related to:
 - Missing color (green) tiles
 - Long loading times
 - In-flight stuttering
-

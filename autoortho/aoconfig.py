@@ -380,6 +380,25 @@ cache_mem_limit = 4
 # Auto clean cache on AutoOrtho exit
 auto_clean_cache = False
 
+[diagnostics]
+# Record per-stage tile latency and per-process memory/CPU usage for each mounted
+# flight session. Reports are written when AutoOrtho unmounts the scenery.
+performance_profiling = True
+# Process resource sampling interval. One second provides useful flight timelines
+# with low overhead.
+sample_interval_seconds = 1.0
+# Keep the slowest operations whose duration exceeds this threshold.
+slow_operation_ms = 250.0
+# Maximum slow operations retained per process. Histograms still include all calls.
+max_slow_operations = 200
+# Track Python allocation sites. This adds material overhead and does not include
+# native image/DDS buffers, so enable only for a dedicated diagnostic flight.
+python_allocation_tracing = False
+# Output directory for Markdown and raw JSON flight reports.
+report_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "reports")}
+# Number of completed profiling sessions to retain.
+max_reports = 20
+
 [seasons]
 seasons_convert_workers = 4
 enabled = False

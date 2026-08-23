@@ -24,6 +24,11 @@ from collections import OrderedDict
 from typing import List, Optional, Tuple
 
 try:
+    from autoortho.diagnostics import profiled_stage
+except ImportError:
+    from diagnostics import profiled_stage
+
+try:
     import zstandard
     _HAS_ZSTD = True
 except ImportError:
@@ -383,6 +388,7 @@ class DynamicDDSCache:
     # Public API
     # ------------------------------------------------------------------
 
+    @profiled_stage("cache.dds_load", tile_arg=1)
     def load(self, tile_id: str, max_zoom: int, tile) -> Optional[bytes]:
         """
         Load a cached DDS from disk.
@@ -524,6 +530,7 @@ class DynamicDDSCache:
             self._misses += 1
             return None
 
+    @profiled_stage("cache.dds_metadata", tile_arg=1)
     def load_metadata(self, tile_id: str, max_zoom: int, tile) -> Optional[dict]:
         """Read DDM metadata without loading the DDS file.
 
@@ -706,6 +713,7 @@ class DynamicDDSCache:
             if i >= len(chunks) or not getattr(chunks[i], 'permanent_failure', False)
         ]
 
+    @profiled_stage("cache.dds_store", tile_arg=1)
     def store(self, tile_id: str, max_zoom: int, dds_bytes: bytes,
               tile,
               mm0_missing_indices: Optional[List[int]] = None,
@@ -799,6 +807,7 @@ class DynamicDDSCache:
                 pass
             return False
 
+    @profiled_stage("cache.dds_store_incremental", tile_arg=1)
     def store_incremental(self, tile_id: str, max_zoom: int,
                           row: int, col: int, maptype: str,
                           tilename_zoom: int,

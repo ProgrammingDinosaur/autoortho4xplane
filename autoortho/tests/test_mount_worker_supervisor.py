@@ -60,6 +60,7 @@ def test_mount_worker_command_and_env_non_frozen(monkeypatch, tmp_path):
         stats_auth=b"AUTH",
         log_addr="127.0.0.1:2345",
         loglevel="debug",
+        extra_env={"AO_PROFILE_SESSION_ID": "test-profile"},
     )
 
     assert captured["cmd"][:3] == [sys.executable, "-m", "autoortho"]
@@ -70,6 +71,7 @@ def test_mount_worker_command_and_env_non_frozen(monkeypatch, tmp_path):
     assert captured["kwargs"]["env"]["AO_STATS_ADDR"] == "127.0.0.1:1234"
     assert captured["kwargs"]["env"]["AO_STATS_AUTH"] == "AUTH"
     assert captured["kwargs"]["env"]["AO_LOG_ADDR"] == "127.0.0.1:2345"
+    assert captured["kwargs"]["env"]["AO_PROFILE_SESSION_ID"] == "test-profile"
     assert captured["kwargs"]["start_new_session"] is True
     assert "creationflags" not in captured["kwargs"]
 

@@ -3466,6 +3466,71 @@ class ConfigUI(QMainWindow):
 
         self.settings_layout.addWidget(general_group)
 
+        diagnostics_group = QGroupBox("Performance Diagnostics")
+        diagnostics_layout = QVBoxLayout()
+        diagnostics_group.setLayout(diagnostics_layout)
+
+        self.performance_profiling_check = QCheckBox(
+            "Create a performance report for each flight session"
+        )
+        self.performance_profiling_check.setChecked(
+            bool(getattr(self.cfg.diagnostics, 'performance_profiling', True))
+        )
+        self.performance_profiling_check.setObjectName('performance_profiling')
+        self.performance_profiling_check.setToolTip(
+            "Records tile pipeline latency histograms and samples CPU/RAM for every\n"
+            "AutoOrtho process. A Markdown report and raw JSON timeline are written\n"
+            "to the diagnostics report directory when scenery is unmounted."
+        )
+        diagnostics_layout.addWidget(self.performance_profiling_check)
+
+        sampling_layout = QHBoxLayout()
+        sampling_label = QLabel("Resource sample interval:")
+        sampling_label.setToolTip(
+            "How often process memory, CPU, thread count, and I/O are sampled.\n"
+            "One second is recommended and has low overhead."
+        )
+        sampling_layout.addWidget(sampling_label)
+        self.performance_sample_interval_spin = QDoubleSpinBox()
+        self.performance_sample_interval_spin.setRange(0.1, 60.0)
+        self.performance_sample_interval_spin.setSingleStep(0.5)
+        self.performance_sample_interval_spin.setDecimals(1)
+        self.performance_sample_interval_spin.setSuffix(" s")
+        self.performance_sample_interval_spin.setValue(
+            float(getattr(self.cfg.diagnostics, 'sample_interval_seconds', 1.0))
+        )
+        self.performance_sample_interval_spin.setObjectName(
+            'sample_interval_seconds'
+        )
+        sampling_layout.addWidget(self.performance_sample_interval_spin)
+        sampling_layout.addStretch()
+        diagnostics_layout.addLayout(sampling_layout)
+
+        self.python_allocation_tracing_check = QCheckBox(
+            "Trace Python allocation growth (diagnostic flights only)"
+        )
+        self.python_allocation_tracing_check.setChecked(
+            bool(getattr(self.cfg.diagnostics, 'python_allocation_tracing', False))
+        )
+        self.python_allocation_tracing_check.setObjectName(
+            'python_allocation_tracing'
+        )
+        self.python_allocation_tracing_check.setToolTip(
+            "Adds file-and-line allocation growth to the report. This can slow the\n"
+            "application and cannot see native C image/DDS buffers, so leave it off\n"
+            "when measuring normal tile latency."
+        )
+        diagnostics_layout.addWidget(self.python_allocation_tracing_check)
+
+        diagnostics_path = QLabel(
+            f"Reports: {getattr(self.cfg.diagnostics, 'report_dir', '~/.autoortho-data/reports')}"
+        )
+        diagnostics_path.setWordWrap(True)
+        diagnostics_path.setStyleSheet("color: #888; font-size: 11px;")
+        diagnostics_layout.addWidget(diagnostics_path)
+
+        self.settings_layout.addWidget(diagnostics_group)
+
         # FUSE Settings group
         fuse_group = QGroupBox("FUSE Settings")
         fuse_layout = QVBoxLayout()
@@ -5818,6 +5883,17 @@ class ConfigUI(QMainWindow):
             self.cfg.general.hide = self.hide_check.isChecked()
             self.cfg.general.console_log_level = self.console_log_level_combo.currentText()
             self.cfg.general.file_log_level = self.file_log_level_combo.currentText()
+
+            # Performance diagnostics settings
+            self.cfg.diagnostics.performance_profiling = (
+                self.performance_profiling_check.isChecked()
+            )
+            self.cfg.diagnostics.sample_interval_seconds = str(
+                self.performance_sample_interval_spin.value()
+            )
+            self.cfg.diagnostics.python_allocation_tracing = (
+                self.python_allocation_tracing_check.isChecked()
+            )
 
             # Scenery settings
             self.cfg.scenery.noclean = self.noclean_check.isChecked()

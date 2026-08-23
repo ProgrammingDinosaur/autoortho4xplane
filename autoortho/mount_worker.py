@@ -271,6 +271,14 @@ def main():
 
     mount_name = args.volname or os.path.basename(os.path.abspath(args.mountpoint))
     configure_worker_logging(mount_name, args.loglevel)
+    try:
+        try:
+            from autoortho.diagnostics import start_worker_profiler_from_env
+        except ImportError:
+            from diagnostics import start_worker_profiler_from_env
+        start_worker_profiler_from_env(mount_name)
+    except Exception as exc:
+        log.error("Could not start worker performance diagnostics: %s", exc)
     _install_crash_handler()
     _install_signal_handlers()
     _start_reload_poll_thread()
@@ -305,6 +313,16 @@ def main():
         log.error("FUSE mount failed with non-negotiable error: %s", exc)
         raise
     finally:
+        # Persist flight timings before subsystem cleanup. The parent may signal
+        # this process as soon as the mount disappears.
+        try:
+            try:
+                from autoortho.diagnostics import stop_active_profiler
+            except ImportError:
+                from diagnostics import stop_active_profiler
+            stop_active_profiler()
+        except Exception as exc:
+            log.error("Could not finalize worker performance diagnostics: %s", exc)
         _begin_worker_shutdown("worker exit")
         _shutdown_getortho()
         try:

@@ -68,6 +68,14 @@ except ImportError:
     from process_supervisor import AOProcessSupervisor, DEFAULT_WORKER_STOP_TIMEOUT
 
 try:
+    from autoortho.diagnostics import (
+        start_parent_profiler,
+        stop_active_profiler,
+    )
+except ImportError:
+    from diagnostics import start_parent_profiler, stop_active_profiler
+
+try:
     from autoortho.version import __version__
 except ImportError:
     from version import __version__
@@ -361,6 +369,8 @@ class AOMount:
         self.mac_os_procs = []
         self._active_mountpoints = []
         self.mount_worker_supervisor = AOProcessSupervisor()
+        self._performance_profiler = None
+        self._performance_profiler_env = {}
 
         # Start shared stats manager and reporter/log servers
         self.start_stats_manager()
@@ -454,6 +464,7 @@ class AOMount:
             stats_auth=None,
             log_addr=None,
     ):
+        self._start_performance_diagnostics()
         log.info(f"AutoOrtho:  root: {root}  mountpoint: {mountpoint}")
         loglevel = getattr(self.cfg.general, 'file_log_level', 'INFO').upper()
         handle = self.mount_worker_supervisor.start_mount_worker(
@@ -465,8 +476,14 @@ class AOMount:
             stats_auth=stats_auth,
             log_addr=log_addr,
             loglevel=loglevel,
+            extra_env=self._performance_profiler_env,
         )
         self.mount_workers.append(handle)
+        if self._performance_profiler is not None:
+            self._performance_profiler.register_process(
+                handle.pid,
+                f"mount-worker:{volname}",
+            )
         # Backward-compatible process list used by maptype/custom-map reload code.
         self.mac_os_procs.append(handle.process)
         return handle
@@ -502,6 +519,51 @@ class AOMount:
     def stop_macfuse_workers(self, timeout: float = DEFAULT_WORKER_STOP_TIMEOUT):
         self.stop_mount_workers(timeout=timeout)
         return
+
+    def _start_performance_diagnostics(self):
+        if getattr(self, "_performance_profiler", None) is not None:
+            return
+        try:
+            profiler = start_parent_profiler(self.cfg)
+        except Exception as exc:
+            log.error("Could not start performance diagnostics: %s", exc)
+            profiler = None
+        self._performance_profiler = profiler
+        self._performance_profiler_env = (
+            profiler.child_environment() if profiler is not None else {}
+        )
+        if profiler is not None:
+            manager_process = getattr(
+                getattr(self, "stats_manager", None),
+                "_process",
+                None,
+            )
+            manager_pid = getattr(manager_process, "pid", None)
+            if manager_pid:
+                profiler.register_process(manager_pid, "stats-manager")
+
+    def _finish_performance_diagnostics(self):
+        if getattr(self, "_performance_profiler", None) is None:
+            return
+        stats_snapshot = {}
+        try:
+            store = getattr(self, "_shared_store", None)
+            if store is not None:
+                stats_snapshot = store.snapshot()
+        except Exception as exc:
+            log.debug("Could not snapshot final diagnostics counters: %s", exc)
+        try:
+            report_path = stop_active_profiler(
+                stats_snapshot=stats_snapshot,
+                finalize_session=True,
+            )
+            if report_path is not None:
+                log.info("Flight performance report written to %s", report_path)
+        except Exception as exc:
+            log.error("Could not finalize performance diagnostics: %s", exc)
+        finally:
+            self._performance_profiler = None
+            self._performance_profiler_env = {}
 
     def reporter(self):
         while True:
@@ -794,6 +856,8 @@ class AOMount:
             )
 
         self.stop_mount_workers(timeout=DEFAULT_WORKER_STOP_TIMEOUT)
+
+        self._finish_performance_diagnostics()
 
         self.stop_reporter()
 

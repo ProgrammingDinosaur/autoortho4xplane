@@ -44,6 +44,15 @@ Key settings include:
 
 For detailed configuration options and recommended settings for different use cases, see the [Performance Tuning Guide](performance.md).
 
+### Performance Diagnostics
+
+The Settings tab can create an end-of-flight performance report containing
+X-Plane DDS read latency, cache/network/build stage distributions, the slowest
+tile operations, and per-process memory/CPU timelines. Reports are written to
+`~/.autoortho-data/reports` by default. See
+[Flight Performance Reports](performance.md#flight-performance-reports) for
+the metric reference and analysis workflow.
+
 For troubleshooting missing tiles or stuttering issues, see the [FAQ](faq.md#missing-color-tiles).
 
 ## Native Pipeline Settings
@@ -143,4 +152,3 @@ When flight data is loaded and the "Use Flight Data" toggle is enabled, addition
 > **ℹ Real-time Changes:** These settings take effect immediately when modified — no restart required. Use **Save Config** to persist your values for future sessions.
 
 See the [Performance Tuning Guide](performance.md#simbrief-integration) for detailed information and limitations.
-
