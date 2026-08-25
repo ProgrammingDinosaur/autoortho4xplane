@@ -113,6 +113,34 @@ def test_parent_preserves_samples_for_ungraceful_worker(tmp_path):
     )
     assert worker["peak_rss_bytes"] > 0
     assert worker["sample_count"] >= 1
+    assert any(
+        "flight-stage latency and worker gauges are incomplete" in flag
+        for flag in report["diagnostic_flags"]
+    )
+
+
+def test_parent_startup_probe_does_not_trigger_flight_http_flag(tmp_path):
+    session_dir = tmp_path / "performance-parent-probe"
+    parent = PerformanceProfiler(
+        session_dir=session_dir,
+        session_id="parent-probe",
+        role="parent",
+        sample_interval=0.05,
+    ).start()
+    parent.record(
+        "network.http_request",
+        2_000.0,
+        tile_id="probe",
+        details={"status_code": 200},
+    )
+
+    report_path = parent.stop(finalize_session=True)
+    report = json.loads(report_path.with_name("report.json").read_text("utf-8"))
+
+    assert not any(
+        "HTTP request p95 exceeds" in flag
+        for flag in report["diagnostic_flags"]
+    )
 
 
 def test_memory_timeline_preserves_subsecond_samples():

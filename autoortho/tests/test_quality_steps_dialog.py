@@ -20,10 +20,20 @@ import pytest
 import sys
 import os
 
-# Add parent directory to path for imports
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QDialog
+
+from config_ui_qt import QualityStepsDialog
 from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
+
+
+@pytest.fixture(scope="module")
+def qt_app():
+    app = QApplication.instance() or QApplication([])
+    yield app
 
 
 # =============================================================================
@@ -41,20 +51,16 @@ class TestQualityStepsDialogInitialization:
         manager = provided_manager or DynamicZoomManager()
         assert manager.is_empty()
 
-    def test_dialog_uses_existing_manager(self):
-        """Simulate dialog using an existing manager passed to it."""
-        # Pre-configured manager
+    def test_dialog_uses_existing_manager(self, qt_app):
+        """The dialog edits an independent working copy."""
         existing = DynamicZoomManager()
         existing.set_base_zoom(17)
         existing.add_step(20000, 15)
 
-        # Dialog receives existing manager
-        provided_manager = existing
-        manager = provided_manager or DynamicZoomManager()
+        dialog = QualityStepsDialog(manager=existing)
 
-        # Should be the same object with same state
-        assert manager is existing
-        assert manager.step_count() == 2
+        assert dialog.manager is not existing
+        assert dialog.manager.save_to_config() == existing.save_to_config()
 
 
 # =============================================================================
@@ -230,18 +236,13 @@ class TestUIEdgeCases:
     """Tests for edge cases specific to UI interactions."""
 
     def test_add_step_at_ground_level(self):
-        """Test adding a step at altitude 0 (ground level)."""
+        """The required ground-level step cannot be duplicated."""
         manager = DynamicZoomManager()
         manager.set_base_zoom(17)
 
-        # User wants different zoom at exactly ground level vs below
         result = manager.add_step(0, 16)
-        assert result is True
-
-        # At exactly 0 ft, use ZL16
-        assert manager.get_zoom_for_altitude(0) == 16
-        # Below 0 ft (below sea level), use base ZL17
-        assert manager.get_zoom_for_altitude(-500) == 17
+        assert result is False
+        assert manager.get_zoom_for_altitude(0) == 17
 
     def test_dialog_with_many_steps(self):
         """Test dialog behavior with many altitude steps."""
@@ -280,3 +281,77 @@ class TestUIEdgeCases:
         assert manager.get_zoom_for_altitude(25000) == 15
         assert manager.get_zoom_for_altitude(35000) == 14
 
+
+class TestQualityStepsDialogInteractions:
+    def test_cancel_discards_removed_step(self, qt_app):
+        manager = DynamicZoomManager()
+        manager.set_base_zoom(17, 18)
+        manager.add_step(20000, 15, 16)
+        original = manager.save_to_config()
+
+        dialog = QualityStepsDialog(manager=manager)
+        dialog._remove_step(20000)
+        dialog.reject()
+
+        assert dialog.result() == QDialog.DialogCode.Rejected
+        assert manager.save_to_config() == original
+
+    def test_accept_applies_edited_altitude_atomically(self, qt_app):
+        manager = DynamicZoomManager()
+        manager.set_base_zoom(17, 18)
+        manager.add_step(20000, 15, 16)
+
+        dialog = QualityStepsDialog(manager=manager)
+        row = next(
+            row for row in range(dialog.steps_table.rowCount())
+            if dialog.steps_table.item(row, 0).text() == "20000"
+        )
+        dialog.steps_table.item(row, 0).setText("25000")
+        dialog._on_accept()
+        result = dialog.get_manager()
+
+        assert dialog.result() == QDialog.DialogCode.Accepted
+        assert all(step.altitude_ft != 20000 for step in result.get_steps())
+        assert any(step.altitude_ft == 25000 for step in result.get_steps())
+        assert all(step.altitude_ft != 25000 for step in manager.get_steps())
+
+    def test_duplicate_altitude_blocks_accept(self, qt_app):
+        manager = DynamicZoomManager()
+        manager.set_base_zoom(17, 18)
+        manager.add_step(10000, 16, 17)
+        manager.add_step(20000, 15, 16)
+
+        dialog = QualityStepsDialog(manager=manager)
+        row = next(
+            row for row in range(dialog.steps_table.rowCount())
+            if dialog.steps_table.item(row, 0).text() == "20000"
+        )
+        dialog.steps_table.item(row, 0).setText("10000")
+        dialog._on_accept()
+
+        assert dialog.result() == QDialog.DialogCode.Rejected
+        assert not dialog.validation_label.isHidden()
+        assert "already exists" in dialog.validation_label.text()
+
+    def test_base_altitude_cell_is_not_editable(self, qt_app):
+        manager = DynamicZoomManager()
+        manager.set_base_zoom(17, 18)
+        dialog = QualityStepsDialog(manager=manager)
+        item = dialog.steps_table.item(0, 0)
+
+        assert not bool(item.flags() & Qt.ItemFlag.ItemIsEditable)
+
+    def test_legacy_negative_base_rule_can_round_trip(self, qt_app):
+        manager = DynamicZoomManager()
+        manager.add_step(-1000, 17, 18)
+        manager.add_step(25000, 15, 16)
+
+        dialog = QualityStepsDialog(manager=manager)
+        dialog._on_accept()
+        result = dialog.get_manager()
+
+        assert dialog.result() == QDialog.DialogCode.Accepted
+        assert result.has_base_step()
+        assert any(
+            step.altitude_ft == -1000 for step in result.get_steps()
+        )

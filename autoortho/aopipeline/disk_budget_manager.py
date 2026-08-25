@@ -116,6 +116,8 @@ class DiskBudgetManager:
         with self._lock:
             self._jpeg_usage += size_bytes
             self._jpeg_usage = max(0, self._jpeg_usage)
+        if self._jpeg_usage > self._jpeg_budget:
+            self._schedule_eviction("jpeg")
 
     # ------------------------------------------------------------------
     # Eviction
@@ -133,8 +135,18 @@ class DiskBudgetManager:
             excess = self._dds_usage - int(self._dds_budget * 0.9)
             if excess > 0:
                 freed = self._dds_cache.evict_lru(excess)
+                if freed == 0:
+                    log.warning(
+                        "DDS cache is over budget but no tracked entries "
+                        "were available for eviction"
+                    )
+
+        if self._jpeg_usage > self._jpeg_budget:
+            excess = self._jpeg_usage - int(self._jpeg_budget * 0.9)
+            if excess > 0:
+                freed = self._evict_oldest_jpegs(excess)
                 with self._lock:
-                    self._dds_usage -= freed
+                    self._jpeg_usage = max(0, self._jpeg_usage - freed)
 
     def _schedule_eviction(self, category: str) -> None:
         """Schedule a background eviction check for the given category."""
@@ -266,6 +278,36 @@ class DiskBudgetManager:
         except OSError:
             pass
         return total
+
+    def _evict_oldest_jpegs(self, bytes_to_free: int) -> int:
+        candidates = []
+        try:
+            for dirpath, _dirnames, filenames in os.walk(self._cache_dir):
+                if "dds_cache" in dirpath:
+                    continue
+                for filename in filenames:
+                    if not filename.lower().endswith((".jpg", ".jpeg")):
+                        continue
+                    path = os.path.join(dirpath, filename)
+                    try:
+                        stat = os.stat(path)
+                    except OSError:
+                        continue
+                    candidates.append((stat.st_mtime, path, stat.st_size))
+        except OSError as exc:
+            log.warning("JPEG cache eviction scan failed: %s", exc)
+            return 0
+
+        freed = 0
+        for _mtime, path, size in sorted(candidates):
+            if freed >= bytes_to_free:
+                break
+            try:
+                os.remove(path)
+                freed += size
+            except OSError:
+                continue
+        return freed
 
     @staticmethod
     def _safe_remove(path: str) -> None:

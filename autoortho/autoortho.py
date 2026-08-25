@@ -76,6 +76,18 @@ except ImportError:
     from diagnostics import start_parent_profiler, stop_active_profiler
 
 try:
+    from autoortho.http2_broker import (
+        HTTP2Broker,
+        BrokerError as HTTP2BrokerError,
+    )
+except ImportError:
+    try:
+        from http2_broker import HTTP2Broker, BrokerError as HTTP2BrokerError
+    except ImportError:
+        HTTP2Broker = None
+        HTTP2BrokerError = Exception
+
+try:
     from autoortho.version import __version__
 except ImportError:
     from version import __version__
@@ -371,6 +383,8 @@ class AOMount:
         self.mount_worker_supervisor = AOProcessSupervisor()
         self._performance_profiler = None
         self._performance_profiler_env = {}
+        self._download_broker = None
+        self._download_broker_env = {}
 
         # Start shared stats manager and reporter/log servers
         self.start_stats_manager()
@@ -467,6 +481,8 @@ class AOMount:
         self._start_performance_diagnostics()
         log.info(f"AutoOrtho:  root: {root}  mountpoint: {mountpoint}")
         loglevel = getattr(self.cfg.general, 'file_log_level', 'INFO').upper()
+        worker_env = dict(self._performance_profiler_env)
+        worker_env.update(self._download_broker_env)
         handle = self.mount_worker_supervisor.start_mount_worker(
             root,
             mountpoint,
@@ -476,7 +492,7 @@ class AOMount:
             stats_auth=stats_auth,
             log_addr=log_addr,
             loglevel=loglevel,
-            extra_env=self._performance_profiler_env,
+            extra_env=worker_env,
         )
         self.mount_workers.append(handle)
         if self._performance_profiler is not None:
@@ -571,14 +587,19 @@ class AOMount:
             snap = self._shared_store.snapshot()
             log.info(f"STATS: {snap}")
 
-    def start_reporter(self, interval_sec: float = 10.0):
-        """Start the periodic global-stats logger (macOS parent)."""
+    def start_reporter(
+        self,
+        interval_sec: float = 10.0,
+        aggregation_interval_sec: float = 1.0,
+    ):
+        """Aggregate process memory frequently while logging less often."""
         if self._reporter_thread and self._reporter_thread.is_alive():
             return
         self._reporter_stop.clear()
 
         def _reporter_loop():
-            while not self._reporter_stop.wait(interval_sec):
+            last_log = time.monotonic()
+            while not self._reporter_stop.wait(aggregation_interval_sec):
                 try:
                     # Update this process's own memory heartbeat so it's counted
                     try:
@@ -593,8 +614,18 @@ class AOMount:
                     try:
                         keys = self._shared_store.keys()
                         for k in keys:
-                            if isinstance(k, str) and k.startswith('proc_mem_rss_bytes:'):
+                            if isinstance(k, str) and (
+                                k.startswith('proc_mem_effective_bytes:')
+                                or k.startswith('proc_mem_rss_bytes:')
+                            ):
                                 pid = k.split(':', 1)[1]
+                                if (
+                                    k.startswith('proc_mem_rss_bytes:')
+                                    and self._shared_store.get(
+                                        f'proc_mem_effective_bytes:{pid}', 0
+                                    )
+                                ):
+                                    continue
                                 # Liveness check: heartbeat within last 45 seconds
                                 alive_ts = self._shared_store.get(f'proc_alive_ts:{pid}', 0)
                                 if isinstance(alive_ts, (int, float)):
@@ -657,6 +688,9 @@ class AOMount:
                     except Exception:
                         pass
 
+                    if time.monotonic() - last_log < interval_sec:
+                        continue
+                    last_log = time.monotonic()
                     snap = self._shared_store.snapshot()
                     # Hide internal per-process and batching keys from logs
                     # Keep proc_mem_mb for debugging memory issues
@@ -664,6 +698,7 @@ class AOMount:
                         def _is_internal(k):
                             return (
                                 (isinstance(k, str) and (
+                                    k.startswith('proc_mem_effective_bytes') or
                                     k.startswith('proc_mem_rss_bytes') or
                                     k.startswith('proc_alive_ts') or
                                     k.startswith('proc_threads') or
@@ -715,7 +750,83 @@ class AOMount:
             self.start_stats_manager()
         if not getattr(self, "log_server", None):
             self.start_log_server()
+        self.start_download_broker()
         self.start_reporter()
+
+    def start_download_broker(self):
+        if self._download_broker is not None:
+            return
+        enabled = getattr(self.cfg.autoortho, "http2_enabled", True)
+        if isinstance(enabled, str):
+            enabled = enabled.lower().strip() in ("true", "1", "yes", "on")
+        if not enabled:
+            return
+        if HTTP2Broker is None:
+            log.warning(
+                "HTTP/2 broker dependencies are unavailable; using direct "
+                "HTTP/1.1 downloads"
+            )
+            return
+        try:
+            max_concurrency = max(
+                1,
+                min(
+                    1024,
+                    int(
+                        getattr(
+                            self.cfg.autoortho,
+                            "max_concurrent_downloads",
+                            256,
+                        )
+                    ),
+                ),
+            )
+            max_connections = max(
+                1,
+                min(
+                    max_concurrency,
+                    int(
+                        getattr(
+                            self.cfg.autoortho,
+                            "http2_max_connections",
+                            64,
+                        )
+                    ),
+                ),
+            )
+            broker = HTTP2Broker(
+                max_concurrency=max_concurrency,
+                max_connections=max_connections,
+                max_response_bytes=8 * 1024 * 1024,
+            )
+            broker.start()
+            self._download_broker = broker
+            self._download_broker_env = broker.client_environment()
+            os.environ.update(self._download_broker_env)
+            log.info(
+                "Shared HTTP/2 broker started "
+                "(concurrency=%d, connections=%d)",
+                max_concurrency,
+                max_connections,
+            )
+        except HTTP2BrokerError as exc:
+            log.warning(
+                "Could not start shared HTTP/2 broker; using direct "
+                "HTTP/1.1 downloads: %s",
+                exc,
+            )
+
+    def stop_download_broker(self):
+        broker = getattr(self, "_download_broker", None)
+        self._download_broker = None
+        self._download_broker_env = {}
+        os.environ.pop("AO_HTTP2_BROKER_ADDR", None)
+        os.environ.pop("AO_HTTP2_BROKER_TOKEN", None)
+        if broker is not None:
+            try:
+                broker.stop()
+            except Exception as exc:
+                log.error("Error stopping shared HTTP/2 broker: %s", exc)
 
     def _launch_scenery_worker(self, root, mountpoint, threading_enabled=True):
         if threading_enabled:
@@ -741,6 +852,7 @@ class AOMount:
         )
 
     def _monitor_mount_workers(self):
+        healthy = True
         while self.mounts_running:
             for handle in list(self.mount_workers):
                 ret = handle.process.poll()
@@ -752,8 +864,17 @@ class AOMount:
                         ret,
                     )
                     self.mounts_running = False
+                    healthy = False
                     break
             time.sleep(0.5)
+        return healthy
+
+    def mount_workers_alive(self):
+        """Return True only when at least one launched mount worker is alive."""
+        return bool(self.mount_workers) and all(
+            handle.process.poll() is None
+            for handle in self.mount_workers
+        )
 
     def mount_single(self, root, mountpoint, threading_enabled=True, blocking=True):
         self._ensure_parent_services()
@@ -788,25 +909,35 @@ class AOMount:
 
         if not self.cfg.scenery_mounts:
             log.warning(f"No installed sceneries detected.  Exiting.")
-            return
+            return False
 
         self.mounts_running = True
         self._active_mountpoints = []
         self.mount_workers = []
         self.mac_os_procs = []
-        for scenery in self.cfg.scenery_mounts:
-            self._launch_scenery_worker(
-                scenery.get('root'),
-                scenery.get('mount'),
-                self.cfg.fuse.threading,
-            )
+        try:
+            for scenery in self.cfg.scenery_mounts:
+                self._launch_scenery_worker(
+                    scenery.get('root'),
+                    scenery.get('mount'),
+                    self.cfg.fuse.threading,
+                )
+        except Exception:
+            log.exception("Failed to launch scenery mount workers")
+            self.unmount_sceneries(force=True)
+            return False
 
         if not blocking:
             log.info("Running mounts in non-blocking mode.")
             time.sleep(1)
-            diagnose(self.cfg)
-            return
+            healthy = self.mount_workers_alive() and diagnose(self.cfg)
+            if not healthy:
+                log.error("Mount startup diagnostics failed")
+                self.unmount_sceneries(force=True)
+                return False
+            return True
 
+        healthy = True
         try:
             def handle_sigterm(sig, frame):
                 raise(SystemExit)
@@ -817,7 +948,7 @@ class AOMount:
             # Check things out
             diagnose(self.cfg)
 
-            self._monitor_mount_workers()
+            healthy = self._monitor_mount_workers()
 
         except (KeyboardInterrupt, SystemExit) as err:
             self.mounts_running = False
@@ -825,6 +956,7 @@ class AOMount:
         finally:
             log.info("Shutting down ...")
             self.unmount_sceneries()
+        return healthy
 
     def unmount_sceneries(self, force=False):
         log.info("Unmounting ...")
@@ -856,6 +988,12 @@ class AOMount:
             )
 
         self.stop_mount_workers(timeout=DEFAULT_WORKER_STOP_TIMEOUT)
+        self.stop_download_broker()
+
+        remaining_mounts = [
+            mountpoint for mountpoint in mountpoints
+            if safe_ismount(mountpoint)
+        ]
 
         self._finish_performance_diagnostics()
 
@@ -866,7 +1004,14 @@ class AOMount:
         self.stop_log_server()
 
         self._active_mountpoints = []
+        if remaining_mounts:
+            log.error(
+                "Unmount incomplete; mountpoints still active: %s",
+                remaining_mounts,
+            )
+            return False
         log.info("Unmount complete")
+        return True
 
     def domount(self, root, mountpoint, threading=True):
         return self._launch_scenery_worker(root, mountpoint, threading)
@@ -912,6 +1057,7 @@ class AOMount:
                         log.warning(f"Windows force unmount failed: {exc}")
             except Exception as exc:
                 log.warning(f"Force unmount attempt failed: {exc}")
+        return not safe_ismount(mountpoint)
 
 
 class AOMountUI(AOMount, config_ui.ConfigUI):
@@ -923,9 +1069,9 @@ class AOMountUI(AOMount, config_ui.ConfigUI):
         """Mount sceneries using AOMount functionality"""
         return AOMount.mount_sceneries(self, blocking)
     
-    def unmount_sceneries(self):
+    def unmount_sceneries(self, force=False):
         """Unmount sceneries using AOMount functionality"""
-        return AOMount.unmount_sceneries(self)
+        return AOMount.unmount_sceneries(self, force=force)
 
 
 def main():

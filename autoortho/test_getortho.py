@@ -1849,6 +1849,36 @@ class TestTimeBudget:
         assert budget.remaining == 0.0
         assert budget.remaining >= 0.0  # Double check
 
+    def test_tile_reuses_one_budget_across_reads(self, monkeypatch):
+        tile = getortho.Tile.__new__(getortho.Tile)
+        tile._tile_time_budget = None
+        tile._fallback_time_budget = None
+        tile._time_budget_lock = getortho.threading.Lock()
+        monkeypatch.setattr(getortho.CFG.autoortho, "use_time_budget", True)
+        monkeypatch.setattr(
+            getortho.CFG.autoortho, "tile_time_budget", "12"
+        )
+        monkeypatch.setattr(
+            getortho.CFG.autoortho, "suspend_maxwait", False
+        )
+
+        first = tile._get_or_create_tile_time_budget()
+        second = tile._get_or_create_tile_time_budget()
+
+        assert first is second
+        assert first.max_seconds == 12
+
+    def test_tile_honors_legacy_budget_mode(self, monkeypatch):
+        tile = getortho.Tile.__new__(getortho.Tile)
+        tile._tile_time_budget = None
+        tile._fallback_time_budget = None
+        tile._time_budget_lock = getortho.threading.Lock()
+        monkeypatch.setattr(
+            getortho.CFG.autoortho, "use_time_budget", False
+        )
+
+        assert tile._get_or_create_tile_time_budget() is None
+
 
 class TestFallbackLevel:
     """Tests for the fallback_level configuration option."""
@@ -1991,8 +2021,7 @@ class TestPerformanceConfig:
         # tile_time_budget should be convertible to float
         tile_budget = float(cfg.autoortho.tile_time_budget)
         assert tile_budget > 0
-        # Default should be 120.0
-        assert tile_budget == 180.0
+        assert tile_budget == 60.0
     
     def test_fallback_level_config_has_correct_default(self, tmpdir):
         """Test that fallback_level config option exists and has correct default."""
@@ -2030,6 +2059,15 @@ class TestPerformanceConfig:
 
 class TestTerrainTileLookup:
     """Tests for TerrainTileLookup coordinate math and spatial index."""
+
+    @staticmethod
+    def _lookup(path):
+        return getortho.TerrainTileLookup(
+            str(path),
+            "test",
+            build_async=False,
+            index_cache_dir=str(path.parent / f"{path.name}-index-cache"),
+        )
 
     def test_latlon_to_tile_grid_alignment(self):
         """All tile coordinates must be aligned to 16-tile grid."""
@@ -2081,7 +2119,7 @@ class TestTerrainTileLookup:
         row16, col16 = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 16)
         (tmp_path / f"{row16}_{col16}_BI16.ter").touch()
 
-        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        lookup = self._lookup(tmp_path)
         assert lookup._highzoom_count == 9, f"Expected 9 indexed tiles, got {lookup._highzoom_count}"
 
     def test_highzoom_query_radius_filter(self, tmp_path):
@@ -2097,7 +2135,7 @@ class TestTerrainTileLookup:
         row_nyc, col_nyc = getortho.TerrainTileLookup._latlon_to_tile(40.6, -73.8, 18)
         (tmp_path / f"{row_nyc}_{col_nyc}_BI18.ter").touch()
 
-        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        lookup = self._lookup(tmp_path)
         assert lookup._highzoom_count == 10
 
         # Query near London - should find 9 tiles, not the NYC one
@@ -2114,7 +2152,7 @@ class TestTerrainTileLookup:
         (tmp_path / f"{row}_{col}_BI18.ter").touch()
         (tmp_path / f"{row}_{col}_EOX18.ter").touch()
 
-        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        lookup = self._lookup(tmp_path)
         assert lookup._highzoom_count == 2
 
         results_bi = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=5.0, maptype_filter="BI")
@@ -2130,14 +2168,16 @@ class TestTerrainTileLookup:
         row, col = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 16)
         (tmp_path / f"{row}_{col}_BI16.ter").touch()
 
-        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        lookup = self._lookup(tmp_path)
         assert lookup._highzoom_count == 0
         results = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=40.0)
         assert len(results) == 0
 
     def test_highzoom_nonexistent_folder(self):
         """Index should handle nonexistent folder gracefully."""
-        lookup = getortho.TerrainTileLookup("/nonexistent/path", "test")
+        lookup = getortho.TerrainTileLookup(
+            "/nonexistent/path", "test", build_async=False
+        )
         assert lookup._highzoom_count == 0
         results = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=40.0)
         assert len(results) == 0
@@ -2147,9 +2187,82 @@ class TestTerrainTileLookup:
         row, col = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 18)
         (tmp_path / f"{row}_{col}_BI18.ter").touch()
 
-        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        lookup = self._lookup(tmp_path)
         assert lookup._highzoom_count == 1
 
         lookup.clear_cache()
         assert lookup._highzoom_count == 0
         assert len(lookup._highzoom_index) == 0
+
+    def test_persistent_index_avoids_rescan(self, tmp_path, monkeypatch):
+        row, col = getortho.TerrainTileLookup._latlon_to_tile(
+            51.47, -0.46, 18
+        )
+        (tmp_path / f"{row}_{col}_BI18.ter").touch()
+        cache_dir = tmp_path.parent / f"{tmp_path.name}-persistent-index"
+        first = getortho.TerrainTileLookup(
+            str(tmp_path),
+            "test",
+            build_async=False,
+            index_cache_dir=str(cache_dir),
+        )
+        assert first._highzoom_count == 1
+
+        def fail_scan(self):
+            raise AssertionError("terrain directory was rescanned")
+
+        monkeypatch.setattr(
+            getortho.TerrainTileLookup,
+            "_scan_highzoom_index",
+            fail_scan,
+        )
+        second = getortho.TerrainTileLookup(
+            str(tmp_path),
+            "test",
+            build_async=False,
+            index_cache_dir=str(cache_dir),
+        )
+        assert second._highzoom_count == 1
+
+    def test_async_index_does_not_block_constructor(
+        self, tmp_path, monkeypatch
+    ):
+        release = getortho.threading.Event()
+
+        def delayed_scan(self):
+            release.wait(timeout=2)
+            return {}, 0
+
+        monkeypatch.setattr(
+            getortho.TerrainTileLookup,
+            "_scan_highzoom_index",
+            delayed_scan,
+        )
+        started = time.monotonic()
+        lookup = getortho.TerrainTileLookup(
+            str(tmp_path),
+            "test",
+            build_async=True,
+            index_cache_dir=str(tmp_path.parent / "async-index"),
+        )
+        assert time.monotonic() - started < 0.2
+        assert not lookup.is_ready
+        release.set()
+        assert lookup.wait_until_ready(timeout=2)
+
+    def test_dsf_bounds_select_exact_region_tiles(self, tmp_path):
+        row, col = getortho.TerrainTileLookup._latlon_to_tile(
+            20.5, -99.5, 16
+        )
+        (tmp_path / f"{row}_{col}_BI16.ter").touch()
+        lookup = self._lookup(tmp_path)
+        original = list(getortho._terrain_lookups)
+        try:
+            getortho._terrain_lookups[:] = [lookup]
+            tiles = getortho.get_tiles_for_dsf(
+                "/Earth nav data/+20-100/+20-100.dsf"
+            )
+        finally:
+            getortho._terrain_lookups[:] = original
+
+        assert (row, col, "BI", 16) in tiles

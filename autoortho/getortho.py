@@ -7,6 +7,7 @@ import glob as glob_mod
 import hashlib
 import heapq
 import itertools
+import json
 import errno
 import os
 import re
@@ -34,6 +35,26 @@ except ImportError:
 
 import requests
 import psutil
+
+try:
+    from autoortho.http2_broker import (
+        HTTP2Broker,
+        RequestTimeout as BrokerRequestTimeout,
+        BrokerTimeoutError,
+        BrokerError,
+    )
+except ImportError:
+    try:
+        from http2_broker import (
+            HTTP2Broker,
+            RequestTimeout as BrokerRequestTimeout,
+            BrokerTimeoutError,
+            BrokerError,
+        )
+    except ImportError:
+        HTTP2Broker = None
+        BrokerRequestTimeout = None
+        BrokerTimeoutError = BrokerError = Exception
 
 try:
     from autoortho.diagnostics import (
@@ -612,7 +633,9 @@ def _get_dds_buffer_pool():
             
             _dds_buffer_pool = native.DDSBufferPool(
                 buffer_size=buffer_size,
-                pool_size=pool_size
+                pool_size=pool_size,
+                queue_enabled=_is_tile_queue_enabled(),
+                max_waiters=_get_tile_queue_max_size(),
             )
             
             total_mb = (pool_size * buffer_size) / (1024 * 1024)
@@ -815,6 +838,41 @@ def create_http_session(pool_size=10):
     return session
 
 
+_http2_client = None
+_http2_client_lock = threading.Lock()
+_http2_client_failed = False
+
+
+def _get_http2_client():
+    global _http2_client, _http2_client_failed
+    if _http2_client is not None:
+        return _http2_client
+    if _http2_client_failed or HTTP2Broker is None:
+        return None
+    address = os.getenv("AO_HTTP2_BROKER_ADDR")
+    token = os.getenv("AO_HTTP2_BROKER_TOKEN")
+    if not address or not token:
+        return None
+    with _http2_client_lock:
+        if _http2_client is not None:
+            return _http2_client
+        try:
+            _http2_client = HTTP2Broker.connect(address, token)
+        except Exception as exc:
+            _http2_client_failed = True
+            log.error("Could not connect to shared HTTP/2 broker: %s", exc)
+            return None
+        return _http2_client
+
+
+def _close_http2_client():
+    global _http2_client
+    with _http2_client_lock:
+        client, _http2_client = _http2_client, None
+    if client is not None:
+        client.stop()
+
+
 def _profiled_http_get(session, url, headers, timeout, chunk):
     tile_id = getattr(chunk, "tile_id", None) or getattr(chunk, "chunk_id", None)
     details = {
@@ -828,7 +886,36 @@ def _profiled_http_get(session, url, headers, timeout, chunk):
         tile_id=tile_id,
         details=details,
     ) as span:
-        response = session.get(url, headers=headers, timeout=timeout)
+        broker = _get_http2_client()
+        if broker is not None:
+            if isinstance(timeout, tuple):
+                connect_timeout = float(timeout[0])
+                read_timeout = float(timeout[1])
+            else:
+                connect_timeout = read_timeout = float(timeout)
+            request_id = uuid.uuid4().hex
+            chunk._broker_request_id = request_id
+            try:
+                response = broker.get(
+                    url,
+                    headers=headers,
+                    priority=int(getattr(chunk, "priority", 0)),
+                    timeout=BrokerRequestTimeout(
+                        connect=connect_timeout,
+                        read=read_timeout,
+                        write=connect_timeout,
+                        pool=connect_timeout,
+                    ),
+                    request_id=request_id,
+                )
+            except BrokerTimeoutError as exc:
+                raise requests.exceptions.Timeout(str(exc)) from exc
+            except BrokerError as exc:
+                raise requests.exceptions.ConnectionError(str(exc)) from exc
+            finally:
+                chunk._broker_request_id = None
+        else:
+            response = session.get(url, headers=headers, timeout=timeout)
         span.annotate(
             status_code=response.status_code,
             response_bytes=len(response.content or b""),
@@ -1469,7 +1556,7 @@ class Getter(object):
     def __init__(self, num_workers):
         
         self.count = 0
-        self.queue = PriorityQueue()
+        self.queue = PriorityQueue(maxsize=max(64, int(num_workers) * 4))
         self.workers = []
         self.WORKING = threading.Event()
         self.WORKING.set()
@@ -1512,10 +1599,11 @@ class Getter(object):
         global STATS
         self.localdata.idx = idx
         
-        # Create thread-local session with connection pooling
+        # A session is retained as an explicit HTTP/1.1 fallback. Each worker
+        # issues at most one request at a time, so a huge per-thread pool only
+        # wastes metadata and fragments connection reuse.
         try:
-            pool_size = max(4, int(int(CFG.autoortho.fetch_threads) * 1.5))
-            self.localdata.session = create_http_session(pool_size=pool_size)
+            self.localdata.session = create_http_session(pool_size=2)
         except Exception as _e:
             log.warning(f"Failed to initialize thread-local session: {_e}")
             self.localdata.session = requests.Session()
@@ -1532,7 +1620,12 @@ class Getter(object):
             #STATS.setdefault('count', 0) + 1
 
             if getattr(obj, 'prefetch', False) and is_live_building():
-                self.queue.put((obj, args, kwargs))
+                try:
+                    self.queue.put_nowait((obj, args, kwargs))
+                except Full:
+                    obj.in_queue = False
+                    obj.cancel()
+                    bump("background_chunk_dropped_queue_full")
                 bump('background_chunk_deferred_live')
                 time.sleep(0.05)
                 continue
@@ -1570,9 +1663,17 @@ class Getter(object):
                     # CRITICAL: Clear in_flight BEFORE re-submitting, otherwise submit()
                     # will see in_flight=True and silently drop the chunk!
                     obj.in_flight = False
-                    did_resubmit = True
                     bump('worker_resubmit')
-                    self.submit(obj, *args, **kwargs)
+                    did_resubmit = bool(
+                        self.submit(obj, *args, **kwargs)
+                    )
+                    if not did_resubmit:
+                        bump("worker_resubmit_dropped")
+                        abandon = getattr(
+                            self, "_abandon_duplicate_waiters", None
+                        )
+                        if abandon is not None:
+                            abandon(obj)
             except Exception as err:
                 log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
                 # Don't re-submit if permanently failed or cancelled
@@ -1584,9 +1685,17 @@ class Getter(object):
                     continue
                 # CRITICAL: Clear in_flight BEFORE re-submitting
                 obj.in_flight = False
-                did_resubmit = True
                 bump('worker_resubmit')
-                self.submit(obj, *args, **kwargs)
+                did_resubmit = bool(
+                    self.submit(obj, *args, **kwargs)
+                )
+                if not did_resubmit:
+                    bump("worker_resubmit_dropped")
+                    abandon = getattr(
+                        self, "_abandon_duplicate_waiters", None
+                    )
+                    if abandon is not None:
+                        abandon(obj)
             finally:
                 if not did_resubmit:
                     # Normal completion — we still own in_flight and _inflight_objs
@@ -1627,7 +1736,13 @@ class Getter(object):
             bump('submit_skip_in_flight')
             return  # Currently downloading
         obj.in_queue = True
-        self.queue.put((obj, args, kwargs))
+        try:
+            self.queue.put_nowait((obj, args, kwargs))
+            return True
+        except Full:
+            obj.in_queue = False
+            bump("chunk_queue_full")
+            return False
 
 class ChunkGetter(Getter):
     # Track in-progress chunk_ids GLOBALLY to prevent queueing duplicates
@@ -1785,7 +1900,17 @@ class ChunkGetter(Getter):
                 self._queued_chunk_objs[chunk_id] = obj
         
         obj._profile_queued_at = time.monotonic()
-        self.queue.put((obj, args, kwargs))
+        try:
+            self.queue.put_nowait((obj, args, kwargs))
+        except Full:
+            obj.in_queue = False
+            obj._profile_queued_at = None
+            if chunk_id:
+                with self._queued_lock:
+                    self._queued_chunk_ids.discard(chunk_id)
+                    self._queued_chunk_objs.pop(chunk_id, None)
+            bump("chunk_queue_full")
+            return False
         return True
 
     def _complete_duplicate_waiters(self, obj, waiters):
@@ -1806,6 +1931,21 @@ class ChunkGetter(Getter):
             try:
                 if tile_completion_tracker is not None and waiter.tile_id:
                     tile_completion_tracker.notify_chunk_ready(waiter.tile_id, waiter)
+            except Exception:
+                pass
+
+    def _abandon_duplicate_waiters(self, obj):
+        chunk_id = getattr(obj, "chunk_id", None)
+        if not chunk_id:
+            return
+        with self._queued_lock:
+            waiters = self._queued_chunk_waiters.pop(chunk_id, [])
+        obj.cancel()
+        for waiter in waiters:
+            try:
+                waiter.in_queue = False
+                waiter.in_flight = False
+                waiter.cancel()
             except Exception:
                 pass
 
@@ -1856,7 +1996,79 @@ def _create_chunk_getter(num_workers: int):
     return ChunkGetter(num_workers)
 
 
-chunk_getter = _create_chunk_getter(int(CFG.autoortho.fetch_threads))
+class LazyChunkGetter:
+    def __init__(self):
+        self._instance = None
+        self._lock = threading.Lock()
+
+    @property
+    def initialized(self):
+        return self._instance is not None
+
+    def _get(self):
+        if self._instance is None:
+            with self._lock:
+                if self._instance is None:
+                    requested = max(
+                        1, int(getattr(CFG.autoortho, "fetch_threads", 32))
+                    )
+                    max_concurrent = max(
+                        1,
+                        min(
+                            1024,
+                            int(
+                                getattr(
+                                    CFG.autoortho,
+                                    "max_concurrent_downloads",
+                                    256,
+                                )
+                            ),
+                        ),
+                    )
+                    if os.getenv("AO_RUN_MODE") not in (
+                        "mount_worker",
+                        "macfuse_worker",
+                    ):
+                        max_concurrent = min(max_concurrent, 8)
+                    workers = min(
+                        requested,
+                        max_concurrent,
+                        max(8, min(64, CURRENT_CPU_COUNT * 2)),
+                    )
+                    if workers != requested:
+                        log.warning(
+                            "Clamping fetch_threads from %d to %d for this process",
+                            requested,
+                            workers,
+                        )
+                    self._instance = _create_chunk_getter(workers)
+        return self._instance
+
+    def submit(self, *args, **kwargs):
+        return self._get().submit(*args, **kwargs)
+
+    def reprioritize_queue(self):
+        if self._instance is not None:
+            return self._instance.reprioritize_queue()
+
+    def cancel_all_work(self, *args, **kwargs):
+        if self._instance is not None:
+            return self._instance.cancel_all_work(*args, **kwargs)
+
+    def cancel_prefetch_work(self, *args, **kwargs):
+        if self._instance is not None:
+            return self._instance.cancel_prefetch_work(*args, **kwargs)
+
+    def stop(self):
+        if self._instance is not None:
+            self._instance.stop()
+            self._instance = None
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+
+chunk_getter = LazyChunkGetter()
 
 #class TileGetter(Getter):
 #    def get(self, obj, *args, **kwargs):
@@ -2248,7 +2460,16 @@ class TerrainTileLookup:
     Example: 10880_10432_BI16.ter → row=10880, col=10432, maptype=BI, zoom=16
     """
     
-    def __init__(self, terrain_folder: str, scenery_name: str):
+    INDEX_SCHEMA_VERSION = 1
+
+    def __init__(
+        self,
+        terrain_folder: str,
+        scenery_name: str,
+        *,
+        build_async: bool = True,
+        index_cache_dir: Optional[str] = None,
+    ):
         """
         Args:
             terrain_folder: Path to the terrain folder (e.g., .../z_ao_na/terrain)
@@ -2275,12 +2496,32 @@ class TerrainTileLookup:
         # Built once at mount time via glob (typically <50ms for a few hundred files).
         self._highzoom_index: Dict[Tuple[int, int], List[Tuple[int, int, str, int]]] = {}
         self._highzoom_count = 0
+        self._index_lock = threading.Lock()
+        self._index_ready = threading.Event()
+        self._index_cancel = threading.Event()
+        self._index_error = None
+        self._index_thread = None
+        cache_root = index_cache_dir or os.path.join(
+            str(CFG.paths.cache_dir), "terrain_index"
+        )
+        cache_key = hashlib.sha256(
+            os.path.normcase(os.path.abspath(terrain_folder)).encode("utf-8")
+        ).hexdigest()
+        self._index_cache_path = os.path.join(cache_root, f"{cache_key}.json")
 
         if self._folder_exists:
-            self._build_highzoom_index()
-            log.info(f"TerrainTileLookup: Ready for {scenery_name} at {terrain_folder}")
+            if build_async:
+                self._index_thread = threading.Thread(
+                    target=self._load_or_build_highzoom_index,
+                    name=f"TerrainIndex-{scenery_name}",
+                    daemon=True,
+                )
+                self._index_thread.start()
+            else:
+                self._load_or_build_highzoom_index()
         else:
             log.warning(f"TerrainTileLookup: Folder not found: {terrain_folder}")
+            self._index_ready.set()
     
     def get_tiles_for_position(self, lat: float, lon: float,
                                maptype_filter: Optional[str] = None,
@@ -2364,6 +2605,44 @@ class TerrainTileLookup:
     def has_tile(self, row: int, col: int, maptype: str, zoom: int) -> bool:
         """Check if a specific tile exists."""
         return self._tile_exists(row, col, maptype, zoom)
+
+    def get_tiles_for_bounds(
+        self,
+        lat_min: float,
+        lon_min: float,
+        lat_max: float,
+        lon_max: float,
+        *,
+        maptype_filter: Optional[str] = None,
+        tile_zooms=(16, 18),
+    ) -> List[Tuple[int, int, str, int]]:
+        """Return terrain tiles intersecting geographic bounds."""
+        if not self._folder_exists:
+            return []
+        maptypes = (
+            [maptype_filter]
+            if maptype_filter
+            else list(get_discovered_maptypes())
+        )
+        results = []
+        for zoom in tile_zooms:
+            north_row, west_col = self._latlon_to_tile(
+                lat_max, lon_min, zoom
+            )
+            south_row, east_col = self._latlon_to_tile(
+                lat_min, lon_max, zoom
+            )
+            row_start, row_end = sorted((north_row, south_row))
+            col_start, col_end = sorted((west_col, east_col))
+            for row in range(row_start, row_end + 1, self.TILE_GRID_STEP):
+                for col in range(
+                    col_start, col_end + 1, self.TILE_GRID_STEP
+                ):
+                    for maptype in maptypes:
+                        if self._tile_exists(row, col, maptype, zoom):
+                            results.append((row, col, maptype, zoom))
+                            break
+        return results
     
     # Tile grid alignment: .ter files are placed every 16 slippy coordinates
     # because each tile covers a 16×16 chunk grid
@@ -2421,28 +2700,56 @@ class TerrainTileLookup:
         lat = math.degrees(lat_rad)
         return (lat, lon)
 
-    def _build_highzoom_index(self) -> None:
-        """
-        Build spatial index of ZL18/19 .ter files using glob (runs once at mount).
+    def _terrain_signature(self) -> int:
+        return int(os.stat(self._terrain_folder).st_mtime_ns)
 
-        These are airport tiles — sparse but important for prefetching.
-        Parses filenames like "144224_260256_BI18.ter" and buckets them
-        by 1° lat/lon cells for fast radius queries.
-
-        Performance: typically <50ms for a few hundred airport tiles.
-        """
+    def _load_or_build_highzoom_index(self) -> None:
         t0 = time.time()
+        try:
+            if not self._load_cached_highzoom_index():
+                index, count = self._scan_highzoom_index()
+                if self._index_cancel.is_set():
+                    return
+                with self._index_lock:
+                    self._highzoom_index = index
+                    self._highzoom_count = count
+                self._write_cached_highzoom_index(index, count)
+            elapsed_ms = (time.time() - t0) * 1000
+            log.info(
+                "TerrainTileLookup: Ready for %s at %s "
+                "(%d high-zoom tiles, %.0fms)",
+                self._scenery_name,
+                self._terrain_folder,
+                self._highzoom_count,
+                elapsed_ms,
+            )
+        except Exception as exc:
+            self._index_error = exc
+            log.error(
+                "TerrainTileLookup: failed to index %s: %s",
+                self._scenery_name,
+                exc,
+            )
+        finally:
+            self._index_ready.set()
 
-        for zoom in (18, 19):
-            # Match any .ter file ending with the zoom number
-            # Pattern: {row}_{col}_{maptype}{zoom}.ter
-            pattern = os.path.join(self._terrain_folder, f"*{zoom}.ter")
-            for path in glob_mod.iglob(pattern):
-                basename = os.path.basename(path)
-                # Parse: "144224_260256_BI18.ter" → row=144224, col=260256, maptype=BI, zoom=18
-                name = basename.rsplit('.', 1)[0]  # strip .ter
+    def _scan_highzoom_index(self):
+        index: Dict[
+            Tuple[int, int], List[Tuple[int, int, str, int]]
+        ] = {}
+        count = 0
+        with os.scandir(self._terrain_folder) as entries:
+            for entry in entries:
+                if self._index_cancel.is_set():
+                    break
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                basename = entry.name
+                if not basename.endswith(".ter"):
+                    continue
+                name = basename[:-4]
                 try:
-                    tokens = name.split('_', 2)  # ['144224', '260256', 'BI18']
+                    tokens = name.split("_", 2)
                     row_val = int(tokens[0])
                     col_val = int(tokens[1])
                     maptype_zoom = tokens[2]
@@ -2450,36 +2757,80 @@ class TerrainTileLookup:
                     file_zoom = int(maptype_zoom[-2:])
                 except (ValueError, IndexError):
                     continue
-
-                # Skip entries where the extracted maptype is a zoom-level
-                # notation (e.g. "ZL18.ter") rather than a real map source.
-                # "ZL" is not a valid imagery source for the prefetcher.
-                if maptype.upper() in ("ZL", ""):
+                if file_zoom not in (18, 19) or maptype.upper() in ("ZL", ""):
                     continue
-
-                # Only index the target zoom levels (the glob may match
-                # files like *118.ter at ZL18 pattern, so verify)
-                if file_zoom != zoom:
+                if (
+                    row_val % self.TILE_GRID_STEP != 0
+                    or col_val % self.TILE_GRID_STEP != 0
+                ):
                     continue
-
-                # Verify grid alignment (defensive)
-                if row_val % self.TILE_GRID_STEP != 0 or col_val % self.TILE_GRID_STEP != 0:
-                    continue
-
-                # Convert tile coords to lat/lon for bucketing
                 lat, lon = self._tile_to_latlon(row_val, col_val, file_zoom)
                 bucket_key = (int(math.floor(lat)), int(math.floor(lon)))
+                index.setdefault(bucket_key, []).append(
+                    (row_val, col_val, maptype, file_zoom)
+                )
+                count += 1
+        return index, count
 
-                if bucket_key not in self._highzoom_index:
-                    self._highzoom_index[bucket_key] = []
-                self._highzoom_index[bucket_key].append((row_val, col_val, maptype, file_zoom))
-                self._highzoom_count += 1
+    def _load_cached_highzoom_index(self) -> bool:
+        try:
+            with open(self._index_cache_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if (
+                payload.get("schema_version") != self.INDEX_SCHEMA_VERSION
+                or payload.get("terrain_folder")
+                != os.path.normcase(os.path.abspath(self._terrain_folder))
+                or int(payload.get("terrain_signature", -1))
+                != self._terrain_signature()
+            ):
+                return False
+            index = {}
+            count = 0
+            for cell in payload.get("cells", []):
+                if not isinstance(cell, list) or len(cell) != 3:
+                    return False
+                entries = [
+                    (int(row), int(col), str(maptype), int(zoom))
+                    for row, col, maptype, zoom in cell[2]
+                ]
+                index[(int(cell[0]), int(cell[1]))] = entries
+                count += len(entries)
+            if count != int(payload.get("tile_count", -1)):
+                return False
+            with self._index_lock:
+                self._highzoom_index = index
+                self._highzoom_count = count
+            return True
+        except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
 
-        elapsed_ms = (time.time() - t0) * 1000
-        if self._highzoom_count > 0:
-            log.info(f"TerrainTileLookup: Indexed {self._highzoom_count} high-zoom tiles "
-                     f"in {len(self._highzoom_index)} cells for {self._scenery_name} "
-                     f"({elapsed_ms:.0f}ms)")
+    def _write_cached_highzoom_index(self, index, count) -> None:
+        payload = {
+            "schema_version": self.INDEX_SCHEMA_VERSION,
+            "terrain_folder": os.path.normcase(
+                os.path.abspath(self._terrain_folder)
+            ),
+            "terrain_signature": self._terrain_signature(),
+            "tile_count": count,
+            "cells": [
+                [lat, lon, entries]
+                for (lat, lon), entries in sorted(index.items())
+            ],
+        }
+        data = json.dumps(
+            payload, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+        os.makedirs(os.path.dirname(self._index_cache_path), exist_ok=True)
+        if not _atomic_write(self._index_cache_path, data):
+            log.warning(
+                "TerrainTileLookup: failed to persist index for %s",
+                self._scenery_name,
+            )
+
+    def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        if not self._index_ready.wait(timeout):
+            return False
+        return self._index_error is None
 
     def get_highzoom_tiles_near(self, lat: float, lon: float,
                                  radius_nm: float = 40.0,
@@ -2499,7 +2850,11 @@ class TerrainTileLookup:
         Returns:
             List of (row, col, maptype, zoom) tuples for matching tiles
         """
-        if not self._highzoom_index:
+        if not self._index_ready.is_set():
+            return []
+        with self._index_lock:
+            highzoom_index = self._highzoom_index
+        if not highzoom_index:
             return []
 
         results = []
@@ -2515,7 +2870,7 @@ class TerrainTileLookup:
 
         for blat in range(lat_min, lat_max + 1):
             for blon in range(lon_min, lon_max + 1):
-                bucket = self._highzoom_index.get((blat, blon))
+                bucket = highzoom_index.get((blat, blon))
                 if not bucket:
                     continue
                 for entry in bucket:
@@ -2534,15 +2889,18 @@ class TerrainTileLookup:
 
     def clear_cache(self) -> None:
         """Clear the lookup cache and spatial index."""
+        self._index_cancel.set()
+        if self._index_thread and self._index_thread.is_alive():
+            self._index_thread.join(timeout=1.0)
         with self._cache_lock:
             self._cache.clear()
-        self._highzoom_index.clear()
-        self._highzoom_count = 0
+        with self._index_lock:
+            self._highzoom_index.clear()
+            self._highzoom_count = 0
 
     @property
     def is_ready(self) -> bool:
-        """Always ready (no async indexing needed)."""
-        return self._folder_exists
+        return self._folder_exists and self._index_ready.is_set()
     
     @property
     def stats(self) -> dict:
@@ -2558,6 +2916,8 @@ class TerrainTileLookup:
             'folder_exists': self._folder_exists,
             'highzoom_tiles_indexed': self._highzoom_count,
             'highzoom_cells': len(self._highzoom_index),
+            'index_ready': self._index_ready.is_set(),
+            'index_error': str(self._index_error) if self._index_error else None,
         }
 
 
@@ -2566,7 +2926,9 @@ _terrain_lookups: List[TerrainTileLookup] = []
 _terrain_lookups_lock = threading.Lock()
 
 
-def register_terrain_index(terrain_folder: str, scenery_name: str) -> None:
+def register_terrain_index(
+    terrain_folder: str, scenery_name: str
+) -> TerrainTileLookup:
     """
     Register a terrain lookup for a scenery.
     
@@ -2578,6 +2940,7 @@ def register_terrain_index(terrain_folder: str, scenery_name: str) -> None:
         lookup = TerrainTileLookup(terrain_folder, scenery_name)
         _terrain_lookups.append(lookup)
         log.info(f"Registered terrain lookup for {scenery_name}")
+        return lookup
 
 
 def get_all_tiles_for_position(lat: float, lon: float,
@@ -2623,6 +2986,33 @@ def get_highzoom_tiles_near(lat: float, lon: float,
             results.extend(lookup.get_highzoom_tiles_near(
                 lat, lon, radius_nm, maptype_filter
             ))
+    return results
+
+
+def get_tiles_for_dsf(
+    dsf_path: str,
+    maptype_filter: Optional[str] = None,
+) -> List[Tuple[int, int, str, int]]:
+    match = re.search(r"([+-]\d{2,3})([+-]\d{3})\.dsf$", dsf_path)
+    if not match:
+        return []
+    lat = int(match.group(1))
+    lon = int(match.group(2))
+    results = []
+    seen = set()
+    with _terrain_lookups_lock:
+        lookups = list(_terrain_lookups)
+    for lookup in lookups:
+        for tile in lookup.get_tiles_for_bounds(
+            lat,
+            lon,
+            lat + 1.0,
+            lon + 1.0,
+            maptype_filter=maptype_filter,
+        ):
+            if tile not in seen:
+                seen.add(tile)
+                results.append(tile)
     return results
 
 
@@ -3405,7 +3795,14 @@ class SpatialPrefetcher:
                 return override
         return None  # Accept any maptype from terrain index
     
-    def _prefetch_tile(self, row, col, zoom, maptype: Optional[str] = None):
+    def _prefetch_tile(
+        self,
+        row,
+        col,
+        zoom,
+        maptype: Optional[str] = None,
+        max_chunks: Optional[int] = None,
+    ):
         """
         Submit prefetch requests for a tile's chunks at ALL mipmap levels.
 
@@ -3483,6 +3880,8 @@ class SpatialPrefetcher:
                     tile_completion_tracker.start_tracking(tile, zoom)
 
                 for chunk in mipmap_chunks:
+                    if max_chunks is not None and submitted >= max_chunks:
+                        return submitted, False
                     # Skip if already ready, in flight, or failed
                     if chunk.ready.is_set():
                         continue
@@ -3520,6 +3919,37 @@ class SpatialPrefetcher:
                 except Exception:
                     pass  # Don't let close errors mask the original exception
 
+    def prefetch_tiles(
+        self,
+        tiles: List[Tuple[int, int, str, int]],
+        max_chunks: Optional[int] = None,
+    ) -> int:
+        """Queue an explicit ordered set of terrain tiles."""
+        limit = self.max_chunks if max_chunks is None else max(1, max_chunks)
+        submitted_total = 0
+        for row, col, maptype, zoom in tiles:
+            if submitted_total >= limit or is_shutdown_requested():
+                break
+            key = (row, col, maptype, zoom)
+            if key in self._recently_prefetched:
+                continue
+            submitted, complete = self._prefetch_tile(
+                row,
+                col,
+                zoom,
+                maptype,
+                max_chunks=limit - submitted_total,
+            )
+            submitted_total += submitted
+            if complete:
+                self._recently_prefetched.add(key)
+                if len(self._recently_prefetched) > self._max_recent:
+                    self._recently_prefetched.pop()
+        if submitted_total:
+            self._prefetch_count += submitted_total
+            bump("dsf_prefetch_chunk_count", submitted_total)
+        return submitted_total
+
 
 # Global prefetcher instance
 spatial_prefetcher = SpatialPrefetcher()
@@ -3530,6 +3960,19 @@ def start_prefetcher(tile_cacher):
     clear_shutdown_request()
     spatial_prefetcher.set_tile_cacher(tile_cacher)
     spatial_prefetcher.start()
+
+
+def prefetch_dsf(dsf_path: str, max_chunks: Optional[int] = None) -> int:
+    tiles = get_tiles_for_dsf(dsf_path)
+    maptype_override = spatial_prefetcher._get_maptype_filter()
+    if maptype_override:
+        tiles = [
+            (row, col, maptype_override, zoom)
+            for row, col, _terrain_maptype, zoom in tiles
+        ]
+    return spatial_prefetcher.prefetch_tiles(
+        tiles, max_chunks=max_chunks
+    )
 
 
 def stop_prefetcher():
@@ -4732,6 +5175,7 @@ tile_completion_tracker: Optional[TileCompletionTracker] = None
 # Persistent DDS cache (cross-session) and disk budget manager
 dynamic_dds_cache = None       # type: ignore[assignment]  # DynamicDDSCache instance
 disk_budget_manager = None     # type: ignore[assignment]  # DiskBudgetManager instance
+_cache_init_thread = None
 _persist_partial_dds: bool = False
 
 
@@ -5038,6 +5482,7 @@ def start_predictive_dds(tile_cacher=None) -> None:
     """
     global background_dds_builder, tile_completion_tracker
     global dynamic_dds_cache, disk_budget_manager
+    global _cache_init_thread
 
     # Prevent duplicate initialization (Windows/Linux: all mounts share one process)
     if background_dds_builder is not None:
@@ -5061,10 +5506,6 @@ def start_predictive_dds(tile_cacher=None) -> None:
     if not enabled:
         log.info("Predictive DDS generation disabled by configuration")
         return
-    
-    # Get configuration
-    disk_cache_mb = int(getattr(CFG.autoortho, 'ephemeral_dds_cache_mb', 4096))
-    disk_cache_mb = max(1024, min(16384, disk_cache_mb))  # Min 1GB, max 16GB
     
     build_interval_ms = int(getattr(CFG.autoortho, 'predictive_dds_build_interval_ms', 250))
     build_interval_ms = max(50, min(2000, build_interval_ms))
@@ -5108,22 +5549,14 @@ def start_predictive_dds(tile_cacher=None) -> None:
         dynamic_dds_cache = DynamicDDSCache(
             cache_dir=cache_dir,
             max_size_mb=persistent_dds_mb,
-            enabled=True
+            enabled=True,
+            cleanup_source_jpegs_after_store=_get_bool_config(
+                CFG.autoortho, "cleanup_source_jpegs_after_dds", False
+            ),
+            maintenance_workers=int(
+                getattr(CFG.autoortho, "dds_cache_maintenance_workers", 2)
+            ),
         )
-
-        # Scan existing cache entries, then migrate uncompressed files
-        import threading as _threading
-
-        def _scan_and_migrate():
-            dynamic_dds_cache.scan_existing()
-            dynamic_dds_cache.migrate_uncompressed()
-
-        _scan_thread = _threading.Thread(
-            target=_scan_and_migrate,
-            daemon=True,
-            name="dds_cache_scan"
-        )
-        _scan_thread.start()
 
         # Wire network healing callback so cache can trigger downloads
         dynamic_dds_cache._network_heal_callback = _dispatch_network_healing
@@ -5169,15 +5602,6 @@ def start_predictive_dds(tile_cacher=None) -> None:
                 dds_cache=dynamic_dds_cache
             )
             
-            # Run initial scan + cleanup in background thread
-            import threading as _threading
-            _budget_thread = _threading.Thread(
-                target=disk_budget_manager.initial_scan,
-                daemon=True,
-                name="disk_budget_scan"
-            )
-            _budget_thread.start()
-
             if dynamic_dds_cache is not None:
                 dynamic_dds_cache._budget_manager = disk_budget_manager
             log.info(f"Disk budget manager initialized (total={total_budget_gb}GB, dds_pct={dds_pct}%)")
@@ -5187,6 +5611,20 @@ def start_predictive_dds(tile_cacher=None) -> None:
     else:
         log.info("Disk budget enforcement disabled by config")
 
+    def _initialize_disk_caches():
+        if dynamic_dds_cache is not None:
+            dynamic_dds_cache.scan_existing()
+            dynamic_dds_cache.migrate_uncompressed()
+        if disk_budget_manager is not None:
+            disk_budget_manager.initial_scan()
+
+    _cache_init_thread = threading.Thread(
+        target=_initialize_disk_caches,
+        daemon=True,
+        name="dds-cache-init",
+    )
+    _cache_init_thread.start()
+
     global _persist_partial_dds
     _persist_partial_dds = _get_bool_config(
         CFG.autoortho, 'persist_partial_dds_cache', False)
@@ -5194,20 +5632,33 @@ def start_predictive_dds(tile_cacher=None) -> None:
     # Start the builder thread
     background_dds_builder.start()
     
-    log.info(f"Predictive DDS generation started "
-            f"(disk_cache={disk_cache_mb}MB, interval={build_interval_ms}ms)")
+    size_desc = (
+        f"{persistent_dds_mb}MB"
+        if persistent_dds_mb > 0
+        else "disk-budget managed"
+    )
+    log.info(
+        "Predictive DDS generation started "
+        f"(persistent_cache={size_desc}, interval={build_interval_ms}ms)"
+    )
 
 
 def stop_predictive_dds() -> None:
     """Stop the predictive DDS generation system and cleanup disk cache."""
     global background_dds_builder, tile_completion_tracker
     global dynamic_dds_cache, disk_budget_manager
+    global _cache_init_thread
     
     if background_dds_builder is not None:
         stats = background_dds_builder.stats
         background_dds_builder.stop()
         log.info(f"BackgroundDDSBuilder: {stats['builds_completed']} tiles built, "
                 f"{stats['builds_failed']} failed")
+
+    if _cache_init_thread is not None and _cache_init_thread.is_alive():
+        _cache_init_thread.join(timeout=10.0)
+        if _cache_init_thread.is_alive():
+            log.warning("DDS cache initialization did not stop within 10 seconds")
     
     # Log dynamic DDS cache stats on shutdown
     if dynamic_dds_cache is not None:
@@ -5218,6 +5669,10 @@ def stop_predictive_dds() -> None:
                     f"{stats['entries']} entries, {stats['upgrades']} ZL upgrades")
         except Exception:
             pass
+        try:
+            dynamic_dds_cache.close()
+        except Exception as exc:
+            log.warning("Dynamic DDS cache shutdown failed: %s", exc)
     
     # Log disk budget stats on shutdown
     if disk_budget_manager is not None:
@@ -5233,6 +5688,7 @@ def stop_predictive_dds() -> None:
     tile_completion_tracker = None
     dynamic_dds_cache = None
     disk_budget_manager = None
+    _cache_init_thread = None
 
 
 # HTTP status codes that indicate permanent failure (no retry)
@@ -5319,6 +5775,7 @@ class Chunk(object):
         # freeing the worker slot for other chunks.
         self.cancelled = False
         self.prefetch = False
+        self._broker_request_id = None
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
 
@@ -5519,6 +5976,7 @@ class Chunk(object):
 
         MAPID = "s2cloudless-2024_3857"
         MATRIXSET = "g"
+        apple_token_generation = apple_token_service.generation
         MAPTYPES = {
             "EOX": f"https://s2maps-tiles.eu/wmts?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
             "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
@@ -5577,7 +6035,10 @@ class Chunk(object):
 
             if self.maptype.upper() == "APPLE" and status_code in (403, 410):
                 log.warning("APPLE tile got %s; rotating token and retrying", status_code)
-                apple_token_service.reset_apple_maps_token()
+                apple_token_service.reset_apple_maps_token(
+                    expected_generation=apple_token_generation
+                )
+                apple_token_generation = apple_token_service.generation
                 MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
                 self.url = MAPTYPES[self.maptype.upper()]
                 if resp is not None:
@@ -5738,6 +6199,11 @@ class Chunk(object):
         if self.cancelled:
             return  # Already cancelled
         self.cancelled = True
+        request_id = self._broker_request_id
+        if request_id:
+            broker = _get_http2_client()
+            if broker is not None:
+                broker.cancel(request_id)
         # Unblock any thread waiting on ready (e.g. other mipmap builders)
         if not self.ready.is_set():
             if not self.data:
@@ -5811,6 +6277,8 @@ class Tile(object):
         # Tile-level time budget - shared across all mipmap builds for this tile
         # This ensures the budget limits the ENTIRE tile processing, not per-mipmap
         self._tile_time_budget = None
+        self._fallback_time_budget = None
+        self._time_budget_lock = threading.Lock()
         
         # === SHARED FALLBACK CHUNK POOL ===
         # When multiple chunks fail and need the same parent chunk at a lower zoom,
@@ -7428,10 +7896,9 @@ class Tile(object):
             self._aopipeline_attempted = True  # Prevent retry loops on failure
             
             try:
-                aopipeline_budget = time_budget
-                if aopipeline_budget is None:
-                    budget_seconds = float(getattr(CFG.autoortho, 'tile_time_budget', 30.0))
-                    aopipeline_budget = TimeBudget(budget_seconds)
+                aopipeline_budget = (
+                    time_budget or self._get_or_create_tile_time_budget()
+                )
 
                 fallback_level = self._get_fallback_level()
                 fallbacks_enabled = fallback_level > 0
@@ -7468,13 +7935,13 @@ class Tile(object):
 
                         # Warm probe said ready but batch failed (race condition:
                         # chunk evicted between probe and collect).
-                        # Try streaming with fallback_timeout budget.
+                        # Retry streaming within the same tile-wide budget. A
+                        # separate fallback extension is only created after the
+                        # main budget is actually exhausted.
                         if getattr(CFG.autoortho, 'streaming_builder_enabled', True):
-                            fallback_timeout = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
-                            streaming_budget = TimeBudget(fallback_timeout)
                             log.debug(f"GET_BYTES: warm-cache batch failed, trying streaming for {self.id}")
 
-                            if self._try_streaming_aopipeline_build(time_budget=streaming_budget):
+                            if self._try_streaming_aopipeline_build(time_budget=aopipeline_budget):
                                 log.debug(f"GET_BYTES: streaming builder succeeded for {self.id}")
                                 return True
 
@@ -7654,18 +8121,10 @@ class Tile(object):
 
     @profiled_stage("tile.dds_read")
     def _read_dds_bytes_inner(self, offset, length):
-        # ═══════════════════════════════════════════════════════════════════════
-        # PER-REQUEST TIME BUDGET
-        # ═══════════════════════════════════════════════════════════════════════
-        # Create a fresh TimeBudget for THIS specific X-Plane read request.
-        # Each read() call is independent - even multiple reads to the same tile
-        # get their own budget. This ensures:
-        # - No "budget starvation" for later reads to the same tile
-        # - Consistent behavior regardless of read order
-        # - Each request gets its full time budget for chunk collection
-        # Default 30s is responsive for flight sims - config can override for quality
-        budget_seconds = float(getattr(CFG.autoortho, 'tile_time_budget', 30.0))
-        request_budget = TimeBudget(budget_seconds)
+        # Every read for the same open tile shares one wall-clock budget. This
+        # matches the user-facing "complete tile" contract and prevents X-Plane's
+        # block-oriented reads from multiplying the configured timeout.
+        request_budget = self._get_or_create_tile_time_budget()
 
         # Track when this tile was first requested (for stats only)
         if self.first_request_time is None:
@@ -7718,6 +8177,48 @@ class Tile(object):
         # Seek and return data
         self.dds.seek(offset)
         return self.dds.read(length)
+
+    def _get_or_create_tile_time_budget(self):
+        use_time_budget = getattr(CFG.autoortho, "use_time_budget", True)
+        if isinstance(use_time_budget, str):
+            use_time_budget = use_time_budget.lower().strip() in (
+                "true", "1", "yes", "on"
+            )
+        if not use_time_budget:
+            return None
+
+        with self._time_budget_lock:
+            if self._tile_time_budget is None:
+                budget_seconds = max(
+                    0.1,
+                    float(getattr(CFG.autoortho, "tile_time_budget", 60.0)),
+                )
+                suspend_maxwait = getattr(
+                    CFG.autoortho, "suspend_maxwait", False
+                )
+                if isinstance(suspend_maxwait, str):
+                    suspend_maxwait = suspend_maxwait.lower().strip() in (
+                        "true", "1", "yes", "on"
+                    )
+                if (
+                    suspend_maxwait
+                    and not getattr(datareftracker, "has_ever_connected", False)
+                ):
+                    budget_seconds = min(budget_seconds * 10.0, 1800.0)
+                self._tile_time_budget = TimeBudget(budget_seconds)
+            return self._tile_time_budget
+
+    def _get_or_create_fallback_time_budget(self):
+        if self.get_fallback_level() < 2 or not self.get_fallback_extends_budget():
+            return None
+        with self._time_budget_lock:
+            if self._fallback_time_budget is None:
+                timeout = max(
+                    0.1,
+                    float(getattr(CFG.autoortho, "fallback_timeout", 30.0)),
+                )
+                self._fallback_time_budget = TimeBudget(timeout)
+            return self._fallback_time_budget
 
     def write(self):
         outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{self.tilename_zoom}.dds")
@@ -8206,9 +8707,13 @@ class Tile(object):
                         pass  # Skip network fallback
                     elif time_budget.exhausted and fallback_extends_budget:
                         if fallback_budget is None:
-                            fallback_budget = TimeBudget(fallback_timeout)
-                            log.info(f"GET_IMG: Main budget exhausted, creating fallback budget {fallback_timeout:.1f}s")
-                        if not fallback_budget.exhausted:
+                            fallback_budget = self._get_or_create_fallback_time_budget()
+                            if fallback_budget is not None:
+                                log.info(
+                                    "GET_IMG: Main budget exhausted, using shared "
+                                    f"fallback budget {fallback_timeout:.1f}s"
+                                )
+                        if fallback_budget is not None and not fallback_budget.exhausted:
                             chunk_img = self.get_or_build_lower_mipmap_chunk(
                                 mipmap, chunk.col, chunk.row, zoom,
                                 main_budget=None,
@@ -9884,6 +10389,7 @@ class Tile(object):
         self._lazy_build_attempted = False
         self._aopipeline_attempted = False
         self._tile_time_budget = None
+        self._fallback_time_budget = None
         self.first_request_time = None
         self._completion_reported = False
         self._is_live = False
@@ -10312,7 +10818,10 @@ class TileCacher(object):
             sum(max(0, getattr(tile, "refs", 0)) for tile in profiled_tiles),
         )
         if chunk_getter is not None:
-            profile_gauge("chunk_queue.depth", chunk_getter.queue.qsize())
+            if chunk_getter.initialized:
+                profile_gauge(
+                    "chunk_queue.depth", chunk_getter.queue.qsize()
+                )
         if _dds_buffer_pool is not None:
             try:
                 for name, value in _dds_buffer_pool.get_stats().items():
@@ -10671,6 +11180,10 @@ class TileCacher(object):
                     update_process_memory_stat()
                 except Exception:
                     pass
+                # The parent refreshes the aggregate once per second. Limit
+                # each pass to one adaptive batch so the next target is based
+                # on fresh post-eviction memory rather than a stale-high total.
+                break
 
             if total_evicted > 0:
                 _release_memory_to_os()
@@ -10759,6 +11272,7 @@ class TileCacher(object):
                 # This ensures returning to an area gets a fresh budget, not the
                 # exhausted budget from a previous (possibly failed) request.
                 tile._tile_time_budget = None
+                tile._fallback_time_budget = None
 
             tile.refs += 1
         return tile
@@ -10854,6 +11368,11 @@ def shutdown():
             log.debug("ChunkGetter stopped")
     except Exception as _err:
         log.debug(f"ChunkGetter stop error: {_err}")
+
+    try:
+        _close_http2_client()
+    except Exception as _err:
+        log.debug(f"HTTP/2 broker client stop error: {_err}")
 
     # 4. Shutdown cache writer executor
     try:

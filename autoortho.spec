@@ -41,6 +41,11 @@ zope_datas, zope_binaries, zope_hiddenimports = safe_collect_all('zope.interface
 
 # Serialization
 msgpack_datas, msgpack_binaries, msgpack_hiddenimports = safe_collect_all('msgpack')
+zmq_datas, zmq_binaries, zmq_hiddenimports = safe_collect_all('zmq')
+
+# Shared HTTP/2 broker
+httpx_datas, httpx_binaries, httpx_hiddenimports = safe_collect_all('httpx')
+h2_datas, h2_binaries, h2_hiddenimports = safe_collect_all('h2')
 
 # Flask dependencies with C extensions
 markupsafe_datas, markupsafe_binaries, markupsafe_hiddenimports = safe_collect_all('markupsafe')
@@ -51,15 +56,19 @@ charset_datas, charset_binaries, charset_hiddenimports = safe_collect_all('chars
 # Collect all datas/binaries/hiddenimports for native modules
 native_module_datas = (
     psutil_datas + numpy_datas + greenlet_datas + gevent_datas + 
-    zope_datas + msgpack_datas + markupsafe_datas + charset_datas
+    zope_datas + msgpack_datas + zmq_datas + httpx_datas + h2_datas +
+    markupsafe_datas + charset_datas
 )
 native_module_binaries = (
     psutil_binaries + numpy_binaries + greenlet_binaries + gevent_binaries + 
-    zope_binaries + msgpack_binaries + markupsafe_binaries + charset_binaries
+    zope_binaries + msgpack_binaries + zmq_binaries + httpx_binaries +
+    h2_binaries + markupsafe_binaries + charset_binaries
 )
 native_module_hiddenimports = (
     psutil_hiddenimports + numpy_hiddenimports + 
-    greenlet_hiddenimports + gevent_hiddenimports + zope_hiddenimports + msgpack_hiddenimports + 
+    greenlet_hiddenimports + gevent_hiddenimports + zope_hiddenimports +
+    msgpack_hiddenimports + zmq_hiddenimports + httpx_hiddenimports +
+    h2_hiddenimports +
     markupsafe_hiddenimports + charset_hiddenimports
 )
 
@@ -214,6 +223,13 @@ hiddenimports = [
     'geocoder.osm',
     'psutil',
     'requests',
+    'httpx',
+    'httpcore',
+    'h2',
+    'hpack',
+    'hyperframe',
+    'zmq',
+    'zmq.asyncio',
     'PIL',
     'PIL.Image',
     # Flask-SocketIO async drivers (required for frozen apps)
@@ -368,4 +384,3 @@ if sys.platform == 'darwin':
             'LSMinimumSystemVersion': '10.15',
         },
     )
-

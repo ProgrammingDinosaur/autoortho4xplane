@@ -14,7 +14,7 @@ Assumptions:
 4. Run the program `./autoortho_lin.bin`
 5. Configure your settings and paths for your system 
 6. Download and setup an ortho set from the 'Scenery' tab.
-7. Click 'Run' to run the program
+7. Click **Start Streaming**
 8. Configure your scenery_packs.ini file appropriately
 9. Run X-Plane and choose a location for an ortho set you have downloaded
 
@@ -39,7 +39,7 @@ Assumptions:
 4. Run `autoortho_win.exe` from within the extracted dir.
 5. Configure your settings and paths for your system 
 6. Download and setup an ortho set from the 'Scenery' tab.
-7. Click 'Run' to run the program
+7. Click **Start Streaming**
 8. Configure your scenery_packs.ini file appropriately 
 9. Run X-Plane and choose a location for an ortho set you have downloaded
 
@@ -55,7 +55,7 @@ experimental ATM:
 4. Run AutoOrtho from your system start menu.
 5. Configure your settings and paths for your system 
 6. Download and setup an ortho set from the 'Scenery' tab.
-7. Click 'Run' to run the program
+7. Click **Start Streaming**
 8. Configure your scenery_packs.ini file appropriately 
 9. Run X-Plane and choose a location for an ortho set you have downloaded
 
@@ -87,7 +87,7 @@ Assumptions:
 
 6. Configure your settings and paths for your system 
 7. Download and setup an ortho set from the 'Scenery' tab.
-8. Click 'Run' to run the program
+8. Click **Start Streaming**
 9. Configure your scenery_packs.ini file appropriately
 10. Run X-Plane and choose a location for an ortho set you have downloaded
 

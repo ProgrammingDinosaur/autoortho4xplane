@@ -97,7 +97,13 @@ class DDSBufferPool:
     SIZE_2048x2048_BC1 = 2_797_500   # 8x8 chunks, BC1 format with mipmaps (~2.67 MB)
     SIZE_1024x1024_BC1 = 700_000     # 4x4 chunks, BC1 format with mipmaps (~0.67 MB)
     
-    def __init__(self, buffer_size: int = SIZE_4096x4096_BC1, pool_size: int = 4):
+    def __init__(
+        self,
+        buffer_size: int = SIZE_4096x4096_BC1,
+        pool_size: int = 4,
+        queue_enabled: bool = True,
+        max_waiters: int = 100,
+    ):
         """
         Create a buffer pool.
         
@@ -124,6 +130,8 @@ class DDSBufferPool:
         # sequence_number breaks ties (FIFO within same priority)
         self._waiters = []  # heap queue
         self._waiter_sequence = 0
+        self._queue_enabled = bool(queue_enabled)
+        self._max_waiters = max(1, int(max_waiters))
         
         # Stats for monitoring
         self._live_acquires = 0
@@ -180,6 +188,13 @@ class DDSBufferPool:
                     return self._buffers[buffer_id], buffer_id
             
             # Slow path: need to wait in queue
+            if not self._queue_enabled:
+                raise TimeoutError("DDSBufferPool: queueing is disabled")
+            if len(self._waiters) >= self._max_waiters:
+                raise TimeoutError(
+                    "DDSBufferPool: waiter queue is full "
+                    f"({len(self._waiters)}/{self._max_waiters})"
+                )
             my_event = threading.Event()
             my_sequence = self._waiter_sequence
             self._waiter_sequence += 1
@@ -981,7 +996,7 @@ class StreamingBuilderPool:
             with self._lock:
                 # Fix: Use actual count of created builders, not buggy calculation
                 current_count = self._total_created
-                if current_count < self._pool_size * 2:
+                if current_count < self._pool_size:
                     # Create new builder
                     handle = self._lib.aodds_builder_create(
                         byref(c_config), self._decode_pool
@@ -1187,27 +1202,23 @@ def _calculate_builder_pool_size() -> int:
     Returns:
         Calculated pool size (minimum 2, maximum 64)
     """
-    prefetch_workers = 2  # Default
-    live_concurrency = 4  # Default
-    
+    configured_pool_size = 4
     try:
         # Try to import config - may fail during early initialization
         try:
             from autoortho.aoconfig import CFG
         except ImportError:
             from aoconfig import CFG
-        
-        prefetch_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 4))
-        live_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 8))
+        configured_pool_size = int(
+            getattr(CFG.autoortho, "streaming_builder_pool_size", 4)
+        )
     except Exception:
         # Config not available yet - use defaults
         pass
     
-    # Calculate pool size and clamp to valid range
-    pool_size = prefetch_workers + live_concurrency
-    pool_size = max(2, min(64, pool_size))
+    pool_size = max(2, min(64, configured_pool_size))
     
-    log.debug(f"Builder pool size: {pool_size} (prefetch={prefetch_workers} + live={live_concurrency})")
+    log.debug(f"Builder pool size: {pool_size} (configured)")
     return pool_size
 
 
@@ -3194,7 +3205,7 @@ def build_from_jpegs_to_file(
     - No allocation overhead (writes incrementally to disk)
     - No copy overhead (data goes straight to file)
     - No Python memory involvement after JPEG data is passed
-    - Perfect integration with EphemeralDDSCache
+    - Perfect integration with DynamicDDSCache
     
     Performance improvement over build_from_jpegs():
     - ~65ms copy overhead eliminated (no buffer → bytes conversion)
@@ -3331,7 +3342,7 @@ def build_tile_to_file(
     - C reads cache files directly
     - C decodes + compresses in parallel
     - C writes directly to disk (no Python involvement)
-    - Perfect integration with EphemeralDDSCache
+    - Perfect integration with DynamicDDSCache
     
     This provides the same optimization as build_from_jpegs_to_file() but for
     native mode where C handles file I/O.

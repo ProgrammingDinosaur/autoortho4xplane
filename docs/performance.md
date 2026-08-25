@@ -2,6 +2,21 @@
 
 AutoOrtho includes advanced performance tuning options that allow you to balance image quality against loading times and in-flight stuttering. This guide explains each setting and provides recommendations for different use cases.
 
+## Loading Architecture
+
+AutoOrtho keeps the selected detail level, including ZL17, while reducing
+startup latency through:
+
+- one loopback-only HTTP/2 broker shared by all mounted regions;
+- bounded global request concurrency and per-request cancellation;
+- coalescing of identical imagery requests across workers;
+- DSF-driven prefetch before flight datarefs become available;
+- a persistent compiled DDS cache for repeat routes; and
+- lazy regional download/build services so inactive regions remain lightweight.
+
+If the optional HTTP/2 dependencies cannot start, AutoOrtho reports the error
+and falls back to the existing HTTP/1.1 request path.
+
 ## Quick Start: Performance Presets
 
 For most users, the easiest way to configure performance is using the **Performance Preset** dropdown in Settings → Performance Tuning:
@@ -187,11 +202,13 @@ When enabled, AutoOrtho uses a wall-clock time limit for tile requests instead o
 
 #### Tile Time Budget (`tile_time_budget`)
 - **Type:** Float (seconds)
-- **Default:** 180
+- **Default:** 60
 - **Range:** 60 - 600 seconds
-- **Config file:** `tile_time_budget = 180.0`
+- **Config file:** `tile_time_budget = 60.0`
 
-The maximum wall-clock time for a **complete tile** (all mipmap levels combined). This budget measures **active processing time only** - queue wait time doesn't count. The budget starts when AutoOrtho actually begins processing the tile's chunks, not when the tile is first requested.
+The maximum wall-clock time for a **complete tile** across every block read and
+mipmap request. A tile receives one shared budget when X-Plane first reads it;
+subsequent reads do not restart the timer.
 
 | Value | Use Case | Effect |
 |-------|----------|--------|
@@ -201,12 +218,13 @@ The maximum wall-clock time for a **complete tile** (all mipmap levels combined)
 
 **How it works:**
 1. X-Plane requests a tile from AutoOrtho (tile enters processing queue)
-2. **Budget timer starts** when AutoOrtho actually begins downloading/processing chunks for this tile
+2. **Budget timer starts** on the tile's first DDS read
 3. AutoOrtho builds all mipmaps (4 → 3 → 2 → 1 → 0) sharing this budget
 4. After `tile_time_budget` seconds of active processing, AutoOrtho builds the DDS with whatever is complete
 5. Any incomplete areas use the configured `missing_color`
 
-**Note:** Queue wait time (when other tiles are being processed first) does NOT count against the budget. This ensures fair time allocation even when many tiles are requested simultaneously.
+Queue and resource-pool waits count against the tile-wide deadline so a busy
+system cannot multiply loading time through repeated reads.
 
 **Note:** Each tile covers a large geographic area (approximately 1 square degree of latitude/longitude at zoom 16). Higher budgets allow more time for all chunks to download and process.
 
@@ -271,28 +289,29 @@ When enabled, network fallbacks (Fallback 3) will continue even after the tile t
 
 #### Extended Fallback Timeout (`fallback_timeout`)
 - **Type:** Float (seconds)
-- **Default:** 3.0
-- **Range:** 1.0 - 10.0 seconds
-- **Config file:** `fallback_timeout = 3.0`
+- **Default:** 30
+- **Range:** 10 - 120 seconds
+- **Config file:** `fallback_timeout = 30`
 
 **Only applies when `fallback_extends_budget = True`.**
 
-When extended fallbacks are enabled, this controls how long each lower-detail mipmap level waits for its chunks to download. The total additional time is this value multiplied by the number of mipmap levels tried (typically 3-4 levels).
+When extended fallbacks are enabled, this is one shared extension for the
+entire tile. Multiple block reads and fallback levels cannot restart it.
 
-| Value | Per-Level Wait | Total Extra Time (4 levels) | Use Case |
-|-------|----------------|----------------------------|----------|
-| 1.5s | 1.5 seconds | ~6 seconds | Fast - minimize extra wait |
-| 3.0s | 3.0 seconds | ~12 seconds | Balanced (default) |
-| 5.0s | 5.0 seconds | ~20 seconds | Quality - more time for slow connections |
-| 10.0s | 10.0 seconds | ~40 seconds | Maximum - ensure fallbacks succeed |
+| Value | Total Extra Time | Use Case |
+|-------|------------------|----------|
+| 10s | Up to 10 seconds | Fast - minimize extra wait |
+| 30s | Up to 30 seconds | Balanced default |
+| 60s | Up to 60 seconds | Quality on slower providers |
+| 120s | Up to 120 seconds | Explicit maximum-quality choice |
 
 **Example calculation:**
-- `tile_time_budget = 10s` (exhausted after 10 seconds)
-- `fallback_timeout = 3.0s`
-- Fallback tries mipmap levels 1, 2, 3, 4 → 4 levels × 3.0s = 12 seconds max
-- **Total worst-case time:** 10s + 12s = **22 seconds**
+- `tile_time_budget = 60s`
+- `fallback_timeout = 30s`
+- **Total worst-case tile time:** 60s + 30s = **90 seconds**
 
-**Recommendation:** Start with 3.0s. If you see fallbacks timing out (check logs), increase to 5.0s. If loading is too slow, decrease to 1.5s.
+**Recommendation:** Start with 30 seconds. Increase it only when complete
+initial imagery is more important than a predictable loading deadline.
 
 ---
 
@@ -510,9 +529,9 @@ When enabled, AutoOrtho uses significantly longer timeouts during X-Plane's init
 | Tile Time Budget | As configured | **10× the configured value** |
 | Per-Chunk Max Wait | As configured | **20 seconds** |
 
-**Example:** With `tile_time_budget = 180` and `maxwait = 5.0`:
-- During startup: 1800s tile budget, 20s per-chunk wait
-- During flight: 180s tile budget, 5s per-chunk wait
+**Example:** With `tile_time_budget = 60` and `maxwait = 5.0`:
+- During startup: up to 600s tile budget when startup extension is enabled
+- During flight: 60s tile budget, 5s per-chunk wait
 
 **How startup is detected:** AutoOrtho considers you to be in "startup mode" until X-Plane's DataRef connection is established, which happens when the flight becomes active (after the "Reading new scenery files" splash screen).
 
@@ -775,7 +794,7 @@ AutoOrtho can integrate with SimBrief to enhance Dynamic Zoom and Prefetching us
 4. Click **Fetch Flight Data** after filing your flight plan in SimBrief
 5. Enable **Use Flight Data for Dynamic Zoom Level and Pre-fetching Calculations**
 
-> **Note:** You can load SimBrief flight data at any time — before or after pressing "Run". The toggle takes effect immediately, so you don't need to restart AutoOrtho or save the config when loading a flight plan mid-session.
+> **Note:** You can load SimBrief flight data at any time — before or after clicking **Start Streaming**. The toggle takes effect immediately, so you don't need to restart AutoOrtho or save the config when loading a flight plan mid-session.
 
 ### How It Works
 
@@ -820,7 +839,7 @@ These settings are available in **Settings** → **Setup** → **SimBrief Integr
 | Route Deviation Threshold | 40 nm | 5-100 nm | Maximum distance off-route before falling back to DataRef-based calculations. Accounts for ATC vectors or weather avoidance. |
 | Route Prefetch Radius | 40 nm | 10-150 nm | Radius around path points for pre-fetching tiles. Larger values prefetch more tiles perpendicular to your route. |
 
-> **ℹ Real-time Changes:** All route settings take effect immediately when modified — no restart required. However, use **Save Config** to persist your values for future AutoOrtho sessions.
+> **ℹ Real-time Changes:** All route settings take effect immediately when modified — no restart required. However, use **Apply** to persist your values for future AutoOrtho sessions.
 
 ### Fallback Behavior
 
@@ -839,12 +858,12 @@ SimBrief integration gracefully falls back to DataRef-based calculations when:
 3. **Enter SimBrief User ID** and click "Fetch Flight Data"
 4. **Verify flight info** displays correctly (route, cruise altitude, aircraft)
 5. **Enable toggle** "Use Flight Data for Dynamic Zoom..."
-6. **Press Run** — AutoOrtho starts and begins prefetching along your route
+6. Click **Start Streaming** — AutoOrtho starts and begins prefetching along your route
 7. **Start X-Plane** and fly your route
 
 #### Option B: Load flight plan after starting (mid-session)
 
-1. **Start AutoOrtho** and press Run (with your SimBrief User ID already saved)
+1. **Start AutoOrtho** and click **Start Streaming** (with your SimBrief User ID already saved)
 2. **Start X-Plane** and begin your flight
 3. **File flight plan** in SimBrief when ready
 4. **Go to Settings → Setup** and click "Fetch Flight Data"
@@ -967,9 +986,9 @@ native_pipeline_threads = 0
 # 0.9 = build at 90%, automatically rebuild when remaining 10% arrive
 live_aopipeline_min_chunk_ratio = 1.0
 
-# Disk-based DDS cache size in MB (0 = disabled)
-# Uses temp directory, auto-cleaned on session end
-ephemeral_dds_cache_mb = 4096
+# Persistent compiled DDS cache size in MB.
+# 0 delegates retention to the shared disk budget.
+persistent_dds_cache_mb = 0
 ```
 
 #### Thread Configuration
@@ -1089,7 +1108,9 @@ If X-Plane takes significantly longer to load scenery with AutoOrtho enabled, th
 2. Set **"Allow extra loading time during startup"** to **Off**
 3. This will use normal time budgets during startup, resulting in faster loads
 
-**Note:** Disabling this may result in some tiles loading at lower quality initially, but they will reload at full quality as you fly.
+**Note:** X-Plane does not automatically refresh a texture after consuming it.
+Choose the startup budget and fallback policy according to the quality required
+for the initial load; background healing improves only future cache reads.
 
 ### Other Common Issues
 

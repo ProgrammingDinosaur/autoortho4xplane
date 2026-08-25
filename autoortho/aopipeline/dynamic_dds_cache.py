@@ -7,7 +7,7 @@ loads skip the expensive JPEG-decode + DXT-compress pipeline entirely.
 The DDS cache stores fully-built textures derived from JPEG tiles.
 
 Key features:
-- Persistent across sessions (unlike EphemeralDDSCache)
+- Persistent across sessions with configurable disk-budget enforcement
 - Staleness detection via DDM metadata sidecar files
 - ZL upgrade support with mipmap shifting (reuses existing mipmaps)
 - LRU eviction when disk budget is exceeded
@@ -21,6 +21,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 
 try:
@@ -113,7 +114,15 @@ class DynamicDDSCache:
         + ``os.replace``) prevent corruption from concurrent access or crashes.
     """
 
-    def __init__(self, cache_dir: str, max_size_mb: int = 4096, enabled: bool = True):
+    def __init__(
+        self,
+        cache_dir: str,
+        max_size_mb: int = 4096,
+        enabled: bool = True,
+        *,
+        cleanup_source_jpegs_after_store: bool = False,
+        maintenance_workers: int = 2,
+    ):
         """
         Args:
             cache_dir: Base cache directory (same as CFG.paths.cache_dir).
@@ -126,6 +135,16 @@ class DynamicDDSCache:
         self._max_size = max_size_mb * 1024 * 1024 if max_size_mb > 0 else 0  # 0 = unlimited
         self._enabled = enabled
         self._current_size = 0
+        self._cleanup_source_jpegs_after_store = bool(
+            cleanup_source_jpegs_after_store
+        )
+        self._maintenance = ThreadPoolExecutor(
+            max_workers=max(1, min(8, int(maintenance_workers))),
+            thread_name_prefix="dds-cache",
+        )
+        self._maintenance_lock = threading.Lock()
+        self._closed = False
+        self._scan_complete = threading.Event()
 
         # LRU tracking: tile_key -> (dds_path, ddm_path, size, last_access)
         # Ordered from oldest to newest access.
@@ -164,6 +183,50 @@ class DynamicDDSCache:
             os.makedirs(self._dds_root, exist_ok=True)
             log.info(f"DynamicDDSCache initialized: {self._dds_root} "
                      f"(max={max_size_mb}MB, compression={self._compression})")
+
+    def _record_store(
+        self,
+        key,
+        dds_path: str,
+        ddm_path: str,
+        size: int,
+    ) -> None:
+        old_size = 0
+        with self._lock:
+            if key in self._entries:
+                old_size = self._entries[key][2]
+                self._current_size -= old_size
+            self._entries[key] = (dds_path, ddm_path, size, time.time())
+            self._entries.move_to_end(key)
+            self._current_size += size
+            self._stores += 1
+            over_limit = (
+                self._max_size > 0 and self._current_size > self._max_size
+            )
+        if self._budget_manager is not None:
+            self._budget_manager.account_dds(size - old_size)
+        if over_limit:
+            self._evict_lru_async()
+
+    def wait_for_scan(self, timeout: Optional[float] = None) -> bool:
+        return self._scan_complete.wait(timeout)
+
+    def close(self) -> None:
+        with self._maintenance_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._maintenance.shutdown(wait=True, cancel_futures=False)
+
+    def _submit_maintenance(self, fn, *args, **kwargs) -> bool:
+        with self._maintenance_lock:
+            if self._closed:
+                return False
+            try:
+                self._maintenance.submit(fn, *args, **kwargs)
+            except RuntimeError:
+                return False
+        return True
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -779,14 +842,7 @@ class DynamicDDSCache:
             # Update LRU tracking (use on-disk size for accurate budget)
             key = self._tile_key(tile_id, max_zoom)
             size = len(disk_bytes)
-            with self._lock:
-                if key in self._entries:
-                    old_size = self._entries[key][2]
-                    self._current_size -= old_size
-                self._entries[key] = (dds_path, ddm_path, size, time.time())
-                self._entries.move_to_end(key)
-                self._current_size += size
-                self._stores += 1
+            self._record_store(key, dds_path, ddm_path, size)
 
             log.debug(f"DDS cache STORE: {tile_id} z{max_zoom} ({size} bytes)")
 
@@ -945,14 +1001,7 @@ class DynamicDDSCache:
 
             # 5. LRU tracking (use actual on-disk size)
             key = self._tile_key(tile_id, max_zoom)
-            with self._lock:
-                if key in self._entries:
-                    old_size = self._entries[key][2]
-                    self._current_size -= old_size
-                self._entries[key] = (dds_path, ddm_path, disk_size, time.time())
-                self._entries.move_to_end(key)
-                self._current_size += disk_size
-                self._stores += 1
+            self._record_store(key, dds_path, ddm_path, disk_size)
 
             log.debug(f"DDS cache STORE_INCR: {tile_id} z{max_zoom} "
                       f"mipmaps={sorted(new_mipmaps.keys())} "
@@ -1060,14 +1109,7 @@ class DynamicDDSCache:
 
             # Update LRU tracking (use on-disk size for accurate budget)
             key = self._tile_key(tile_id, max_zoom)
-            with self._lock:
-                if key in self._entries:
-                    old_size = self._entries[key][2]
-                    self._current_size -= old_size
-                self._entries[key] = (dds_path, ddm_path, disk_size, time.time())
-                self._entries.move_to_end(key)
-                self._current_size += disk_size
-                self._stores += 1
+            self._record_store(key, dds_path, ddm_path, disk_size)
 
             log.debug(f"DDS cache STORE (from file): {tile_id} z{max_zoom} "
                       f"({disk_size} bytes, compression={disk_compression})")
@@ -1374,6 +1416,8 @@ class DynamicDDSCache:
 
         if freed > 0:
             log.debug(f"DDS cache evicted {len(to_delete)} entries, freed {freed / (1024*1024):.1f}MB")
+            if self._budget_manager is not None:
+                self._budget_manager.account_dds(-freed)
         return freed
 
     def get_disk_usage(self) -> int:
@@ -1416,6 +1460,7 @@ class DynamicDDSCache:
             Number of entries discovered
         """
         if not self._enabled:
+            self._scan_complete.set()
             return 0
 
         count = 0
@@ -1473,6 +1518,8 @@ class DynamicDDSCache:
 
         except Exception as e:
             log.warning(f"DDS cache scan error: {e}")
+        finally:
+            self._scan_complete.set()
 
         if count > 0:
             # Sort by access time (oldest first for LRU)
@@ -2024,19 +2071,24 @@ class DynamicDDSCache:
 
     def _cleanup_jpegs_async(self, tile) -> None:
         """Schedule JPEG cleanup for a tile whose DDS is now complete."""
+        if not self._cleanup_source_jpegs_after_store:
+            return
         jpeg_cache_dir = getattr(tile, 'cache_dir', None)
         if not jpeg_cache_dir:
             return
-        t = threading.Thread(
-            target=cleanup_source_jpegs,
-            args=(jpeg_cache_dir, tile.col, tile.row,
-                  tile.tilename_zoom, tile.max_zoom,
-                  getattr(tile, 'min_zoom', 12),
-                  getattr(tile, 'width', 1), getattr(tile, 'height', 1),
-                  tile.maptype),
-            kwargs={'budget_manager': self._budget_manager},
-            daemon=True)
-        t.start()
+        self._submit_maintenance(
+            cleanup_source_jpegs,
+            jpeg_cache_dir,
+            tile.col,
+            tile.row,
+            tile.tilename_zoom,
+            tile.max_zoom,
+            getattr(tile, 'min_zoom', 12),
+            getattr(tile, 'width', 1),
+            getattr(tile, 'height', 1),
+            tile.maptype,
+            budget_manager=self._budget_manager,
+        )
 
     def _evict_lru_async(self) -> None:
         """Schedule LRU eviction in a background thread."""
@@ -2045,5 +2097,4 @@ class DynamicDDSCache:
         excess = self._current_size - target
         if excess <= 0:
             return
-        t = threading.Thread(target=self.evict_lru, args=(excess,), daemon=True)
-        t.start()
+        self._submit_maintenance(self.evict_lru, excess)

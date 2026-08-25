@@ -1,5 +1,4 @@
 import argparse
-import ctypes
 import gc
 import logging
 import logging.handlers
@@ -211,11 +210,25 @@ def _runtime_for_platform():
         if not systemtype or not libpath:
             raise RuntimeError("No usable Windows FUSE backend was found")
 
+        # mfusepy configures ctypes signatures and binds fuse_main_real while it
+        # imports. Replacing mfusepy._libfuse afterwards leaves those bindings
+        # pointing at different CDLL instances and makes fuse_get_context return
+        # a plain integer. Select the backend before importing mfusepy instead.
+        os.environ["FUSE_LIBRARY_PATH"] = os.path.abspath(libpath)
         try:
             from autoortho import mfusepy
         except ImportError:
             import mfusepy
-        mfusepy._libfuse = ctypes.CDLL(libpath)
+
+        loaded_path = os.path.normcase(
+            os.path.abspath(str(getattr(mfusepy, "_libfuse_path", "")))
+        )
+        requested_path = os.path.normcase(os.path.abspath(libpath))
+        if loaded_path != requested_path:
+            raise RuntimeError(
+                "mfusepy was imported before the selected Windows FUSE backend "
+                f"was configured (loaded={loaded_path!r}, requested={requested_path!r})"
+            )
     elif system_type == "darwin":
         systemtype = "macOS"
     else:

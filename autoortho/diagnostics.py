@@ -1103,6 +1103,7 @@ def _build_session_summary(
         stage_rows,
         peak_total_memory,
         parent_metadata,
+        process_profiles,
     )
 
     started = min(
@@ -1185,7 +1186,10 @@ def _aggregate_memory_timeline(process_profiles: list[dict]) -> list[dict]:
                 "total_physical_footprint_bytes": total_footprint,
                 "total_effective_memory_bytes": sum(
                     int(sample.get("physical_footprint_bytes", 0) or 0)
-                    or int(sample.get("rss_bytes", 0) or 0)
+                    or max(
+                        int(sample.get("rss_bytes", 0) or 0),
+                        int(sample.get("uss_bytes", 0) or 0),
+                    )
                     for sample in last_by_process.values()
                 ),
                 "process_count": len(last_by_process),
@@ -1199,37 +1203,58 @@ def _diagnostic_flags(
     stages: list[dict],
     peak_total_memory: int,
     metadata: dict,
+    process_profiles: Optional[list[dict]] = None,
 ) -> list[str]:
     flags = []
     by_stage = {}
     for row in stages:
         by_stage.setdefault(row["stage"], []).append(row)
 
-    def worst_p95(stage: str) -> float:
+    incomplete_workers = [
+        profile
+        for profile in (process_profiles or [])
+        if str(profile.get("role", "")).startswith("mount-worker:")
+        and bool(profile.get("settings", {}).get("observed_by_parent"))
+    ]
+    if incomplete_workers:
+        flags.append(
+            f"{len(incomplete_workers)} mount worker profile(s) were reconstructed "
+            "from parent process samples after an ungraceful exit; flight-stage "
+            "latency and worker gauges are incomplete."
+        )
+
+    def worst_p95(stage: str, *, worker_only: bool = False) -> float:
+        rows = by_stage.get(stage, [])
+        if worker_only:
+            rows = [
+                row
+                for row in rows
+                if str(row.get("role", "")).startswith("mount-worker:")
+            ]
         return max(
-            (float(row.get("p95_ms", 0) or 0) for row in by_stage.get(stage, [])),
+            (float(row.get("p95_ms", 0) or 0) for row in rows),
             default=0.0,
         )
 
-    if worst_p95("chunk.queue_wait") > 100:
+    if worst_p95("chunk.queue_wait", worker_only=True) > 100:
         flags.append(
             "Chunk queue p95 exceeds 100 ms; download workers are saturated or "
             "prefetch work is delaying live requests."
         )
-    if worst_p95("network.http_request") > 1_000:
+    if worst_p95("network.http_request", worker_only=True) > 1_000:
         flags.append(
             "HTTP request p95 exceeds 1 second; network/provider latency is a "
             "primary contributor to tile delivery time."
         )
     if max(
-        worst_p95("dds.buffer_pool_wait"),
-        worst_p95("dds.builder_pool_wait"),
+        worst_p95("dds.buffer_pool_wait", worker_only=True),
+        worst_p95("dds.builder_pool_wait", worker_only=True),
     ) > 50:
         flags.append(
             "DDS pool wait p95 exceeds 50 ms; builder concurrency is higher than "
             "available native buffers/builders."
         )
-    if worst_p95("dds.native_mipmap_build") > 500:
+    if worst_p95("dds.native_mipmap_build", worker_only=True) > 500:
         flags.append(
             "Native mipmap build p95 exceeds 500 ms; decode/compression CPU work "
             "should be profiled against configured native thread concurrency."

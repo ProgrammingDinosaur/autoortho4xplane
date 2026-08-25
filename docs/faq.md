@@ -100,7 +100,7 @@ If you're seeing many missing tiles with `fallback_level = full`, check these:
 Stuttering occurs when X-Plane waits for AutoOrtho to provide imagery. To minimize stutters:
 
 1. **Use Time Budget System:** Keep `use_time_budget = True` (default)
-2. **Use reasonable budget:** Set `tile_time_budget` to 180-300 seconds
+2. **Use a bounded tile budget:** Start with the 60-second default
 3. **Use cache-only fallbacks:** Set `fallback_level = cache` to avoid network delays during fallbacks
 4. **Enable prefetching:** Keep `prefetch_enabled = True` to download tiles ahead of your aircraft
 5. **Increase prefetch lookahead:** Set `prefetch_lookahead = 30` or higher for faster aircraft
@@ -108,12 +108,12 @@ Stuttering occurs when X-Plane waits for AutoOrtho to provide imagery. To minimi
 **Recommended settings for stutter-free flying:**
 ```ini
 use_time_budget = True
-tile_time_budget = 180
+tile_time_budget = 60
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
 prefetch_lookahead = 30
-max_zoom_level = 16
+# Keep the detail level you prefer; performance features apply through ZL17.
 ```
 
 **Trade-off:** You may see occasional blurry or missing tiles, but your flight will be smoother.
@@ -130,11 +130,11 @@ At startup, X-Plane requests the initial scenery tiles. Loading time depends on:
 4. **CPU speed:** Slower CPUs = longer decode/compress times
 5. **Time budget:** Higher budgets = more time spent per tile
 
-**To speed up startup:**
-- **Lower your Max Zoom Level** - This has the biggest impact! ZL16→ZL15 is 4× faster
-- Use a lower `tile_time_budget` (180-300 seconds)
-- Enable `suspend_maxwait = True` to use extended timeouts only during startup
-- The second time you load the same area will be faster (cached data)
+**To speed up startup without lowering detail:**
+- Keep the shared HTTP/2 downloader and DSF-driven prefetch enabled
+- Use the 60-second tile-wide default unless you explicitly want longer waits
+- Keep the persistent compiled DDS cache enabled for repeat visits
+- Choose the fallback policy that matches your initial-quality requirement
 
 **Zoom Level Resource Scaling:**
 | Zoom | Chunks/Tile | Relative Load Time |
@@ -179,17 +179,15 @@ See the [Native Pipeline Architecture](performance.md#native-pipeline-architectu
 
 ### Why are Apple Maps downloads slower than other sources?
 
-**Apple Maps always uses the Python HTTP client**, not the native libcurl client. This is intentional because Apple Maps requires:
+Apple Maps uses the shared HTTP/2 broker while retaining its specialized token
+handling:
 
 1. **Dynamic authentication**: Tokens must be fetched via DuckDuckGo proxy
 2. **Token rotation**: On 403/410 errors, the token must be refreshed
 3. **Special headers**: Requires `Authorization: Bearer` headers
 
-The Python path handles all this authentication flow correctly. Other imagery sources (BI, EOX, ARC, NAIP, USGS, FIREFLY, YNDX, GO2) use the faster native HTTP client.
-
-**Impact:** Apple Maps initial loading may be 2-3x slower than other sources. Once cached, performance is identical.
-
-**Workaround:** Consider using an alternative imagery source if download speed is critical.
+Concurrent 403/410 responses share one token refresh, preventing refresh storms.
+Provider-side throttling can still make Apple slower than another source.
 
 ---
 
@@ -213,8 +211,9 @@ The Python path handles all this authentication flow correctly. Other imagery so
 - Worst case: 256 × 1.5s = 384 seconds (due to serial execution)
 - Actual time varies widely based on parallelism
 
-**Example:** With `tile_time_budget = 180s`:
-- Always release a tile to X-Plane within 180 seconds (predictable)
+**Example:** With `tile_time_budget = 60s`:
+- Always release a tile to X-Plane within 60 seconds, plus any explicitly
+  configured shared fallback extension
 - May have some missing chunks if network is slow or zoom level is high
 
 **Recommendation:** Keep `use_time_budget = True` to use the new predictable system.
@@ -254,7 +253,7 @@ If in doubt, re-install the scenery packs.
 ### Something went wrong with scenery setup and I'd like to start again.  How do I reinstall?
 AutoOrtho checks for metadata for installed scenery packs in `Custom Scenery/z_autoorth/**_info.json`  Where '**' is a shortname for each scenery pack installed.  You can delete the corresponding .json file, and re-run the configuration utility and should be able to reinstall the scenery pack
 
-### I installed scenery, setup Custom Scenery, and clicked 'Run' but X-Plane did not automatically startup
+### I installed scenery, clicked "Start Streaming," but X-Plane did not automatically start
 You have to start X-Plane separately from this tool.  It's also best to start X-Plane _after_ starting autoortho so that all new files and directories are picked up.
 
 ---

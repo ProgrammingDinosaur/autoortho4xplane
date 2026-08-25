@@ -179,6 +179,33 @@ class TestDynamicDDSCache:
         assert loaded is not None
         assert loaded == sample_dds_bytes
 
+    def test_store_updates_disk_budget(
+        self, dds_cache, mock_tile, sample_dds_bytes
+    ):
+        class Budget:
+            def __init__(self):
+                self.changes = []
+
+            def account_dds(self, amount):
+                self.changes.append(amount)
+
+        budget = Budget()
+        dds_cache._budget_manager = budget
+        assert dds_cache.store(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            sample_dds_bytes,
+            mock_tile,
+        )
+
+        assert budget.changes
+        assert budget.changes[-1] > 0
+
+    def test_maintenance_submit_is_safe_after_close(self, dds_cache):
+        dds_cache.close()
+
+        assert dds_cache._submit_maintenance(lambda: None) is False
+
     def test_cache_miss(self, dds_cache, mock_tile):
         """Test that load returns None on cache miss."""
         result = dds_cache.load("nonexistent_tile", 16, mock_tile)
@@ -1250,12 +1277,16 @@ class TestZstdCompression:
 
         # Store with compression disabled
         monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'none')
-        cache_none = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+        cache_none = DynamicDDSCache(
+            cache_dir=cache_dir, max_size_mb=100, enabled=True
+        )
         cache_none.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
 
         # Load with compression enabled (new instance reads 'zstd' from config)
         monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'zstd')
-        cache_zstd = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+        cache_zstd = DynamicDDSCache(
+            cache_dir=cache_dir, max_size_mb=100, enabled=True
+        )
         cache_zstd.scan_existing()
 
         loaded = cache_zstd.load(mock_tile.id, mock_tile.max_zoom, mock_tile)
@@ -1267,7 +1298,9 @@ class TestZstdCompression:
         from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
 
         monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'none')
-        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+        cache = DynamicDDSCache(
+            cache_dir=cache_dir, max_size_mb=100, enabled=True
+        )
 
         cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
 

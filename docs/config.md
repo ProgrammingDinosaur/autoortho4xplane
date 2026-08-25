@@ -6,6 +6,31 @@ Setup and configuration for most use cases should be pretty simple. The importan
 * X-Plane install path
 * Downloader directory
 
+## First-run setup
+
+On a new installation, AutoOrtho opens a guided setup wizard that:
+
+1. Detects or asks for the X-Plane installation.
+2. Validates scenery, cache, archive, and temporary-download folders.
+3. Checks the required FUSE backend for the current platform.
+4. Lets you select scenery regions and reviews disk-space requirements.
+
+Existing installations with valid paths and dependencies are detected
+automatically and are not forced through the wizard. The wizard remains
+available from **Setup → System Readiness**.
+
+## Applying and reverting settings
+
+Configuration edits remain pending until **Apply** is selected. **Revert**
+restores the last applied values. If streaming is started or the application is
+closed with pending edits, AutoOrtho asks whether to apply or discard them.
+Settings that affect mount workers display a restart notice when applied during
+streaming.
+
+Long-running operations appear in the persistent **Activity** panel. Completed
+and failed tasks remain available until dismissed. Only operations that can be
+stopped without corrupting files expose a Cancel action.
+
 ## Scenery install path
 This is the location that scenery will be installed to.  Previously this defaulted to a user's existing X-Plane Custom Scenery directory, but that is no longer the case.  
 
@@ -74,19 +99,20 @@ Controls how many CPU threads the native pipeline uses for parallel operations (
 
 **Recommendation:** Leave at 0 unless you need to limit CPU usage for other applications.
 
-### Predictive DDS Disk Cache (`ephemeral_dds_cache_mb`)
+### Persistent Predictive DDS Cache (`persistent_dds_cache_mb`)
 - **Type:** Integer (megabytes)
-- **Default:** 4096
-- **Range:** 1024 - 16384
-- **Config file:** `ephemeral_dds_cache_mb = 4096`
+- **Default:** 0 (managed by the shared disk budget)
+- **Config file:** `persistent_dds_cache_mb = 0`
 
-Size of the disk cache for pre-built DDS textures. The predictive DDS system builds tiles in the background and stores them on disk for instant serving when X-Plane requests them.
+Size of the cross-session cache for compiled DDS textures. The deprecated
+`ephemeral_dds_cache_mb` key is accepted for compatibility but no longer
+creates a separate cache.
 
 | Value | Behavior |
 |-------|----------|
-| **1024-4096** | Balanced - good for most systems |
-| **8192** | Large flights - covers more waypoints |
-| **16384** | Maximum capacity - long-haul flights |
+| **0** | Use the shared disk budget and DDS allocation percentage |
+| **1024-4096** | Fixed, bounded compiled-texture cache |
+| **8192+** | Larger fixed cache for repeat long-haul routes |
 
 **Why disk-only caching?**
 
@@ -94,15 +120,15 @@ AutoOrtho uses disk-only caching (no dedicated RAM cache) because:
 - **SSD reads are fast enough:** Reading a pre-built DDS from disk takes ~1-2ms, which is negligible compared to the ~100-500ms build time it saves
 - **OS file cache handles hot files:** Your operating system automatically keeps frequently accessed files in RAM
 - **Simpler memory management:** No need to configure RAM limits - the OS handles it naturally
-- **Session-based:** Cache is fresh every session, avoiding stale texture issues
+- **Cross-session:** Valid compiled textures eliminate repeat downloads and builds
 
 **Key properties:**
-- Uses OS temp directory (not your JPEG cache)
-- Automatically cleaned when AutoOrtho exits
-- Fresh cache every session (no stale tiles)
+- Uses atomic DDS and metadata sidecar files
+- Validates provider/build metadata before reuse
+- Enforces the configured DDS and JPEG disk budgets
 - OS file cache keeps hot files in RAM automatically
 
-**Recommendation:** 4096MB for most users. Increase to 8192-16384MB for long-haul flights covering many tiles.
+**Recommendation:** Leave at 0 so the shared disk budget controls retention.
 
 ### Apple Maps Caveat
 
@@ -149,6 +175,13 @@ When flight data is loaded and the "Use Flight Data" toggle is enabled, addition
 | **Route Deviation Threshold** | Maximum distance (nm) off-route before falling back to DataRef-based calculations. |
 | **Route Prefetch Radius** | How far (nm) perpendicular to your route to prefetch tiles. The path is sampled uniformly along the route; this controls the width of coverage. |
 
-> **ℹ Real-time Changes:** These settings take effect immediately when modified — no restart required. Use **Save Config** to persist your values for future sessions.
+> **ℹ Real-time Changes:** These settings take effect immediately when modified — no restart required. Use **Apply** to persist your values for future sessions.
+
+## Storage safety
+
+The Scenery tab includes a configurable free-space safety margin. AutoOrtho
+shows cache usage and available space, estimates temporary and final package
+requirements, and blocks scenery installation when either destination is too
+small or not writable.
 
 See the [Performance Tuning Guide](performance.md#simbrief-integration) for detailed information and limitations.

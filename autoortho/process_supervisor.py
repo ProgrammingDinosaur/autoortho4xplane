@@ -77,7 +77,7 @@ class AOProcessSupervisor:
             cmd = [sys.executable]
             cwd = None
         else:
-            cmd = [sys.executable, str(_REPO_ROOT / "autoortho")]
+            cmd = [sys.executable, "-m", "autoortho"]
             cwd = str(_REPO_ROOT)
 
         cmd += [

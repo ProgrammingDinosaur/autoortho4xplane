@@ -329,13 +329,12 @@ class AutoOrtho(Operations):
         # Critical for predictive DDS: ensures we prefetch the exact tiles X-Plane will request
         terrain_folder = os.path.join(self.root, "terrain")
         scenery_name = os.path.basename(self.root)
-        getortho.register_terrain_index(terrain_folder, scenery_name)
-        
-        # Start spatial prefetcher for proactive tile loading
-        getortho.start_prefetcher(self.tc)
-        
-        # Start predictive DDS generation (pre-builds DDS in background)
-        getortho.start_predictive_dds(self.tc)
+        self._terrain_lookup = getortho.register_terrain_index(
+            terrain_folder, scenery_name
+        )
+        self._runtime_services_started = False
+        self._runtime_services_lock = threading.Lock()
+        self._dsf_prefetch_paths = set()
     
         #self.path_condition = threading.Condition()
         #self.read_lock = threading.Lock()
@@ -367,6 +366,40 @@ class AutoOrtho(Operations):
         except ImportError:
             from datareftrack import dt as datareftracker
         time_exclusion_manager.set_dataref_tracker(datareftracker)
+
+    def _ensure_runtime_services(self):
+        if self._runtime_services_started:
+            return
+        with self._runtime_services_lock:
+            if self._runtime_services_started:
+                return
+            getortho.start_prefetcher(self.tc)
+            getortho.start_predictive_dds(self.tc)
+            self._runtime_services_started = True
+
+    def _schedule_dsf_prefetch(self, path):
+        with self._runtime_services_lock:
+            if path in self._dsf_prefetch_paths:
+                return
+            self._dsf_prefetch_paths.add(path)
+        self._ensure_runtime_services()
+
+        def _run():
+            try:
+                submitted = getortho.prefetch_dsf(path)
+                log.info(
+                    "DSF prefetch queued %d chunks for %s",
+                    submitted,
+                    path,
+                )
+            except Exception as exc:
+                log.error("DSF prefetch failed for %s: %s", path, exc)
+
+        threading.Thread(
+            target=_run,
+            name=f"DSFPrefetch-{os.path.basename(path)}",
+            daemon=True,
+        ).start()
 
     # Helpers
     # =======
@@ -938,11 +971,13 @@ class AutoOrtho(Operations):
             
             # Normal mode - serve AutoOrtho ortho scenery
             log.info(f"OPEN: DSF [{path}]{pid_text} opened in ORTHO mode (AutoOrtho scenery)")
+            self._schedule_dsf_prefetch(path)
             # Register this DSF as being in use (prevents redirect during active use)
             time_exclusion_manager.register_dsf_open(path)
         
         dds_match = self.dds_re.match(path)
         if dds_match:
+            self._ensure_runtime_services()
             row, col, maptype, zoom = dds_match.groups()
             row = int(row)
             col = int(col)

@@ -15,41 +15,72 @@ import webbrowser
 import requests
 from packaging import version
 
-# Handle imports for both frozen (PyInstaller) and direct Python execution
-try:
+# Handle imports for both package and direct Python execution without importing
+# autoortho.py while this module is still being initialized.
+if __package__:
     import autoortho.utils.resources_rc
-except ImportError:
-    import utils.resources_rc
-
-try:
     from autoortho.utils.constants import MAPTYPES, system_type
-except ImportError:
-    from utils.constants import MAPTYPES, system_type
-
-try:
     from autoortho.utils.mappers import map_kubilus_region_to_simheaven_region
-except ImportError:
-    from utils.mappers import map_kubilus_region_to_simheaven_region
-
-try:
     from autoortho.utils.dsf_utils import DsfUtils, dsf_utils
-except ImportError:
-    from utils.dsf_utils import DsfUtils, dsf_utils
-
-try:
     from autoortho.utils.mount_utils import cleanup_mountpoint, safe_ismount
-except ImportError:
-    from utils.mount_utils import cleanup_mountpoint, safe_ismount
-
-try:
     from autoortho.utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
-except ImportError:
-    from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
-
-try:
     from autoortho.utils.custom_map import get_custom_map_config
-except ImportError:
+    from autoortho.utils.simbrief_flight import simbrief_flight_manager
+    from autoortho.ui.config_validation import (
+        ConfigurationInput,
+        ValidationIssue,
+        ValidationSeverity,
+        validate_configuration,
+    )
+    from autoortho.ui.runtime_state import RuntimeState
+    from autoortho.ui.settings_session import SettingsSession
+    from autoortho.ui.task_manager import TaskManager, TaskPanel
+    from autoortho.ui.task_models import TaskState, TaskType
+    from autoortho.ui.readiness import (
+        ReadinessStatus,
+        SceneryChoice,
+        build_readiness,
+        format_bytes,
+        free_space_bytes,
+        infer_setup_complete,
+        package_storage_requirements,
+        recursive_directory_usage_bytes,
+    )
+    from autoortho.ui.setup_wizard import SetupWizard
+    from autoortho import downloader
+    from autoortho.version import __version__
+else:
+    import utils.resources_rc
+    from utils.constants import MAPTYPES, system_type
+    from utils.mappers import map_kubilus_region_to_simheaven_region
+    from utils.dsf_utils import DsfUtils, dsf_utils
+    from utils.mount_utils import cleanup_mountpoint, safe_ismount
+    from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
     from utils.custom_map import get_custom_map_config
+    from utils.simbrief_flight import simbrief_flight_manager
+    from ui.config_validation import (
+        ConfigurationInput,
+        ValidationIssue,
+        ValidationSeverity,
+        validate_configuration,
+    )
+    from ui.runtime_state import RuntimeState
+    from ui.settings_session import SettingsSession
+    from ui.task_manager import TaskManager, TaskPanel
+    from ui.task_models import TaskState, TaskType
+    from ui.readiness import (
+        ReadinessStatus,
+        SceneryChoice,
+        build_readiness,
+        format_bytes,
+        free_space_bytes,
+        infer_setup_complete,
+        package_storage_requirements,
+        recursive_directory_usage_bytes,
+    )
+    from ui.setup_wizard import SetupWizard
+    import downloader
+    from version import __version__
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -66,16 +97,6 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QPixmap, QIcon, QColor, QWheelEvent, QCursor
 )
-
-try:
-    from autoortho import downloader
-except ImportError:
-    import downloader
-
-try:
-    from autoortho.version import __version__
-except ImportError:
-    from version import __version__
 
 log = logging.getLogger(__name__)
 
@@ -198,8 +219,13 @@ class UpdateCheckWorker(QThread):
     result = Signal(object)  # tuple(latest_version_str, html_url) or None
     error = Signal(str)
 
+    def cancel(self):
+        self.requestInterruption()
+
     def run(self):
         try:
+            if self.isInterruptionRequested():
+                return
             api_url = "https://api.github.com/repos/ProgrammingDinosaur/autoortho4xplane/releases/latest"
             headers = {
                 "Accept": "application/vnd.github+json",
@@ -207,14 +233,17 @@ class UpdateCheckWorker(QThread):
             }
             resp = requests.get(api_url, timeout=7, headers=headers)
             if resp.status_code != 200:
-                self.result.emit(None)
+                if not self.isInterruptionRequested():
+                    self.result.emit(None)
                 return
             data = resp.json()
             tag = data.get("tag_name") or data.get("name") or ""
             html_url = data.get("html_url") or "https://github.com/ProgrammingDinosaur/autoortho4xplane/releases"
-            self.result.emit((tag, html_url))
+            if not self.isInterruptionRequested():
+                self.result.emit((tag, html_url))
         except Exception as err:
-            self.error.emit(str(err))
+            if not self.isInterruptionRequested():
+                self.error.emit(str(err))
 
 class AddSeasonsWorker(QThread):
     """Worker thread for adding seasons"""
@@ -358,12 +387,19 @@ class SimBriefFetchWorker(QThread):
     def __init__(self, userid):
         super().__init__()
         self.userid = userid
+
+    def cancel(self):
+        self.requestInterruption()
     
     def run(self):
         try:
+            if self.isInterruptionRequested():
+                return
             url = f"{self.SIMBRIEF_API_URL}?userid={self.userid}&json=1"
             response = requests.get(url, timeout=15)
             response.raise_for_status()
+            if self.isInterruptionRequested():
+                return
             
             data = response.json()
             
@@ -377,15 +413,119 @@ class SimBriefFetchWorker(QThread):
             self.success.emit(data)
             
         except requests.exceptions.Timeout:
-            self.error.emit("Request timed out. Please check your internet connection.")
+            if not self.isInterruptionRequested():
+                self.error.emit("Request timed out. Please check your internet connection.")
         except requests.exceptions.ConnectionError:
-            self.error.emit("Connection error. Please check your internet connection.")
+            if not self.isInterruptionRequested():
+                self.error.emit("Connection error. Please check your internet connection.")
         except requests.exceptions.HTTPError as e:
-            self.error.emit(f"HTTP error: {e.response.status_code}")
+            if not self.isInterruptionRequested():
+                self.error.emit(f"HTTP error: {e.response.status_code}")
         except ValueError as e:
-            self.error.emit(f"Invalid response from SimBrief: {str(e)}")
+            if not self.isInterruptionRequested():
+                self.error.emit(f"Invalid response from SimBrief: {str(e)}")
         except Exception as e:
-            self.error.emit(f"Unexpected error: {str(e)}")
+            if not self.isInterruptionRequested():
+                self.error.emit(f"Unexpected error: {str(e)}")
+
+
+class MountControlWorker(QThread):
+    """Run blocking mount lifecycle operations away from the Qt event loop."""
+
+    completed = Signal(str, bool, str)
+
+    def __init__(self, controller, action, lingering_mounts=None):
+        super().__init__(controller)
+        self.controller = controller
+        self.action = action
+        self.lingering_mounts = list(lingering_mounts or [])
+
+    def run(self):
+        try:
+            if self.action == "start":
+                if self.lingering_mounts:
+                    self.controller.cleanup_lingering_mounts(
+                        self.lingering_mounts
+                    )
+                success = bool(
+                    self.controller.mount_sceneries(blocking=False)
+                )
+                message = (
+                    "Streaming started."
+                    if success
+                    else "AutoOrtho could not start the scenery mounts."
+                )
+            elif self.action == "stop":
+                success = bool(self.controller.unmount_sceneries())
+                message = (
+                    "Streaming stopped."
+                    if success
+                    else "One or more scenery mounts could not be stopped."
+                )
+            else:
+                raise ValueError(f"Unknown mount action: {self.action}")
+            self.completed.emit(self.action, success, message)
+        except Exception as exc:
+            log.exception("Mount %s operation failed", self.action)
+            if self.action == "start":
+                try:
+                    self.controller.unmount_sceneries(force=True)
+                except Exception:
+                    log.exception("Failed to clean up after mount startup error")
+            self.completed.emit(self.action, False, str(exc))
+
+
+class StorageScanWorker(QThread):
+    completed = Signal(str, object, object)
+
+    def __init__(self, cache_path):
+        super().__init__()
+        self.cache_path = str(cache_path)
+
+    def run(self):
+        usage = recursive_directory_usage_bytes(
+            self.cache_path,
+            cancel_callback=self.isInterruptionRequested,
+        )
+        free = free_space_bytes(self.cache_path)
+        self.completed.emit(self.cache_path, usage, free)
+
+
+class CacheCleanupWorker(QThread):
+    progress = Signal(str)
+    completed = Signal(bool, str, bool)
+
+    def __init__(self, controller, mode, target_size_gb=0):
+        super().__init__(controller)
+        self.controller = controller
+        self.mode = mode
+        self.target_size_gb = target_size_gb
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    def run(self):
+        try:
+            if self.mode == "jpeg":
+                success, message, cancelled = (
+                    self.controller.clean_jpegs_only(
+                        self.controller.cfg.paths.cache_dir,
+                        cancel_event=self._cancel_event,
+                        progress_callback=self.progress.emit,
+                    )
+                )
+            else:
+                success, message, cancelled = self.controller.clean_cache(
+                    self.controller.cfg.paths.cache_dir,
+                    self.target_size_gb,
+                    cancel_event=self._cancel_event,
+                    progress_callback=self.progress.emit,
+                )
+            self.completed.emit(success, message, cancelled)
+        except Exception as exc:
+            log.exception("Cache cleanup failed")
+            self.completed.emit(False, str(exc), False)
 
 
 class StyledButton(QPushButton):
@@ -543,7 +683,18 @@ class QualityStepsDialog(QDialog):
             current_max_zoom: Current fixed max zoom (for initializing base step)
         """
         super().__init__(parent)
-        self.manager = manager if manager is not None else DynamicZoomManager()
+        self.manager = (
+            manager.clone() if manager is not None else DynamicZoomManager()
+        )
+        if not self.manager.has_base_step() and not self.manager.is_empty():
+            lowest_step = min(
+                self.manager.get_steps(),
+                key=lambda step: step.altitude_ft,
+            )
+            self.manager.set_base_zoom(
+                lowest_step.zoom_level,
+                lowest_step.zoom_level_airports,
+            )
         self.current_max_zoom = current_max_zoom
         self.setWindowTitle("Dynamic Zoom - Quality Steps")
         self.setMinimumSize(550, 450)
@@ -605,6 +756,15 @@ class QualityStepsDialog(QDialog):
             }
         """)
         layout.addWidget(self.steps_table)
+
+        self.validation_label = QLabel("")
+        self.validation_label.setWordWrap(True)
+        self.validation_label.setStyleSheet(
+            "color: #ff8a80; padding: 6px; background: #3a2a2a; "
+            "border-radius: 4px;"
+        )
+        self.validation_label.hide()
+        layout.addWidget(self.validation_label)
         
         # Add step button
         add_btn = StyledButton("Add Quality Step")
@@ -772,8 +932,11 @@ class QualityStepsDialog(QDialog):
                 airport_spinbox.blockSignals(False)
     
     def _on_accept(self):
-        """Handle dialog acceptance - apply table edits to manager."""
-        # Apply any table edits to manager
+        """Validate all rows and atomically replace the working model."""
+        self.validation_label.hide()
+        candidate = DynamicZoomManager()
+        rows = []
+
         for i in range(self.steps_table.rowCount()):
             alt_item = self.steps_table.item(i, 0)
             zoom_spinbox = self.steps_table.cellWidget(i, 1)
@@ -781,14 +944,64 @@ class QualityStepsDialog(QDialog):
             if alt_item and zoom_spinbox and isinstance(zoom_spinbox, QSpinBox):
                 try:
                     alt = int(alt_item.text())
-                    zoom = zoom_spinbox.value()  # Already validated by spinbox
-                    airport_zoom = None
-                    if airport_zoom_spinbox and isinstance(airport_zoom_spinbox, QSpinBox):
-                        airport_zoom = airport_zoom_spinbox.value()
-                    self.manager.update_step(alt, zoom, airport_zoom)
+                    zoom = zoom_spinbox.value()
+                    airport_zoom = airport_zoom_spinbox.value()
                 except ValueError:
-                    pass
+                    self._show_row_error(
+                        i,
+                        "Altitude must be a whole number.",
+                    )
+                    return
+
+                if alt < -1000 or alt > 60000:
+                    self._show_row_error(
+                        i,
+                        "Altitude must be between -1,000 and 60,000 ft AGL.",
+                    )
+                    return
+                if airport_zoom < zoom:
+                    self._show_row_error(
+                        i,
+                        "Near-airport zoom cannot be lower than regular zoom.",
+                    )
+                    return
+                rows.append((i, alt, zoom, airport_zoom))
+
+        altitudes = [alt for _, alt, _, _ in rows]
+        if len(altitudes) != len(set(altitudes)):
+            duplicate = next(
+                alt for alt in altitudes if altitudes.count(alt) > 1
+            )
+            row = next(item[0] for item in rows if item[1] == duplicate)
+            self._show_row_error(
+                row,
+                f"A quality step at {duplicate:,} ft already exists.",
+            )
+            return
+        if BASE_ALTITUDE_FT not in altitudes:
+            self.validation_label.setText(
+                "The required base quality step is missing."
+            )
+            self.validation_label.show()
+            return
+
+        for _, altitude, zoom, airport_zoom in rows:
+            if altitude == BASE_ALTITUDE_FT:
+                candidate.set_base_zoom(zoom, airport_zoom)
+            else:
+                candidate.add_step(altitude, zoom, airport_zoom)
+
+        self.manager = candidate
         self.accept()
+
+    def _show_row_error(self, row: int, message: str):
+        item = self.steps_table.item(row, 0)
+        if item is not None:
+            item.setBackground(QColor(110, 45, 45))
+            item.setToolTip(message)
+        self.steps_table.setCurrentCell(row, 0)
+        self.validation_label.setText(message)
+        self.validation_label.show()
     
     def get_manager(self) -> DynamicZoomManager:
         """
@@ -797,7 +1010,7 @@ class QualityStepsDialog(QDialog):
         Returns:
             The DynamicZoomManager with any changes applied
         """
-        return self.manager
+        return self.manager.clone()
 
 
 class RoughnessValueDialog(QDialog):
@@ -1080,6 +1293,134 @@ class SceneryPatchesWidget(QWidget):
 class ConfigUI(QMainWindow):
     """Main configuration UI window using PyQt6"""
 
+    SETTINGS_WIDGET_ATTRS = (
+        "scenery_path_edit",
+        "xplane_path_edit",
+        "cache_dir_edit",
+        "lt_cache_dir_edit",
+        "download_dir_edit",
+        "showconfig_check",
+        "maptype_combo",
+        "simheaven_compat_check",
+        "using_custom_tiles_check",
+        "simbrief_userid_edit",
+        "simbrief_use_flight_data_check",
+        "simbrief_consideration_radius_spin",
+        "simbrief_deviation_threshold_spin",
+        "simbrief_prefetch_parked_check",
+        "noclean_check",
+        "max_download_workers_spin",
+        "storage_safety_margin_spin",
+        "seasons_convert_workers_slider",
+        "compress_dsf_check",
+        "mem_cache_slider",
+        "file_cache_slider",
+        "auto_clean_cache_check",
+        "min_zoom_slider",
+        "max_zoom_mode_combo",
+        "max_zoom_slider",
+        "max_zoom_near_airports_slider",
+        "use_time_budget_check",
+        "tile_budget_slider",
+        "maxwait_slider",
+        "suspend_maxwait_check",
+        "fallback_level_combo",
+        "fallback_extends_budget_check",
+        "fallback_timeout_slider",
+        "prefetch_enabled_check",
+        "prefetch_lookahead_slider",
+        "prefetch_interval_slider",
+        "prefetch_max_chunks_slider",
+        "prefetch_radius_slider",
+        "predictive_dds_enabled_check",
+        "predictive_interval_slider",
+        "background_workers_slider",
+        "predictive_use_fallbacks_check",
+        "pipeline_mode_combo",
+        "live_concurrency_slider",
+        "buffer_pool_slider",
+        "fetch_threads_spinbox",
+        "seasons_enabled_check",
+        "spr_sat_slider",
+        "sum_sat_slider",
+        "fal_sat_slider",
+        "win_sat_slider",
+        "compressor_combo",
+        "format_combo",
+        "gui_check",
+        "hide_check",
+        "console_log_level_combo",
+        "file_log_level_combo",
+        "performance_profiling_check",
+        "performance_sample_interval_spin",
+        "python_allocation_tracing_check",
+        "threading_check",
+        "winfsp_check",
+        "webui_port_edit",
+        "xplane_udp_port_edit",
+        "time_exclusion_enabled_check",
+        "time_exclusion_default_check",
+        "sun_night_threshold_spin",
+        "sun_day_threshold_spin",
+    )
+    RESTART_REQUIRED_SETTINGS = {
+        "scenery_path_edit",
+        "xplane_path_edit",
+        "cache_dir_edit",
+        "lt_cache_dir_edit",
+        "download_dir_edit",
+        "using_custom_tiles_check",
+        "max_download_workers_spin",
+        "seasons_convert_workers_slider",
+        "compress_dsf_check",
+        "mem_cache_slider",
+        "file_cache_slider",
+        "min_zoom_slider",
+        "max_zoom_mode_combo",
+        "max_zoom_slider",
+        "max_zoom_near_airports_slider",
+        "use_time_budget_check",
+        "tile_budget_slider",
+        "maxwait_slider",
+        "suspend_maxwait_check",
+        "fallback_level_combo",
+        "fallback_extends_budget_check",
+        "fallback_timeout_slider",
+        "prefetch_enabled_check",
+        "prefetch_lookahead_slider",
+        "prefetch_interval_slider",
+        "prefetch_max_chunks_slider",
+        "prefetch_radius_slider",
+        "predictive_dds_enabled_check",
+        "predictive_interval_slider",
+        "background_workers_slider",
+        "predictive_use_fallbacks_check",
+        "pipeline_mode_combo",
+        "live_concurrency_slider",
+        "buffer_pool_slider",
+        "fetch_threads_spinbox",
+        "seasons_enabled_check",
+        "spr_sat_slider",
+        "sum_sat_slider",
+        "fal_sat_slider",
+        "win_sat_slider",
+        "compressor_combo",
+        "format_combo",
+        "performance_profiling_check",
+        "performance_sample_interval_spin",
+        "python_allocation_tracing_check",
+        "threading_check",
+        "winfsp_check",
+        "webui_port_edit",
+        "xplane_udp_port_edit",
+        "time_exclusion_enabled_check",
+        "time_exclusion_default_check",
+        "sun_night_threshold_spin",
+        "sun_day_threshold_spin",
+        "dynamic_zoom_steps",
+        "missing_color",
+    }
+
     status_update = Signal(str)
     log_update = Signal(str)
     show_error = Signal(str)
@@ -1118,6 +1459,23 @@ class ConfigUI(QMainWindow):
         self._closing = False
         self._shutdown_in_progress = False
         self._ready_to_close = False
+        self.runtime_state = RuntimeState.STOPPED
+        self.mount_control_worker = None
+        self._stop_target_state = RuntimeState.STOPPED
+        self._runtime_error_message = ""
+        self._close_after_stop = False
+        self._restoring_settings = False
+        self._settings_tracking_ready = False
+        self._restart_pending = False
+        self._settings_observe_scheduled = False
+        self._setup_wizard_checked = False
+        self.current_readiness = None
+        self.storage_scan_worker = None
+        self.task_manager = TaskManager(self)
+        self.settings_session = SettingsSession(
+            self.RESTART_REQUIRED_SETTINGS,
+            self,
+        )
 
         # Set up logging handler for UI (must be None before init_ui is called)
         self.ui_log_handler = None
@@ -1129,6 +1487,25 @@ class ConfigUI(QMainWindow):
         self.status_update.connect(self.update_status_bar)
         self.log_update.connect(self.append_log)
         self.show_error.connect(self.display_error)
+
+        self.mount_monitor_timer = QTimer(self)
+        self.mount_monitor_timer.setInterval(1000)
+        self.mount_monitor_timer.timeout.connect(self._check_mount_workers)
+        self._set_runtime_state(RuntimeState.STOPPED)
+        self._initialize_settings_session()
+        self.readiness_timer = QTimer(self)
+        self.readiness_timer.setSingleShot(True)
+        self.readiness_timer.setInterval(300)
+        self.readiness_timer.timeout.connect(self._run_readiness_checks)
+        for edit in (
+            self.xplane_path_edit,
+            self.scenery_path_edit,
+            self.cache_dir_edit,
+            self.lt_cache_dir_edit,
+            self.download_dir_edit,
+        ):
+            edit.textChanged.connect(self._schedule_readiness_checks)
+        self._run_readiness_checks()
 
         self.ready.set()
 
@@ -1185,6 +1562,9 @@ class ConfigUI(QMainWindow):
             }
             QLineEdit:focus {
                 border-color: #1d71d1;
+            }
+            QLineEdit[validationError="true"] {
+                border: 1px solid #d9534f;
             }
             QTextEdit {
                 background-color: #2A2A2A;
@@ -1302,23 +1682,41 @@ class ConfigUI(QMainWindow):
         self.create_settings_tab()
         self.create_custom_map_tab()
         self.create_logs_tab()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        self.task_panel = TaskPanel(self.task_manager)
+        main_layout.addWidget(self.task_panel)
 
         # Button layout
         button_layout = QHBoxLayout()
         button_layout.setSpacing(10)
 
-        self.run_button = StyledButton("Run", primary=True)
+        self.run_button = StyledButton("Start Streaming", primary=True)
         self.run_button.clicked.connect(self.on_run)
 
-        self.save_button = StyledButton("Save Config")
-        self.save_button.clicked.connect(self.on_save)
+        self.apply_button = StyledButton("Apply")
+        self.apply_button.clicked.connect(self.on_save)
+        self.save_button = self.apply_button
+
+        self.revert_button = StyledButton("Revert")
+        self.revert_button.clicked.connect(self.on_revert)
+
+        self.restart_notice_label = QLabel(
+            "Restart streaming to apply all changes."
+        )
+        self.restart_notice_label.setStyleSheet(
+            "color: #f0ad4e; font-weight: bold;"
+        )
+        self.restart_notice_label.hide()
 
         self.quit_button = StyledButton("Quit")
         self.quit_button.clicked.connect(self.close)
 
         button_layout.addStretch()
+        button_layout.addWidget(self.restart_notice_label)
         button_layout.addWidget(self.run_button)
-        button_layout.addWidget(self.save_button)
+        button_layout.addWidget(self.apply_button)
+        button_layout.addWidget(self.revert_button)
         button_layout.addWidget(self.quit_button)
 
         main_layout.addLayout(button_layout)
@@ -1345,9 +1743,420 @@ class ConfigUI(QMainWindow):
                 return True
         return super().eventFilter(obj, event)
 
+    def _settings_widgets(self):
+        widgets = []
+        for attr in self.SETTINGS_WIDGET_ATTRS:
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widgets.append((attr, widget))
+        return widgets
+
+    @staticmethod
+    def _settings_widget_value(widget):
+        if isinstance(widget, QLineEdit):
+            return widget.text()
+        if isinstance(widget, QCheckBox):
+            return widget.isChecked()
+        if isinstance(widget, QComboBox):
+            return widget.currentText()
+        if isinstance(widget, (QSlider, QSpinBox, QDoubleSpinBox)):
+            return widget.value()
+        raise TypeError(f"Unsupported settings widget: {type(widget)!r}")
+
+    def _snapshot_settings(self):
+        snapshot = {
+            attr: self._settings_widget_value(widget)
+            for attr, widget in self._settings_widgets()
+        }
+        if hasattr(self, "missing_color"):
+            snapshot["missing_color"] = (
+                self.missing_color.red(),
+                self.missing_color.green(),
+                self.missing_color.blue(),
+            )
+        if hasattr(self, "_dynamic_zoom_manager"):
+            snapshot["dynamic_zoom_steps"] = (
+                self._dynamic_zoom_manager.save_to_config()
+            )
+        return snapshot
+
+    def _initialize_settings_session(self):
+        self.settings_session.dirty_changed.connect(
+            self._update_settings_actions
+        )
+        self.settings_session.restart_required_changed.connect(
+            self._update_settings_actions
+        )
+        self._hook_settings_widgets()
+        self.settings_session.initialize(self._snapshot_settings())
+        self._settings_tracking_ready = True
+        self._update_settings_actions()
+        self._on_tab_changed(self.tabs.currentIndex())
+
+    def _hook_settings_widgets(self):
+        for _, widget in self._settings_widgets():
+            if widget.property("settingsTracked"):
+                continue
+            widget.setProperty("settingsTracked", True)
+            if isinstance(widget, QLineEdit):
+                widget.textChanged.connect(self._on_settings_control_changed)
+            elif isinstance(widget, QCheckBox):
+                widget.toggled.connect(self._on_settings_control_changed)
+            elif isinstance(widget, QComboBox):
+                widget.currentTextChanged.connect(
+                    self._on_settings_control_changed
+                )
+            elif isinstance(widget, (QSlider, QSpinBox, QDoubleSpinBox)):
+                widget.valueChanged.connect(self._on_settings_control_changed)
+
+    def _on_settings_control_changed(self, *args):
+        if (
+            not self._settings_tracking_ready
+            or self._restoring_settings
+            or self._settings_observe_scheduled
+        ):
+            return
+        self._settings_observe_scheduled = True
+        QTimer.singleShot(0, self._observe_settings)
+
+    def _observe_settings(self):
+        self._settings_observe_scheduled = False
+        if self._restoring_settings:
+            return
+        self.settings_session.observe(self._snapshot_settings())
+
+    def _restore_settings_snapshot(self, snapshot):
+        self._restoring_settings = True
+        try:
+            target_custom = snapshot.get("using_custom_tiles_check")
+            if (
+                target_custom is not None
+                and bool(target_custom)
+                != self.using_custom_tiles_check.isChecked()
+            ):
+                self.using_custom_tiles_check.blockSignals(True)
+                self.using_custom_tiles_check.setChecked(bool(target_custom))
+                self.using_custom_tiles_check.blockSignals(False)
+                self.cfg.autoortho.using_custom_tiles = bool(target_custom)
+                self.refresh_settings_tab()
+
+            for attr, widget in self._settings_widgets():
+                if attr not in snapshot:
+                    continue
+                value = snapshot[attr]
+                was_blocked = widget.blockSignals(True)
+                try:
+                    if isinstance(widget, QLineEdit):
+                        widget.setText(str(value))
+                    elif isinstance(widget, QCheckBox):
+                        widget.setChecked(bool(value))
+                    elif isinstance(widget, QComboBox):
+                        widget.setCurrentText(str(value))
+                    elif isinstance(
+                        widget,
+                        (QSlider, QSpinBox, QDoubleSpinBox),
+                    ):
+                        widget.setValue(value)
+                finally:
+                    widget.blockSignals(was_blocked)
+
+            if "missing_color" in snapshot and hasattr(
+                self,
+                "missing_color",
+            ):
+                self.missing_color = QColor(*snapshot["missing_color"])
+                self.update_missing_color_button()
+            if "dynamic_zoom_steps" in snapshot and hasattr(
+                self,
+                "_dynamic_zoom_manager",
+            ):
+                self._dynamic_zoom_manager.load_from_config(
+                    snapshot["dynamic_zoom_steps"]
+                )
+                self._update_dynamic_summary()
+
+            for method_name in (
+                "_update_zoom_mode_visibility",
+                "_update_time_budget_controls",
+                "_update_prefetch_controls",
+                "_update_predictive_dds_controls",
+                "_update_fallback_extends_control",
+                "_update_pipeline_controls",
+                "_update_builder_concurrency_labels",
+                "_update_buffer_pool_label",
+                "_on_time_exclusion_toggled",
+                "on_seasons_enabled_toggled",
+            ):
+                method = getattr(self, method_name, None)
+                if method is not None:
+                    method()
+            self._hook_settings_widgets()
+        finally:
+            self._restoring_settings = False
+
+    def _update_settings_actions(self, *args):
+        transitioning = self.runtime_state in (
+            RuntimeState.STARTING,
+            RuntimeState.STOPPING,
+        )
+        self.apply_button.setEnabled(
+            self.settings_session.dirty and not transitioning
+        )
+        self.revert_button.setEnabled(
+            self.settings_session.dirty and not transitioning
+        )
+        self.restart_notice_label.setVisible(
+            self._restart_pending
+            or (
+                self.settings_session.dirty
+                and self.settings_session.restart_required
+            )
+        )
+
+    def _on_tab_changed(self, index):
+        if not hasattr(self, "apply_button"):
+            return
+        page = self.tabs.widget(index)
+        show_settings_actions = page not in (
+            self.custom_map_widget,
+            self.logs_widget,
+        )
+        self.apply_button.setVisible(show_settings_actions)
+        self.revert_button.setVisible(show_settings_actions)
+
+    def on_revert(self):
+        if not self.settings_session.dirty:
+            return True
+        snapshot = self.settings_session.revert()
+        self._restore_settings_snapshot(snapshot)
+        self.save_config(persist=False, refresh_scenery=False)
+        self.update_ui_log_level()
+        self.update_file_log_level()
+        self._update_settings_actions()
+        self.update_status_bar("Pending configuration changes reverted.")
+        return True
+
+    def _resolve_pending_settings(self, *, for_start=False):
+        if not self.settings_session.dirty:
+            return True
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        if for_start:
+            dialog.setWindowTitle("Pending Configuration Changes")
+            dialog.setText(
+                "Apply pending configuration changes before starting?"
+            )
+            apply_button = dialog.addButton(
+                "Apply and Start",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            discard_button = dialog.addButton(
+                "Start With Saved Settings",
+                QMessageBox.ButtonRole.DestructiveRole,
+            )
+        else:
+            dialog.setWindowTitle("Unsaved Configuration Changes")
+            dialog.setText("Save pending configuration changes before quitting?")
+            apply_button = dialog.addButton(
+                "Apply",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            discard_button = dialog.addButton(
+                "Discard",
+                QMessageBox.ButtonRole.DestructiveRole,
+            )
+        cancel_button = dialog.addButton(
+            QMessageBox.StandardButton.Cancel
+        )
+        dialog.setDefaultButton(cancel_button)
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+        if clicked is apply_button:
+            return bool(self.on_save())
+        if clicked is discard_button:
+            return bool(self.on_revert())
+        return False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._setup_wizard_checked:
+            QTimer.singleShot(0, self._maybe_show_setup_wizard)
+
+    def _readiness_values(self):
+        values = self._current_configuration_input().__dict__.copy()
+        values["storage_safety_margin_gb"] = str(
+            self.storage_safety_margin_spin.value()
+            if hasattr(self, "storage_safety_margin_spin")
+            else getattr(self.cfg.scenery, "storage_safety_margin_gb", 2)
+        )
+        return values
+
+    def _scenery_choices(self):
+        choices = []
+        for region in self.dl.regions.values():
+            try:
+                latest = region.get_latest_release()
+                latest.parse()
+                title = latest.name
+                size_bytes = int(getattr(latest, "totalsize", 0) or 0)
+            except Exception:
+                title = region.region_id
+                size_bytes = 0
+            choices.append(
+                SceneryChoice(
+                    region_id=region.region_id,
+                    title=title,
+                    installed=region.local_rel is not None,
+                    size_bytes=size_bytes,
+                )
+            )
+        return choices
+
+    def _schedule_readiness_checks(self, *args):
+        if hasattr(self, "readiness_timer"):
+            self.readiness_timer.start()
+
+    def _run_readiness_checks(self):
+        self.current_readiness = build_readiness(
+            self._readiness_values(),
+            self._scenery_choices(),
+        )
+        colors = {
+            ReadinessStatus.PENDING: "#aaa",
+            ReadinessStatus.SUCCESS: "#6fcf7b",
+            ReadinessStatus.WARNING: "#f0ad4e",
+            ReadinessStatus.ERROR: "#ff8a80",
+        }
+        symbols = {
+            ReadinessStatus.PENDING: "○",
+            ReadinessStatus.SUCCESS: "✓",
+            ReadinessStatus.WARNING: "!",
+            ReadinessStatus.ERROR: "×",
+        }
+        for check in self.current_readiness.checks:
+            label = self.readiness_labels.get(check.id)
+            button = self.readiness_fix_buttons.get(check.id)
+            if label is not None:
+                label.setText(
+                    f"{symbols[check.status]}  {check.title}: {check.message}"
+                )
+                label.setStyleSheet(f"color: {colors[check.status]};")
+                label.setToolTip(check.fix_action)
+            if button is not None:
+                button.setVisible(check.status != ReadinessStatus.SUCCESS)
+                button.setToolTip(check.fix_action)
+        self._start_storage_scan()
+        return self.current_readiness
+
+    def _start_storage_scan(self):
+        if (
+            self.storage_scan_worker is not None
+            and self.storage_scan_worker.isRunning()
+        ):
+            return
+        path = self.cache_dir_edit.text().strip()
+        worker = StorageScanWorker(path)
+        worker.completed.connect(self._on_storage_scan_completed)
+        worker.finished.connect(
+            lambda current=worker: self._on_storage_scan_finished(current)
+        )
+        self.storage_scan_worker = worker
+        self.cache_storage_label.setText("Calculating cache usage…")
+        worker.start()
+
+    def _on_storage_scan_completed(self, path, usage, free):
+        if path != self.cache_dir_edit.text().strip():
+            return
+        self.cache_storage_label.setText(
+            f"Cache usage: {format_bytes(usage)} • "
+            f"Free space: {format_bytes(free)}"
+        )
+
+    def _on_storage_scan_finished(self, worker):
+        if self.storage_scan_worker is worker:
+            self.storage_scan_worker = None
+        worker.deleteLater()
+        if self.cache_dir_edit.text().strip() != worker.cache_path:
+            self._start_storage_scan()
+
+    def _fix_readiness(self, check_id):
+        if check_id == "setup-xplane":
+            self.tabs.setCurrentWidget(self.setup_widget)
+            self.browse_folder(self.xplane_path_edit)
+        elif check_id == "setup-storage":
+            self.tabs.setCurrentWidget(self.setup_widget)
+            self.scenery_path_edit.setFocus()
+        elif check_id == "setup-scenery":
+            self.tabs.setCurrentWidget(self.scenery_widget)
+        elif check_id == "setup-dependencies":
+            check = (
+                self.current_readiness.by_id(check_id)
+                if self.current_readiness
+                else None
+            )
+            QMessageBox.information(
+                self,
+                "FUSE Dependency Required",
+                check.fix_action if check else "Install the required FUSE backend.",
+            )
+
+    def _maybe_show_setup_wizard(self, force=False):
+        self._setup_wizard_checked = True
+        setup_complete = bool(
+            getattr(self.cfg.general, "setup_complete", False)
+        )
+        if not force and not setup_complete:
+            setup_complete = infer_setup_complete(self._readiness_values())
+            if setup_complete:
+                self.cfg.general.setup_complete = True
+                self.cfg.save()
+        if setup_complete and not force:
+            return
+
+        wizard = SetupWizard(
+            initial_values=self._readiness_values(),
+            scenery_choices=self._scenery_choices(),
+            parent=self,
+        )
+        if wizard.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected_paths = wizard.get_selected_paths()
+        self._restoring_settings = True
+        try:
+            self.xplane_path_edit.setText(selected_paths["xplane_path"])
+            self.scenery_path_edit.setText(selected_paths["scenery_path"])
+            self.cache_dir_edit.setText(selected_paths["cache_dir"])
+            self.lt_cache_dir_edit.setText(
+                selected_paths["long_term_cache_dir"]
+            )
+            self.download_dir_edit.setText(selected_paths["download_dir"])
+        finally:
+            self._restoring_settings = False
+        self.settings_session.observe(self._snapshot_settings())
+        self.cfg.general.setup_complete = True
+        if not self.on_save():
+            self.cfg.general.setup_complete = False
+            return
+
+        self._run_readiness_checks()
+        for region_id in wizard.get_selected_region_ids():
+            region = self.dl.regions.get(region_id)
+            if region is not None and region.local_rel is None:
+                QTimer.singleShot(
+                    0,
+                    lambda rid=region_id: self.on_install_scenery(
+                        rid,
+                        skip_confirmation=True,
+                    ),
+                )
+
     def create_setup_tab(self):
         """Create the setup configuration tab"""
         setup_widget = QWidget()
+        self.setup_widget = setup_widget
 
         # Create scroll area for setup content
         scroll_area = QScrollArea()
@@ -1362,8 +2171,50 @@ class ConfigUI(QMainWindow):
         layout.setSpacing(15)
         setup_content.setLayout(layout)
 
+        self.readiness_group = QGroupBox("System Readiness")
+        readiness_layout = QVBoxLayout(self.readiness_group)
+        self.readiness_labels = {}
+        self.readiness_fix_buttons = {}
+        for check_id in (
+            "setup-xplane",
+            "setup-storage",
+            "setup-dependencies",
+            "setup-scenery",
+        ):
+            row = QHBoxLayout()
+            label = QLabel("Pending…")
+            label.setWordWrap(True)
+            fix_button = StyledButton("Fix")
+            fix_button.clicked.connect(
+                lambda checked=False, cid=check_id: self._fix_readiness(cid)
+            )
+            row.addWidget(label, 1)
+            row.addWidget(fix_button)
+            readiness_layout.addLayout(row)
+            self.readiness_labels[check_id] = label
+            self.readiness_fix_buttons[check_id] = fix_button
+        self.cache_storage_label = QLabel("")
+        self.cache_storage_label.setStyleSheet(
+            "color: #aaa; font-size: 11px;"
+        )
+        readiness_layout.addWidget(self.cache_storage_label)
+        readiness_actions = QHBoxLayout()
+        recheck_button = StyledButton("Run Checks")
+        recheck_button.clicked.connect(self._run_readiness_checks)
+        wizard_button = StyledButton("Setup Wizard…")
+        wizard_button.clicked.connect(
+            lambda: self._maybe_show_setup_wizard(force=True)
+        )
+        readiness_actions.addWidget(recheck_button)
+        readiness_actions.addWidget(wizard_button)
+        readiness_actions.addStretch()
+        readiness_layout.addLayout(readiness_actions)
+        layout.addWidget(self.readiness_group)
+
         # Paths group
         paths_group = QGroupBox("Paths Configuration")
+        self.paths_group = paths_group
+        self.path_browse_buttons = []
         paths_layout = QVBoxLayout()
         paths_group.setLayout(paths_layout)
 
@@ -1382,6 +2233,7 @@ class ConfigUI(QMainWindow):
         )
         scenery_layout.addWidget(self.scenery_path_edit)
         browse_btn = StyledButton("Browse")
+        self.path_browse_buttons.append(browse_btn)
         browse_btn.clicked.connect(
             lambda: self.browse_folder(self.scenery_path_edit)
         )
@@ -1405,6 +2257,7 @@ class ConfigUI(QMainWindow):
         )
         xplane_layout.addWidget(self.xplane_path_edit)
         browse_btn = StyledButton("Browse")
+        self.path_browse_buttons.append(browse_btn)
         browse_btn.clicked.connect(
             lambda: self.browse_folder(self.xplane_path_edit)
         )
@@ -1430,6 +2283,7 @@ class ConfigUI(QMainWindow):
         )
         cache_layout.addWidget(self.cache_dir_edit)
         browse_btn = StyledButton("Browse")
+        self.path_browse_buttons.append(browse_btn)
         browse_btn.clicked.connect(
             lambda: self.browse_folder(self.cache_dir_edit)
         )
@@ -1456,6 +2310,7 @@ class ConfigUI(QMainWindow):
         )
         lt_cache_layout.addWidget(self.lt_cache_dir_edit)
         browse_btn = StyledButton("Browse")
+        self.path_browse_buttons.append(browse_btn)
         browse_btn.clicked.connect(
             lambda: self.browse_folder(self.lt_cache_dir_edit)
         )
@@ -1480,16 +2335,27 @@ class ConfigUI(QMainWindow):
         )
         download_layout.addWidget(self.download_dir_edit)
         browse_btn = StyledButton("Browse")
+        self.path_browse_buttons.append(browse_btn)
         browse_btn.clicked.connect(
             lambda: self.browse_folder(self.download_dir_edit)
         )
         download_layout.addWidget(browse_btn)
         paths_layout.addLayout(download_layout)
 
+        self.setup_validation_label = QLabel("")
+        self.setup_validation_label.setWordWrap(True)
+        self.setup_validation_label.setStyleSheet(
+            "color: #ff8a80; padding: 8px; background: #3a2a2a; "
+            "border-radius: 4px;"
+        )
+        self.setup_validation_label.hide()
+        paths_layout.addWidget(self.setup_validation_label)
+
         layout.addWidget(paths_group)
 
         # Options group
         options_group = QGroupBox("Basic Settings")
+        self.options_group = options_group
         options_layout = QVBoxLayout()
         options_group.setLayout(options_layout)
 
@@ -1580,6 +2446,7 @@ class ConfigUI(QMainWindow):
 
         # SimBrief Integration group
         simbrief_group = QGroupBox("SimBrief Integration")
+        self.simbrief_group = simbrief_group
         simbrief_layout = QVBoxLayout()
         simbrief_group.setLayout(simbrief_layout)
 
@@ -1886,6 +2753,7 @@ class ConfigUI(QMainWindow):
     def create_settings_tab(self):
         """Create the advanced settings configuration tab"""
         settings_widget = QWidget()
+        self.settings_widget = settings_widget
 
         # Create scroll area for settings content
         scroll_area = QScrollArea()
@@ -1917,6 +2785,7 @@ class ConfigUI(QMainWindow):
     def create_scenery_tab(self):
         """Create the scenery management tab"""
         scenery_widget = QWidget()
+        self.scenery_widget = scenery_widget
         layout = QVBoxLayout()
         scenery_widget.setLayout(layout)
 
@@ -1964,6 +2833,31 @@ class ConfigUI(QMainWindow):
         dl_workers_layout.addWidget(self.max_download_workers_spin)
         dl_workers_layout.addStretch()
         scenery_layout.addLayout(dl_workers_layout)
+
+        storage_margin_layout = QHBoxLayout()
+        storage_margin_label = QLabel("Free-space safety margin:")
+        storage_margin_label.setToolTip(
+            "Minimum disk space AutoOrtho keeps free when checking scenery "
+            "downloads and storage locations."
+        )
+        self.storage_safety_margin_spin = QDoubleSpinBox()
+        self.storage_safety_margin_spin.setRange(0.0, 100.0)
+        self.storage_safety_margin_spin.setSingleStep(1.0)
+        self.storage_safety_margin_spin.setDecimals(1)
+        self.storage_safety_margin_spin.setSuffix(" GB")
+        self.storage_safety_margin_spin.setValue(
+            float(
+                getattr(
+                    self.cfg.scenery,
+                    "storage_safety_margin_gb",
+                    2,
+                )
+            )
+        )
+        storage_margin_layout.addWidget(storage_margin_label)
+        storage_margin_layout.addWidget(self.storage_safety_margin_spin)
+        storage_margin_layout.addStretch()
+        scenery_layout.addLayout(storage_margin_layout)
 
         layout.addWidget(scenery_group)
 
@@ -2027,6 +2921,7 @@ class ConfigUI(QMainWindow):
     def create_logs_tab(self):
         """Create the logs tab"""
         logs_widget = QWidget()
+        self.logs_widget = logs_widget
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
         logs_widget.setLayout(layout)
@@ -2043,6 +2938,7 @@ class ConfigUI(QMainWindow):
     def create_custom_map_tab(self):
         """Create the Custom Map editor tab with a button to open in browser."""
         custom_map_widget = QWidget()
+        self.custom_map_widget = custom_map_widget
         layout = QVBoxLayout()
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
@@ -2891,7 +3787,7 @@ class ConfigUI(QMainWindow):
         predictive_enable_layout.addStretch()
         autoortho_layout.addLayout(predictive_enable_layout)
         
-        # Note: DDS cache is disk-only (ephemeral_dds_cache_mb in advanced settings)
+        # Compiled DDS cache is persistent and disk-budget managed.
         # OS file cache naturally keeps hot files in RAM when memory is available
         
         # Build interval slider
@@ -3152,7 +4048,7 @@ class ConfigUI(QMainWindow):
         self.fetch_threads_spinbox = ModernSpinBox()
         self.fetch_threads_spinbox.setFocusPolicy(Qt.StrongFocus) # Prevent focus by hovering mouse wheel
 
-        max_threads = 1000
+        max_threads = max(8, min(64, (os.cpu_count() or 4) * 2))
         self.fetch_threads_spinbox.setRange(1, max_threads)
 
         # Ensure initial value doesn't exceed available threads
@@ -3162,7 +4058,9 @@ class ConfigUI(QMainWindow):
         self.fetch_threads_spinbox.setValue(initial_threads)
         self.fetch_threads_spinbox.setObjectName('fetch_threads')
         self.fetch_threads_spinbox.setToolTip(
-            f"Number of download threads per mount (1-{max_threads})" if self.system == "darwin" else f"Number of global download threads (1-{max_threads})"
+            f"Number of local download dispatch threads per active mount "
+            f"(1-{max_threads}). Network concurrency is controlled globally "
+            "by the shared HTTP/2 broker."
         )
 
         threads_layout.addWidget(self.fetch_threads_spinbox)
@@ -3718,6 +4616,8 @@ class ConfigUI(QMainWindow):
         self.settings_layout.addWidget(time_exclusion_group)
 
         self.settings_layout.addStretch()
+        if self._settings_tracking_ready:
+            self._hook_settings_widgets()
 
     def show_missing_color_dialog(self):
         color = QColorDialog.getColor(
@@ -3726,6 +4626,7 @@ class ConfigUI(QMainWindow):
         if color.isValid():
             self.missing_color = color
             self.update_missing_color_button()
+            self._on_settings_control_changed()
 
     def _get_missing_color_style(self):
         return f"""
@@ -3982,6 +4883,16 @@ class ConfigUI(QMainWindow):
 
     def on_restore_default_dsfs(self, region_id):
         """Handle restoring default DSFs"""
+        self.task_manager.create_task(
+            f"scenery-restore:{region_id}",
+            TaskType.RESTORE,
+            "Restore default scenery files",
+            package=region_id,
+            stage="Preparing",
+            retry_callback=lambda rid=region_id: self.on_restore_default_dsfs(
+                rid
+            ),
+        )
         # Button now is scenery-options, disable it while working
         button = self.findChild(QPushButton, f"scenery-options-{region_id}")
         if button:
@@ -4004,6 +4915,10 @@ class ConfigUI(QMainWindow):
 
     def on_restore_default_dsfs_error(self, region_id, error_msg):
         """Handle restore default DSFs error"""
+        self.task_manager.fail_task(
+            f"scenery-restore:{region_id}",
+            error_msg,
+        )
         self.show_error.emit(f"Failed to restore default DSFs to {region_id}:\n{error_msg}")
         self.on_restore_default_dsfs_finished(region_id, False)
 
@@ -4016,6 +4931,15 @@ class ConfigUI(QMainWindow):
         dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if dsf_progress_bar:
             dsf_progress_bar.setVisible(False)
+        task_id = f"scenery-restore:{region_id}"
+        task = self.task_manager.task(task_id)
+        if success:
+            self.task_manager.complete_task(task_id, stage="Restored")
+        elif task is not None and task.state != TaskState.FAILED:
+            self.task_manager.fail_task(
+                task_id,
+                f"Failed to restore {region_id}.",
+            )
         # If this was part of a reapply flow, start add seasons next
         try:
             if success and region_id in self.reapply_after_restore:
@@ -4028,6 +4952,11 @@ class ConfigUI(QMainWindow):
 
     def on_restore_default_dsfs_progress(self, region_id, progress_data):
         """Update restore default DSFs progress"""
+        self.task_manager.update_task(
+            f"scenery-restore:{region_id}",
+            stage=progress_data.get("status", "Restoring files"),
+            progress=float(progress_data.get("pcnt_done", 0) or 0),
+        )
         dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if dsf_progress_bar:
             dsf_progress_bar.setValue(progress_data["pcnt_done"])
@@ -4195,6 +5124,16 @@ class ConfigUI(QMainWindow):
 
     def _start_add_roughness_job(self, region_id, roughness_value):
         """Start the SUPER_ROUGHNESS patching job."""
+        self.task_manager.create_task(
+            f"roughness:{region_id}",
+            TaskType.ROUGHNESS,
+            "Apply terrain reflectivity",
+            package=region_id,
+            stage="Scanning terrain files",
+            retry_callback=lambda rid=region_id, value=roughness_value: (
+                self._start_add_roughness_job(rid, value)
+            ),
+        )
         button = self.findChild(QPushButton, f"scenery-options-{region_id}")
         if button:
             button.setEnabled(False)
@@ -4222,6 +5161,16 @@ class ConfigUI(QMainWindow):
 
     def _start_remove_roughness_job(self, region_id):
         """Start the SUPER_ROUGHNESS removal job."""
+        self.task_manager.create_task(
+            f"roughness:{region_id}",
+            TaskType.ROUGHNESS,
+            "Remove terrain reflectivity",
+            package=region_id,
+            stage="Preparing",
+            retry_callback=lambda rid=region_id: (
+                self._start_remove_roughness_job(rid)
+            ),
+        )
         button = self.findChild(QPushButton, f"scenery-options-{region_id}")
         if button:
             button.setEnabled(False)
@@ -4249,6 +5198,20 @@ class ConfigUI(QMainWindow):
 
     def on_add_roughness_progress(self, region_id, progress_data):
         """Update SUPER_ROUGHNESS patching progress."""
+        stage = progress_data.get("stage")
+        self.task_manager.update_task(
+            f"roughness:{region_id}",
+            stage=(
+                "Scanning terrain files"
+                if stage == "scanning"
+                else progress_data.get("status", "Updating terrain files")
+            ),
+            progress=(
+                None
+                if stage == "scanning"
+                else float(progress_data.get("pcnt_done", 0) or 0)
+            ),
+        )
         progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if not progress_bar:
             return
@@ -4278,6 +5241,15 @@ class ConfigUI(QMainWindow):
 
     def on_add_roughness_finished(self, region_id, success):
         """Handle SUPER_ROUGHNESS patching completion."""
+        task_id = f"roughness:{region_id}"
+        task = self.task_manager.task(task_id)
+        if success:
+            self.task_manager.complete_task(task_id, stage="Completed")
+        elif task is not None and task.state != TaskState.FAILED:
+            self.task_manager.fail_task(
+                task_id,
+                f"Terrain update failed for {region_id}.",
+            )
         button = self.findChild(QPushButton, f"scenery-options-{region_id}")
         if button:
             button.setEnabled(True)
@@ -4303,6 +5275,10 @@ class ConfigUI(QMainWindow):
 
     def on_add_roughness_error(self, region_id, error_msg):
         """Handle SUPER_ROUGHNESS patching error."""
+        self.task_manager.fail_task(
+            f"roughness:{region_id}",
+            error_msg,
+        )
         self.show_error.emit(f"Failed SUPER_ROUGHNESS operation on {region_id}:\n{error_msg}")
         self.on_add_roughness_finished(region_id, False)
 
@@ -4416,6 +5392,32 @@ class ConfigUI(QMainWindow):
 
     def on_delete_scenery(self, region_id):
         """Handle scenery deletion"""
+        region = self.dl.regions.get(region_id)
+        local_release = region.local_rel if region is not None else None
+        install_path = (
+            getattr(local_release, "subfolder_dir", None)
+            or os.path.join(self.cfg.paths.scenery_path, "z_autoortho")
+        )
+        reply = QMessageBox.question(
+            self,
+            "Uninstall Scenery?",
+            f"Uninstall {region_id}?\n\n"
+            f"Files will be removed from:\n{install_path}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.task_manager.create_task(
+            f"scenery-uninstall:{region_id}",
+            TaskType.SCENERY_UNINSTALL,
+            "Uninstall scenery",
+            package=region_id,
+            stage="Removing files",
+            retry_callback=lambda rid=region_id: self.on_delete_scenery(rid),
+        )
+
         button = self.findChild(QPushButton, f"uninstall-{region_id}")
         if button:
             button.setEnabled(False)
@@ -4725,6 +5727,7 @@ class ConfigUI(QMainWindow):
             self._dynamic_zoom_manager = dialog.get_manager()
             self._update_dynamic_summary()
             self._update_buffer_pool_label()
+            self._on_settings_control_changed()
 
     def _update_dynamic_summary(self):
         """Update the summary label for dynamic zoom steps."""
@@ -4884,7 +5887,6 @@ class ConfigUI(QMainWindow):
             self.simbrief_flight_data = None
             
             # Clear the flight manager
-            from utils.simbrief_flight import simbrief_flight_manager
             simbrief_flight_manager.clear()
         else:
             # If we have a userid and use_flight_data was previously enabled in config,
@@ -4915,6 +5917,15 @@ class ConfigUI(QMainWindow):
         
         # Create and start worker
         self.simbrief_fetch_worker = SimBriefFetchWorker(userid)
+        self.task_manager.create_task(
+            "simbrief-fetch",
+            TaskType.SIMBRIEF,
+            "Fetch SimBrief flight plan",
+            stage="Connecting to SimBrief",
+            cancellable=True,
+            cancel_callback=self.simbrief_fetch_worker.cancel,
+            retry_callback=self._on_simbrief_fetch,
+        )
         self.simbrief_fetch_worker.success.connect(self._on_simbrief_fetch_success)
         self.simbrief_fetch_worker.error.connect(self._on_simbrief_fetch_error)
         self.simbrief_fetch_worker.finished.connect(self._on_simbrief_fetch_finished)
@@ -4922,6 +5933,10 @@ class ConfigUI(QMainWindow):
 
     def _on_simbrief_fetch_success(self, data):
         """Handle successful SimBrief fetch"""
+        self.task_manager.complete_task(
+            "simbrief-fetch",
+            stage="Flight plan loaded",
+        )
         self.simbrief_flight_data = data
         self._display_simbrief_flight_info(data)
         self.simbrief_info_frame.show()
@@ -4930,7 +5945,6 @@ class ConfigUI(QMainWindow):
         self.simbrief_unload_btn.show()  # Show unload button when flight is loaded
         
         # Load flight data into the global flight manager for use by dynamic zoom and prefetcher
-        from utils.simbrief_flight import simbrief_flight_manager
         if simbrief_flight_manager.load_flight_data(data):
             log.info(f"SimBrief flight loaded into manager: {simbrief_flight_manager.origin} -> {simbrief_flight_manager.destination}")
         else:
@@ -4940,6 +5954,7 @@ class ConfigUI(QMainWindow):
 
     def _on_simbrief_fetch_error(self, error_msg):
         """Handle SimBrief fetch error"""
+        self.task_manager.fail_task("simbrief-fetch", error_msg)
         self.simbrief_error_label.setText(f"⚠ {error_msg}")
         self.simbrief_error_label.show()
         self.simbrief_info_frame.show()
@@ -4951,13 +5966,15 @@ class ConfigUI(QMainWindow):
         self.simbrief_flight_data = None
         
         # Clear the flight manager
-        from utils.simbrief_flight import simbrief_flight_manager
         simbrief_flight_manager.clear()
         
         log.warning(f"SimBrief fetch error: {error_msg}")
 
     def _on_simbrief_fetch_finished(self):
         """Handle SimBrief fetch completion (success or error)"""
+        task = self.task_manager.task("simbrief-fetch")
+        if task is not None and task.state == TaskState.CANCELLING:
+            self.task_manager.mark_cancelled("simbrief-fetch")
         self.simbrief_fetch_btn.setEnabled(True)
         self.simbrief_fetch_btn.setText("Fetch Flight Data")
 
@@ -4967,7 +5984,6 @@ class ConfigUI(QMainWindow):
         self.simbrief_flight_data = None
         
         # Clear the global flight manager
-        from utils.simbrief_flight import simbrief_flight_manager
         simbrief_flight_manager.clear()
         
         # Hide flight info UI
@@ -5099,50 +6115,383 @@ class ConfigUI(QMainWindow):
         if folder:
             line_edit.setText(folder)
 
-    def on_run(self):
-        """Handle Run button click"""
-        # Block run while seasons are being added
-        try:
-            if getattr(self, 'add_seasons_workers', None) and len(self.add_seasons_workers) > 0:
-                QMessageBox.warning(
-                    self,
-                    "Seasons In Progress",
-                    "Cannot Run while Native Seasons are being added. Please wait for the seasons operation to finish."
+    def _current_configuration_input(self):
+        return ConfigurationInput(
+            xplane_path=self.xplane_path_edit.text(),
+            scenery_path=self.scenery_path_edit.text(),
+            cache_dir=self.cache_dir_edit.text(),
+            long_term_cache_dir=self.lt_cache_dir_edit.text(),
+            download_dir=self.download_dir_edit.text(),
+            webui_port=self.webui_port_edit.text(),
+            xplane_udp_port=self.xplane_udp_port_edit.text(),
+        )
+
+    def _validation_field_widgets(self):
+        return {
+            "xplane_path": self.xplane_path_edit,
+            "scenery_path": self.scenery_path_edit,
+            "cache_dir": self.cache_dir_edit,
+            "long_term_cache_dir": self.lt_cache_dir_edit,
+            "download_dir": self.download_dir_edit,
+            "webui_port": self.webui_port_edit,
+            "xplane_udp_port": self.xplane_udp_port_edit,
+        }
+
+    def _clear_validation_feedback(self):
+        self.setup_validation_label.hide()
+        self.setup_validation_label.clear()
+        for widget in self._validation_field_widgets().values():
+            widget.setProperty("validationError", False)
+            original_tooltip = widget.property("validationOriginalToolTip")
+            if original_tooltip is not None:
+                widget.setToolTip(original_tooltip)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+    def _show_validation_issues(self, issues):
+        self._clear_validation_feedback()
+        errors = [
+            issue for issue in issues
+            if issue.severity == ValidationSeverity.ERROR
+        ]
+        if not errors:
+            return
+
+        widgets = self._validation_field_widgets()
+        for issue in errors:
+            widget = widgets.get(issue.field)
+            if widget is not None:
+                if widget.property("validationOriginalToolTip") is None:
+                    widget.setProperty(
+                        "validationOriginalToolTip",
+                        widget.toolTip(),
+                    )
+                widget.setProperty("validationError", True)
+                widget.setToolTip(issue.message)
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+
+        self.setup_validation_label.setText(
+            "\n".join(f"• {issue.message}" for issue in errors)
+        )
+        self.setup_validation_label.show()
+
+        if errors[0].field == "scenery":
+            target_page = self.scenery_widget
+        elif errors[0].field in ("webui_port", "xplane_udp_port"):
+            target_page = self.settings_widget
+        else:
+            target_page = self.setup_widget
+        self.tabs.setCurrentWidget(target_page)
+        first_widget = widgets.get(errors[0].field)
+        if first_widget is not None:
+            first_widget.setFocus()
+
+    def _prepare_runtime_directories(self):
+        issues = []
+        paths = (
+            ("scenery_path", "Scenery install folder", self.scenery_path_edit.text()),
+            ("cache_dir", "Image cache folder", self.cache_dir_edit.text()),
+            ("download_dir", "Temporary download folder", self.download_dir_edit.text()),
+        )
+        long_term = self.lt_cache_dir_edit.text().strip()
+        if long_term:
+            paths += (
+                ("long_term_cache_dir", "Long-term cache folder", long_term),
+            )
+
+        for field, label, path in paths:
+            try:
+                os.makedirs(os.path.expanduser(path), exist_ok=True)
+            except OSError as exc:
+                issues.append(
+                    ValidationIssue(
+                        field,
+                        ValidationSeverity.ERROR,
+                        f"{label} could not be created: {exc}",
+                    )
                 )
-                self.update_status_bar("Run blocked: adding seasons in progress")
-                return
-        except Exception:
-            pass
-        # Disable Add Seasons buttons while running
-        try:
-            for rid in self.installed_packages:
-                btn = self.findChild(QPushButton, f"scenery-options-{rid}")
-                if btn:
-                    btn.setEnabled(False)
-                    btn.setToolTip("Disabled while AutoOrtho is running")
-        except Exception:
-            pass
-        self.save_config()
-        # Note: cfg.load() removed - save_config() already saves to disk and updates cfg object
-        # The redundant load() was creating a race condition window where defaults could be exposed
-        # Preflight check: prompt to unmount previous mounts if detected
-        try:
-            if not self.preflight_mount_check_and_prompt():
-                self.update_status_bar("Run cancelled by user")
-                return
-        except Exception:
-            # Non-fatal; continue
-            pass
-        self.update_status_bar("Mounting sceneries...")
-        self.run_button.setEnabled(False)
-        self.run_button.setText("Running")
-        self.verify()
-        self.mount_sceneries(blocking=False)
-        self.running = True  # Set running state
-        self.update_status_bar("Running")
-        # Minimize window if hide setting is enabled
-        if self.cfg.general.hide:
-            self.showMinimized()
+        return issues
+
+    def _has_active_ui_jobs(self):
+        worker_maps = (
+            self.download_workers,
+            self.uninstall_workers,
+            self.add_seasons_workers,
+            self.restore_default_dsfs_workers,
+            getattr(self, "add_roughness_workers", {}),
+            getattr(self, "restore_roughness_workers", {}),
+        )
+        return (
+            any(bool(workers) for workers in worker_maps)
+            or self.add_seasons_current is not None
+            or (
+                self.cache_thread is not None
+                and self.cache_thread.isRunning()
+            )
+        )
+
+    def _set_runtime_state(self, state, message=None):
+        self.runtime_state = RuntimeState(state)
+        self.running = self.runtime_state == RuntimeState.RUNNING
+
+        labels = {
+            RuntimeState.STOPPED: ("Start Streaming", True),
+            RuntimeState.STARTING: ("Starting…", False),
+            RuntimeState.RUNNING: ("Stop Streaming", True),
+            RuntimeState.STOPPING: ("Stopping…", False),
+            RuntimeState.ERROR: ("Retry Streaming", True),
+        }
+        button_text, button_enabled = labels[self.runtime_state]
+        self.run_button.setText(button_text)
+        self.run_button.setEnabled(
+            button_enabled and not self._has_active_ui_jobs()
+        )
+
+        editable = self.runtime_state in (
+            RuntimeState.STOPPED,
+            RuntimeState.ERROR,
+        )
+        transitioning = self.runtime_state in (
+            RuntimeState.STARTING,
+            RuntimeState.STOPPING,
+        )
+
+        self.tabs.setTabEnabled(
+            self.tabs.indexOf(self.setup_widget),
+            not transitioning,
+        )
+        self.tabs.setTabEnabled(
+            self.tabs.indexOf(self.scenery_widget),
+            editable,
+        )
+        self.tabs.setTabEnabled(
+            self.tabs.indexOf(self.settings_widget),
+            editable,
+        )
+        self.save_button.setEnabled(not transitioning)
+
+        self.paths_group.setEnabled(editable)
+        self.showconfig_check.setEnabled(editable)
+        self.simheaven_compat_check.setEnabled(editable)
+        self.using_custom_tiles_check.setEnabled(editable)
+        self.maptype_combo.setEnabled(
+            self.runtime_state in (
+                RuntimeState.STOPPED,
+                RuntimeState.RUNNING,
+                RuntimeState.ERROR,
+            )
+        )
+        self.simbrief_group.setEnabled(not transitioning)
+        self._update_settings_actions()
+
+        if message:
+            self.update_status_bar(message)
+
+    def _start_mount_control(
+        self,
+        action,
+        *,
+        lingering_mounts=None,
+        stop_target=RuntimeState.STOPPED,
+    ):
+        if (
+            self.mount_control_worker is not None
+            and self.mount_control_worker.isRunning()
+        ):
+            return False
+
+        if action == "start":
+            self._set_runtime_state(
+                RuntimeState.STARTING,
+                "Starting scenery streaming…",
+            )
+        else:
+            self._stop_target_state = RuntimeState(stop_target)
+            self._set_runtime_state(
+                RuntimeState.STOPPING,
+                "Stopping scenery streaming…",
+            )
+
+        self.task_manager.create_task(
+            "mount-control",
+            TaskType.MOUNT,
+            (
+                "Start scenery streaming"
+                if action == "start"
+                else "Stop scenery streaming"
+            ),
+            stage=("Starting mounts" if action == "start" else "Unmounting"),
+            retry_callback=(
+                self.on_run
+                if action == "start"
+                else lambda: self._start_mount_control(
+                    "stop",
+                    stop_target=RuntimeState.ERROR,
+                )
+            ),
+        )
+
+        worker = MountControlWorker(
+            self,
+            action,
+            lingering_mounts=lingering_mounts,
+        )
+        worker.completed.connect(self._on_mount_control_completed)
+        worker.finished.connect(
+            lambda current=worker: self._on_mount_control_thread_finished(
+                current
+            )
+        )
+        self.mount_control_worker = worker
+        worker.start()
+        return True
+
+    def _on_mount_control_completed(self, action, success, message):
+        if success:
+            self.task_manager.complete_task(
+                "mount-control",
+                stage=message,
+            )
+        else:
+            self.task_manager.fail_task("mount-control", message)
+        if action == "start":
+            if success:
+                self._runtime_error_message = ""
+                self._restart_pending = False
+                self._set_runtime_state(RuntimeState.RUNNING, message)
+                self.mount_monitor_timer.start()
+            else:
+                self._close_after_stop = False
+                self._runtime_error_message = message
+                self._set_runtime_state(RuntimeState.ERROR, message)
+                self.display_error(
+                    f"AutoOrtho could not start streaming.\n\n{message}"
+                )
+            return
+
+        self.mount_monitor_timer.stop()
+        if success:
+            target = self._stop_target_state
+            target_message = (
+                self._runtime_error_message
+                if target == RuntimeState.ERROR
+                else message
+            )
+            self._set_runtime_state(target, target_message)
+            if self._close_after_stop:
+                self._close_after_stop = False
+                QTimer.singleShot(0, self.close)
+        else:
+            self._close_after_stop = False
+            self._runtime_error_message = message
+            self._set_runtime_state(RuntimeState.ERROR, message)
+            self.display_error(
+                f"AutoOrtho could not stop streaming cleanly.\n\n{message}"
+            )
+
+    def _on_mount_control_thread_finished(self, worker):
+        if self.mount_control_worker is worker:
+            self.mount_control_worker = None
+        worker.deleteLater()
+
+    def _check_mount_workers(self):
+        if self.runtime_state != RuntimeState.RUNNING:
+            return
+        handles = list(getattr(self, "mount_workers", []))
+        dead = [
+            handle for handle in handles
+            if handle.process.poll() is not None
+        ]
+        if handles and not dead:
+            return
+
+        self.mount_monitor_timer.stop()
+        if dead:
+            detail = (
+                f"Mount worker for {dead[0].mountpoint} exited with "
+                f"code {dead[0].process.poll()}."
+            )
+        else:
+            detail = "No active mount workers remain."
+        self._runtime_error_message = detail
+        self._start_mount_control(
+            "stop",
+            stop_target=RuntimeState.ERROR,
+        )
+
+    def _request_stop_streaming(self, stop_target=RuntimeState.STOPPED):
+        if self.runtime_state != RuntimeState.RUNNING:
+            return
+        self._start_mount_control("stop", stop_target=stop_target)
+
+    def on_run(self):
+        """Start or stop scenery streaming based on current runtime state."""
+        if self.runtime_state == RuntimeState.RUNNING:
+            self._request_stop_streaming()
+            return
+        if self.runtime_state not in (
+            RuntimeState.STOPPED,
+            RuntimeState.ERROR,
+        ):
+            return
+        if not self._resolve_pending_settings(for_start=True):
+            self.update_status_bar("Start cancelled.")
+            return
+        readiness = self._run_readiness_checks()
+        if not readiness.can_finish:
+            blocking = [
+                check for check in readiness.checks
+                if check.status != ReadinessStatus.SUCCESS
+            ]
+            self.tabs.setCurrentWidget(
+                self.scenery_widget
+                if any(check.id == "setup-scenery" for check in blocking)
+                else self.setup_widget
+            )
+            QMessageBox.warning(
+                self,
+                "AutoOrtho Is Not Ready",
+                "\n".join(
+                    f"• {check.title}: {check.message}"
+                    for check in blocking
+                ),
+            )
+            self.update_status_bar(
+                "Streaming blocked: complete the readiness checks."
+            )
+            return
+        if self._has_active_ui_jobs():
+            QMessageBox.warning(
+                self,
+                "Operation In Progress",
+                "Wait for active scenery or cache operations to finish before "
+                "starting streaming.",
+            )
+            return
+        if not self.verify():
+            self.update_status_bar(
+                "Streaming blocked: correct the highlighted configuration."
+            )
+            return
+
+        directory_issues = self._prepare_runtime_directories()
+        if directory_issues:
+            self._show_validation_issues(directory_issues)
+            self.update_status_bar(
+                "Streaming blocked: required folders could not be created."
+            )
+            return
+
+        lingering_mounts = self.preflight_mount_check_and_prompt()
+        if lingering_mounts is None:
+            self.update_status_bar("Start cancelled.")
+            return
+
+        self._start_mount_control(
+            "start",
+            lingering_mounts=lingering_mounts,
+        )
 
     def _on_maptype_combo_changed(self, text):
         """Show the Switch button when maptype is changed while running."""
@@ -5155,9 +6504,10 @@ class ConfigUI(QMainWindow):
         """Apply the new maptype to all live TileCacher instances."""
         import platform
 
+        if self.settings_session.dirty and not self.on_save():
+            return
         new_maptype = self.maptype_combo.currentText()
         self.cfg.autoortho.maptype_override = new_maptype
-        self.cfg.save()
 
         if hasattr(self, 'mac_os_procs') and self.mac_os_procs:
             # TileCachers live in mount worker processes on all platforms.
@@ -5209,7 +6559,24 @@ class ConfigUI(QMainWindow):
         self.update_status_bar(f"Map type switched to {new_maptype}")
 
     def on_save(self):
-        """Handle Save button click"""
+        """Validate and apply the current settings session."""
+        restart_required = self.settings_session.restart_required
+        issues = validate_configuration(
+            self._current_configuration_input(),
+            scenery_mounts=self.cfg.scenery_mounts,
+            require_installed_scenery=False,
+        )
+        errors = [
+            issue for issue in issues
+            if issue.severity == ValidationSeverity.ERROR
+        ]
+        if errors:
+            self._show_validation_issues(errors)
+            self.update_status_bar(
+                "Save blocked: correct the highlighted configuration."
+            )
+            return False
+
         # Check if the directory exists
         scenery_path = self.scenery_path_edit.text()
         if not os.path.isdir(scenery_path):
@@ -5221,40 +6588,62 @@ class ConfigUI(QMainWindow):
                 QMessageBox.StandardButton.Yes
             )
             if reply == QMessageBox.StandardButton.No:
-                self.update_status_bar("Save cancelled.")
-                return
+                self.update_status_bar("Apply cancelled.")
+                return False
+        directory_issues = self._prepare_runtime_directories()
+        if directory_issues:
+            self._show_validation_issues(directory_issues)
+            self.update_status_bar(
+                "Apply blocked: required folders could not be created."
+            )
+            return False
         # Check if program is already running
         if self.running:
             reply = QMessageBox.question(
                 self,
-                "Save Settings While Running",
-                "AutoOrtho Injection is already running. Some settings may not take effect until you restart AutoOrtho.\n\n"
-                "Do you want to save the settings anyway?",
+                "Apply Settings While Running",
+                "Some settings will not take effect until streaming is "
+                "restarted.\n\nApply the settings anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes
             )
             
             if reply == QMessageBox.StandardButton.No:
-                self.update_status_bar("Save cancelled")
-                return
+                self.update_status_bar("Apply cancelled")
+                return False
         
         self.save_config()
-        # Note: cfg.load() removed - save_config() already saves to disk and updates cfg object
-        # The redundant load() was creating a race condition window where defaults could be exposed
         self.refresh_scenery_list()
+        snapshot = self._snapshot_settings()
+        self.settings_session.mark_applied(snapshot)
+        self._restart_pending = bool(self.running and restart_required)
+        self._update_settings_actions()
 
-        
-        if self.running:
-            self.update_status_bar("Configuration saved - some changes may require restart")
+        if self._restart_pending:
+            self.update_status_bar(
+                "Configuration applied — restart streaming to apply all changes."
+            )
             QMessageBox.information(
                 self,
-                "Settings Saved",
-                "Settings have been saved. Some changes may not take effect until you restart AutoOrtho."
+                "Settings Applied",
+                "Settings were saved. Restart streaming to apply all changes.",
             )
         else:
-            self.update_status_bar("Configuration saved")
+            self.update_status_bar("Configuration applied")
+        return True
 
     def on_delete_cache(self):
+        reply = QMessageBox.question(
+            self,
+            "Delete Entire Cache?",
+            "Delete all cached imagery?\n\n"
+            f"Cache location:\n{self.cfg.paths.cache_dir}\n\n"
+            "AutoOrtho will need to download this imagery again.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
         self.on_clean_cache(delete_all=True)
 
     def on_clean_jpegs(self):
@@ -5269,66 +6658,134 @@ class ConfigUI(QMainWindow):
 
         self.update_status_bar("Cleaning JPEG files...")
         self._set_cache_buttons_enabled(False)
-
-        # Run in separate thread
-        self.cache_thread = QThread()
-        self.cache_thread.run = lambda: self.clean_jpegs_only(self.cfg.paths.cache_dir)
-        self.cache_thread.finished.connect(self.on_jpegs_cleaned)
-        self.cache_thread.start()
+        worker = CacheCleanupWorker(self, "jpeg")
+        self.task_manager.create_task(
+            "cache-cleanup",
+            TaskType.CACHE,
+            "Clean JPEG cache",
+            stage="Scanning cache",
+            cancellable=True,
+            cancel_callback=worker.cancel,
+            retry_callback=self.on_clean_jpegs,
+        )
+        worker.progress.connect(self._on_cache_cleanup_progress)
+        worker.completed.connect(
+            lambda success, message, cancelled: (
+                self._on_cache_cleanup_completed(
+                    success,
+                    message,
+                    cancelled,
+                    False,
+                )
+            )
+        )
+        worker.finished.connect(
+            lambda current=worker: self._on_cache_cleanup_thread_finished(
+                current
+            )
+        )
+        self.cache_thread = worker
+        worker.start()
 
     def on_jpegs_cleaned(self):
-        """Called when JPEG cleaning is complete"""
-        try:
-            self._set_cache_buttons_enabled(True)
-            QMessageBox.information(
-                self, "JPEG Files Cleaned", "JPEG file cleaning completed!"
-            )
-        finally:
-            # Clean up the thread reference
-            if self.cache_thread is not None:
-                try:
-                    self.cache_thread.quit()
-                except Exception:
-                    pass
-                try:
-                    self.cache_thread.wait()
-                except Exception:
-                    pass
-                try:
-                    self.cache_thread.deleteLater()
-                except Exception:
-                    pass
-                self.cache_thread = None
+        """Compatibility callback for older integrations."""
+        self._on_cache_cleanup_completed(
+            True,
+            "JPEG file cleaning completed.",
+            False,
+            False,
+        )
 
     def on_clean_cache(self, for_exit=False, delete_all=False):
-        """Handle Clean Cache button click
-
-        Args:
-            for_exit (bool): When True, invoked from closeEvent - suppress dialogs
-                             and allow closeEvent to wait on the thread.
-            delete_all (bool) : When True, all files in the cache should be deleted.
-        """
-
+        """Clean cached imagery without blocking the UI."""
         if self.running:
             QMessageBox.warning(
                 self,
                 "Cannot clean cache while running",
-                "Cannot clean cache while AutoOrtho injection is running. Please stop AutoOrtho and try again."
+                "Stop scenery streaming before cleaning the cache.",
             )
             return
 
         self._closing = for_exit
         self.update_status_bar("Cleaning cache...")
         self._set_cache_buttons_enabled(False)
-
-        # Run in separate thread and keep reference so we can wait on exit
-        self.cache_thread = QThread()
-        self.cache_thread.run = lambda: self.clean_cache(
-            self.cfg.paths.cache_dir,
-            int(self.file_cache_slider.value() if not delete_all else 0)
+        target_size = int(
+            self.file_cache_slider.value() if not delete_all else 0
         )
-        self.cache_thread.finished.connect(lambda: self.on_cache_cleaned(for_exit))
-        self.cache_thread.start()
+        worker = CacheCleanupWorker(self, "all", target_size)
+        self.task_manager.create_task(
+            "cache-cleanup",
+            TaskType.CACHE,
+            "Delete cache" if delete_all else "Clean cache",
+            stage="Scanning cache",
+            cancellable=not delete_all,
+            cancel_callback=(worker.cancel if not delete_all else None),
+            retry_callback=lambda: self.on_clean_cache(
+                delete_all=delete_all
+            ),
+        )
+        worker.progress.connect(self._on_cache_cleanup_progress)
+        worker.completed.connect(
+            lambda success, message, cancelled: (
+                self._on_cache_cleanup_completed(
+                    success,
+                    message,
+                    cancelled,
+                    for_exit,
+                )
+            )
+        )
+        worker.finished.connect(
+            lambda current=worker: self._on_cache_cleanup_thread_finished(
+                current
+            )
+        )
+        self.cache_thread = worker
+        worker.start()
+
+    def _on_cache_cleanup_progress(self, message):
+        self.update_status_bar(message)
+        self.task_manager.update_task(
+            "cache-cleanup",
+            stage=message,
+        )
+
+    def _on_cache_cleanup_completed(
+        self,
+        success,
+        message,
+        cancelled,
+        for_exit,
+    ):
+        self._set_cache_buttons_enabled(True)
+        if cancelled:
+            self.task_manager.mark_cancelled("cache-cleanup")
+        elif success:
+            self.task_manager.complete_task(
+                "cache-cleanup",
+                stage=message or "Cache cleaned",
+            )
+            if not for_exit:
+                QMessageBox.information(
+                    self,
+                    "Cache Cleaned",
+                    message or "Cache cleaning completed.",
+                )
+        else:
+            self.task_manager.fail_task("cache-cleanup", message)
+            if not for_exit:
+                self.display_error(f"Cache cleanup failed:\n{message}")
+        self._cache_finalize_pending = for_exit
+        if not for_exit:
+            self._start_storage_scan()
+
+    def _on_cache_cleanup_thread_finished(self, worker):
+        if self.cache_thread is worker:
+            self.cache_thread = None
+        worker.deleteLater()
+        if getattr(self, "_cache_finalize_pending", False):
+            self._cache_finalize_pending = False
+            QTimer.singleShot(0, self._finalize_shutdown)
 
     def _set_cache_buttons_enabled(self, enabled):
         """Enable or disable all cache-related buttons"""
@@ -5337,36 +6794,83 @@ class ConfigUI(QMainWindow):
                 getattr(self, btn_name).setEnabled(enabled)
 
     def on_cache_cleaned(self, for_exit=False):
-        """Called when cache cleaning is complete"""
-        try:
-            self._set_cache_buttons_enabled(True)
-            if not for_exit:
-                QMessageBox.information(
-                    self, "Cache Cleaned", "Cache cleaning completed!"
-                )
-        finally:
-            # Clean up the thread reference
-            if self.cache_thread is not None:
-                try:
-                    self.cache_thread.quit()
-                except Exception:
-                    pass
-                try:
-                    self.cache_thread.wait()
-                except Exception:
-                    pass
-                try:
-                    self.cache_thread.deleteLater()
-                except Exception:
-                    pass
-                self.cache_thread = None
-            # If invoked during shutdown, finalize closing without blocking UI
-            if for_exit:
-                from PySide6.QtCore import QTimer
-                QTimer.singleShot(0, self._finalize_shutdown)
+        """Compatibility callback for older integrations."""
+        self._on_cache_cleanup_completed(
+            True,
+            "Cache cleaning completed.",
+            False,
+            for_exit,
+        )
 
-    def on_install_scenery(self, region_id):
+    def on_install_scenery(self, region_id, skip_confirmation=False):
         """Handle scenery installation"""
+        storage_issues = [
+            issue for issue in validate_configuration(
+                self._current_configuration_input(),
+                require_installed_scenery=False,
+            )
+            if issue.field in ("scenery_path", "download_dir")
+            and issue.severity == ValidationSeverity.ERROR
+        ]
+        if storage_issues:
+            self._show_validation_issues(storage_issues)
+            return
+        region = self.dl.regions.get(region_id)
+        if region is None:
+            self.display_error(
+                f"Scenery region {region_id} is no longer available."
+            )
+            return
+        latest = region.get_latest_release()
+        latest.parse()
+        size_bytes = int(getattr(latest, "totalsize", 0) or 0)
+        temporary_required, final_required = (
+            package_storage_requirements(
+                size_bytes,
+                safety_margin_gb=float(
+                    getattr(
+                        self.cfg.scenery,
+                        "storage_safety_margin_gb",
+                        2,
+                    )
+                ),
+            )
+        )
+        destination = self.cfg.paths.scenery_path
+        download_free = free_space_bytes(self.cfg.paths.download_dir)
+        scenery_free = free_space_bytes(destination)
+        if (
+            download_free < temporary_required
+            or scenery_free < final_required
+        ):
+            QMessageBox.critical(
+                self,
+                "Not Enough Disk Space",
+                f"{latest.name} needs approximately:\n\n"
+                f"Temporary download space: "
+                f"{format_bytes(temporary_required)} "
+                f"(available {format_bytes(download_free)})\n"
+                f"Final scenery space: {format_bytes(final_required)} "
+                f"(available {format_bytes(scenery_free)})",
+            )
+            return
+
+        if not skip_confirmation:
+            reply = QMessageBox.question(
+                self,
+                "Install Scenery?",
+                f"Install {latest.name} version {latest.ver}?\n\n"
+                f"Download size: {format_bytes(size_bytes)}\n"
+                f"Temporary space required: "
+                f"{format_bytes(temporary_required)}\n"
+                f"Final space required: {format_bytes(final_required)}\n"
+                f"Destination:\n{destination}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         button = self.findChild(QPushButton, f"scenery-{region_id}")
         progress_current = self.findChild(QProgressBar, f"progress-current-{region_id}")
         progress_overall = self.findChild(QProgressBar, f"progress-overall-{region_id}")
@@ -5379,6 +6883,19 @@ class ConfigUI(QMainWindow):
             progress_current.setVisible(True)
         if progress_overall:
             progress_overall.setVisible(True)
+
+        task = self.task_manager.create_task(
+            f"scenery-install:{region_id}",
+            TaskType.SCENERY_INSTALL,
+            "Install scenery",
+            package=latest.name,
+            stage="Downloading",
+            retry_callback=lambda rid=region_id: self.on_install_scenery(
+                rid,
+                skip_confirmation=True,
+            ),
+        )
+        task.bytes_total = size_bytes
 
         # Create worker thread
         worker = SceneryDownloadWorker(
@@ -5412,6 +6929,16 @@ class ConfigUI(QMainWindow):
             # Avoid duplicates in queue
             if region_id not in self.add_seasons_queue:
                 self.add_seasons_queue.append(region_id)
+                self.task_manager.create_task(
+                    f"seasons:{region_id}",
+                    TaskType.SEASONS,
+                    "Apply native seasons",
+                    package=region_id,
+                    stage="Queued",
+                    retry_callback=lambda rid=region_id, status=seasons_status: (
+                        self.on_add_seasons(rid, status)
+                    ),
+                )
                 try:
                     button.setEnabled(False)
                     button.setText("Queued for seasons…")
@@ -5424,6 +6951,10 @@ class ConfigUI(QMainWindow):
 
     def on_add_seasons_error(self, region_id, error_msg):
         """Handle add seasons error"""
+        self.task_manager.fail_task(
+            f"seasons:{region_id}",
+            error_msg,
+        )
         self.show_error.emit(f"Failed to add seasons to {region_id}:\n{error_msg}")
         # Ensure current is cleared so queue can progress
         try:
@@ -5442,14 +6973,24 @@ class ConfigUI(QMainWindow):
 
         if success:
             self.update_status_bar(f"Successfully added seasons to {region_id}")
-            button.setText("Scenery Options")
         else:
             self.update_status_bar(f"Failed to add seasons to {region_id}")
-            button.setText("Scenery Options")
 
         dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if dsf_progress_bar:
             dsf_progress_bar.setVisible(False)
+        task_id = f"seasons:{region_id}"
+        task = self.task_manager.task(task_id)
+        if success:
+            self.task_manager.complete_task(
+                task_id,
+                stage="Seasons applied",
+            )
+        elif task is not None and task.state != TaskState.FAILED:
+            self.task_manager.fail_task(
+                task_id,
+                f"Failed to apply seasons to {region_id}.",
+            )
 
         # Clean up worker
         if region_id in self.add_seasons_workers:
@@ -5490,12 +7031,8 @@ class ConfigUI(QMainWindow):
                     pass
             else:
                 if hasattr(self, 'run_button') and not self.running:
-                    self.run_button.setEnabled(True)
                     self.run_button.setToolTip("")
-                    try:
-                        self.run_button.setText("Run")
-                    except Exception:
-                        pass
+                    self._set_runtime_state(self.runtime_state)
                 # Re-enable Scenery Options buttons when idle
                 try:
                     for rid in getattr(self, 'installed_package_names', []):
@@ -5521,6 +7058,17 @@ class ConfigUI(QMainWindow):
     def _start_add_seasons_job(self, region_id):
         """Internal helper to begin processing a single add-seasons job for region_id."""
         try:
+            task = self.task_manager.create_task(
+                f"seasons:{region_id}",
+                TaskType.SEASONS,
+                "Apply native seasons",
+                package=region_id,
+                stage="Preparing",
+                retry_callback=lambda rid=region_id: (
+                    self._start_add_seasons_job(rid)
+                ),
+            )
+            self.task_manager.update_task(task.id, stage="Converting files")
             button = self.findChild(QPushButton, f"scenery-options-{region_id}")
             if button:
                 button.setEnabled(False)
@@ -5565,6 +7113,11 @@ class ConfigUI(QMainWindow):
 
     def on_add_seasons_progress(self, region_id, progress_data):
         """Handle add seasons progress"""
+        self.task_manager.update_task(
+            f"seasons:{region_id}",
+            stage=progress_data.get("status", "Converting files"),
+            progress=float(progress_data.get("pcnt_done", 0) or 0),
+        )
 
         dsf_progress_bar = self.findChild(QProgressBar, f"dsf-progress-bar-{region_id}")
         if dsf_progress_bar:
@@ -5608,6 +7161,10 @@ class ConfigUI(QMainWindow):
 
     def on_uninstall_error(self, region_id, error_msg):
         """Handle uninstall error"""
+        self.task_manager.fail_task(
+            f"scenery-uninstall:{region_id}",
+            error_msg,
+        )
         self.show_error.emit(f"Failed to uninstall {region_id}:\n{error_msg}")
         self.on_uninstall_finished(region_id, False)
 
@@ -5618,12 +7175,26 @@ class ConfigUI(QMainWindow):
             button.setEnabled(True)
 
         if success:
+            self.task_manager.complete_task(
+                f"scenery-uninstall:{region_id}",
+                stage="Uninstalled",
+            )
             self.update_status_bar(f"Successfully uninstalled {region_id}")
             self.refresh_scenery_list()
-            button.setText("Uninstalled")
+            if button:
+                button.setText("Uninstalled")
         else:
+            task = self.task_manager.task(
+                f"scenery-uninstall:{region_id}"
+            )
+            if task is not None and task.state != TaskState.FAILED:
+                self.task_manager.fail_task(
+                    task.id,
+                    f"Failed to uninstall {region_id}.",
+                )
             self.update_status_bar(f"Failed to uninstall {region_id}")
-            button.setText("Uninstall")
+            if button:
+                button.setText("Uninstall")
 
         # Clean up worker
         if region_id in self.uninstall_workers:
@@ -5671,7 +7242,15 @@ class ConfigUI(QMainWindow):
         progress_overall = self.findChild(QProgressBar, f"progress-overall-{region_id}")
 
         stage = progress_data.get('stage')
+        task_id = f"scenery-install:{region_id}"
         if stage == 'verify':
+            verify_progress = float(progress_data.get('verify_pcnt', 0) or 0)
+            self.task_manager.update_task(
+                task_id,
+                stage=progress_data.get("status", "Installing"),
+                progress=verify_progress,
+                cancellable=False,
+            )
             if progress_current:
                 progress_current.setVisible(False)
             if progress_overall:
@@ -5696,6 +7275,18 @@ class ConfigUI(QMainWindow):
                 progress_overall.setValue(int(overall_pcnt))
 
             status = progress_data.get('status', 'Downloading...')
+            task = self.task_manager.task(task_id)
+            overall = float(overall_pcnt)
+            total_bytes = task.bytes_total if task is not None else 0
+            self.task_manager.update_task(
+                task_id,
+                stage=status,
+                progress=overall,
+                bytes_completed=int(total_bytes * overall / 100.0),
+                rate=float(
+                    progress_data.get("aggregate_MBps", 0) or 0
+                ) * 1024 * 1024,
+            )
             self.update_status_bar(f"{region_id}: {status}")
         else:
             # Legacy per-file progress (single-threaded fallback)
@@ -5719,6 +7310,17 @@ class ConfigUI(QMainWindow):
             MBps = progress_data.get('MBps', 0)
             status = progress_data.get('status', 'Downloading...')
             if pcnt_done > 0:
+                task = self.task_manager.task(task_id)
+                total_bytes = task.bytes_total if task is not None else 0
+                self.task_manager.update_task(
+                    task_id,
+                    stage=status,
+                    progress=float(overall_pcnt or pcnt_done),
+                    bytes_completed=int(
+                        total_bytes * float(overall_pcnt or pcnt_done) / 100.0
+                    ),
+                    rate=float(MBps or 0) * 1024 * 1024,
+                )
                 self.update_status_bar(
                     f"{region_id}: {pcnt_done:.1f}% ({MBps:.1f} MB/s)"
                 )
@@ -5732,6 +7334,10 @@ class ConfigUI(QMainWindow):
         progress_overall = self.findChild(QProgressBar, f"progress-overall-{region_id}")
 
         if success:
+            self.task_manager.complete_task(
+                f"scenery-install:{region_id}",
+                stage="Installed",
+            )
             if button:
                 button.setVisible(False)
             if progress_current:
@@ -5742,6 +7348,14 @@ class ConfigUI(QMainWindow):
             # Refresh the scenery list
             self.refresh_scenery_list()
         else:
+            task = self.task_manager.task(
+                f"scenery-install:{region_id}"
+            )
+            if task is not None and task.state != TaskState.FAILED:
+                self.task_manager.fail_task(
+                    task.id,
+                    f"Failed to install {region_id}.",
+                )
             if button:
                 button.setText("Retry?")
                 button.setEnabled(True)
@@ -5757,11 +7371,15 @@ class ConfigUI(QMainWindow):
 
     def on_download_error(self, region_id, error_msg):
         """Handle download error"""
+        self.task_manager.fail_task(
+            f"scenery-install:{region_id}",
+            error_msg,
+        )
         self.show_error.emit(f"Failed to install {region_id}:\n{error_msg}")
         self.on_download_finished(region_id, False)
 
-    def save_config(self):
-        """Save configuration from UI to config object"""
+    def save_config(self, persist=True, refresh_scenery=True):
+        """Copy UI values to config, optionally persisting them to disk."""
         self.ready.clear()
 
         # Save paths
@@ -5899,6 +7517,9 @@ class ConfigUI(QMainWindow):
             self.cfg.scenery.noclean = self.noclean_check.isChecked()
             self.dl.noclean = self.cfg.scenery.noclean
             self.cfg.scenery.max_download_workers = self.max_download_workers_spin.value()
+            self.cfg.scenery.storage_safety_margin_gb = str(
+                self.storage_safety_margin_spin.value()
+            )
 
             # FUSE settings
             self.cfg.fuse.threading = self.threading_check.isChecked()
@@ -5937,98 +7558,116 @@ class ConfigUI(QMainWindow):
             if hasattr(self, 'simbrief_use_flight_data_check'):
                 self.cfg.simbrief.use_flight_data = self.simbrief_use_flight_data_check.isChecked()
 
-        self.cfg.save()
+        if persist:
+            self.cfg.save()
+            self.cfg.get_config()
+        else:
+            self.cfg.set_config()
+            self.cfg.refresh_derived_paths(create_missing=False)
         self.ready.set()
-        self.refresh_scenery()
+        if refresh_scenery:
+            self.refresh_scenery()
 
     def preflight_mount_check_and_prompt(self):
-        """Detect lingering mounts and prompt user to unmount/clean.
+        """Confirm cleanup of lingering mounts without blocking the UI."""
+        lingering = []
+        for scenery in self.cfg.scenery_mounts:
+            mount = scenery.get("mount")
+            if mount and safe_ismount(mount):
+                lingering.append(mount)
+        if not lingering:
+            return []
 
-        Returns True if it's OK to proceed with Run, False if user cancels.
-        """
-        try:
-            lingering = []
-            for scenery in self.cfg.scenery_mounts:
-                mount = scenery.get('mount')
-                if not mount:
-                    continue
-                if safe_ismount(mount):
-                    lingering.append(mount)
-            if not lingering:
-                return True
+        msg = (
+            "Previous AutoOrtho mounts are still active:\n\n"
+            + "\n".join(lingering)
+            + "\n\nStop these mounts before starting?"
+        )
+        reply = QMessageBox.question(
+            self,
+            "Existing Mounts Detected",
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return None
+        return lingering
 
-            msg = (
-                "Previous AutoOrtho mounts are still active:\n\n"
-                + "\n".join(lingering)
-                + "\n\nDo you want AutoOrtho to unmount them now?"
-            )
-            reply = QMessageBox.question(
-                self,
-                "Existing Mounts Detected",
-                msg,
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return False
+    def cleanup_lingering_mounts(self, lingering):
+        """Unmount stale mountpoints from the mount-control worker thread."""
+        import subprocess as _sp
 
-            import subprocess as _sp
-            for scenery in self.cfg.scenery_mounts:
-                mount = scenery.get('mount')
-                if not mount:
-                    continue
-                if safe_ismount(mount):
+        for mount in lingering:
+            if safe_ismount(mount):
+                if system_type == "darwin":
+                    _sp.run(
+                        ["diskutil", "unmount", "force", mount],
+                        check=False,
+                        stdout=_sp.DEVNULL,
+                        stderr=_sp.DEVNULL,
+                    )
+                elif system_type == "linux":
+                    command = (
+                        ["fusermount", "-u", "-z", mount]
+                        if shutil.which("fusermount")
+                        else ["umount", "-l", mount]
+                    )
+                    _sp.run(
+                        command,
+                        check=False,
+                        stdout=_sp.DEVNULL,
+                        stderr=_sp.DEVNULL,
+                    )
+                elif system_type == "windows":
                     try:
-                        if system_type == 'darwin':
-                            _sp.run(["diskutil", "unmount", "force", mount],
-                                    check=False, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                        elif system_type == 'linux':
-                            if shutil.which("fusermount"):
-                                _sp.run(["fusermount", "-u", "-z", mount],
-                                        check=False, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                            else:
-                                _sp.run(["umount", "-l", mount],
-                                        check=False, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                    except Exception as exc:
-                        log.warning(f"Force unmount attempt failed for {mount}: {exc}")
-                if not safe_ismount(mount):
-                    try:
-                        cleanup_mountpoint(mount)
-                        log.info(f"Cleaned up mountpoint: {mount}")
-                    except Exception as exc:
-                        log.error(f"Failed to cleanup mountpoint: {mount}: {exc}")
+                        from autoortho import winsetup
+                    except ImportError:
+                        import winsetup
+                    winsetup.force_unmount(mount)
 
-            # Brief wait loop for unmount completion
-            import time as _time
-            deadline = _time.time() + 10
-            while _time.time() < deadline:
-                if not any(safe_ismount(x) for x in lingering):
-                    break
-                _time.sleep(0.3)
-            if any(safe_ismount(x) for x in lingering):
-                QMessageBox.warning(
-                    self,
-                    "Unmount Incomplete",
-                    "Some mounts could not be unmounted automatically.\n"
-                    "Please remove the z_ao_<scenery_name> directories from your Custom Scenery directory manually and run AutoOrtho again."
-                )
-            else:
-                log.info("All mounts cleaned up successfully")
-            return True
-        except Exception:
-            return True
+            if not safe_ismount(mount):
+                cleanup_mountpoint(mount)
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not any(safe_ismount(path) for path in lingering):
+                log.info("All lingering mounts cleaned up successfully")
+                return
+            time.sleep(0.3)
+
+        remaining = [
+            path for path in lingering if safe_ismount(path)
+        ]
+        raise RuntimeError(
+            "These mounts could not be stopped automatically:\n"
+            + "\n".join(remaining)
+        )
 
     def on_using_custom_tiles_check(self, state):
         """Handle using custom tiles check"""
+        snapshot = (
+            self._snapshot_settings()
+            if self._settings_tracking_ready
+            else None
+        )
         if not state: 
             if self.cfg.autoortho.using_custom_tiles and int(self.cfg.autoortho.max_zoom) > 17:
                 log.info("Max zoom being capped to 17 after custom tiles disabled")
                 self.cfg.autoortho.max_zoom = 17
+                if snapshot is not None:
+                    snapshot["max_zoom_slider"] = min(
+                        17,
+                        int(snapshot.get("max_zoom_slider", 17)),
+                    )
             self.cfg.autoortho.using_custom_tiles = False
         else:
             self.cfg.autoortho.using_custom_tiles = True
 
         self.refresh_settings_tab()
+        if snapshot is not None:
+            self._restore_settings_snapshot(snapshot)
+            self.settings_session.observe(self._snapshot_settings())
         self._update_buffer_pool_label()
 
     def apply_simheaven_compat(self, use_simheaven_overlay=False):
@@ -6168,21 +7807,37 @@ class ConfigUI(QMainWindow):
         """Start background update check against GitHub releases"""
         try:
             self._update_worker = UpdateCheckWorker()
+            self.task_manager.create_task(
+                "update-check",
+                TaskType.UPDATE,
+                "Check for AutoOrtho updates",
+                stage="Contacting GitHub",
+                cancellable=True,
+                cancel_callback=self._update_worker.cancel,
+                retry_callback=self.start_update_check,
+            )
             self._update_worker.result.connect(self.on_update_check_result)
-            self._update_worker.error.connect(lambda e: None)
+            self._update_worker.error.connect(self.on_update_check_error)
+            self._update_worker.finished.connect(
+                self.on_update_check_finished
+            )
             self._update_worker.start()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.exception("Failed to start update check")
+            self.task_manager.fail_task("update-check", str(exc))
 
     def on_update_check_result(self, data):
         """Handle result from update check worker"""
+        self.task_manager.complete_task(
+            "update-check",
+            stage=("Update available" if data else "Up to date"),
+        )
         try:
             if not data:
                 return
             latest_tag, html_url = data
-            from version import __version__ as current_version
             latest_ver = self._parse_version(latest_tag)
-            current_ver = self._parse_version(current_version)
+            current_ver = self._parse_version(__version__)
             if latest_ver is None or current_ver is None:
                 return
             if latest_ver > current_ver:
@@ -6199,7 +7854,15 @@ class ConfigUI(QMainWindow):
                     except Exception:
                         pass
         except Exception:
-            pass
+            log.exception("Failed to process update check result")
+
+    def on_update_check_error(self, error):
+        self.task_manager.fail_task("update-check", error)
+
+    def on_update_check_finished(self):
+        task = self.task_manager.task("update-check")
+        if task is not None and task.state == TaskState.CANCELLING:
+            self.task_manager.mark_cancelled("update-check")
 
 
     def update_status_bar(self, message):
@@ -6216,47 +7879,57 @@ class ConfigUI(QMainWindow):
         QMessageBox.critical(self, "Error", message)
 
     def verify(self):
-        """Verify configuration"""
-        self._check_xplane_dir(self.cfg.paths.xplane_path)
-        for scenery in self.cfg.scenery_mounts:
-            self._check_ortho_dir(scenery.get('root'))
+        """Validate current form values without saving or exiting."""
+        self.warnings = []
+        self.errors = []
+        issues = validate_configuration(
+            self._current_configuration_input(),
+            scenery_mounts=self.cfg.scenery_mounts,
+            require_installed_scenery=True,
+        )
+        self.warnings = [
+            issue.message for issue in issues
+            if issue.severity == ValidationSeverity.WARNING
+        ]
+        self.errors = [
+            issue.message for issue in issues
+            if issue.severity == ValidationSeverity.ERROR
+        ]
 
-        if not self.cfg.scenery_mounts:
-            self.errors.append("No installed scenery detected!")
+        for warning in self.warnings:
+            log.warning(warning)
+        for error in self.errors:
+            log.error(error)
 
-        msg = []
+        self._show_validation_issues(issues)
+        if self.errors:
+            return False
         if self.warnings:
-            msg.append("WARNINGS:")
-            msg.extend(self.warnings)
-            msg.append("\n")
+            reply = QMessageBox.question(
+                self,
+                "Configuration Warnings",
+                "\n".join(f"• {warning}" for warning in self.warnings)
+                + "\n\nStart streaming anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return reply == QMessageBox.StandardButton.Yes
+        return True
 
-        for warn in self.warnings:
-            log.warning(warn)
-
-        if self.errors:
-            msg.append("ERRORS:")
-            msg.extend(self.errors)
-            msg.append("\nWILL EXIT DUE TO ERRORS")
-
-        for err in self.errors:
-            log.error(err)
-
-        if msg:
-            if self.cfg.general.gui:
-                QMessageBox.warning(
-                    self, "Configuration Issues", "\n".join(msg)
-                )
-
-        if self.errors:
-            log.error("ERRORS DETECTED. Exiting.")
-            sys.exit(1)
-
-    def clean_cache(self, cache_dir, size_gb):
+    def clean_cache(
+        self,
+        cache_dir,
+        size_gb,
+        *,
+        cancel_event=None,
+        progress_callback=None,
+    ):
         """Clean cache with 2-phase deletion order:
         1. JPEGs (always delete all)
         2. Dynamic DDS (LRU eviction if still over budget)
         """
-        self.status_update.emit(
+        emit_progress = progress_callback or self.status_update.emit
+        emit_progress(
             f"Cleaning up cache_dir {cache_dir}. Please wait..."
         )
 
@@ -6266,20 +7939,24 @@ class ConfigUI(QMainWindow):
             # --- Phase 1: JPEGs ---
             jpeg_count = 0
             for entry in os.scandir(cache_dir):
+                if cancel_event is not None and cancel_event.is_set():
+                    return True, "Cache cleanup cancelled safely.", True
                 if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg')):
                     try:
                         os.remove(entry.path)
                         jpeg_count += 1
                     except OSError:
                         pass
-            self.status_update.emit(f"Phase 1: Deleted {jpeg_count} JPEG files.")
+            emit_progress(f"Phase 1: Deleted {jpeg_count} JPEG files.")
 
             # --- Phase 2: DDS cache (LRU, only if still over target) ---
             dds_root = os.path.join(cache_dir, "dds_cache")
+            if cancel_event is not None and cancel_event.is_set():
+                return True, "Cache cleanup cancelled safely.", True
             if size_gb == 0:
                 if os.path.isdir(dds_root):
                     shutil.rmtree(dds_root, ignore_errors=True)
-                    self.status_update.emit("Phase 2: Deleted all DDS cache files.")
+                    emit_progress("Phase 2: Deleted all DDS cache files.")
             else:
                 try:
                     from autoortho.getortho import dynamic_dds_cache
@@ -6291,38 +7968,51 @@ class ConfigUI(QMainWindow):
                     if usage > remaining_budget:
                         excess = usage - int(remaining_budget * 0.9)
                         freed = dynamic_dds_cache.evict_lru(excess)
-                        self.status_update.emit(
+                        emit_progress(
                             f"Phase 2: Evicted {freed // (1024*1024)} MB from DDS cache.")
                     else:
-                        self.status_update.emit("Phase 2: DDS cache within budget.")
+                        emit_progress("Phase 2: DDS cache within budget.")
                 else:
-                    self.status_update.emit("Phase 2: DDS cache not initialized, skipping.")
+                    emit_progress("Phase 2: DDS cache not initialized, skipping.")
 
-            self.status_update.emit("Cache cleanup done.")
+            emit_progress("Cache cleanup done.")
+            return True, "Cache cleaning completed.", False
         except Exception as e:
-            self.status_update.emit(f"Cache cleanup error: {str(e)}")
+            emit_progress(f"Cache cleanup error: {str(e)}")
+            return False, str(e), False
 
-    def clean_jpegs_only(self, cache_dir):
+    def clean_jpegs_only(
+        self,
+        cache_dir,
+        *,
+        cancel_event=None,
+        progress_callback=None,
+    ):
         """Clean only JPEG files from cache directory, leaving DDS cache untouched."""
-        self.status_update.emit(
+        emit_progress = progress_callback or self.status_update.emit
+        emit_progress(
             f"Cleaning JPEG files from {cache_dir}. Please wait..."
         )
 
         try:
             jpeg_count = 0
             for entry in os.scandir(cache_dir):
+                if cancel_event is not None and cancel_event.is_set():
+                    return True, "JPEG cleanup cancelled safely.", True
                 if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg')):
                     os.remove(entry.path)
                     jpeg_count += 1
             
             if jpeg_count > 0:
-                self.status_update.emit(f"Deleted {jpeg_count} JPEG files.")
+                emit_progress(f"Deleted {jpeg_count} JPEG files.")
             else:
-                self.status_update.emit("No JPEG files found to delete.")
+                emit_progress("No JPEG files found to delete.")
             
-            self.status_update.emit("JPEG cleanup done.")
+            emit_progress("JPEG cleanup done.")
+            return True, "JPEG file cleaning completed.", False
         except Exception as e:
-            self.status_update.emit(f"JPEG cleanup error: {str(e)}")
+            emit_progress(f"JPEG cleanup error: {str(e)}")
+            return False, str(e), False
 
     def _check_ortho_dir(self, path):
         """Check if orthophoto directory is valid"""
@@ -6353,12 +8043,83 @@ class ConfigUI(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event without freezing UI during cache clean"""
-        self.running = False
-
         # If we're in the second pass (ready to close), just accept and exit
         if self._ready_to_close:
             event.accept()
             return
+
+        if self.runtime_state == RuntimeState.RUNNING:
+            reply = QMessageBox.question(
+                self,
+                "Stop Streaming and Quit?",
+                "AutoOrtho is currently streaming scenery.\n\n"
+                "Stop streaming and quit the application?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._close_after_stop = True
+            self._request_stop_streaming()
+            event.ignore()
+            return
+
+        if self.runtime_state in (
+            RuntimeState.STARTING,
+            RuntimeState.STOPPING,
+        ):
+            QMessageBox.information(
+                self,
+                "Operation In Progress",
+                "Wait for the streaming operation to finish before quitting.",
+            )
+            event.ignore()
+            return
+
+        if self._has_active_ui_jobs():
+            QMessageBox.warning(
+                self,
+                "Background Operation In Progress",
+                "Wait for active scenery or cache operations to finish before "
+                "quitting. This prevents partial installations and cache damage.",
+            )
+            event.ignore()
+            return
+
+        if not self._resolve_pending_settings(for_start=False):
+            event.ignore()
+            return
+
+        self.running = False
+
+        if (
+            self.storage_scan_worker is not None
+            and self.storage_scan_worker.isRunning()
+        ):
+            self.storage_scan_worker.requestInterruption()
+            if not self.storage_scan_worker.wait(2000):
+                self.storage_scan_worker.terminate()
+                self.storage_scan_worker.wait()
+            self.storage_scan_worker = None
+
+        if hasattr(self, "unmount_sceneries"):
+            try:
+                unmounted = self.unmount_sceneries()
+            except Exception as exc:
+                self.display_error(
+                    f"AutoOrtho could not stop all scenery mounts:\n{exc}"
+                )
+                event.ignore()
+                return
+            if unmounted is False:
+                self.display_error(
+                    "AutoOrtho could not stop all scenery mounts. "
+                    "The application will remain open to avoid leaving "
+                    "active mounts behind."
+                )
+                event.ignore()
+                return
 
         # Clean up UI logging handler
         try:
@@ -6386,8 +8147,11 @@ class ConfigUI(QMainWindow):
         # Stop update check worker if running
         try:
             if hasattr(self, '_update_worker') and self._update_worker:
-                self._update_worker.terminate()
+                self._update_worker.cancel()
                 self._update_worker.wait(2000)  # 2 second timeout
+                if self._update_worker.isRunning():
+                    self._update_worker.terminate()
+                    self._update_worker.wait(1000)
                 self._update_worker = None
         except Exception:
             pass
@@ -6395,8 +8159,11 @@ class ConfigUI(QMainWindow):
         # Stop SimBrief fetch worker if running
         try:
             if hasattr(self, 'simbrief_fetch_worker') and self.simbrief_fetch_worker:
-                self.simbrief_fetch_worker.terminate()
+                self.simbrief_fetch_worker.cancel()
                 self.simbrief_fetch_worker.wait(2000)
+                if self.simbrief_fetch_worker.isRunning():
+                    self.simbrief_fetch_worker.terminate()
+                    self.simbrief_fetch_worker.wait(1000)
                 self.simbrief_fetch_worker = None
         except Exception:
             pass
@@ -6427,13 +8194,6 @@ class ConfigUI(QMainWindow):
                 self.restore_dsfs_worker = None
         except Exception:
             pass
-
-        # Clean up background mount processes
-        if hasattr(self, 'unmount_sceneries'):
-            try:
-                self.unmount_sceneries()
-            except Exception:
-                pass
 
         # If auto-clean is enabled and we haven't started shutdown cleaning yet,
         # kick it off asynchronously and ignore this close event.
@@ -6481,6 +8241,6 @@ class AOMountUI(ConfigUI):
         """Mount sceneries (stub - implemented in parent)"""
         pass
 
-    def unmount_sceneries(self):
+    def unmount_sceneries(self, force=False):
         """Unmount sceneries (stub - implemented in parent)"""
         pass

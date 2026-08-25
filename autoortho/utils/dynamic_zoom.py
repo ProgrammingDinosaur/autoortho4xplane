@@ -200,6 +200,12 @@ class DynamicZoomManager:
         """
         return [step.to_dict() for step in self._steps]
 
+    def clone(self) -> "DynamicZoomManager":
+        """Return an independent copy suitable for transactional editing."""
+        manager = DynamicZoomManager()
+        manager.load_from_config(self.save_to_config())
+        return manager
+
     def get_steps(self) -> List[QualityStep]:
         """
         Get all steps sorted by altitude (highest first).
