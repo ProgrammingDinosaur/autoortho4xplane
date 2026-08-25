@@ -12,12 +12,6 @@ from ui.readiness import ReadinessCheck, ReadinessStatus
 from ui.setup_wizard import SetupWizard
 
 
-@pytest.fixture(scope="module")
-def qt_app():
-    app = QApplication.instance() or QApplication([])
-    yield app
-
-
 def _deps_ready():
     return ReadinessCheck(
         id="setup-dependencies",

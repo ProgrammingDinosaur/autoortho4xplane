@@ -17,7 +17,37 @@ On a new installation, AutoOrtho opens a guided setup wizard that:
 
 Existing installations with valid paths and dependencies are detected
 automatically and are not forced through the wizard. The wizard remains
-available from **Setup → System Readiness**.
+available from the header overflow menu or **Settings → Paths & Storage**.
+If setup is interrupted, reopen the wizard from that menu; unaccepted wizard
+changes are discarded and the last applied configuration remains active.
+
+## Application navigation
+
+The application is organized around five primary destinations:
+
+- **Home** — runtime, readiness, X-Plane, cache, task, and failure summaries.
+- **Scenery Library** — scenery search, filters, installation, updates, and
+  package details.
+- **Flight Plan & Map** — SimBrief controls, loaded-flight details, and the
+  local Custom Map Editor.
+- **Settings** — searchable Basic/Expert categories, presets, exact numeric
+  inputs, and Apply/Revert.
+- **Diagnostics** — health checks, searchable logs, export actions, and
+  performance-report history.
+
+The last destination and window geometry are restored on the next launch.
+
+### Keyboard and accessibility
+
+All primary workflows are keyboard accessible. Use `Ctrl+1` through `Ctrl+5`
+to open Home, Scenery Library, Flight Plan & Map, Settings, and Diagnostics.
+Use `Ctrl+S` to apply settings, `Ctrl+Shift+R` to revert pending settings, and
+`F1` to open documentation. Statuses combine text, symbols, and color so they
+remain understandable without color perception.
+
+AutoOrtho follows the operating system UI font and supports Qt display scaling,
+including 200% scaling. Search fields, tables, task actions, settings controls,
+and custom editors expose accessible names for assistive technologies.
 
 ## Applying and reverting settings
 
@@ -30,6 +60,11 @@ streaming.
 Long-running operations appear in the persistent **Activity** panel. Completed
 and failed tasks remain available until dismissed. Only operations that can be
 stopped without corrupting files expose a Cancel action.
+
+Use the header's **Start Streaming** action after readiness checks pass. The
+same action becomes **Stop Streaming** while AutoOrtho is running. Start and
+stop progress remains visible as an Activity task, and the application waits
+for mounts to stop cleanly before it exits.
 
 ## Scenery install path
 This is the location that scenery will be installed to.  Previously this defaulted to a user's existing X-Plane Custom Scenery directory, but that is no longer the case.  
@@ -59,7 +94,7 @@ The configuration file `.autoortho` is located in the user's home directory.
 
 ## Performance Tuning
 
-AutoOrtho includes advanced performance settings that allow you to balance image quality against loading times and stuttering. These settings are available in the Settings tab under "Performance Tuning".
+AutoOrtho includes advanced performance settings that allow you to balance image quality against loading times and stuttering. These settings are available under **Settings → Performance** and **Settings → Prefetching** in Expert mode.
 
 Key settings include:
 - **Tile Time Budget** - Maximum time to wait for a tile before returning results
@@ -148,7 +183,7 @@ AutoOrtho can automatically adjust imagery zoom levels based on your altitude Ab
 - Lower detail (faster loading) imagery at high altitudes
 - Terrain-aware calculations — flying at 10,000ft MSL over 5,000ft mountains uses higher quality than 10,000ft over ocean
 
-Configure quality steps in **Settings** → **Imagery** → **Dynamic Zoom Mode**.
+Configure quality steps in **Settings → Dynamic Zoom**.
 
 See the [Performance Tuning Guide](performance.md#dynamic-zoom-levels) for detailed configuration.
 
@@ -179,7 +214,7 @@ When flight data is loaded and the "Use Flight Data" toggle is enabled, addition
 
 ## Storage safety
 
-The Scenery tab includes a configurable free-space safety margin. AutoOrtho
+**Settings → Paths & Storage** includes a configurable free-space safety margin. AutoOrtho
 shows cache usage and available space, estimates temporary and final package
 requirements, and blocks scenery installation when either destination is too
 small or not writable.

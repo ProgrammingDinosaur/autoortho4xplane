@@ -206,7 +206,11 @@ def _common_xplane_roots() -> list[Path]:
     return roots
 
 
-def detect_xplane_installation(search_roots: Iterable[str | os.PathLike[str]] | None = None) -> Path | None:
+def detect_xplane_installation(
+    search_roots: Iterable[str | os.PathLike[str]] | None = None,
+    *,
+    cancel_callback=None,
+) -> Path | None:
     roots: list[Path] = [Path(root).expanduser() for root in _common_xplane_roots()]
     if search_roots:
         for root in search_roots:
@@ -214,6 +218,8 @@ def detect_xplane_installation(search_roots: Iterable[str | os.PathLike[str]] | 
 
     seen: set[str] = set()
     for root in roots:
+        if cancel_callback is not None and cancel_callback():
+            return None
         key = str(root)
         if key in seen:
             continue
@@ -234,10 +240,14 @@ def detect_xplane_installation(search_roots: Iterable[str | os.PathLike[str]] | 
 
     if search_roots:
         for root in search_roots:
+            if cancel_callback is not None and cancel_callback():
+                return None
             root_path = Path(root).expanduser()
             if not root_path.exists() or not root_path.is_dir():
                 continue
             for install_txt in root_path.rglob("x-plane_install.txt"):
+                if cancel_callback is not None and cancel_callback():
+                    return None
                 candidate = _parse_install_txt(install_txt)
                 if candidate:
                     return candidate
@@ -293,8 +303,14 @@ def _config_input_from(values: Any) -> ConfigurationInput:
 
 def _check_xplane(values: Any, search_roots: Iterable[str | os.PathLike[str]] | None = None) -> ReadinessCheck:
     configured = _path_value(values, "xplane_path").strip()
-    detected = detect_xplane_installation(search_roots)
-    candidate = Path(configured).expanduser() if configured else detected
+    detected = None
+    if not configured:
+        detected = detect_xplane_installation(search_roots)
+    candidate = (
+        Path(configured).expanduser()
+        if configured
+        else detected
+    )
 
     if not candidate:
         return ReadinessCheck(
@@ -436,7 +452,7 @@ def _mac_dependency_state() -> ReadinessCheck:
         if candidate and os.path.exists(candidate):
             return ReadinessCheck(
                 id="setup-dependencies",
-                title="FUSE dependencies",
+                title="Virtual drive driver (FUSE)",
                 status=ReadinessStatus.SUCCESS,
                 message=f"Found macFUSE/FUSE-T support at {candidate}.",
                 fix_action="",
@@ -445,7 +461,7 @@ def _mac_dependency_state() -> ReadinessCheck:
             )
     return ReadinessCheck(
         id="setup-dependencies",
-        title="FUSE dependencies",
+        title="Virtual drive driver (FUSE)",
         status=ReadinessStatus.ERROR,
         message="macFUSE or FUSE-T was not detected.",
         fix_action="Install macFUSE or FUSE-T and reopen the wizard.",
@@ -463,7 +479,7 @@ def _linux_dependency_state() -> ReadinessCheck:
     if fusermount and fuse_accessible:
         return ReadinessCheck(
             id="setup-dependencies",
-            title="FUSE dependencies",
+            title="Virtual drive driver (FUSE)",
             status=ReadinessStatus.SUCCESS,
             message=f"Found {Path(fusermount).name} and /dev/fuse.",
             fix_action="",
@@ -477,7 +493,7 @@ def _linux_dependency_state() -> ReadinessCheck:
         missing.append("/dev/fuse read/write access")
     return ReadinessCheck(
         id="setup-dependencies",
-        title="FUSE dependencies",
+        title="Virtual drive driver (FUSE)",
         status=ReadinessStatus.ERROR,
         message="Missing Linux FUSE support: " + ", ".join(missing) + ".",
         fix_action="Install FUSE support and ensure /dev/fuse is available.",
@@ -495,7 +511,7 @@ def _windows_dependency_state() -> ReadinessCheck:
     except Exception as exc:
         return ReadinessCheck(
             id="setup-dependencies",
-            title="FUSE dependencies",
+            title="Virtual drive driver (FUSE)",
             status=ReadinessStatus.ERROR,
             message=f"Unable to load Windows FUSE helpers: {exc}",
             fix_action="Install WinFSP or Dokan and reopen the wizard.",
@@ -506,7 +522,7 @@ def _windows_dependency_state() -> ReadinessCheck:
     if mode and libpath:
         return ReadinessCheck(
             id="setup-dependencies",
-            title="FUSE dependencies",
+            title="Virtual drive driver (FUSE)",
             status=ReadinessStatus.SUCCESS,
             message=f"Detected {mode} at {libpath}.",
             fix_action="",
@@ -515,7 +531,7 @@ def _windows_dependency_state() -> ReadinessCheck:
         )
     return ReadinessCheck(
         id="setup-dependencies",
-        title="FUSE dependencies",
+        title="Virtual drive driver (FUSE)",
         status=ReadinessStatus.ERROR,
         message="WinFSP or Dokan was not detected.",
         fix_action="Install WinFSP or Dokan and reopen the wizard.",

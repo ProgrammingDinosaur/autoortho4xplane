@@ -7,6 +7,7 @@ from typing import Optional
 
 
 class TaskType(str, Enum):
+    CATALOG = "catalog"
     MOUNT = "mount"
     SCENERY_INSTALL = "scenery_install"
     SCENERY_UNINSTALL = "scenery_uninstall"

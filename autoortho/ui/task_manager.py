@@ -9,11 +9,10 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QProgressBar,
-    QPushButton,
-    QScrollArea,
+    QSizePolicy,
+    QListView,
+    QToolButton,
     QVBoxLayout,
-    QWidget,
 )
 
 if __package__ and __package__.startswith("autoortho."):
@@ -22,8 +21,10 @@ if __package__ and __package__.startswith("autoortho."):
         TaskState,
         TaskType,
     )
+    from autoortho.ui.widgets.task_row import TaskRow
 else:
     from ui.task_models import BackgroundTask, TaskState, TaskType
+    from ui.widgets.task_row import TaskRow
 
 
 CancelCallback = Callable[[], None]
@@ -202,168 +203,134 @@ class TaskManager(QObject):
         self.active_count_changed.emit(len(self.active_tasks()))
 
 
-class TaskRow(QWidget):
-    def __init__(self, manager: TaskManager, task: BackgroundTask, parent=None):
-        super().__init__(parent)
-        self.manager = manager
-        self.task_id = task.id
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(3)
-
-        header = QHBoxLayout()
-        self.title_label = QLabel()
-        self.title_label.setStyleSheet("font-weight: bold;")
-        self.state_label = QLabel()
-        header.addWidget(self.title_label)
-        header.addStretch()
-        header.addWidget(self.state_label)
-        layout.addLayout(header)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setTextVisible(True)
-        layout.addWidget(self.progress_bar)
-
-        footer = QHBoxLayout()
-        self.detail_label = QLabel()
-        self.detail_label.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.detail_label.setWordWrap(True)
-        self.action_button = QPushButton()
-        self.action_button.clicked.connect(self._perform_action)
-        footer.addWidget(self.detail_label, 1)
-        footer.addWidget(self.action_button)
-        layout.addLayout(footer)
-        self.update_task(task)
-
-    def update_task(self, task: BackgroundTask) -> None:
-        title = task.title
-        if task.package:
-            title += f" — {task.package}"
-        self.title_label.setText(title)
-        self.state_label.setText(task.state.value.replace("_", " ").title())
-
-        if task.progress is None and not task.state.terminal:
-            self.progress_bar.setRange(0, 0)
-            self.progress_bar.setFormat(task.stage or "Working…")
-        else:
-            self.progress_bar.setRange(0, 100)
-            self.progress_bar.setValue(
-                max(
-                    0,
-                    min(
-                        100,
-                        round(
-                            task.progress
-                            if task.progress is not None
-                            else (
-                                100
-                                if task.state == TaskState.COMPLETED
-                                else 0
-                            )
-                        ),
-                    ),
-                )
-            )
-            if task.progress is None and task.state.terminal:
-                self.progress_bar.setFormat(task.stage or task.state.value)
-            else:
-                self.progress_bar.setFormat(
-                    f"{task.stage} — %p%" if task.stage else "%p%"
-                )
-
-        details = []
-        if task.bytes_total > 0:
-            details.append(
-                f"{task.bytes_completed / (1024 ** 2):.0f}/"
-                f"{task.bytes_total / (1024 ** 2):.0f} MB"
-            )
-        if task.rate > 0:
-            details.append(f"{task.rate / (1024 * 1024):.1f} MB/s")
-        if task.eta_seconds is not None:
-            minutes, seconds = divmod(round(task.eta_seconds), 60)
-            details.append(
-                f"ETA {minutes}m {seconds:02d}s"
-                if minutes
-                else f"ETA {seconds}s"
-            )
-        if task.error:
-            details.append(task.error)
-        self.detail_label.setText(" • ".join(details))
-
-        if task.state == TaskState.RUNNING and task.cancellable:
-            self.action_button.setText("Cancel")
-            self.action_button.setProperty("taskAction", "cancel")
-            self.action_button.show()
-        elif task.state == TaskState.FAILED and task.recovery_action:
-            self.action_button.setText(task.recovery_action)
-            self.action_button.setProperty("taskAction", "retry")
-            self.action_button.show()
-        elif task.state.terminal:
-            self.action_button.setText("Dismiss")
-            self.action_button.setProperty("taskAction", "dismiss")
-            self.action_button.show()
-        else:
-            self.action_button.hide()
-
-    def _perform_action(self) -> None:
-        action = self.action_button.property("taskAction")
-        if action == "cancel":
-            self.manager.cancel_task(self.task_id)
-        elif action == "retry":
-            self.manager.retry_task(self.task_id)
-        elif action == "dismiss":
-            self.manager.dismiss_task(self.task_id)
 
 
 class TaskPanel(QGroupBox):
+    EXPANDED_HEIGHT = 220
+    COLLAPSED_HEIGHT = 62
+
     def __init__(self, manager: TaskManager, parent=None):
         super().__init__("Activity", parent)
         self.manager = manager
         self.rows: dict[str, TaskRow] = {}
-        self.setMaximumHeight(190)
+        self._expanded = False
+        self._had_active_tasks = False
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Maximum,
+        )
         self.setVisible(False)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 8, 6, 6)
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setHorizontalScrollBarPolicy(
+        outer.setContentsMargins(8, 6, 8, 8)
+        outer.setSpacing(4)
+        header = QHBoxLayout()
+        self.summary_label = QLabel()
+        self.summary_label.setProperty("textRole", "secondary")
+        self.toggle_button = QToolButton()
+        self.toggle_button.setProperty("role", "quiet")
+        self.toggle_button.setAccessibleName("Show activity details")
+        self.toggle_button.clicked.connect(self.toggle_expanded)
+        header.addWidget(self.summary_label)
+        header.addStretch()
+        header.addWidget(self.toggle_button)
+        outer.addLayout(header)
+
+        if __package__ and __package__.startswith("autoortho."):
+            from autoortho.ui.models.task_model import TaskListModel
+        else:
+            from ui.models.task_model import TaskListModel
+        self._task_model_type = TaskListModel
+        self.model = TaskListModel(manager, self)
+        self.view = QListView()
+        self.view.setModel(self.model)
+        self.view.setUniformItemSizes(False)
+        self.view.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.content = QWidget()
-        self.rows_layout = QVBoxLayout(self.content)
-        self.rows_layout.setContentsMargins(0, 0, 0, 0)
-        self.rows_layout.setSpacing(4)
-        self.rows_layout.addStretch()
-        self.scroll.setWidget(self.content)
-        outer.addWidget(self.scroll)
-
-        manager.task_added.connect(self._add_task)
-        manager.task_updated.connect(self._update_task)
-        manager.task_removed.connect(self._remove_task)
-
-    def _add_task(self, task: BackgroundTask) -> None:
-        old = self.rows.pop(task.id, None)
-        if old is not None:
-            old.deleteLater()
-        row = TaskRow(self.manager, task)
-        self.rows[task.id] = row
-        self.rows_layout.insertWidget(
-            max(0, self.rows_layout.count() - 1),
-            row,
+        self.view.setVerticalScrollMode(
+            QListView.ScrollMode.ScrollPerPixel
         )
-        self.setVisible(True)
+        self.view.setAccessibleName("Background task activity")
+        outer.addWidget(self.view)
 
-    def _update_task(self, task: BackgroundTask) -> None:
-        row = self.rows.get(task.id)
-        if row is None:
-            self._add_task(task)
+        self.model.rowsInserted.connect(self._sync_rows)
+        self.model.rowsRemoved.connect(self._sync_rows)
+        self.model.modelReset.connect(self._sync_rows)
+        self.model.dataChanged.connect(self._sync_rows)
+        self._sync_rows()
+
+    def toggle_expanded(self) -> None:
+        self.set_expanded(not self._expanded)
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._expanded = bool(expanded)
+        self.view.setVisible(self._expanded)
+        self.setMaximumHeight(
+            self.EXPANDED_HEIGHT
+            if self._expanded
+            else self.COLLAPSED_HEIGHT
+        )
+        self.toggle_button.setText(
+            "Hide details" if self._expanded else "Show details"
+        )
+        self.toggle_button.setAccessibleName(
+            "Hide activity details"
+            if self._expanded
+            else "Show activity details"
+        )
+
+    def _sync_rows(self, *args) -> None:
+        live_ids = set()
+        active_count = 0
+        failed_count = 0
+        for row_index in range(self.model.rowCount()):
+            index = self.model.index(row_index, 0)
+            task = self.model.data(
+                index,
+                self._task_model_type.TaskRole,
+            )
+            if task is None:
+                continue
+            live_ids.add(task.id)
+            if not task.state.terminal:
+                active_count += 1
+            elif task.state == TaskState.FAILED:
+                failed_count += 1
+            row = self.rows.get(task.id)
+            if row is None:
+                row = TaskRow(self.manager, task)
+                self.rows[task.id] = row
+                self.view.setIndexWidget(index, row)
+            else:
+                row.update_task(task)
+        for task_id in list(self.rows):
+            if task_id not in live_ids:
+                self.rows.pop(task_id)
+
+        task_count = len(live_ids)
+        if active_count:
+            self.summary_label.setText(
+                f"{active_count} active"
+                + (
+                    f" · {task_count - active_count} recent"
+                    if task_count > active_count
+                    else ""
+                )
+            )
+            if not self._had_active_tasks:
+                self.set_expanded(True)
         else:
-            row.update_task(task)
-
-    def _remove_task(self, task_id: str) -> None:
-        row = self.rows.pop(task_id, None)
-        if row is not None:
-            row.deleteLater()
-        self.setVisible(bool(self.rows))
+            suffix = (
+                f" · {failed_count} failed"
+                if failed_count
+                else ""
+            )
+            self.summary_label.setText(
+                f"{task_count} recent task"
+                f"{'s' if task_count != 1 else ''}{suffix}"
+            )
+            if self._had_active_tasks or task_count == 0:
+                self.set_expanded(False)
+        self._had_active_tasks = active_count > 0
+        self.setVisible(bool(live_ids))

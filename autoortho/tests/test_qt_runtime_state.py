@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
+from PySide6.QtCore import QThread
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QDialog
 from PySide6.QtWidgets import QMessageBox
@@ -16,12 +17,7 @@ from PySide6.QtWidgets import QMessageBox
 from aoconfig import AOConfig
 from config_ui_qt import ConfigUI
 from ui.runtime_state import RuntimeState
-
-
-@pytest.fixture(scope="module")
-def qt_app():
-    app = QApplication.instance() or QApplication([])
-    yield app
+from ui.services.common import ServiceResult
 
 
 @pytest.fixture
@@ -42,6 +38,14 @@ def config_ui(qt_app, monkeypatch, tmp_path):
     cfg.get_config()
 
     ui = ConfigUI(cfg)
+    readiness_worker = ui.readiness_worker
+    if readiness_worker is not None and readiness_worker.isRunning():
+        readiness_worker.wait(2000)
+        qt_app.processEvents()
+    storage_worker = ui.storage_scan_worker
+    if storage_worker is not None and storage_worker.isRunning():
+        storage_worker.wait(2000)
+        qt_app.processEvents()
     yield ui
     worker = ui.mount_control_worker
     if worker is not None:
@@ -54,6 +58,7 @@ def config_ui(qt_app, monkeypatch, tmp_path):
     ui.close()
     ui.deleteLater()
     qt_app.processEvents()
+    qt_app.exit(0)
 
 
 def _wait_for_state(app, ui, state, timeout=2.0):
@@ -99,7 +104,7 @@ def test_settings_change_enables_apply_and_revert(
     assert config_ui.apply_button.isEnabled()
     assert config_ui.revert_button.isEnabled()
 
-    monkeypatch.setattr(config_ui, "save_config", lambda **kwargs: None)
+    monkeypatch.setattr(config_ui, "save_config", lambda **kwargs: True)
     config_ui.on_revert()
 
     assert config_ui.cache_dir_edit.text() == original
@@ -137,7 +142,7 @@ def test_apply_marks_settings_session_clean(
         "_prepare_runtime_directories",
         lambda: [],
     )
-    monkeypatch.setattr(config_ui, "save_config", lambda **kwargs: None)
+    monkeypatch.setattr(config_ui, "save_config", lambda **kwargs: True)
     monkeypatch.setattr(config_ui, "refresh_scenery_list", lambda: None)
 
     assert config_ui.on_save() is True
@@ -165,20 +170,122 @@ def test_custom_tiles_rebuild_preserves_other_pending_values(
 
 def test_apply_revert_hidden_on_non_settings_tabs(config_ui):
     config_ui.tabs.setCurrentWidget(config_ui.logs_widget)
-    assert config_ui.apply_button.isHidden()
-    assert config_ui.revert_button.isHidden()
+    assert config_ui.shell.current_page() is config_ui.diagnostics_page
 
     config_ui.tabs.setCurrentWidget(config_ui.setup_widget)
-    assert not config_ui.apply_button.isHidden()
-    assert not config_ui.revert_button.isHidden()
+    assert config_ui.shell.current_page() is config_ui.categorized_settings_page
+    assert config_ui.apply_button.parent() is config_ui.categorized_settings_page
+    assert config_ui.revert_button.parent() is config_ui.categorized_settings_page
 
 
-def test_existing_valid_setup_is_inferred(config_ui, monkeypatch):
+def test_shell_exposes_five_task_oriented_destinations(config_ui):
+    assert config_ui.shell.navigation.destination_keys() == [
+        "home",
+        "scenery-library",
+        "flight-plan-map",
+        "settings",
+        "diagnostics",
+    ]
+    config_ui.navigate_to("diagnostics")
+    assert config_ui.shell.current_page() is config_ui.diagnostics_page
+    config_ui.navigate_to("settings", "Dynamic Zoom")
+    assert (
+        config_ui.shell.current_page()
+        is config_ui.categorized_settings_page
+    )
+    assert (
+        config_ui.categorized_settings_page.category_list.currentItem().text()
+        == "Dynamic Zoom"
+    )
+
+
+def test_validation_navigates_visible_shell_even_when_legacy_tab_is_stale(
+    config_ui,
+):
+    from ui.config_validation import ValidationIssue, ValidationSeverity
+
+    config_ui.tabs.setCurrentWidget(config_ui.setup_widget)
+    config_ui.navigate_to("home")
+    config_ui._show_validation_issues(
+        [
+            ValidationIssue(
+                "xplane_path",
+                ValidationSeverity.ERROR,
+                "Invalid X-Plane path",
+            )
+        ]
+    )
+
+    assert (
+        config_ui.shell.current_page()
+        is config_ui.categorized_settings_page
+    )
+    assert (
+        config_ui.categorized_settings_page.category_list.currentItem().text()
+        == "Paths & Storage"
+    )
+
+
+def test_header_start_action_stays_disabled_during_background_jobs(
+    config_ui,
+):
+    config_ui.download_workers["na"] = object()
+    config_ui._set_runtime_state(RuntimeState.STOPPED)
+    assert not config_ui.run_button.isEnabled()
+
+    config_ui._update_shell_status()
+    assert not config_ui.run_button.isEnabled()
+    config_ui.download_workers.clear()
+
+
+def test_update_result_uses_nonmodal_header_banner(
+    config_ui,
+    monkeypatch,
+):
+    monkeypatch.setattr("config_ui_qt.__version__", "1.0.0")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args: pytest.fail("update checks must not open a modal"),
+    )
+
+    config_ui.on_update_check_result(
+        ("v2.0.0", "https://example.test/release")
+    )
+
+    assert not config_ui.shell.header.update_banner.isHidden()
+    assert config_ui._latest_update_url == "https://example.test/release"
+    config_ui._remind_update_later()
+    assert config_ui.shell.header.update_banner.isHidden()
+
+
+def test_shell_page_and_geometry_are_persisted(config_ui, monkeypatch):
+    saved = []
+    monkeypatch.setattr(config_ui.cfg, "save", lambda: saved.append(True))
+    config_ui.navigate_to("diagnostics")
+
+    config_ui._persist_shell_state()
+
+    assert config_ui.cfg.general.last_page == "Diagnostics"
+    assert config_ui.cfg.general.window_width == config_ui.width()
+    assert saved == [True]
+
+
+def test_existing_valid_setup_is_inferred(
+    qt_app,
+    config_ui,
+    monkeypatch,
+):
     saved = []
     config_ui.cfg.general.setup_complete = False
     monkeypatch.setattr(
-        "config_ui_qt.infer_setup_complete",
-        lambda values: True,
+        config_ui.readiness_service,
+        "infer_complete",
+        lambda values: SimpleNamespace(
+            success=True,
+            value=True,
+            error=None,
+        ),
     )
     monkeypatch.setattr(
         config_ui.cfg,
@@ -193,6 +300,8 @@ def test_existing_valid_setup_is_inferred(config_ui, monkeypatch):
     )
 
     config_ui._maybe_show_setup_wizard()
+    config_ui.setup_inference_worker.wait()
+    qt_app.processEvents()
 
     assert config_ui.cfg.general.setup_complete is True
     assert saved == [True]
@@ -256,7 +365,7 @@ def test_start_and_stop_are_asynchronous(
     monkeypatch.setattr(config_ui, "verify", lambda: True)
     monkeypatch.setattr(
         config_ui,
-        "_run_readiness_checks",
+        "_readiness_for_start",
         lambda: SimpleNamespace(can_finish=True, checks=[]),
     )
     monkeypatch.setattr(
@@ -289,6 +398,60 @@ def test_start_and_stop_are_asynchronous(
 
     config_ui.on_run()
     assert config_ui.runtime_state == RuntimeState.STOPPING
+    _wait_for_state(qt_app, config_ui, RuntimeState.STOPPED)
+
+
+def test_start_waits_for_nonblocking_readiness(
+    qt_app,
+    config_ui,
+    monkeypatch,
+):
+    existing = config_ui.readiness_worker
+    if existing is not None and existing.isRunning():
+        existing.wait(2000)
+        qt_app.processEvents()
+    config_ui.current_readiness = None
+    config_ui._readiness_signature = None
+    monkeypatch.setattr(
+        config_ui.readiness_service,
+        "check",
+        lambda *args, **kwargs: ServiceResult(
+            SimpleNamespace(can_finish=True, checks=[])
+        ),
+    )
+    monkeypatch.setattr(config_ui, "verify", lambda: True)
+    monkeypatch.setattr(
+        config_ui,
+        "_prepare_runtime_directories",
+        lambda: [],
+    )
+    monkeypatch.setattr(config_ui, "save_config", lambda: True)
+    monkeypatch.setattr(
+        config_ui,
+        "preflight_mount_check_and_prompt",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        config_ui,
+        "mount_sceneries",
+        lambda blocking=False: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        config_ui,
+        "unmount_sceneries",
+        lambda force=False: True,
+        raising=False,
+    )
+
+    config_ui.on_run()
+
+    assert config_ui.runtime_state == RuntimeState.STOPPED
+    worker = config_ui.readiness_worker
+    assert worker is not None
+    worker.wait(2000)
+    _wait_for_state(qt_app, config_ui, RuntimeState.RUNNING)
+    config_ui.on_run()
     _wait_for_state(qt_app, config_ui, RuntimeState.STOPPED)
 
 
@@ -500,6 +663,8 @@ def test_production_aomountui_mro_runs_async_lifecycle(
     tmp_path,
 ):
     import autoortho as autoortho_module
+    if not hasattr(autoortho_module, "AOMount"):
+        from autoortho import autoortho as autoortho_module
 
     monkeypatch.setattr(
         ConfigUI,
@@ -556,7 +721,7 @@ def test_production_aomountui_mro_runs_async_lifecycle(
     monkeypatch.setattr(ui, "verify", lambda: True)
     monkeypatch.setattr(
         ui,
-        "_run_readiness_checks",
+        "_readiness_for_start",
         lambda: SimpleNamespace(can_finish=True, checks=[]),
     )
     monkeypatch.setattr(ui, "_prepare_runtime_directories", lambda: [])
@@ -582,6 +747,17 @@ def test_production_aomountui_mro_runs_async_lifecycle(
     ]
 
     ui.mount_monitor_timer.stop()
-    ui.close()
+    close_event = QCloseEvent()
+    ui.closeEvent(close_event)
+    assert close_event.isAccepted()
+    storage_worker = ui.storage_scan_worker
+    if storage_worker is not None and storage_worker.isRunning():
+        storage_worker.requestInterruption()
+        storage_worker.wait(2000)
+    assert not any(
+        worker.isRunning()
+        for worker in ui.findChildren(QThread)
+    )
     ui.deleteLater()
     qt_app.processEvents()
+    qt_app.exit(0)

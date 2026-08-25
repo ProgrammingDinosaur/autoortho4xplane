@@ -103,9 +103,14 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
 
 try:
-    from autoortho import config_ui_qt as config_ui
+    from autoortho.ui import main_window as config_ui
 except ImportError:
-    import config_ui_qt as config_ui
+    from ui import main_window as config_ui
+
+try:
+    from autoortho.ui.theme import apply_theme
+except ImportError:
+    from ui.theme import apply_theme
 
 USE_QT = True
 
@@ -1150,6 +1155,7 @@ def main():
         log.info("Running CFG UI")
         if USE_QT:
             app = QApplication(sys.argv)
+            apply_theme(app)
             
             # Set application icon - required for macOS dock icon visibility
             if system_type == 'darwin':

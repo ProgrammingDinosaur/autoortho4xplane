@@ -51,6 +51,11 @@ complete one-second resource timeline, latency histograms, slow-operation
 records, final counters, relevant configuration, gauges, and individual process
 profiles.
 
+The **Diagnostics** destination lists these reports newest-first and loads the
+selected report without blocking the application. Use **Open Report** for the
+full file or **Open Folder** to inspect the accompanying JSON and per-process
+profiles.
+
 ### What is measured
 
 | Stage | What it identifies |
@@ -390,6 +395,11 @@ Quality Steps define zoom levels for different altitude ranges. Each step specif
 - **Zoom Level**: The maximum zoom level for normal tiles
 - **Airports Zoom Level**: The maximum zoom level near airports (can be higher for detail)
 
+The inline editor under **Settings → Dynamic Zoom** shows the resulting altitude
+ranges and preview chart, includes Airliner/General Aviation/Low VRAM presets,
+and supports undo, redo, reset, and keyboard row removal. Changes remain
+transactional until **Apply** is selected.
+
 **Example configuration:**
 
 | Altitude (AGL) | Normal ZL | Airports ZL | Use Case |
@@ -489,7 +499,7 @@ These settings work **alongside** the tile time budget to control individual chu
 - **Default:** 5.0
 - **Range:** 0.1 - 10.0
 - **Config file:** `maxwait = 5.0`
-- **UI:** Settings → Advanced Settings → Per-chunk max wait
+- **UI:** Settings → Performance → Per-chunk max wait
 
 Maximum time to wait for a **single chunk** to download. This works in combination with the tile time budget:
 
@@ -518,7 +528,7 @@ For each chunk:
 - **Type:** Boolean
 - **Default:** True
 - **Config file:** `suspend_maxwait = True`
-- **UI:** Settings → Advanced Settings → "Allow extra loading time during startup"
+- **UI:** Settings → Performance → "Allow extra loading time during startup"
 
 When enabled, AutoOrtho uses significantly longer timeouts during X-Plane's initial scenery load (before the flight starts). This ensures tiles load at full quality before you begin flying.
 
@@ -854,7 +864,7 @@ SimBrief integration gracefully falls back to DataRef-based calculations when:
 #### Option A: Load flight plan before starting
 
 1. **File flight plan** in SimBrief (e.g., KJFK → KLAX)
-2. **Start AutoOrtho** and go to Settings → Setup
+2. **Start AutoOrtho** and go to **Flight Plan & Map**
 3. **Enter SimBrief User ID** and click "Fetch Flight Data"
 4. **Verify flight info** displays correctly (route, cruise altitude, aircraft)
 5. **Enable toggle** "Use Flight Data for Dynamic Zoom..."
@@ -866,7 +876,7 @@ SimBrief integration gracefully falls back to DataRef-based calculations when:
 1. **Start AutoOrtho** and click **Start Streaming** (with your SimBrief User ID already saved)
 2. **Start X-Plane** and begin your flight
 3. **File flight plan** in SimBrief when ready
-4. **Go to Settings → Setup** and click "Fetch Flight Data"
+4. Go to **Flight Plan & Map** and click **Fetch Flight Data**
 5. **Enable toggle** — takes effect immediately, no restart needed
 6. AutoOrtho will immediately start using your flight plan for prefetching and dynamic zoom
 
@@ -1104,7 +1114,7 @@ If X-Plane takes significantly longer to load scenery with AutoOrtho enabled, th
 
 **To reduce loading times:**
 
-1. Go to **Settings** → **Advanced Settings**
+1. Go to **Settings** → **Performance** in Expert mode
 2. Set **"Allow extra loading time during startup"** to **Off**
 3. This will use normal time budgets during startup, resulting in faster loads
 

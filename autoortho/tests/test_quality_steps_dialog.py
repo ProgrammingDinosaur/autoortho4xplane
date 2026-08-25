@@ -24,16 +24,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog
 
 from config_ui_qt import QualityStepsDialog
+from ui.models.dynamic_zoom_model import DynamicZoomTableModel
 from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
-
-
-@pytest.fixture(scope="module")
-def qt_app():
-    app = QApplication.instance() or QApplication([])
-    yield app
 
 
 # =============================================================================
@@ -303,10 +299,20 @@ class TestQualityStepsDialogInteractions:
 
         dialog = QualityStepsDialog(manager=manager)
         row = next(
-            row for row in range(dialog.steps_table.rowCount())
-            if dialog.steps_table.item(row, 0).text() == "20000"
+            row for row in range(dialog.editor.model.rowCount())
+            if dialog.editor.model.data(
+                dialog.editor.model.index(row, 0),
+                DynamicZoomTableModel.AltitudeRole,
+            )
+            == 20000
         )
-        dialog.steps_table.item(row, 0).setText("25000")
+        assert dialog.editor.model.setData(
+            dialog.editor.model.index(
+                row,
+                DynamicZoomTableModel.MinAltitudeColumn,
+            ),
+            25000,
+        )
         dialog._on_accept()
         result = dialog.get_manager()
 
@@ -323,11 +329,20 @@ class TestQualityStepsDialogInteractions:
 
         dialog = QualityStepsDialog(manager=manager)
         row = next(
-            row for row in range(dialog.steps_table.rowCount())
-            if dialog.steps_table.item(row, 0).text() == "20000"
+            row for row in range(dialog.editor.model.rowCount())
+            if dialog.editor.model.data(
+                dialog.editor.model.index(row, 0),
+                DynamicZoomTableModel.AltitudeRole,
+            )
+            == 20000
         )
-        dialog.steps_table.item(row, 0).setText("10000")
-        dialog._on_accept()
+        assert not dialog.editor.model.setData(
+            dialog.editor.model.index(
+                row,
+                DynamicZoomTableModel.MinAltitudeColumn,
+            ),
+            10000,
+        )
 
         assert dialog.result() == QDialog.DialogCode.Rejected
         assert not dialog.validation_label.isHidden()
@@ -337,9 +352,12 @@ class TestQualityStepsDialogInteractions:
         manager = DynamicZoomManager()
         manager.set_base_zoom(17, 18)
         dialog = QualityStepsDialog(manager=manager)
-        item = dialog.steps_table.item(0, 0)
+        index = dialog.editor.model.index(
+            0,
+            DynamicZoomTableModel.MinAltitudeColumn,
+        )
 
-        assert not bool(item.flags() & Qt.ItemFlag.ItemIsEditable)
+        assert not bool(index.flags() & Qt.ItemFlag.ItemIsEditable)
 
     def test_legacy_negative_base_rule_can_round_trip(self, qt_app):
         manager = DynamicZoomManager()
@@ -355,3 +373,29 @@ class TestQualityStepsDialogInteractions:
         assert any(
             step.altitude_ft == -1000 for step in result.get_steps()
         )
+
+    def test_enter_in_spinbox_advances_without_accepting(self, qt_app):
+        manager = DynamicZoomManager()
+        manager.set_base_zoom(16, 18)
+        dialog = QualityStepsDialog(manager=manager)
+        dialog.show()
+        index = dialog.editor.model.index(
+            0,
+            DynamicZoomTableModel.NormalZoomColumn,
+        )
+        dialog.steps_table.setCurrentIndex(index)
+        dialog.steps_table.edit(index)
+        qt_app.processEvents()
+        spinbox = dialog.steps_table.focusWidget()
+        spinbox.setFocus()
+        expected = spinbox.value()
+
+        QTest.keyClick(spinbox, Qt.Key.Key_Return)
+        qt_app.processEvents()
+
+        assert dialog.result() == QDialog.DialogCode.Rejected
+        assert dialog.editor.model.data(
+            index,
+            Qt.ItemDataRole.EditRole,
+        ) == expected
+        dialog.close()

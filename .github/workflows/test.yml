@@ -27,6 +27,45 @@ jobs:
         cd autoortho
         pytest --log-level=DEBUG -v test_getortho.py test_pydds.py test_downloader.py
 
+  test-ui-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - uses: actions/setup-python@v3
+      with:
+        python-version: '3.14'
+
+    - name: Setup
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libegl1 libgl1
+        python -m pip install -U -r requirements.txt
+
+    - name: Test modular UI
+      env:
+        QT_QPA_PLATFORM: offscreen
+      run: |
+        python -m pytest -q \
+          autoortho/tests/test_ui_services.py \
+          autoortho/tests/test_ui_models.py \
+          autoortho/tests/test_task_manager.py \
+          autoortho/tests/test_dynamic_zoom_editor.py \
+          autoortho/tests/test_scenery_page.py \
+          autoortho/tests/test_diagnostics_page.py \
+          autoortho/tests/test_main_window.py \
+          autoortho/tests/test_navigation.py \
+          autoortho/tests/test_home_page.py \
+          autoortho/tests/test_flight_plan_page.py \
+          autoortho/tests/test_settings_page.py \
+          autoortho/tests/test_setup_wizard.py \
+          autoortho/tests/test_quality_steps_dialog.py \
+          autoortho/tests/test_accessibility.py \
+          autoortho/tests/test_theme.py \
+          autoortho/tests/test_readiness.py \
+          autoortho/tests/test_qt_runtime_state.py
+
 
   test-windows:
     runs-on: windows-latest

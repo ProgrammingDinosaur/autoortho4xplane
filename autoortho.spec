@@ -53,6 +53,10 @@ markupsafe_datas, markupsafe_binaries, markupsafe_hiddenimports = safe_collect_a
 # Character encoding
 charset_datas, charset_binaries, charset_hiddenimports = safe_collect_all('charset_normalizer')
 
+# Modular Qt UI packages include conditional direct-execution imports that are
+# not always visible to PyInstaller's static analysis.
+ui_hiddenimports = collect_submodules('autoortho.ui')
+
 # Collect all datas/binaries/hiddenimports for native modules
 native_module_datas = (
     psutil_datas + numpy_datas + greenlet_datas + gevent_datas + 
@@ -288,7 +292,11 @@ a = Analysis(
     pathex=[autoortho_path],
     binaries=binaries + native_module_binaries,
     datas=datas + native_module_datas,
-    hiddenimports=hiddenimports + native_module_hiddenimports,
+    hiddenimports=(
+        hiddenimports
+        + ui_hiddenimports
+        + native_module_hiddenimports
+    ),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

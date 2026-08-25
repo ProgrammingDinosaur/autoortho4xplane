@@ -98,6 +98,13 @@ gui = True
 showconfig = True
 # First-run setup was completed or inferred from an existing valid config
 setup_complete = False
+# Application shell state
+window_width = 1100
+window_height = 760
+window_x = 100
+window_y = 100
+last_page = Home
+dismissed_update_version =
 # Hide when running
 hide = True
 # Console/UI log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
