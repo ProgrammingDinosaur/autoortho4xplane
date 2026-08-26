@@ -378,6 +378,12 @@ class AutoOrtho(Operations):
             self._runtime_services_started = True
 
     def _schedule_dsf_prefetch(self, path):
+        if not getortho.is_prefetch_runtime_allowed():
+            log.debug(
+                "DSF prefetch deferred until X-Plane flight connection: %s",
+                path,
+            )
+            return
         with self._runtime_services_lock:
             if path in self._dsf_prefetch_paths:
                 return

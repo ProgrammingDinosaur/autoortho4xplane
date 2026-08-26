@@ -10,7 +10,8 @@ startup latency through:
 - one loopback-only HTTP/2 broker shared by all mounted regions;
 - bounded global request concurrency and per-request cancellation;
 - coalescing of identical imagery requests across workers;
-- DSF-driven prefetch before flight datarefs become available;
+- DSF- and trajectory-driven prefetch only after X-Plane reports a valid
+  flight connection;
 - a persistent compiled DDS cache for repeat routes; and
 - lazy regional download/build services so inactive regions remain lightweight.
 
@@ -438,6 +439,12 @@ The prefetching system proactively downloads tiles ahead of your aircraft to red
 - **Config file:** `prefetch_enabled = True`
 
 When enabled, AutoOrtho monitors your aircraft's position, heading, and speed to predict which tiles you'll need next and downloads them in advance.
+
+Prefetch is intentionally disabled while X-Plane displays the initial
+"Reading scenery files" screen. Live DDS requests receive all downloader and
+builder capacity until the parent process publishes a valid flight connection.
+After the flight starts, prefetch uses a separate bounded queue; live requests
+remain unbounded and always take priority.
 
 **How it works:**
 

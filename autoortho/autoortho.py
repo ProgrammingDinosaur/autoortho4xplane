@@ -664,6 +664,37 @@ class AOMount:
                     except Exception:
                         pass
 
+                    # Mount workers do not run their own X-Plane UDP listener.
+                    # Publish one bounded snapshot so they can enable predictive
+                    # work only after the parent confirms a valid flight.
+                    try:
+                        try:
+                            from autoortho.datareftrack import dt
+                        except ImportError:
+                            from datareftrack import dt
+                        with dt._lock:
+                            flight_state = {
+                                "connected": bool(dt.connected),
+                                "data_valid": bool(dt.data_valid),
+                                "has_ever_connected": bool(
+                                    dt.has_ever_connected
+                                ),
+                                "lat": float(dt.lat),
+                                "lon": float(dt.lon),
+                                "alt": float(dt.alt),
+                                "hdg": float(dt.hdg),
+                                "spd": float(dt.spd),
+                                "local_time_sec": float(dt.local_time_sec),
+                                "pressure_alt": float(dt.pressure_alt),
+                                "sun_pitch": float(dt.sun_pitch),
+                                "timestamp": time.time(),
+                            }
+                        self._shared_store.set(
+                            "flight_state", flight_state
+                        )
+                    except Exception:
+                        pass
+
                     # Aggregate mm and partial-mm counters into averages and counts
                     try:
                         keys = self._shared_store.keys()
@@ -712,7 +743,11 @@ class AOMount:
                                     k.startswith('mm_time_total_ms:') or
                                     k.startswith('partial_mm_count:') or
                                     k.startswith('partial_mm_time_total_ms:')
-                                )) or k in ('proc_count', 'cur_mem_mb_ts')
+                                )) or k in (
+                                    'proc_count',
+                                    'cur_mem_mb_ts',
+                                    'flight_state',
+                                )
                             )
                         filtered = {k: v for k, v in snap.items() if not _is_internal(k)}
                     except Exception:

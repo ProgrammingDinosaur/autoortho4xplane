@@ -1018,6 +1018,86 @@ def is_live_building() -> bool:
         return _live_reads_in_progress >= 6
 
 
+_shared_flight_state_lock = threading.Lock()
+_shared_flight_state_last_poll = 0.0
+_shared_flight_state_allowed = False
+_shared_flight_state_timestamp = 0.0
+
+
+def _sync_shared_flight_state() -> bool:
+    """Refresh the worker-local tracker from the parent stats snapshot."""
+    global _shared_flight_state_last_poll
+    global _shared_flight_state_allowed
+    global _shared_flight_state_timestamp
+
+    if (
+        getattr(datareftracker, "running", False)
+        and
+        getattr(datareftracker, "has_ever_connected", False)
+        and getattr(datareftracker, "connected", False)
+        and getattr(datareftracker, "data_valid", False)
+    ):
+        return True
+
+    now = time.monotonic()
+    with _shared_flight_state_lock:
+        if now - _shared_flight_state_last_poll < 0.5:
+            return _shared_flight_state_allowed
+        _shared_flight_state_last_poll = now
+        state = get_stat("flight_state")
+        if not isinstance(state, dict):
+            _shared_flight_state_allowed = False
+            return False
+        try:
+            state_timestamp = float(state.get("timestamp", 0.0))
+            fresh = time.time() - state_timestamp <= 3.0
+            connected = bool(state.get("connected")) and fresh
+            data_valid = bool(state.get("data_valid")) and fresh
+            has_connected = bool(state.get("has_ever_connected"))
+            with datareftracker._lock:
+                datareftracker.has_ever_connected = (
+                    datareftracker.has_ever_connected or has_connected
+                )
+                datareftracker.connected = connected
+                datareftracker.data_valid = data_valid
+                if connected and data_valid:
+                    for name in (
+                        "lat",
+                        "lon",
+                        "alt",
+                        "hdg",
+                        "spd",
+                        "local_time_sec",
+                        "pressure_alt",
+                        "sun_pitch",
+                    ):
+                        setattr(datareftracker, name, float(state[name]))
+            if (
+                connected
+                and data_valid
+                and state_timestamp > _shared_flight_state_timestamp
+            ):
+                datareftracker.flight_averager.add_sample(
+                    lat=float(state["lat"]),
+                    lon=float(state["lon"]),
+                    alt_ft=float(state["alt"]) * 3.28084,
+                    hdg=float(state["hdg"]),
+                    spd=float(state["spd"]),
+                )
+                _shared_flight_state_timestamp = state_timestamp
+            _shared_flight_state_allowed = bool(
+                connected and data_valid and has_connected
+            )
+        except (KeyError, TypeError, ValueError):
+            _shared_flight_state_allowed = False
+        return _shared_flight_state_allowed
+
+
+def is_prefetch_runtime_allowed() -> bool:
+    """Allow speculative work only after X-Plane has entered the flight."""
+    return bool(_sync_shared_flight_state() and not is_live_building())
+
+
 def _thread_budget_for(active: int) -> int:
     """Per-build OpenMP thread count given the number of active builds (including self).
 
@@ -1556,7 +1636,24 @@ class Getter(object):
     def __init__(self, num_workers):
         
         self.count = 0
-        self.queue = PriorityQueue(maxsize=max(64, int(num_workers) * 4))
+        # Live work is never capacity-rejected. Prefetch has a separate,
+        # bounded lane and cannot occupy or block live admission.
+        self.live_queue = PriorityQueue()
+        self.prefetch_queue = PriorityQueue(
+            maxsize=max(
+                32,
+                min(
+                    4096,
+                    int(
+                        getattr(
+                            CFG.autoortho, "prefetch_max_chunks", 512
+                        )
+                    ),
+                ),
+            )
+        )
+        # Compatibility alias for diagnostics that inspect the live lane.
+        self.queue = self.live_queue
         self.workers = []
         self.WORKING = threading.Event()
         self.WORKING.set()
@@ -1577,12 +1674,12 @@ class Getter(object):
     def stop(self):
         self.WORKING.clear()
         
-        # Drain queue to unblock workers waiting on queue.get()
-        try:
-            while True:
-                self.queue.get_nowait()
-        except Empty:
-            pass
+        for work_queue in (self.live_queue, self.prefetch_queue):
+            try:
+                while True:
+                    work_queue.get_nowait()
+            except Empty:
+                pass
         
         # Join workers with timeout to prevent hanging on shutdown
         for t in self.workers:
@@ -1609,26 +1706,10 @@ class Getter(object):
             self.localdata.session = requests.Session()
         
         while self.WORKING.is_set():
-            try:
-                obj, args, kwargs = self.queue.get(timeout=5)
-                #log.debug(f"Got: {obj} {args} {kwargs}")
-            except Empty:
-                #log.debug(f"timeout, continue")
-                #log.info(f"Got {self.counter}")
+            work_queue, work_item = self._get_next_work()
+            if work_item is None:
                 continue
-
-            #STATS.setdefault('count', 0) + 1
-
-            if getattr(obj, 'prefetch', False) and is_live_building():
-                try:
-                    self.queue.put_nowait((obj, args, kwargs))
-                except Full:
-                    obj.in_queue = False
-                    obj.cancel()
-                    bump("background_chunk_dropped_queue_full")
-                bump('background_chunk_deferred_live')
-                time.sleep(0.05)
-                continue
+            obj, args, kwargs = work_item
 
             queued_at = getattr(obj, '_profile_queued_at', None)
             if queued_at is not None:
@@ -1704,6 +1785,7 @@ class Getter(object):
                         self._inflight_objs.discard(obj)
                 # If did_resubmit: in_flight was already cleared before submit(), and
                 # _inflight_objs will be managed by whichever worker picks up the chunk next.
+                work_queue.task_done()
         
         # Worker loop ended - cleanup thread-local HTTP session
         try:
@@ -1713,6 +1795,54 @@ class Getter(object):
                 self.localdata.session = None
         except Exception:
             pass
+
+    def _get_next_work(self):
+        """Always service live work first; never spin on paused prefetch."""
+        try:
+            return self.live_queue, self.live_queue.get_nowait()
+        except Empty:
+            pass
+
+        if is_prefetch_runtime_allowed():
+            try:
+                return self.prefetch_queue, self.prefetch_queue.get_nowait()
+            except Empty:
+                pass
+
+        try:
+            return self.live_queue, self.live_queue.get(timeout=0.05)
+        except Empty:
+            if is_prefetch_runtime_allowed():
+                try:
+                    return (
+                        self.prefetch_queue,
+                        self.prefetch_queue.get(timeout=0.05),
+                    )
+                except Empty:
+                    pass
+        return None, None
+
+    def _enqueue(self, obj, args, kwargs) -> bool:
+        if getattr(obj, "prefetch", False):
+            if not is_prefetch_runtime_allowed():
+                bump("prefetch_skipped_until_flight")
+                return False
+            target = self.prefetch_queue
+        else:
+            target = self.live_queue
+        try:
+            target.put_nowait((obj, args, kwargs))
+            return True
+        except Full:
+            # Only the prefetch lane is bounded.
+            bump("prefetch_queue_full")
+            return False
+
+    def queue_depths(self):
+        return {
+            "live": self.live_queue.qsize(),
+            "prefetch": self.prefetch_queue.qsize(),
+        }
 
     def get(obj, *args, **kwargs):
         raise NotImplementedError
@@ -1736,12 +1866,10 @@ class Getter(object):
             bump('submit_skip_in_flight')
             return  # Currently downloading
         obj.in_queue = True
-        try:
-            self.queue.put_nowait((obj, args, kwargs))
+        if self._enqueue(obj, args, kwargs):
             return True
-        except Full:
+        else:
             obj.in_queue = False
-            bump("chunk_queue_full")
             return False
 
 class ChunkGetter(Getter):
@@ -1752,11 +1880,24 @@ class ChunkGetter(Getter):
     _queued_lock = threading.Lock()
 
     def reprioritize_queue(self) -> None:
-        """Rebuild the heap after a queued chunk's priority changes."""
+        """Rebuild both heaps and move promoted prefetch into the live lane."""
+        promoted = []
         try:
-            with self.queue.mutex:
-                heapq.heapify(self.queue.queue)
-                self.queue.not_empty.notify_all()
+            with self.prefetch_queue.mutex:
+                kept = []
+                for item in self.prefetch_queue.queue:
+                    if getattr(item[0], "prefetch", False):
+                        kept.append(item)
+                    else:
+                        promoted.append(item)
+                self.prefetch_queue.queue[:] = kept
+                heapq.heapify(self.prefetch_queue.queue)
+                self.prefetch_queue.not_full.notify_all()
+            for item in promoted:
+                self.live_queue.put_nowait(item)
+            with self.live_queue.mutex:
+                heapq.heapify(self.live_queue.queue)
+                self.live_queue.not_empty.notify_all()
         except Exception:
             pass
 
@@ -1772,18 +1913,28 @@ class ChunkGetter(Getter):
         """
         cancelled = []
 
-        with self.queue.mutex:
-            kept = []
-            for item in list(self.queue.queue):
-                obj = item[0]
-                if (not prefetch_only) or getattr(obj, 'prefetch', False):
-                    cancelled.append(obj)
-                else:
-                    kept.append(item)
-            if cancelled:
-                self.queue.queue[:] = kept
-                heapq.heapify(self.queue.queue)
-                self.queue.not_full.notify_all()
+        queues = (
+            (self.prefetch_queue,)
+            if prefetch_only
+            else (self.live_queue, self.prefetch_queue)
+        )
+        for work_queue in queues:
+            with work_queue.mutex:
+                kept = []
+                removed = []
+                for item in list(work_queue.queue):
+                    obj = item[0]
+                    if (not prefetch_only) or getattr(
+                        obj, 'prefetch', False
+                    ):
+                        removed.append(obj)
+                    else:
+                        kept.append(item)
+                if removed:
+                    work_queue.queue[:] = kept
+                    heapq.heapify(work_queue.queue)
+                    work_queue.not_full.notify_all()
+                    cancelled.extend(removed)
 
         for obj in cancelled:
             try:
@@ -1900,16 +2051,13 @@ class ChunkGetter(Getter):
                 self._queued_chunk_objs[chunk_id] = obj
         
         obj._profile_queued_at = time.monotonic()
-        try:
-            self.queue.put_nowait((obj, args, kwargs))
-        except Full:
+        if not self._enqueue(obj, args, kwargs):
             obj.in_queue = False
             obj._profile_queued_at = None
             if chunk_id:
                 with self._queued_lock:
                     self._queued_chunk_ids.discard(chunk_id)
                     self._queued_chunk_objs.pop(chunk_id, None)
-            bump("chunk_queue_full")
             return False
         return True
 
@@ -3826,6 +3974,9 @@ class SpatialPrefetcher:
         If X-Plane has also opened this tile (refs > 1 after our open), we drop
         it and let the on-demand tile build logic handle it instead.
         """
+        if not is_prefetch_runtime_allowed():
+            return 0, False
+
         # Get maptype from parameter or config
         if maptype is None:
             maptype = getattr(CFG.autoortho, 'maptype_override', None)
@@ -3925,6 +4076,8 @@ class SpatialPrefetcher:
         max_chunks: Optional[int] = None,
     ) -> int:
         """Queue an explicit ordered set of terrain tiles."""
+        if not is_prefetch_runtime_allowed():
+            return 0
         limit = self.max_chunks if max_chunks is None else max(1, max_chunks)
         submitted_total = 0
         for row, col, maptype, zoom in tiles:
@@ -3963,6 +4116,8 @@ def start_prefetcher(tile_cacher):
 
 
 def prefetch_dsf(dsf_path: str, max_chunks: Optional[int] = None) -> int:
+    if not is_prefetch_runtime_allowed():
+        return 0
     tiles = get_tiles_for_dsf(dsf_path)
     maptype_override = spatial_prefetcher._get_maptype_filter()
     if maptype_override:
@@ -10819,8 +10974,14 @@ class TileCacher(object):
         )
         if chunk_getter is not None:
             if chunk_getter.initialized:
+                depths = chunk_getter.queue_depths()
+                profile_gauge("chunk_queue.live_depth", depths["live"])
                 profile_gauge(
-                    "chunk_queue.depth", chunk_getter.queue.qsize()
+                    "chunk_queue.prefetch_depth", depths["prefetch"]
+                )
+                profile_gauge(
+                    "chunk_queue.depth",
+                    depths["live"] + depths["prefetch"],
                 )
         if _dds_buffer_pool is not None:
             try:
