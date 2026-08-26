@@ -1,4 +1,4 @@
-"""Categorized settings workspace with search, modes, and presets."""
+"""Categorized settings workspace with search and presets."""
 
 from dataclasses import dataclass
 
@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
 class CategoryEntry:
     name: str
     page: QWidget
-    expert: bool = False
     searchable_text: str = ""
 
 
@@ -46,8 +45,6 @@ class SettingsPage(QWidget):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search settings…")
         self.search_edit.setAccessibleName("Search settings")
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["Basic", "Expert"])
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(
             [
@@ -60,13 +57,9 @@ class SettingsPage(QWidget):
         )
         title_row.addWidget(title)
         title_row.addStretch()
-        mode_label = QLabel("&Mode")
-        mode_label.setBuddy(self.mode_combo)
         preset_label = QLabel("&Preset")
         preset_label.setBuddy(self.preset_combo)
         title_row.addWidget(self.search_edit)
-        title_row.addWidget(mode_label)
-        title_row.addWidget(self.mode_combo)
         title_row.addWidget(preset_label)
         title_row.addWidget(self.preset_combo)
         root.addLayout(title_row)
@@ -93,7 +86,6 @@ class SettingsPage(QWidget):
         root.addLayout(footer)
 
         self.search_edit.textChanged.connect(self._refresh_categories)
-        self.mode_combo.currentTextChanged.connect(self._refresh_categories)
         self.category_list.currentRowChanged.connect(
             self._show_category_row
         )
@@ -106,7 +98,6 @@ class SettingsPage(QWidget):
         name,
         widgets,
         *,
-        expert=False,
         recommendation="",
         numeric_bindings=(),
     ):
@@ -187,7 +178,7 @@ class SettingsPage(QWidget):
             )
         text = " ".join(search_parts).lower()
         self.entries.append(
-            CategoryEntry(name, wrapper, expert=expert, searchable_text=text)
+            CategoryEntry(name, wrapper, searchable_text=text)
         )
         self.stack.addWidget(wrapper)
         self._refresh_categories()
@@ -205,12 +196,9 @@ class SettingsPage(QWidget):
         if current is not None:
             current_name = current.data(Qt.ItemDataRole.UserRole)
         query = self.search_edit.text().strip().lower()
-        expert_mode = self.mode_combo.currentText() == "Expert"
         self.category_list.blockSignals(True)
         self.category_list.clear()
         for entry in self.entries:
-            if entry.expert and not expert_mode:
-                continue
             if query and query not in entry.searchable_text:
                 continue
             item = QListWidgetItem(entry.name)

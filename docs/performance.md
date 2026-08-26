@@ -1121,7 +1121,7 @@ If X-Plane takes significantly longer to load scenery with AutoOrtho enabled, th
 
 **To reduce loading times:**
 
-1. Go to **Settings** → **Performance** in Expert mode
+1. Go to **Settings** → **Performance**
 2. Set **"Allow extra loading time during startup"** to **Off**
 3. This will use normal time budgets during startup, resulting in faster loads
 

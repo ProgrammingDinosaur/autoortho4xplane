@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QSlider
 from ui.pages.settings_page import SettingsPage
 
 
-def test_settings_categories_search_modes_and_presets(qt_app):
+def test_settings_categories_search_and_presets(qt_app):
     apply_button = QPushButton("Apply")
     revert_button = QPushButton("Revert")
     restart = QLabel("Restart")
@@ -22,10 +22,8 @@ def test_settings_categories_search_modes_and_presets(qt_app):
         [QLabel("Startup behavior")],
         numeric_bindings=[("Exact", slider, 1, "")],
     )
-    page.add_category("Pipeline", [QLabel("Buffer pool")], expert=True)
+    page.add_category("Pipeline", [QLabel("Buffer pool")])
 
-    assert page.category_list.count() == 1
-    page.mode_combo.setCurrentText("Expert")
     assert page.category_list.count() == 2
     page.search_edit.setText("buffer")
     assert page.category_list.count() == 1

@@ -30,7 +30,7 @@ The application is organized around five primary destinations:
   package details.
 - **Flight Plan & Map** — SimBrief controls, loaded-flight details, and the
   local Custom Map Editor.
-- **Settings** — searchable Basic/Expert categories, presets, exact numeric
+- **Settings** — searchable categories, presets, exact numeric
   inputs, and Apply/Revert.
 - **Diagnostics** — health checks, searchable logs, export actions, and
   performance-report history.
@@ -94,7 +94,7 @@ The configuration file `.autoortho` is located in the user's home directory.
 
 ## Performance Tuning
 
-AutoOrtho includes advanced performance settings that allow you to balance image quality against loading times and stuttering. These settings are available under **Settings → Performance** and **Settings → Prefetching** in Expert mode.
+AutoOrtho includes advanced performance settings that allow you to balance image quality against loading times and stuttering. These settings are available under **Settings → Performance** and **Settings → Prefetching**.
 
 Key settings include:
 - **Tile Time Budget** - Maximum time to wait for a tile before returning results

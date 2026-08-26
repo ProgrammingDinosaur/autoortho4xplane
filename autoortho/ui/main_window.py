@@ -786,10 +786,6 @@ class ConfigUI(QMainWindow):
             )
         self.setTabOrder(
             self.categorized_settings_page.search_edit,
-            self.categorized_settings_page.mode_combo,
-        )
-        self.setTabOrder(
-            self.categorized_settings_page.mode_combo,
             self.categorized_settings_page.preset_combo,
         )
         self.setTabOrder(
@@ -953,7 +949,6 @@ class ConfigUI(QMainWindow):
         self.categorized_settings_page.add_category(
             "Performance",
             [self.performance_settings_group],
-            expert=True,
             recommendation=(
                 "Change timeout and fallback behavior only when diagnosing "
                 "loading stalls or missing imagery."
@@ -980,7 +975,6 @@ class ConfigUI(QMainWindow):
         self.categorized_settings_page.add_category(
             "Compression & Pipeline",
             [self.dds_settings_group, self.pipeline_settings_group],
-            expert=True,
             numeric_bindings=(
                 (
                     "Tile build workers",
@@ -1003,12 +997,10 @@ class ConfigUI(QMainWindow):
         self.categorized_settings_page.add_category(
             "Diagnostics",
             [self.diagnostics_settings_group],
-            expert=True,
         )
         self.categorized_settings_page.add_category(
             "Platform & Mounting",
             [self.fuse_settings_group, self.night_settings_group],
-            expert=True,
         )
         self.categorized_settings_page.preset_requested.connect(
             self._apply_settings_preset
