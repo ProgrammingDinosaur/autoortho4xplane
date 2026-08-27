@@ -79,13 +79,19 @@ try:
     from autoortho.http2_broker import (
         HTTP2Broker,
         BrokerError as HTTP2BrokerError,
+        BrokerStartupError as HTTP2BrokerStartupError,
     )
 except ImportError:
     try:
-        from http2_broker import HTTP2Broker, BrokerError as HTTP2BrokerError
+        from http2_broker import (
+            HTTP2Broker,
+            BrokerError as HTTP2BrokerError,
+            BrokerStartupError as HTTP2BrokerStartupError,
+        )
     except ImportError:
         HTTP2Broker = None
         HTTP2BrokerError = Exception
+        HTTP2BrokerStartupError = Exception
 
 try:
     from autoortho.version import __version__
@@ -834,18 +840,34 @@ class AOMount:
                     ),
                 ),
             )
-            broker = HTTP2Broker(
-                max_concurrency=max_concurrency,
-                max_connections=max_connections,
-                max_response_bytes=8 * 1024 * 1024,
-            )
-            broker.start()
+            broker_kwargs = {
+                "max_concurrency": max_concurrency,
+                "max_connections": max_connections,
+                "max_response_bytes": 8 * 1024 * 1024,
+            }
+            broker = HTTP2Broker(**broker_kwargs)
+            try:
+                broker.start()
+                broker_mode = "process"
+            except HTTP2BrokerStartupError as process_exc:
+                log.warning(
+                    "HTTP/2 broker process startup failed; retrying with "
+                    "an in-process selector-loop server: %s",
+                    process_exc,
+                )
+                broker = HTTP2Broker(
+                    in_process=True,
+                    **broker_kwargs,
+                )
+                broker.start()
+                broker_mode = "thread"
             self._download_broker = broker
             self._download_broker_env = broker.client_environment()
             os.environ.update(self._download_broker_env)
             log.info(
                 "Shared HTTP/2 broker started "
-                "(concurrency=%d, connections=%d)",
+                "(mode=%s, concurrency=%d, connections=%d)",
+                broker_mode,
                 max_concurrency,
                 max_connections,
             )

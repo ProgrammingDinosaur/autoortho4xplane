@@ -389,6 +389,36 @@ def test_handshake_timeout_propagates_as_broker_startup_error():
         broker.start()
 
 
+def test_server_loop_crash_is_reported_instead_of_plain_timeout():
+    class _CrashingServer:
+        def __init__(self, **kwargs):
+            self._router = kwargs["router"]
+
+        async def run(self):
+            raise RuntimeError("simulated selector failure")
+
+    broker = hb.HTTP2Broker(
+        in_process=True,
+        server_factory=_CrashingServer,
+        handshake_timeout=1.0,
+    )
+    with pytest.raises(
+        hb.BrokerStartupError,
+        match="simulated selector failure",
+    ):
+        broker.start()
+    assert broker._zmq_ctx is None
+
+
+def test_windows_broker_uses_selector_event_loop(monkeypatch):
+    monkeypatch.setattr(hb.sys, "platform", "win32")
+    loop = hb._new_broker_event_loop()
+    try:
+        assert isinstance(loop, asyncio.SelectorEventLoop)
+    finally:
+        hb._close_broker_event_loop(loop)
+
+
 def test_missing_dependency_raises_broker_unavailable_error(monkeypatch):
     monkeypatch.setattr(hb, "httpx", None)
     broker = hb.HTTP2Broker()

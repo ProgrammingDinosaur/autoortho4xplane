@@ -231,6 +231,49 @@ def test_parent_broker_environment_is_forwarded(monkeypatch):
     assert broker.stopped is True
 
 
+def test_parent_retries_broker_in_process_after_spawn_failure(monkeypatch):
+    import importlib
+
+    autoortho_mod = importlib.import_module("autoortho")
+    mount = autoortho_mod.AOMount.__new__(autoortho_mod.AOMount)
+    mount.cfg = SimpleNamespace(
+        autoortho=SimpleNamespace(
+            http2_enabled=True,
+            max_concurrent_downloads=32,
+            http2_max_connections=8,
+        )
+    )
+    mount._download_broker = None
+    mount._download_broker_env = {}
+    created = []
+
+    class FakeBroker:
+        def __init__(self, in_process=False, **kwargs):
+            self.in_process = in_process
+            created.append(self)
+
+        def start(self):
+            if not self.in_process:
+                raise autoortho_mod.HTTP2BrokerStartupError(
+                    "spawn handshake failed"
+                )
+
+        def client_environment(self):
+            return {
+                "AO_HTTP2_BROKER_ADDR": "tcp://127.0.0.1:1234",
+                "AO_HTTP2_BROKER_TOKEN": "token",
+            }
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(autoortho_mod, "HTTP2Broker", FakeBroker)
+    mount.start_download_broker()
+
+    assert [broker.in_process for broker in created] == [False, True]
+    assert mount._download_broker is created[1]
+
+
 def test_windows_runtime_selects_fuse_library_before_import(
     monkeypatch, tmp_path
 ):

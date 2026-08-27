@@ -56,6 +56,7 @@ import math
 import multiprocessing
 import queue as _queue_module
 import secrets
+import sys
 import threading
 import time
 import uuid
@@ -109,7 +110,7 @@ __all__ = [
 
 DEFAULT_MAX_REQUEST_BYTES = 64 * 1024
 DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
-DEFAULT_HANDSHAKE_TIMEOUT = 5.0
+DEFAULT_HANDSHAKE_TIMEOUT = 10.0
 DEFAULT_MAX_CONCURRENCY = 8
 DEFAULT_MAX_CONNECTIONS = 16
 DEFAULT_PRIORITY = 10
@@ -245,6 +246,30 @@ def _require_dependencies(*, require_http2: bool = False) -> None:
             "http2_broker requires the following packages, which are not "
             "installed: " + ", ".join(missing)
         )
+
+
+def _new_broker_event_loop() -> asyncio.AbstractEventLoop:
+    """Return a loop compatible with zmq.asyncio on every platform.
+
+    Windows defaults to ProactorEventLoop, which lacks add_reader and makes
+    pyzmq fail as soon as ROUTER.recv_multipart() starts unless Tornado happens
+    to be installed. The broker has no need for proactor-specific subprocess
+    support, so a selector loop is the direct and dependency-free solution.
+    """
+    if sys.platform == "win32":
+        return asyncio.SelectorEventLoop()
+    return asyncio.new_event_loop()
+
+
+def _close_broker_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    try:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    except Exception:
+        pass
+    try:
+        loop.close()
+    except Exception:
+        pass
 
 
 def _encode(obj: Dict[str, Any]) -> bytes:
@@ -578,7 +603,10 @@ class _RouterServer:
 
         mtype = msg.get("type")
         if mtype == "HELLO":
-            await self._send(identity, {"type": "HELLO_ACK"})
+            await self._send(
+                identity,
+                {"type": "HELLO_ACK", "id": msg.get("id")},
+            )
         elif mtype == "REQUEST":
             await self._handle_request(identity, msg)
         elif mtype == "CANCEL":
@@ -638,10 +666,21 @@ def _process_entrypoint(token: str, handshake_queue, config: Dict[str, Any]) -> 
     except BrokerUnavailableError as exc:
         handshake_queue.put(("error", str(exc)))
         return
+    loop = _new_broker_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        asyncio.run(_serve_process(token, handshake_queue, config))
-    except Exception as exc:  # pragma: no cover - defensive, logged best-effort
-        log.error("Broker process crashed: %s", exc)
+        loop.run_until_complete(
+            _serve_process(token, handshake_queue, config)
+        )
+    except BaseException as exc:  # pragma: no cover - process boundary
+        message = f"{type(exc).__name__}: {exc}"
+        try:
+            handshake_queue.put(("runtime_error", message))
+        except Exception:
+            pass
+        log.error("Broker process crashed: %s", message)
+    finally:
+        _close_broker_event_loop(loop)
 
 
 async def _serve_process(token: str, handshake_queue, config: Dict[str, Any]) -> None:
@@ -713,6 +752,22 @@ class _ProcessRuntime:
             proc.kill()
             proc.join(timeout=timeout)
 
+    def diagnostic(self) -> Optional[str]:
+        messages = []
+        while True:
+            try:
+                status, payload = self._queue.get_nowait()
+            except _queue_module.Empty:
+                break
+            if status in ("error", "runtime_error"):
+                messages.append(str(payload))
+        proc = self._process
+        if proc is not None and not proc.is_alive():
+            messages.append(
+                f"broker process exited with code {proc.exitcode}"
+            )
+        return "; ".join(messages) or None
+
 
 class _ThreadRuntime:
     """Runs the broker server on a background thread of the caller's process.
@@ -730,13 +785,16 @@ class _ThreadRuntime:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._server: Any = None
+        self._server_task: Optional[asyncio.Task] = None
         self._zmq_ctx = None
+        self._runtime_error: Optional[str] = None
+        self._stopping = False
 
     def start(self, handshake_timeout: float) -> int:
         ready: "_queue_module.Queue" = _queue_module.Queue()
 
         def _run() -> None:
-            loop = asyncio.new_event_loop()
+            loop = _new_broker_event_loop()
             asyncio.set_event_loop(loop)
             self._loop = loop
             ctx = zmq.asyncio.Context()
@@ -759,11 +817,24 @@ class _ThreadRuntime:
             self._server = server
             ready.put(("ok", port))
             try:
-                loop.run_until_complete(server.run())
-            except Exception as exc:  # pragma: no cover - defensive
-                log.error("In-process broker server crashed: %s", exc)
+                self._server_task = loop.create_task(server.run())
+                loop.run_until_complete(self._server_task)
+            except BaseException as exc:  # pragma: no cover - thread boundary
+                if not (
+                    self._stopping
+                    and isinstance(exc, asyncio.CancelledError)
+                ):
+                    self._runtime_error = f"{type(exc).__name__}: {exc}"
+                    log.error(
+                        "In-process broker server crashed: %s",
+                        self._runtime_error,
+                    )
             finally:
-                loop.close()
+                try:
+                    ctx.destroy(linger=0)
+                except Exception:
+                    pass
+                _close_broker_event_loop(loop)
 
         self._thread = threading.Thread(target=_run, name="http2-broker-inprocess", daemon=True)
         self._thread.start()
@@ -776,17 +847,32 @@ class _ThreadRuntime:
         return int(payload)
 
     def stop(self, timeout: float = 5.0) -> None:
+        self._stopping = True
         stop_event = getattr(self._server, "_stop_event", None)
         loop = self._loop
-        if stop_event is not None and loop is not None:
+        if loop is not None:
             try:
-                loop.call_soon_threadsafe(stop_event.set)
+                def _request_stop():
+                    if stop_event is not None:
+                        stop_event.set()
+                    task = self._server_task
+                    if task is not None and not task.done():
+                        task.cancel()
+
+                loop.call_soon_threadsafe(_request_stop)
             except RuntimeError:
                 pass
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
                 log.warning("In-process broker thread did not stop within %.1fs", timeout)
+
+    def diagnostic(self) -> Optional[str]:
+        if self._runtime_error:
+            return self._runtime_error
+        if self._thread is not None and not self._thread.is_alive():
+            return "broker server thread exited unexpectedly"
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -885,8 +971,10 @@ class HTTP2Broker:
         try:
             port = runtime.start(self._handshake_timeout)
         except BrokerError:
+            self._close_sockets()
             raise
         except Exception as exc:
+            self._close_sockets()
             raise BrokerStartupError(f"failed to start broker: {exc}") from exc
 
         self._runtime = runtime
@@ -900,6 +988,8 @@ class HTTP2Broker:
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
             self._runtime = None
+            self._address = None
+            self._close_sockets()
             raise
 
         self._started = True
@@ -1029,20 +1119,69 @@ class HTTP2Broker:
         sock.setsockopt(zmq.LINGER, 0)
         try:
             sock.connect(self._address)
-            sock.send(_encode({"type": "HELLO", "token": self._token}))
             poller = zmq.Poller()
             poller.register(sock, zmq.POLLIN)
-            events = dict(poller.poll(timeout=int(self._handshake_timeout * 1000)))
-            if sock not in events:
-                raise BrokerStartupError("broker handshake timed out")
-            reply = _decode(sock.recv())
-            if reply.get("type") == "ERROR":
-                err = reply.get("error", {})
-                raise BrokerStartupError(f"broker handshake rejected: {err.get('message', 'unknown error')}")
-            if reply.get("type") != "HELLO_ACK":
-                raise BrokerStartupError(f"unexpected handshake reply: {reply.get('type')!r}")
+            handshake_id = uuid.uuid4().hex
+            hello = _encode(
+                {
+                    "type": "HELLO",
+                    "token": self._token,
+                    "id": handshake_id,
+                }
+            )
+            deadline = time.monotonic() + self._handshake_timeout
+            next_send = 0.0
+            while time.monotonic() < deadline:
+                now = time.monotonic()
+                if now >= next_send:
+                    sock.send(hello)
+                    next_send = now + 0.25
+                remaining_ms = max(
+                    1,
+                    min(250, int((deadline - now) * 1000)),
+                )
+                events = dict(poller.poll(timeout=remaining_ms))
+                if sock not in events:
+                    diagnostic = self._runtime_diagnostic()
+                    if diagnostic:
+                        raise BrokerStartupError(
+                            "broker server exited before handshake: "
+                            + diagnostic
+                        )
+                    continue
+                reply = _decode(sock.recv())
+                if reply.get("id") not in (None, handshake_id):
+                    continue
+                if reply.get("type") == "ERROR":
+                    err = reply.get("error", {})
+                    raise BrokerStartupError(
+                        "broker handshake rejected: "
+                        + err.get("message", "unknown error")
+                    )
+                if reply.get("type") == "HELLO_ACK":
+                    return
+                raise BrokerStartupError(
+                    f"unexpected handshake reply: {reply.get('type')!r}"
+                )
+            diagnostic = self._runtime_diagnostic()
+            suffix = f": {diagnostic}" if diagnostic else ""
+            raise BrokerStartupError(
+                "broker handshake timed out" + suffix
+            )
         finally:
             sock.close(0)
+
+    def _runtime_diagnostic(self) -> Optional[str]:
+        runtime = self._runtime
+        if runtime is None:
+            return None
+        diagnostic = getattr(runtime, "diagnostic", None)
+        if diagnostic is None:
+            return None
+        try:
+            return diagnostic()
+        except Exception:
+            return None
 
     def _get_socket(self):
         sock = getattr(self._local, "socket", None)
