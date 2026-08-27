@@ -384,6 +384,10 @@ class _BrokerCore:
         limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections)
         client_kwargs: Dict[str, Any] = {
             "http2": transport is None,
+            # Match requests.get(), which historically followed imagery
+            # provider redirects. Several providers redirect HTTP tile URLs to
+            # HTTPS and must not be reported as failed with a 301/302 response.
+            "follow_redirects": True,
             "limits": limits,
         }
         if transport is not None:

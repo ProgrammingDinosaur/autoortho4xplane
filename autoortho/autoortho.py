@@ -296,9 +296,11 @@ def setupmount(mountpoint, systemtype):
             log.warning(f"Failed to cleanup mountpoint {mountpoint}: {e}")
 
 
-def diagnose(CFG):
+def diagnose(CFG, mount_timeout=60.0, retry_interval=0.25):
 
     location = geocoder.ip("me")
+    mount_failed = False
+    provider_failures = []
 
     def _check_mount(mount):
         try:
@@ -309,75 +311,87 @@ def diagnose(CFG):
         except Exception:
             return False
 
-    # Use a small executor so a hung filesystem call (e.g. unresponsive macFUSE
-    # or stale NFS) can be timed out per-attempt instead of blocking forever.
-    pool_size = max(2, len(CFG.scenery_mounts))
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=pool_size, thread_name_prefix="diag_mount"
-    ) as mount_pool:
+    mounts = [s.get('mount') for s in CFG.scenery_mounts]
+    mount_results = [False] * len(mounts)
+    probe_done = [threading.Event() for _ in mounts]
+    deadline = time.monotonic() + max(0.0, float(mount_timeout))
 
-        def _check_mount_with_timeout(mount, timeout):
-            try:
-                return mount_pool.submit(_check_mount, mount).result(timeout=timeout)
-            except (concurrent.futures.TimeoutError, Exception):
-                return False
+    def _probe_mount(index, mount):
+        try:
+            while time.monotonic() < deadline:
+                if _check_mount(mount):
+                    mount_results[index] = True
+                    return
+                probe_done[index].wait(max(0.01, retry_interval))
+        finally:
+            probe_done[index].set()
 
-        def _wait_for_mount(mount, attempts=40, interval=0.25):
-            for _ in range(attempts):
-                if _check_mount_with_timeout(mount, timeout=max(1.0, interval * 4)):
-                    return True
-                time.sleep(interval)
-            return False
+    for index, mount in enumerate(mounts):
+        threading.Thread(
+            target=_probe_mount,
+            args=(index, mount),
+            name=f"diag_mount_{index}",
+            daemon=True,
+        ).start()
 
-        log.info("Waiting for mounts...")
-        log.info("Checking %d mount(s) in parallel (up to 10s)...", len(CFG.scenery_mounts))
-        # Check all mounts in parallel so large regions don't delay smaller ones
-        list(mount_pool.map(_wait_for_mount, [s.get('mount') for s in CFG.scenery_mounts]))
+    log.info("Waiting for mounts...")
+    log.info(
+        "Checking %d mount(s) in parallel (up to %.1fs)...",
+        len(mounts),
+        mount_timeout,
+    )
+    for done in probe_done:
+        remaining = max(0.0, deadline - time.monotonic())
+        done.wait(remaining)
 
-        failed = False
-        log.info("\n\n")
-        log.info("------------------------------------")
-        log.info(" Diagnostic check ...")
-        log.info("------------------------------------")
-        log.info(f"Detected system: {platform.uname()}")
-        log.info(f"Detected location {location.address}")
-        log.info(f"Detected installed scenery:")
-        for scenery in CFG.scenery_mounts:
-            root = scenery.get('root')
-            mount = scenery.get('mount')
-            log.info(f"    {root}")
-            # Retry for mounts that are slow to appear (e.g. large regions still initialising)
-            ret = _wait_for_mount(mount, attempts=12, interval=5.0)
-            log.info(f"        Mounted? {ret}")
-            if not ret:
-                failed = True
+    log.info("\n\n")
+    log.info("------------------------------------")
+    log.info(" Diagnostic check ...")
+    log.info("------------------------------------")
+    log.info(f"Detected system: {platform.uname()}")
+    log.info(f"Detected location {location.address}")
+    log.info(f"Detected installed scenery:")
+    for index, scenery in enumerate(CFG.scenery_mounts):
+        root = scenery.get('root')
+        log.info(f"    {root}")
+        ret = mount_results[index]
+        log.info(f"        Mounted? {ret}")
+        if not ret:
+            mount_failed = True
 
-        log.info(f"Checking maptypes:")
-        import getortho
-        for maptype in MAPTYPES:
-            if maptype in ("Use tile default", "Custom Map"):
-                continue
-            # Use ignore_cleanup_errors=True to handle race with async cache writes
-            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
-                c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
-                ret = c.get()
-                # Give async cache writer a moment to complete or detect deleted dir
-                time.sleep(0.1)
-                if ret:
-                    log.info(f"    Maptype: {maptype} OK!")
-                else:
-                    log.warning(f"    Maptype: {maptype} FAILED!")
-                    failed = True
+    log.info(f"Checking maptypes:")
+    import getortho
+    for maptype in MAPTYPES:
+        if maptype in ("Use tile default", "Custom Map"):
+            continue
+        # Use ignore_cleanup_errors=True to handle race with async cache writes
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
+            ret = c.get()
+            # Give async cache writer a moment to complete or detect deleted dir
+            time.sleep(0.1)
+            if ret:
+                log.info(f"    Maptype: {maptype} OK!")
+            else:
+                log.warning(f"    Maptype: {maptype} FAILED!")
+                provider_failures.append(maptype)
 
     log.info("------------------------------------")
-    if failed:
+    if mount_failed:
         log.warning("***************")
         log.warning("***************")
-        log.warning("FAILURES DETECTED!!")
-        log.warning("Please review logs and setup.")
+        log.warning("MOUNT FAILURES DETECTED!!")
+        log.warning("Please review the filesystem and FUSE setup.")
         log.warning("***************")
         log.warning("***************")
         return False
+    if provider_failures:
+        log.warning(
+            "Optional imagery provider check(s) failed: %s. "
+            "Mounted scenery remains available; provider availability "
+            "does not determine mount health.",
+            ", ".join(provider_failures),
+        )
     log.info(" Diagnostics done.  All checks passed")
     return True
 

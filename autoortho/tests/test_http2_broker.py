@@ -95,6 +95,29 @@ def test_response_is_duck_type_compatible():
     resp.close()
 
 
+def test_provider_redirects_are_followed():
+    requests_seen = []
+
+    async def handler(request):
+        requests_seen.append(str(request.url))
+        if request.url.path == "/tile":
+            return httpx.Response(
+                301,
+                headers={"Location": "https://example.test/imagery"},
+            )
+        return httpx.Response(200, content=b"redirected-tile")
+
+    broker = make_broker(handler)
+    response = broker.get("http://example.test/tile")
+
+    assert response.status_code == 200
+    assert response.content == b"redirected-tile"
+    assert requests_seen == [
+        "http://example.test/tile",
+        "https://example.test/imagery",
+    ]
+
+
 def test_attached_client_does_not_stop_owner():
     async def handler(request):
         return httpx.Response(200, content=b"shared")

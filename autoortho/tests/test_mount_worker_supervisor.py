@@ -2,6 +2,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 sys.path.insert(
@@ -432,3 +433,92 @@ def test_nonblocking_mount_cleans_up_failed_diagnostics(monkeypatch):
 
     assert aom.mount_sceneries(blocking=False) is False
     assert cleanup_calls == [True]
+
+
+def test_provider_probe_failure_does_not_fail_healthy_mounts(monkeypatch):
+    import importlib
+
+    autoortho_mod = importlib.import_module("autoortho")
+    cfg = SimpleNamespace(
+        scenery_mounts=[{"root": "/root", "mount": "/mount"}]
+    )
+    monkeypatch.setattr(
+        autoortho_mod.geocoder,
+        "ip",
+        lambda _value: SimpleNamespace(address="test"),
+    )
+    monkeypatch.setattr(
+        autoortho_mod.os.path,
+        "isdir",
+        lambda path: path == "/mount/textures",
+    )
+    monkeypatch.setattr(autoortho_mod, "system_type", "windows")
+    monkeypatch.setattr(autoortho_mod, "MAPTYPES", ["ARC"])
+    monkeypatch.setattr(autoortho_mod.time, "sleep", lambda _seconds: None)
+
+    class FailedProviderChunk:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get(self):
+            return False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "getortho",
+        SimpleNamespace(Chunk=FailedProviderChunk),
+    )
+
+    assert autoortho_mod.diagnose(cfg, mount_timeout=0.1) is True
+
+
+def test_mount_readiness_failure_remains_fatal(monkeypatch):
+    import importlib
+
+    autoortho_mod = importlib.import_module("autoortho")
+    cfg = SimpleNamespace(
+        scenery_mounts=[{"root": "/root", "mount": "/mount"}]
+    )
+    monkeypatch.setattr(
+        autoortho_mod.geocoder,
+        "ip",
+        lambda _value: SimpleNamespace(address="test"),
+    )
+    monkeypatch.setattr(autoortho_mod.os.path, "isdir", lambda _path: False)
+    monkeypatch.setattr(autoortho_mod, "system_type", "windows")
+    monkeypatch.setattr(autoortho_mod, "MAPTYPES", [])
+    monkeypatch.setattr(autoortho_mod.time, "sleep", lambda _seconds: None)
+
+    assert autoortho_mod.diagnose(cfg, mount_timeout=0.01) is False
+
+
+def test_hung_mount_probe_respects_global_deadline(monkeypatch):
+    import importlib
+    import time
+
+    autoortho_mod = importlib.import_module("autoortho")
+    cfg = SimpleNamespace(
+        scenery_mounts=[{"root": "/root", "mount": "/mount"}]
+    )
+    release = threading.Event()
+    monkeypatch.setattr(
+        autoortho_mod.geocoder,
+        "ip",
+        lambda _value: SimpleNamespace(address="test"),
+    )
+    monkeypatch.setattr(
+        autoortho_mod.os.path,
+        "isdir",
+        lambda _path: release.wait(5.0),
+    )
+    monkeypatch.setattr(autoortho_mod, "system_type", "windows")
+    monkeypatch.setattr(autoortho_mod, "MAPTYPES", [])
+
+    started = time.monotonic()
+    try:
+        assert autoortho_mod.diagnose(
+            cfg, mount_timeout=0.05
+        ) is False
+        assert time.monotonic() - started < 0.5
+    finally:
+        release.set()
