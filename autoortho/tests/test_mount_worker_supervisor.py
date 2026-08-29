@@ -345,8 +345,8 @@ def test_unmount_sceneries_unmounts_before_stopping_workers():
 
     assert autoortho_mod.AOMount.unmount_sceneries(aom) is True
 
-    assert calls[0] == ("unmount", "/tmp/ao-mount", False, 3.0)
-    assert calls[1] == ("stop_workers", 3.0)
+    assert calls[0] == ("unmount", "/tmp/ao-mount", False, 8.0)
+    assert calls[1] == ("stop_workers", 8.0)
 
 
 def test_unmount_success_is_checked_after_workers_stop(monkeypatch):

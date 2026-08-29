@@ -22,6 +22,7 @@ from typing import Optional, Dict, Tuple, List
 
 from io import BytesIO
 from urllib.request import urlopen, Request
+import queue
 from queue import PriorityQueue, Empty, Full
 from functools import wraps, lru_cache
 from pathlib import Path
@@ -40,7 +41,10 @@ try:
     from autoortho.http2_broker import (
         HTTP2Broker,
         RequestTimeout as BrokerRequestTimeout,
+        BrokerCancelledError,
+        BrokerCapacityError,
         BrokerTimeoutError,
+        BrokerShutdownError,
         BrokerError,
     )
 except ImportError:
@@ -48,13 +52,30 @@ except ImportError:
         from http2_broker import (
             HTTP2Broker,
             RequestTimeout as BrokerRequestTimeout,
+            BrokerCancelledError,
+            BrokerCapacityError,
             BrokerTimeoutError,
+            BrokerShutdownError,
             BrokerError,
         )
     except ImportError:
         HTTP2Broker = None
         BrokerRequestTimeout = None
-        BrokerTimeoutError = BrokerError = Exception
+
+        class BrokerError(Exception):
+            """Placeholder used when the broker package is unavailable."""
+
+        class BrokerTimeoutError(BrokerError):
+            """Placeholder used when the broker package is unavailable."""
+
+        class BrokerCancelledError(BrokerError):
+            """Placeholder used when the broker package is unavailable."""
+
+        class BrokerCapacityError(BrokerError):
+            """Placeholder used when the broker package is unavailable."""
+
+        class BrokerShutdownError(BrokerError):
+            """Placeholder used when the broker package is unavailable."""
 
 try:
     from autoortho.diagnostics import (
@@ -72,9 +93,9 @@ except ImportError:
     from aoimage import AoImage
 
 try:
-    from autoortho.aoconfig import CFG
+    from autoortho.aoconfig import CFG, resolve_provider_setting
 except ImportError:
-    from aoconfig import CFG
+    from aoconfig import CFG, resolve_provider_setting
 
 try:
     from autoortho.aostats import STATS, StatTracker, StatsBatcher, get_stat, inc_many, inc_stat, set_stat, update_process_memory_stat, clear_process_memory_stat, update_decode_pool_stats, _get_macos_phys_footprint
@@ -857,7 +878,11 @@ def _get_http2_client():
         if _http2_client is not None:
             return _http2_client
         try:
-            _http2_client = HTTP2Broker.connect(address, token)
+            _http2_client = HTTP2Broker.connect(
+                address,
+                token,
+                max_pending=resolve_provider_setting("provider_max_in_flight"),
+            )
         except Exception as exc:
             _http2_client_failed = True
             log.error("Could not connect to shared HTTP/2 broker: %s", exc)
@@ -873,26 +898,69 @@ def _close_http2_client():
         client.stop()
 
 
-def _profiled_http_get(session, url, headers, timeout, chunk):
-    tile_id = getattr(chunk, "tile_id", None) or getattr(chunk, "chunk_id", None)
-    details = {
+def _reset_http2_client(failed_client=None):
+    """Discard a dead attached client so the next request can reconnect."""
+    global _http2_client, _http2_client_failed
+    with _http2_client_lock:
+        if failed_client is not None and _http2_client is not failed_client:
+            return
+        client, _http2_client = _http2_client, None
+        _http2_client_failed = False
+    if client is not None:
+        try:
+            client.stop()
+        except Exception:
+            log.debug("Failed closing dead HTTP/2 broker client", exc_info=True)
+
+
+def _broker_env_configured():
+    """True when this process is meant to download through the shared broker.
+
+    Checked without connecting: it stays true while the client is being
+    (re)established, which is what the worker-pool sizing needs to know.
+    """
+
+    if HTTP2Broker is None:
+        return False
+    return bool(
+        os.getenv("AO_HTTP2_BROKER_ADDR") and os.getenv("AO_HTTP2_BROKER_TOKEN")
+    )
+
+
+def _broker_timeout(timeout):
+    """Convert a requests-style timeout into a broker RequestTimeout."""
+
+    if isinstance(timeout, tuple):
+        connect_timeout = float(timeout[0])
+        read_timeout = float(timeout[1])
+    else:
+        connect_timeout = read_timeout = float(timeout)
+    return BrokerRequestTimeout(
+        connect=connect_timeout,
+        read=read_timeout,
+        write=connect_timeout,
+        pool=connect_timeout,
+    )
+
+
+def _http_span_details(chunk):
+    return {
         "maptype": getattr(chunk, "maptype", None),
         "zoom": getattr(chunk, "zoom", None),
         "attempt": getattr(chunk, "attempt", None),
         "prefetch": bool(getattr(chunk, "prefetch", False)),
     }
+
+
+def _profiled_http_get(session, url, headers, timeout, chunk):
+    tile_id = getattr(chunk, "tile_id", None) or getattr(chunk, "chunk_id", None)
     with profile_span(
         "network.http_request",
         tile_id=tile_id,
-        details=details,
+        details=_http_span_details(chunk),
     ) as span:
         broker = _get_http2_client()
         if broker is not None:
-            if isinstance(timeout, tuple):
-                connect_timeout = float(timeout[0])
-                read_timeout = float(timeout[1])
-            else:
-                connect_timeout = read_timeout = float(timeout)
             request_id = uuid.uuid4().hex
             chunk._broker_request_id = request_id
             try:
@@ -900,14 +968,13 @@ def _profiled_http_get(session, url, headers, timeout, chunk):
                     url,
                     headers=headers,
                     priority=int(getattr(chunk, "priority", 0)),
-                    timeout=BrokerRequestTimeout(
-                        connect=connect_timeout,
-                        read=read_timeout,
-                        write=connect_timeout,
-                        pool=connect_timeout,
-                    ),
+                    timeout=_broker_timeout(timeout),
                     request_id=request_id,
                 )
+            except BrokerCancelledError:
+                # Cancellation is an intentional outcome, not a transport
+                # failure: keep the typed error so callers skip retry/backoff.
+                raise
             except BrokerTimeoutError as exc:
                 raise requests.exceptions.Timeout(str(exc)) from exc
             except BrokerError as exc:
@@ -972,6 +1039,19 @@ def native_thread_load_peak_and_reset() -> tuple:
 # `BackgroundDDSBuilder: 0 tiles built`).
 _live_reads_in_progress = 0
 _live_reads_lock = threading.Lock()
+try:
+    _live_tile_admission_limit = max(
+        1,
+        min(
+            128,
+            int(getattr(CFG.autoortho, "live_tile_admission", 16)),
+        ),
+    )
+except (TypeError, ValueError):
+    _live_tile_admission_limit = 16
+_live_tile_admission = threading.BoundedSemaphore(
+    _live_tile_admission_limit
+)
 
 # Bounded repair queue for partial DDS entries that are missing mipmap 0.
 _partial_mm0_promotions = OrderedDict()
@@ -1010,6 +1090,26 @@ def _live_read_end():
     global _live_reads_in_progress
     with _live_reads_lock:
         _live_reads_in_progress -= 1
+
+
+def acquire_live_tile_slot(timeout: float) -> bool:
+    """Bound complete live tile work before expensive tile state is created."""
+    started = time.monotonic()
+    acquired = _live_tile_admission.acquire(timeout=max(0.0, timeout))
+    record_stage(
+        "tile.admission_wait",
+        (time.monotonic() - started) * 1000.0,
+        outcome="ok" if acquired else "timeout",
+        details={"limit": _live_tile_admission_limit},
+    )
+    return acquired
+
+
+def release_live_tile_slot() -> None:
+    try:
+        _live_tile_admission.release()
+    except ValueError:
+        log.error("Live tile admission released without a matching acquire")
 
 
 def is_live_building() -> bool:
@@ -1627,6 +1727,685 @@ class TimeBudget:
                 f"exhausted={self.exhausted})")
 
 
+class _AsyncDownload(object):
+    """Bookkeeping for one chunk download owned by :class:`_BrokerDownloadStage`."""
+
+    __slots__ = ("obj", "args", "kwargs", "idx", "request", "request_id",
+                 "started_at")
+
+    def __init__(self, obj, args, kwargs, idx, request):
+        self.obj = obj
+        self.args = args
+        self.kwargs = kwargs
+        self.idx = idx
+        self.request = request
+        self.request_id = None
+        self.started_at = 0.0
+
+
+class _DeferredDispatch(object):
+    """A chunk accepted by the stage but still waiting for an admission slot.
+
+    Holds no network state at all: `begin_network_attempt` has not run yet, so
+    a deferred chunk has not consumed one of its retry attempts and can be
+    handed back to the work queue unchanged.
+    """
+
+    __slots__ = ("obj", "args", "kwargs", "idx")
+
+    def __init__(self, obj, args, kwargs, idx):
+        self.obj = obj
+        self.args = args
+        self.kwargs = kwargs
+        self.idx = idx
+
+
+class _BrokerDownloadStage(object):
+    """Bounded asynchronous network stage backed by the shared HTTP/2 broker.
+
+    Worker threads hand a chunk to :meth:`dispatch` and go straight back to the
+    queue, so the number of outstanding provider requests is bounded by the
+    broker's pending budget instead of by the size of the downloader pool.
+
+    Three cooperating pieces, none of which ever sleeps on a backoff:
+
+    * the broker dispatcher thread settles futures and only pushes them onto
+      ``_completions`` (it must never run chunk logic inline),
+    * a small pool of completion threads applies responses to chunks,
+    * one scheduler thread owns every timed action (pre-request backoff, retry
+      backoff, capacity re-admission).
+
+    Admission mirrors the broker: background/prefetch work may only use
+    ``max_outstanding - reserved_live`` slots, so prefetch can never starve
+    live requests.  A chunk that finds the stage full is **not** handed back
+    to the worker for a synchronous download -- that would silently exceed
+    ``provider_max_in_flight`` and burn the reserved live capacity.  It is
+    parked in a bounded, priority-ordered deferred queue instead and admitted
+    by :meth:`_release` as soon as a slot frees.  Only when that queue is also
+    full does the calling worker block (bounded by
+    ``_BACKPRESSURE_TIMEOUT``); if capacity still has not appeared the chunk is
+    quietly requeued, which throttles the feeders without ever bypassing the
+    admission bound.
+
+    :meth:`dispatch` therefore returns False only when this stage cannot serve
+    the request at all (no broker, shutting down, or a legacy call signature).
+    """
+
+    _CAPACITY_RETRY_DELAY = 0.05
+    # How long a worker thread may block when even the deferred queue is full.
+    _BACKPRESSURE_TIMEOUT = 0.25
+    _BACKPRESSURE_POLL = 0.05
+
+    def __init__(self, getter, max_outstanding, workers, live_priority_threshold=PRIORITY_PREFETCH,
+                 max_deferred=None):
+        self._getter = getter
+        self._max_outstanding = max(1, int(max_outstanding))
+        self._reserved_live = max(1, self._max_outstanding // 4)
+        self._live_priority_threshold = live_priority_threshold
+        self._lock = threading.Lock()
+        self._admit_cv = threading.Condition(self._lock)
+        self._outstanding = 0
+        self._background_outstanding = 0
+        self._peak_outstanding = 0
+        self._active = {}
+        self._stopping = threading.Event()
+
+        # Deferred admission queue: bounded so a stalled provider cannot grow
+        # the backlog without limit, ordered so live work overtakes prefetch.
+        if max_deferred is None:
+            max_deferred = min(4096, max(64, 4 * self._max_outstanding))
+        self._max_deferred = max(1, int(max_deferred))
+        self._deferred = []
+        self._deferred_seq = itertools.count()
+        self._drain_scheduled = False
+
+        self._completions = queue.Queue()
+        self._sched_cv = threading.Condition()
+        self._sched_heap = []
+        self._sched_seq = itertools.count()
+
+        self._threads = []
+        self._scheduler = threading.Thread(
+            target=self._scheduler_loop,
+            name="ao-dl-sched",
+            daemon=True,
+        )
+        self._scheduler.start()
+        self._threads.append(self._scheduler)
+        for i in range(max(1, int(workers))):
+            t = threading.Thread(
+                target=self._completion_loop,
+                name=f"ao-dl-complete-{i}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+    # -- admission ---------------------------------------------------------
+
+    def _is_background(self, obj):
+        if getattr(obj, "prefetch", False):
+            return True
+        return int(getattr(obj, "priority", 0)) >= self._live_priority_threshold
+
+    def _try_admit(self, obj):
+        background = self._is_background(obj)
+        with self._lock:
+            return self._try_admit_locked(background)
+
+    def _try_admit_locked(self, background):
+        if self._stopping.is_set():
+            return False
+        limit = self._max_outstanding
+        if background:
+            limit -= self._reserved_live
+        if self._outstanding >= limit:
+            bump(
+                "download_stage_full_background"
+                if background
+                else "download_stage_full_live"
+            )
+            return False
+        self._outstanding += 1
+        if self._outstanding > self._peak_outstanding:
+            self._peak_outstanding = self._outstanding
+        if background:
+            self._background_outstanding += 1
+        return True
+
+    def _release(self, obj):
+        background = self._is_background(obj)
+        with self._admit_cv:
+            self._outstanding = max(0, self._outstanding - 1)
+            if background:
+                self._background_outstanding = max(
+                    0, self._background_outstanding - 1
+                )
+            has_deferred = bool(self._deferred)
+            self._admit_cv.notify()
+        if has_deferred:
+            self._request_drain()
+
+    def outstanding(self):
+        with self._lock:
+            return self._outstanding
+
+    def peak_outstanding(self):
+        with self._lock:
+            return self._peak_outstanding
+
+    def deferred_depth(self):
+        with self._lock:
+            return len(self._deferred)
+
+    # -- dispatch ----------------------------------------------------------
+
+    def dispatch(self, obj, args, kwargs, idx):
+        """Take ownership of ``obj``'s download, or return False.
+
+        Returning True means this stage is responsible for eventually calling
+        ``Getter._finalize_attempt`` for the chunk (possibly after deferring
+        or requeueing it); the worker must not touch it again.  False is
+        returned only when the stage cannot serve this request at all, never
+        merely because it is at capacity.
+        """
+
+        if self._stopping.is_set():
+            return False
+        if args:
+            # Unknown positional arguments belong to the legacy sync path.
+            return False
+        if set(kwargs) - {"timeout", "max_attempts"}:
+            return False
+        if _get_http2_client() is None:
+            return False
+        if self._try_admit(obj):
+            self._start(obj, args, kwargs, idx)
+            return True
+        return self._defer(_DeferredDispatch(obj, args, kwargs, idx))
+
+    def _defer(self, pending):
+        """Park a chunk until a slot frees, applying backpressure if needed."""
+
+        deadline = time.monotonic() + self._BACKPRESSURE_TIMEOUT
+        pending_is_background = self._is_background(pending.obj)
+        while True:
+            stopping = False
+            evicted_background = None
+            with self._admit_cv:
+                if self._stopping.is_set():
+                    stopping = True
+                    queued = False
+                    expired = False
+                elif len(self._deferred) < self._max_deferred:
+                    heapq.heappush(
+                        self._deferred,
+                        (
+                            int(getattr(pending.obj, "priority", 0)),
+                            next(self._deferred_seq),
+                            pending,
+                        ),
+                    )
+                    bump("download_stage_deferred")
+                    queued = True
+                elif not pending_is_background:
+                    background_entries = [
+                        (index, item)
+                        for index, item in enumerate(self._deferred)
+                        if self._is_background(item[2].obj)
+                    ]
+                    if background_entries:
+                        evict_index, evicted_item = max(
+                            background_entries,
+                            key=lambda pair: pair[1][0],
+                        )
+                        evicted_background = evicted_item[2]
+                        self._deferred.pop(evict_index)
+                        heapq.heapify(self._deferred)
+                        heapq.heappush(
+                            self._deferred,
+                            (
+                                int(getattr(pending.obj, "priority", 0)),
+                                next(self._deferred_seq),
+                                pending,
+                            ),
+                        )
+                        bump("download_stage_live_displaced_prefetch")
+                        queued = True
+                    else:
+                        queued = False
+                        expired = time.monotonic() >= deadline
+                        if not expired:
+                            self._admit_cv.wait(self._BACKPRESSURE_POLL)
+                else:
+                    # Deferred queue is full too: hold this worker briefly so
+                    # the feeders slow down instead of the bound being ignored.
+                    queued = False
+                    bump("download_stage_backpressure")
+                    expired = time.monotonic() >= deadline
+                    if not expired:
+                        self._admit_cv.wait(self._BACKPRESSURE_POLL)
+            if stopping:
+                # Shutdown raced this dispatch.  Retire the chunk instead of
+                # letting the worker open a synchronous connection while the
+                # process is tearing down.
+                self._retire_deferred(pending)
+                return True
+            if evicted_background is not None:
+                self._requeue_deferred(evicted_background)
+            if queued:
+                # A slot may have been freed between the failed admission and
+                # the push above, so make sure someone looks at the queue.
+                self._request_drain()
+                return True
+            if expired:
+                self._requeue_deferred(pending)
+                return True
+            if _get_http2_client() is None:
+                # The broker went away: the legacy synchronous path is now the
+                # only way this chunk can still be fetched.
+                return False
+
+    def _start(self, obj, args, kwargs, idx):
+        """Begin one network attempt for an already-admitted chunk."""
+
+        try:
+            prepared = obj.begin_network_attempt(
+                idx=idx,
+                timeout=kwargs.get("timeout"),
+                max_attempts=kwargs.get("max_attempts"),
+            )
+        except Exception as err:
+            self._release(obj)
+            self._getter._settle_attempt(obj, args, kwargs, False, err)
+            return
+
+        if isinstance(prepared, _AttemptOutcome):
+            self._release(obj)
+            if prepared.resolved:
+                self._record_chunk_resolve(obj)
+            self._getter._settle_attempt(obj, args, kwargs, prepared.resolved)
+            return
+
+        state = _AsyncDownload(obj, args, kwargs, idx, prepared)
+        try:
+            if prepared.delay > 0:
+                delay, prepared.delay = prepared.delay, 0.0
+                self._schedule(delay, self._send, state)
+            else:
+                self._send(state)
+        except Exception as err:
+            self._release(obj)
+            self._getter._settle_attempt(
+                obj,
+                args,
+                kwargs,
+                False,
+                err,
+            )
+
+    # -- deferred admission ------------------------------------------------
+
+    def _request_drain(self):
+        """Ask the scheduler thread to admit whatever deferred work fits.
+
+        Draining happens on the single scheduler thread so completion threads
+        never recurse into `_start`, and a flag keeps at most one drain
+        callback queued -- the scheduler heap cannot accumulate one entry per
+        completed download.
+        """
+
+        with self._lock:
+            if self._drain_scheduled or not self._deferred:
+                return
+            self._drain_scheduled = True
+        self._schedule(0.0, self._drain_deferred)
+
+    def _drain_deferred(self):
+        while True:
+            with self._admit_cv:
+                self._drain_scheduled = False
+                pending = self._take_admissible_locked()
+                if pending is None:
+                    return
+                self._admit_cv.notify()
+            if self._stopping.is_set() or getattr(pending.obj, "cancelled", False):
+                self._release(pending.obj)
+                self._retire_deferred(pending)
+                continue
+            self._start(pending.obj, pending.args, pending.kwargs, pending.idx)
+
+    def _take_admissible_locked(self):
+        """Pop and admit the highest-priority deferred chunk that fits.
+
+        The caller must hold ``_admit_cv``.  When the head of the queue is
+        background work that no longer fits its (smaller) budget, the queue is
+        scanned once for live work: the reserved live slots must stay usable
+        even while prefetch saturates the stage.
+        """
+
+        if not self._deferred:
+            return None
+        head_background = self._is_background(self._deferred[0][2].obj)
+        if self._try_admit_locked(head_background):
+            return heapq.heappop(self._deferred)[2]
+        if not head_background:
+            return None
+        for index, item in enumerate(self._deferred):
+            if self._is_background(item[2].obj):
+                continue
+            if not self._try_admit_locked(False):
+                return None
+            self._deferred.pop(index)
+            heapq.heapify(self._deferred)
+            return item[2]
+        return None
+
+    def _requeue_deferred(self, pending):
+        """Hand a still-unstarted chunk back to the work queue, quietly."""
+
+        bump("download_stage_requeued")
+        self._getter._settle_attempt(
+            pending.obj, pending.args, pending.kwargs, False, quiet=True
+        )
+
+    def _retire_deferred(self, pending):
+        """Settle a deferred chunk that will never run (shutdown/cancel)."""
+
+        abandon = getattr(self._getter, "_abandon_duplicate_waiters", None)
+        if abandon is not None:
+            abandon(pending.obj)
+        else:
+            cancel = getattr(pending.obj, "cancel", None)
+            if cancel is not None:
+                cancel()
+        self._getter._settle_attempt(
+            pending.obj, pending.args, pending.kwargs, False, quiet=True
+        )
+
+    def _send(self, state):
+        broker = _get_http2_client()
+        if broker is None:
+            self._finish(state, _AttemptOutcome(requeue_delay=0.0))
+            return
+        if self._stopping.is_set() or getattr(state.obj, "cancelled", False):
+            self._finish(state, _AttemptOutcome(resolved=True))
+            return
+
+        request = state.request
+        request_id = uuid.uuid4().hex
+        state.request_id = request_id
+        state.obj._broker_request_id = request_id
+        state.started_at = time.monotonic()
+        try:
+            future = broker.submit_async(
+                request.url,
+                headers=request.headers,
+                priority=int(getattr(state.obj, "priority", 0)),
+                timeout=_broker_timeout(request.timeout),
+                request_id=request_id,
+            )
+        except BrokerCapacityError:
+            # Another client filled the shared pending budget; re-offer soon
+            # instead of failing the chunk. Our own outstanding counter caps
+            # how many states can ever be waiting here.
+            state.obj._broker_request_id = None
+            bump("download_broker_capacity_deferred")
+            self._schedule(self._CAPACITY_RETRY_DELAY, self._send, state)
+            return
+        except BrokerError as err:
+            state.obj._broker_request_id = None
+            self._finish(state, state.obj.finish_network_attempt(request, None, err))
+            return
+
+        with self._lock:
+            self._active[request_id] = state
+        future.add_done_callback(self._on_future_done)
+
+    def _on_future_done(self, future):
+        # Runs on the broker dispatcher thread: never do chunk work here.
+        with self._lock:
+            state = self._active.pop(future.request_id, None)
+        if state is None:
+            return
+        self._completions.put((state, future))
+
+    # -- completion --------------------------------------------------------
+
+    def _completion_loop(self):
+        while True:
+            item = self._completions.get()
+            try:
+                if item is None:
+                    return
+                state, future = item
+                self._apply_result(state, future)
+            except Exception:
+                log.exception("Unhandled error in download completion worker")
+            finally:
+                self._completions.task_done()
+
+    def _apply_result(self, state, future):
+        obj = state.obj
+        obj._broker_request_id = None
+        error = future.exception()
+        response = None if error is not None else future.result()
+
+        duration_ms = (time.monotonic() - state.started_at) * 1000.0
+        details = _http_span_details(obj)
+        if error is None:
+            details["status_code"] = response.status_code
+            details["response_bytes"] = len(response.content or b"")
+            outcome_label = "ok" if response.status_code < 400 else "failed"
+        else:
+            outcome_label = (
+                "cancelled"
+                if isinstance(error, BrokerCancelledError)
+                else "failed"
+            )
+        record_stage(
+            "network.http_request",
+            duration_ms,
+            tile_id=getattr(obj, "tile_id", None) or getattr(obj, "chunk_id", None),
+            outcome=outcome_label,
+            details=details,
+        )
+
+        try:
+            try:
+                outcome = obj.finish_network_attempt(
+                    state.request,
+                    response,
+                    error,
+                )
+            finally:
+                if response is not None:
+                    response.close()
+        except Exception as err:
+            self._release(obj)
+            self._getter._settle_attempt(
+                obj,
+                state.args,
+                state.kwargs,
+                False,
+                err,
+            )
+            return
+
+        if outcome.retry_request is not None:
+            state.request = outcome.retry_request
+            try:
+                self._send(state)
+            except Exception as err:
+                self._release(obj)
+                self._getter._settle_attempt(
+                    obj,
+                    state.args,
+                    state.kwargs,
+                    False,
+                    err,
+                )
+            return
+        self._finish(state, outcome)
+
+    def _finish(self, state, outcome):
+        if outcome.requeue_delay > 0:
+            # Backoff must not consume network admission while no request is
+            # active. Resubmission will pass through normal priority admission.
+            self._release(state.obj)
+            if self._stopping.is_set():
+                state.obj.cancel()
+                self._getter._settle_attempt(
+                    state.obj,
+                    state.args,
+                    state.kwargs,
+                    True,
+                    quiet=True,
+                )
+                return
+            self._schedule(
+                outcome.requeue_delay,
+                self._getter._settle_attempt,
+                state.obj,
+                state.args,
+                state.kwargs,
+                outcome.resolved,
+                None,
+                True,
+            )
+            return
+        self._release(state.obj)
+        state.obj._broker_request_id = None
+        if outcome.resolved:
+            self._record_chunk_resolve(state.obj)
+        self._getter._settle_attempt(
+            state.obj, state.args, state.kwargs, outcome.resolved
+        )
+
+    def _record_chunk_resolve(self, obj):
+        started = getattr(obj, "starttime", None)
+        if not started:
+            return
+        record_stage(
+            "chunk.resolve",
+            max(0.0, time.time() - started) * 1000.0,
+            tile_id=getattr(obj, "tile_id", None)
+            or getattr(obj, "chunk_id", None),
+            outcome=(
+                "cancelled"
+                if getattr(obj, "cancelled", False)
+                else "failed"
+                if getattr(obj, "permanent_failure", False)
+                else "ok"
+            ),
+            details={
+                "attempts": getattr(obj, "attempt", 0),
+                "prefetch": bool(getattr(obj, "prefetch", False)),
+            },
+        )
+
+    # -- scheduler ---------------------------------------------------------
+
+    def _schedule(self, delay, fn, *args):
+        when = time.monotonic() + max(0.0, float(delay))
+        with self._sched_cv:
+            heapq.heappush(
+                self._sched_heap, (when, next(self._sched_seq), fn, args)
+            )
+            self._sched_cv.notify()
+
+    def _scheduler_loop(self):
+        while True:
+            with self._sched_cv:
+                while True:
+                    if self._stopping.is_set() and not self._sched_heap:
+                        return
+                    if not self._sched_heap:
+                        self._sched_cv.wait(0.25)
+                        continue
+                    when = self._sched_heap[0][0]
+                    remaining = when - time.monotonic()
+                    if remaining <= 0:
+                        _, _, fn, args = heapq.heappop(self._sched_heap)
+                        break
+                    self._sched_cv.wait(min(remaining, 0.25))
+            try:
+                fn(*args)
+            except Exception:
+                log.exception("Unhandled error in download scheduler")
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def stop(self, timeout=5.0):
+        self._stopping.set()
+        broker = _get_http2_client()
+        with self._admit_cv:
+            active = list(self._active.keys())
+            deferred = [item[2] for item in self._deferred]
+            self._deferred = []
+            self._admit_cv.notify_all()
+        if broker is not None:
+            for request_id in active:
+                try:
+                    broker.cancel(request_id)
+                except BrokerError:
+                    log.debug("Broker cancel failed during stage shutdown",
+                              exc_info=True)
+        # Deferred chunks never started an attempt, so nothing else will ever
+        # finalize them: retire them here or their waiters block forever.
+        for pending in deferred:
+            try:
+                self._retire_deferred(pending)
+            except Exception:
+                log.exception("Failed to retire deferred chunk during shutdown")
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            with self._lock:
+                active_count = len(self._active)
+            if active_count == 0 and self._completions.unfinished_tasks == 0:
+                break
+            time.sleep(0.01)
+        with self._sched_cv:
+            self._sched_cv.notify_all()
+        for _ in range(len(self._threads) - 1):
+            self._completions.put(None)
+        for t in self._threads:
+            t.join(timeout=timeout)
+            if t.is_alive():
+                log.warning("Download stage thread %s did not stop in time", t.name)
+        with self._lock:
+            remaining_active = list(self._active.values())
+            self._active.clear()
+        for state in remaining_active:
+            self._release(state.obj)
+            state.obj.cancel()
+            self._getter._settle_attempt(
+                state.obj,
+                state.args,
+                state.kwargs,
+                True,
+                quiet=True,
+            )
+
+    def cancel_deferred(self, prefetch_only=True):
+        """Remove deferred work before it reaches provider admission."""
+        removed = []
+        with self._admit_cv:
+            kept = []
+            for item in self._deferred:
+                pending = item[2]
+                if (not prefetch_only) or self._is_background(pending.obj):
+                    removed.append(pending)
+                else:
+                    kept.append(item)
+            self._deferred = kept
+            heapq.heapify(self._deferred)
+            self._admit_cv.notify_all()
+        for pending in removed:
+            self._retire_deferred(pending)
+        return len(removed)
+
+
 class Getter(object):
     queue = None
     workers = None
@@ -1660,6 +2439,9 @@ class Getter(object):
         self.localdata = threading.local()
         self._inflight_objs = set()
         self._inflight_objs_lock = threading.Lock()
+        # Broker-backed downloads are dispatched here instead of blocking a
+        # worker thread for the whole request/response round trip.
+        self._async_stage = self._create_async_stage()
         # Thread-local sessions created in worker() to avoid shared-state contention
 
         for i in range(num_workers):
@@ -1670,10 +2452,17 @@ class Getter(object):
         #self.stat_t = t = threading.Thread(target=self.show_stats, daemon=True)
         #self.stat_t.start()
 
+    def _create_async_stage(self):
+        """Subclasses return a `_BrokerDownloadStage`, or None to stay sync."""
+        return None
 
     def stop(self):
         self.WORKING.clear()
-        
+
+        stage, self._async_stage = self._async_stage, None
+        if stage is not None:
+            stage.stop()
+
         for work_queue in (self.live_queue, self.prefetch_queue):
             try:
                 while True:
@@ -1711,80 +2500,48 @@ class Getter(object):
                 continue
             obj, args, kwargs = work_item
 
-            queued_at = getattr(obj, '_profile_queued_at', None)
-            if queued_at is not None:
-                record_stage(
-                    "chunk.queue_wait",
-                    (time.monotonic() - queued_at) * 1000.0,
-                    tile_id=getattr(obj, 'tile_id', None) or getattr(obj, 'chunk_id', None),
-                    details={
-                        "priority": getattr(obj, 'priority', None),
-                        "prefetch": bool(getattr(obj, 'prefetch', False)),
-                    },
-                )
-                obj._profile_queued_at = None
-
-            did_resubmit = False
             try:
+                queued_at = getattr(obj, '_profile_queued_at', None)
+                if queued_at is not None:
+                    record_stage(
+                        "chunk.queue_wait",
+                        (time.monotonic() - queued_at) * 1000.0,
+                        tile_id=getattr(obj, 'tile_id', None) or getattr(obj, 'chunk_id', None),
+                        details={
+                            "priority": getattr(obj, 'priority', None),
+                            "prefetch": bool(getattr(obj, 'prefetch', False)),
+                        },
+                    )
+                    obj._profile_queued_at = None
+
                 # Mark chunk as in-flight (Chunk always has these attributes)
                 obj.in_queue = False
                 obj.in_flight = True
                 with self._inflight_objs_lock:
                     self._inflight_objs.add(obj)
 
-                if not self.get(obj, *args, **kwargs):
-                    # Check if chunk is permanently failed or cancelled before re-submitting
-                    if obj.permanent_failure:
-                        log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
-                        continue
-                    if getattr(obj, 'cancelled', False):
-                        log.debug(f"Chunk {obj} cancelled, not re-submitting")
-                        continue
-                    log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
-                    # CRITICAL: Clear in_flight BEFORE re-submitting, otherwise submit()
-                    # will see in_flight=True and silently drop the chunk!
-                    obj.in_flight = False
-                    bump('worker_resubmit')
-                    did_resubmit = bool(
-                        self.submit(obj, *args, **kwargs)
-                    )
-                    if not did_resubmit:
-                        bump("worker_resubmit_dropped")
-                        abandon = getattr(
-                            self, "_abandon_duplicate_waiters", None
-                        )
-                        if abandon is not None:
-                            abandon(obj)
+                if self._dispatch_async(obj, args, kwargs, idx):
+                    # Ownership moved to the async stage: it now owns the
+                    # in-flight bookkeeping and the eventual finalisation.
+                    continue
+
+                try:
+                    resolved = self.get(obj, *args, **kwargs)
+                    error = None
+                except Exception as err:
+                    resolved = False
+                    error = err
+                self._finalize_attempt(obj, args, kwargs, resolved, error)
             except Exception as err:
-                log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
-                # Don't re-submit if permanently failed or cancelled
-                if obj.permanent_failure:
-                    log.debug(f"Chunk {obj} permanently failed during exception, not re-submitting")
-                    continue
-                if getattr(obj, 'cancelled', False):
-                    log.debug(f"Chunk {obj} cancelled during exception, not re-submitting")
-                    continue
-                # CRITICAL: Clear in_flight BEFORE re-submitting
-                obj.in_flight = False
-                bump('worker_resubmit')
-                did_resubmit = bool(
-                    self.submit(obj, *args, **kwargs)
+                log.exception("Unhandled chunk dispatch failure for %s", obj)
+                self._finalize_attempt(
+                    obj,
+                    args,
+                    kwargs,
+                    False,
+                    err,
                 )
-                if not did_resubmit:
-                    bump("worker_resubmit_dropped")
-                    abandon = getattr(
-                        self, "_abandon_duplicate_waiters", None
-                    )
-                    if abandon is not None:
-                        abandon(obj)
             finally:
-                if not did_resubmit:
-                    # Normal completion — we still own in_flight and _inflight_objs
-                    obj.in_flight = False
-                    with self._inflight_objs_lock:
-                        self._inflight_objs.discard(obj)
-                # If did_resubmit: in_flight was already cleared before submit(), and
-                # _inflight_objs will be managed by whichever worker picks up the chunk next.
                 work_queue.task_done()
         
         # Worker loop ended - cleanup thread-local HTTP session
@@ -1795,6 +2552,65 @@ class Getter(object):
                 self.localdata.session = None
         except Exception:
             pass
+
+    def _dispatch_async(self, obj, args, kwargs, idx) -> bool:
+        """Hand the download to the async stage; True means ownership moved."""
+        return False
+
+    def _settle_chunk(self, obj, resolved):
+        """Release per-chunk coalescing state. Overridden by ChunkGetter."""
+        return resolved
+
+    def _settle_attempt(self, obj, args, kwargs, resolved, error=None, quiet=False):
+        """Terminal bookkeeping for an asynchronously dispatched attempt.
+
+        Mirrors what the synchronous worker path does after `self.get()`:
+        release coalescing state first (so a resubmit is not mistaken for a
+        duplicate), then resubmit/finalize.  ``quiet`` marks an unstarted
+        attempt being handed back (capacity backpressure or shutdown), which
+        is expected flow control rather than a download failure.
+        """
+        try:
+            self._settle_chunk(obj, resolved)
+        except Exception:
+            log.exception("Failed to settle chunk state for %s", obj)
+        return self._finalize_attempt(obj, args, kwargs, resolved, error, quiet=quiet)
+
+    def _finalize_attempt(self, obj, args, kwargs, resolved, error=None, quiet=False):
+        """Resubmit or retire one finished attempt and clear in-flight state."""
+        did_resubmit = False
+        try:
+            if error is not None:
+                log.error(f"ERROR {error} getting: {obj} {args} {kwargs}, re-submit.")
+            if not resolved:
+                if obj.permanent_failure:
+                    log.debug(f"Chunk {obj} permanently failed ({obj.failure_reason}), not re-submitting")
+                elif getattr(obj, 'cancelled', False):
+                    log.debug(f"Chunk {obj} cancelled, not re-submitting")
+                else:
+                    if error is None and not quiet:
+                        log.warning(f"Failed getting: {obj} {args} {kwargs}, re-submit.")
+                    # CRITICAL: Clear in_flight BEFORE re-submitting, otherwise
+                    # submit() sees in_flight=True and silently drops the chunk!
+                    obj.in_flight = False
+                    bump('worker_resubmit')
+                    did_resubmit = bool(self.submit(obj, *args, **kwargs))
+                    if not did_resubmit:
+                        bump("worker_resubmit_dropped")
+                        abandon = getattr(
+                            self, "_abandon_duplicate_waiters", None
+                        )
+                        if abandon is not None:
+                            abandon(obj)
+        finally:
+            if not did_resubmit:
+                # Normal completion — we still own in_flight and _inflight_objs
+                obj.in_flight = False
+                with self._inflight_objs_lock:
+                    self._inflight_objs.discard(obj)
+            # If did_resubmit: in_flight was already cleared before submit(), and
+            # _inflight_objs will be managed by whichever worker picks it up next.
+        return did_resubmit
 
     def _get_next_work(self):
         """Always service live work first; never spin on paused prefetch."""
@@ -1912,6 +2728,9 @@ class ChunkGetter(Getter):
         event unblocks immediately.
         """
         cancelled = []
+        stage = self._async_stage
+        if stage is not None:
+            stage.cancel_deferred(prefetch_only=prefetch_only)
 
         queues = (
             (self.prefetch_queue,)
@@ -2112,7 +2931,11 @@ class ChunkGetter(Getter):
         kwargs['idx'] = self.localdata.idx
         kwargs['session'] = getattr(self.localdata, 'session', None) or requests
         result = obj.get(*args, **kwargs)
-        
+        self._settle_chunk(obj, result)
+        return result
+
+    def _settle_chunk(self, obj, result):
+        """Release chunk_id coalescing state and fan out to duplicate waiters."""
         chunk_id = getattr(obj, 'chunk_id', None)
         waiters = []
         if chunk_id:
@@ -2126,8 +2949,28 @@ class ChunkGetter(Getter):
 
         if result:
             self._complete_duplicate_waiters(obj, waiters)
-        
+
         return result
+
+    def _create_async_stage(self):
+        if HTTP2Broker is None:
+            return None
+        try:
+            max_outstanding = resolve_provider_setting("provider_max_in_flight")
+            workers = resolve_provider_setting("download_dispatch_workers")
+        except Exception:
+            log.exception("Falling back to synchronous downloads")
+            return None
+        return _BrokerDownloadStage(self, max_outstanding, workers)
+
+    def _dispatch_async(self, obj, args, kwargs, idx) -> bool:
+        stage = self._async_stage
+        if stage is None:
+            return False
+        if obj.ready.is_set():
+            # Matches the fast path in get(); cheap enough to run inline.
+            return False
+        return stage.dispatch(obj, args, kwargs, idx)
 
 
 def _create_chunk_getter(num_workers: int):
@@ -2144,6 +2987,53 @@ def _create_chunk_getter(num_workers: int):
     return ChunkGetter(num_workers)
 
 
+def _resolve_getter_workers():
+    """Size the chunk worker pool for this process.
+
+    With the broker configured the workers no longer own a socket for the
+    whole round trip: they only hand chunks to the async stage, which caps
+    real network concurrency at ``provider_max_in_flight``.  A handful of
+    coordination threads (``download_dispatch_workers``) is therefore enough,
+    and a large ``fetch_threads`` value would only add context switching.
+    Without a broker the legacy sizing still applies, because each worker
+    then blocks on its own synchronous request.
+    """
+
+    if _broker_env_configured():
+        try:
+            workers = max(1, int(resolve_provider_setting("download_dispatch_workers")))
+        except Exception:
+            log.exception(
+                "Could not resolve download_dispatch_workers; using legacy sizing"
+            )
+        else:
+            log.info(
+                "Broker configured: using %d coordination workers "
+                "(network concurrency is provider_max_in_flight)",
+                workers,
+            )
+            return workers
+
+    requested = max(1, int(getattr(CFG.autoortho, "fetch_threads", 32)))
+    max_concurrent = resolve_provider_setting("provider_max_in_flight")
+    if os.getenv("AO_RUN_MODE") not in ("mount_worker", "macfuse_worker"):
+        max_concurrent = min(max_concurrent, 8)
+    workers = min(
+        requested,
+        max_concurrent,
+        max(8, min(64, CURRENT_CPU_COUNT * 2)),
+    )
+    if workers != requested:
+        log.warning(
+            "Clamping fetch_threads from %d to %d for this process "
+            "(in-flight budget: %d)",
+            requested,
+            workers,
+            max_concurrent,
+        )
+    return workers
+
+
 class LazyChunkGetter:
     def __init__(self):
         self._instance = None
@@ -2157,39 +3047,9 @@ class LazyChunkGetter:
         if self._instance is None:
             with self._lock:
                 if self._instance is None:
-                    requested = max(
-                        1, int(getattr(CFG.autoortho, "fetch_threads", 32))
+                    self._instance = _create_chunk_getter(
+                        _resolve_getter_workers()
                     )
-                    max_concurrent = max(
-                        1,
-                        min(
-                            1024,
-                            int(
-                                getattr(
-                                    CFG.autoortho,
-                                    "max_concurrent_downloads",
-                                    256,
-                                )
-                            ),
-                        ),
-                    )
-                    if os.getenv("AO_RUN_MODE") not in (
-                        "mount_worker",
-                        "macfuse_worker",
-                    ):
-                        max_concurrent = min(max_concurrent, 8)
-                    workers = min(
-                        requested,
-                        max_concurrent,
-                        max(8, min(64, CURRENT_CPU_COUNT * 2)),
-                    )
-                    if workers != requested:
-                        log.warning(
-                            "Clamping fetch_threads from %d to %d for this process",
-                            requested,
-                            workers,
-                        )
-                    self._instance = _create_chunk_getter(workers)
         return self._instance
 
     def submit(self, *args, **kwargs):
@@ -2300,6 +3160,106 @@ _cache_write_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=2,
     thread_name_prefix="cache_writer"
 )
+
+_cache_write_pending_bytes = 0
+_cache_write_pending_lock = threading.Lock()
+_lt_cache_write_pending_bytes = 0
+_lt_cache_write_pending_lock = threading.Lock()
+
+
+def _cache_write_limit_bytes() -> int:
+    try:
+        value = int(
+            float(getattr(CFG.autoortho, "cache_write_buffer_mb", 256))
+            * 1048576
+        )
+    except (TypeError, ValueError):
+        value = 256 * 1048576
+    return max(16 * 1048576, value)
+
+
+def _lt_cache_write_limit_bytes() -> int:
+    try:
+        value = int(
+            float(
+                getattr(
+                    CFG.autoortho,
+                    "long_term_cache_write_buffer_mb",
+                    128,
+                )
+            )
+            * 1048576
+        )
+    except (TypeError, ValueError):
+        value = 128 * 1048576
+    return max(16 * 1048576, value)
+
+
+def _release_pending_bytes(kind: str, byte_count: int) -> None:
+    global _cache_write_pending_bytes, _lt_cache_write_pending_bytes
+    if kind == "local":
+        with _cache_write_pending_lock:
+            _cache_write_pending_bytes = max(
+                0, _cache_write_pending_bytes - byte_count
+            )
+            profile_gauge(
+                "cache_write.pending_bytes",
+                _cache_write_pending_bytes,
+            )
+    else:
+        with _lt_cache_write_pending_lock:
+            _lt_cache_write_pending_bytes = max(
+                0, _lt_cache_write_pending_bytes - byte_count
+            )
+            profile_gauge(
+                "lt_cache_write.pending_bytes",
+                _lt_cache_write_pending_bytes,
+            )
+
+
+def _submit_bounded_cache_write(
+    executor,
+    function,
+    *args,
+    byte_count: int,
+    kind: str,
+) -> bool:
+    global _cache_write_pending_bytes, _lt_cache_write_pending_bytes
+    byte_count = max(0, int(byte_count))
+    if kind == "local":
+        lock = _cache_write_pending_lock
+        limit = _cache_write_limit_bytes()
+    else:
+        lock = _lt_cache_write_pending_lock
+        limit = _lt_cache_write_limit_bytes()
+
+    with lock:
+        pending = (
+            _cache_write_pending_bytes
+            if kind == "local"
+            else _lt_cache_write_pending_bytes
+        )
+        if pending + byte_count > limit:
+            bump(f"{kind}_cache_write_backpressure")
+            return False
+        if kind == "local":
+            _cache_write_pending_bytes += byte_count
+            current = _cache_write_pending_bytes
+        else:
+            _lt_cache_write_pending_bytes += byte_count
+            current = _lt_cache_write_pending_bytes
+        gauge_prefix = "cache_write" if kind == "local" else "lt_cache_write"
+        profile_gauge(f"{gauge_prefix}.pending_bytes", current)
+
+    try:
+        future = executor.submit(function, *args)
+    except Exception:
+        _release_pending_bytes(kind, byte_count)
+        return False
+    future.add_done_callback(
+        lambda _future: _release_pending_bytes(kind, byte_count)
+    )
+    return True
 
 _lt_cache_write_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=2,
@@ -2470,7 +3430,7 @@ def _atomic_write(target_path: str, data: bytes) -> bool:
     return False
 
 
-def _async_cache_write(chunk):
+def _async_cache_write(chunk, data):
     """Fire-and-forget cache write. Errors are logged but don't affect processing."""
     try:
         # Check if cache directory still exists (may have been cleaned up by temp directory)
@@ -2478,7 +3438,7 @@ def _async_cache_write(chunk):
         if not os.path.exists(chunk.cache_dir):
             log.debug(f"Cache dir gone for {chunk}, skipping async write")
             return
-        chunk.save_cache()
+        chunk.save_cache(data=data)
     except (FileNotFoundError, OSError) as e:
         # Directory may have been deleted between check and write (race condition)
         # This is expected for temporary directories, so just log at debug level
@@ -5867,6 +6827,49 @@ MAX_TRANSIENT_RETRIES = {
 # invalid responses) that don't return specific HTTP error codes
 MAX_TOTAL_ATTEMPTS = 15
 
+# Maptypes whose URL embeds a rotating server number; used only for logging.
+MAPTYPES_WITH_SERVER = ("YNDX", "EOX", "GO2")
+
+
+class _NetworkRequest(object):
+    """A single provider HTTP request prepared by :meth:`Chunk.begin_network_attempt`.
+
+    ``delay`` is the backoff the caller must observe *before* issuing the
+    request.  It is reported instead of slept so async dispatchers can schedule
+    it without occupying a thread.
+    """
+
+    __slots__ = (
+        "url", "headers", "timeout", "delay", "server", "idx",
+        "apple_token_generation", "apple_retried",
+    )
+
+    def __init__(self, url, headers, timeout, delay, server, idx,
+                 apple_token_generation, apple_retried=False):
+        self.url = url
+        self.headers = headers
+        self.timeout = timeout
+        self.delay = delay
+        self.server = server
+        self.idx = idx
+        self.apple_token_generation = apple_token_generation
+        self.apple_retried = apple_retried
+
+
+class _AttemptOutcome(object):
+    """Result of applying one HTTP result to a chunk.
+
+    ``resolved`` mirrors the legacy ``Chunk.get()`` return value: True means
+    the chunk reached a terminal state and the worker must stop retrying.
+    """
+
+    __slots__ = ("resolved", "retry_request", "requeue_delay")
+
+    def __init__(self, resolved=False, retry_request=None, requeue_delay=0.0):
+        self.resolved = resolved
+        self.retry_request = retry_request
+        self.requeue_delay = requeue_delay
+
 
 class Chunk(object):
     col = -1
@@ -6024,12 +7027,20 @@ class Chunk(object):
                     self.data = data
                     bump('chunk_lt_hit')
                     log.debug(f"LT cache hit for {self}")
-                    _lt_cache_write_executor.submit(self._save_to_dir, self.cache_dir)
+                    if not _submit_bounded_cache_write(
+                        _cache_write_executor,
+                        self._save_to_dir,
+                        self.cache_dir,
+                        data,
+                        byte_count=len(data),
+                        kind="local",
+                    ):
+                        self._save_to_dir(self.cache_dir, data)
                     return True
             return False
 
-    def _save_to_dir(self, target_dir):
-        data = self.data
+    def _save_to_dir(self, target_dir, data=None):
+        data = self.data if data is None else data
         if not data:
             return
 
@@ -6060,9 +7071,8 @@ class Chunk(object):
         elif target_dir == self.cache_dir and disk_budget_manager is not None:
             disk_budget_manager.account_jpeg(len(data))
 
-    def save_cache(self):
-        # Snapshot data to avoid races with close() mutating self.data
-        data = self.data
+    def save_cache(self, data=None):
+        data = self.data if data is None else data
         if not data:
             return
 
@@ -6077,57 +7087,34 @@ class Chunk(object):
         if disk_budget_manager is not None:
             disk_budget_manager.account_jpeg(len(data))
         if self.lt_cache_dir:
-            _lt_cache_write_executor.submit(self._save_to_dir, self.lt_cache_dir)
+            if not _submit_bounded_cache_write(
+                _lt_cache_write_executor,
+                self._save_to_dir,
+                self.lt_cache_dir,
+                data,
+                byte_count=len(data),
+                kind="lt",
+            ):
+                bump("lt_cache_write_dropped")
 
-    @profiled_stage("chunk.resolve")
-    def get(self, idx=0, session=requests, timeout=None, max_attempts=None):
-        log.debug(f"Getting {self}")
+    def _notify_ready(self):
+        try:
+            if tile_completion_tracker is not None and self.tile_id:
+                tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+        except Exception:
+            pass  # Never block downloads
 
-        # Signal that download has started (not waiting in queue anymore)
-        self.download_started.set()
+    def _build_tile_url(self, idx):
+        """Build the provider URL/headers for attempt ``idx``.
 
-        if is_shutdown_requested():
-            self.cancel()
-            return True
-
-        if self.get_cache():
-            self.ready.set()
-            try:
-                if tile_completion_tracker is not None and self.tile_id:
-                    tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
-            except Exception:
-                pass
-            return True
-
-        _max_attempts = max_attempts or MAX_TOTAL_ATTEMPTS
-
-        # === TOTAL ATTEMPT LIMIT ===
-        # Prevent infinite retries for persistent failures (network issues,
-        # invalid responses, etc.) that don't return specific HTTP codes
-        if self.attempt >= _max_attempts:
-            log.warning(f"Chunk {self} exceeded {_max_attempts} total attempts, marking as permanently failed")
-            self.permanent_failure = True
-            self.failure_reason = "max_total_attempts"
-            self.data = b''
-            self.ready.set()
-            bump('chunk_max_attempts_exhausted')
-            # Notify tile completion tracker
-            try:
-                if tile_completion_tracker is not None and self.tile_id:
-                    tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
-            except Exception:
-                pass
-            return True  # Return True to stop worker retries
-
-        if not self.starttime:
-            self.starttime = time.time()
+        Returns ``(url, headers, server, apple_token_generation)``.  The Apple
+        token generation is captured *before* the URL is rendered so a 403/410
+        retry can rotate exactly the token it used.
+        """
 
         server_num = idx % (len(self.serverlist))
         server = self.serverlist[server_num]
         quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
-
-        # Hack override maptype
-        #maptype = "ARC"
 
         MAPID = "s2cloudless-2024_3857"
         MATRIXSET = "g"
@@ -6144,17 +7131,62 @@ class Chunk(object):
             "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
         }
 
-        MAPTYPES_WITH_SERVER = ["YNDX", "EOX", "GO2"]
-
-        self.url = MAPTYPES[self.maptype.upper()]
-        #log.debug(f"{self} getting {url}")
+        url = MAPTYPES[self.maptype.upper()]
         header = {
                 "user-agent": "curl/7.68.0"
         }
         if self.maptype.upper() == "EOX":
             log.debug("EOX DETECTED")
             header.update({'referer': 'https://s2maps.eu/'})
-       
+        return url, header, server, apple_token_generation
+
+    def begin_network_attempt(self, idx=0, timeout=None, max_attempts=None):
+        """Prepare the next network attempt for this chunk.
+
+        Returns a :class:`_NetworkRequest` describing the HTTP call to issue,
+        or an :class:`_AttemptOutcome` when the chunk resolved without any
+        network I/O (cache hit, cancellation, attempt budget exhausted).
+
+        This performs no blocking I/O and no sleeping: any required backoff is
+        reported through ``_NetworkRequest.delay`` so async callers can
+        schedule it instead of occupying a thread.
+        """
+
+        log.debug(f"Getting {self}")
+
+        # Signal that download has started (not waiting in queue anymore)
+        self.download_started.set()
+
+        if is_shutdown_requested():
+            self.cancel()
+            return _AttemptOutcome(resolved=True)
+
+        if self.get_cache():
+            self.ready.set()
+            self._notify_ready()
+            return _AttemptOutcome(resolved=True)
+
+        _max_attempts = max_attempts or MAX_TOTAL_ATTEMPTS
+
+        # === TOTAL ATTEMPT LIMIT ===
+        # Prevent infinite retries for persistent failures (network issues,
+        # invalid responses, etc.) that don't return specific HTTP codes
+        if self.attempt >= _max_attempts:
+            log.warning(f"Chunk {self} exceeded {_max_attempts} total attempts, marking as permanently failed")
+            self.permanent_failure = True
+            self.failure_reason = "max_total_attempts"
+            self.data = b''
+            self.ready.set()
+            bump('chunk_max_attempts_exhausted')
+            self._notify_ready()
+            return _AttemptOutcome(resolved=True)  # Stop worker retries
+
+        if not self.starttime:
+            self.starttime = time.time()
+
+        url, header, server, apple_token_generation = self._build_tile_url(idx)
+        self.url = url
+
         # === CANCELLATION CHECK ===
         # If the caller gave up waiting (Pass 2 timeout, budget exhausted, etc.),
         # abandon this download immediately to free the worker slot.
@@ -6162,12 +7194,11 @@ class Chunk(object):
             log.debug(f"Chunk {self} cancelled before download attempt {self.attempt}")
             bump('chunk_cancelled_before_download')
             self.cancel()
-            return True  # Return True to stop worker retries
+            return _AttemptOutcome(resolved=True)  # Stop worker retries
 
         # Capped backoff: grows with attempts but maxes at 2 seconds
         # This prevents runaway delays when server is slow/throttling
         backoff_sleep = min(2.0, self.attempt / 10.0)
-        time.sleep(backoff_sleep)
         self.attempt += 1
 
         # Read timeout = maxwait + 1s safety margin. No point keeping a
@@ -6180,124 +7211,89 @@ class Chunk(object):
 
         log.debug(f"Requesting {self.url} ..")
 
-        resp = None
-        try:
+        return _NetworkRequest(
+            url=url,
+            headers=header,
+            timeout=_http_timeout,
+            delay=backoff_sleep,
+            server=server,
+            idx=idx,
+            apple_token_generation=apple_token_generation,
+        )
 
-            resp = _profiled_http_get(
-                session, self.url, header, _http_timeout, self
-            )
-            status_code = resp.status_code
+    def finish_network_attempt(self, request, response=None, error=None):
+        """Apply one HTTP result to this chunk.
 
-            if self.maptype.upper() == "APPLE" and status_code in (403, 410):
+        Exactly one of ``response``/``error`` is expected.  Returns an
+        :class:`_AttemptOutcome`; the caller owns closing ``response`` and
+        honouring ``retry_request``/``requeue_delay``.
+        """
+
+        if error is not None:
+            return self._handle_attempt_error(request, error)
+
+        status_code = response.status_code
+
+        if self.maptype.upper() == "APPLE" and status_code in (403, 410):
+            if not request.apple_retried:
                 log.warning("APPLE tile got %s; rotating token and retrying", status_code)
                 apple_token_service.reset_apple_maps_token(
-                    expected_generation=apple_token_generation
+                    expected_generation=request.apple_token_generation,
                 )
-                apple_token_generation = apple_token_service.generation
-                MAPTYPES["APPLE"] = f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
-                self.url = MAPTYPES[self.maptype.upper()]
-                if resp is not None:
-                    resp.close()
-                resp = _profiled_http_get(
-                    session, self.url, header, _http_timeout, self
+                url, header, server, generation = self._build_tile_url(request.idx)
+                self.url = url
+                return _AttemptOutcome(
+                    retry_request=_NetworkRequest(
+                        url=url,
+                        headers=header,
+                        timeout=request.timeout,
+                        delay=0.0,
+                        server=server,
+                        idx=request.idx,
+                        apple_token_generation=generation,
+                        apple_retried=True,
+                    ),
                 )
-                status_code = resp.status_code
 
-            if status_code != 200:
-                log.warning(f"Failed with status {status_code} to get chunk {self}" + (" on server " + server if self.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
-                bump_many({f"http_{status_code}": 1, "req_err": 1})
-                
-                # Check if this is a permanent failure
-                if status_code in PERMANENT_FAILURE_CODES:
-                    log.info(f"Chunk {self} permanently failed with {status_code}, marking as failed")
-                    self.permanent_failure = True
-                    self.failure_reason = str(status_code)
-                    self.data = b''  # Empty data
-                    self.ready.set()  # Mark as ready (with no data) to unblock waiters
-                    bump(f'chunk_permanent_fail_{status_code}')
-                    # Notify tile completion tracker even on failure
-                    # This allows DDS prebuild to proceed with available chunks
-                    # (fallbacks will be applied during build for failed chunks)
-                    try:
-                        if tile_completion_tracker is not None and self.tile_id:
-                            tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
-                    except Exception:
-                        pass
-                    return True  # Return True to stop worker retries
-                
-                # Check if transient failure has exceeded max retries
-                if status_code in TRANSIENT_FAILURE_CODES:
-                    self.retry_count += 1
-                    max_retries = MAX_TRANSIENT_RETRIES.get(status_code, 5)
-                    if self.retry_count >= max_retries:
-                        log.warning(f"Chunk {self} exceeded {max_retries} retries for {status_code}, giving up")
-                        self.permanent_failure = True
-                        self.failure_reason = f"{status_code}_max_retries"
-                        self.data = b''
-                        self.ready.set()
-                        bump(f'chunk_transient_fail_{status_code}_exhausted')
-                        # Notify tile completion tracker even on exhausted retries
-                        try:
-                            if tile_completion_tracker is not None and self.tile_id:
-                                tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
-                        except Exception:
-                            pass
-                        return True
-                    # Back off for all transient failures, not only rate limits.
-                    backoff_time = min(10.0, 0.5 * (2 ** min(self.retry_count, 5)))
-                    if status_code == 429:
-                        log.debug(f"Rate limited, backing off for {backoff_time}s (attempt {self.retry_count}/{max_retries})")
-                        bump('chunk_rate_limited')
-                    else:
-                        log.debug(f"Transient error {status_code}, backing off for {backoff_time}s (attempt {self.retry_count}/{max_retries})")
-                    time.sleep(backoff_time)
-                    bump(f'chunk_transient_fail_{status_code}_retry')
+        if status_code != 200:
+            return self._handle_failed_status(request, response, status_code)
 
-                err = get_stat("req_err")
-                if err > 50:
-                    ok = get_stat("req_ok")
-                    error_rate = err / ( err + ok )
-                    if error_rate >= 0.10:
-                        log.error(f"Very high network error rate detected : {error_rate * 100 : .2f}%")
-                        log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
-                        # Enhanced circuit breaker: reduce wait times on severe error rates
-                        if error_rate >= 0.25:
-                            log.warning("Severe error rate (>=25%%) detected, consider checking configuration")
-                return False
-
-            data = resp.content
-
-            if data and _is_jpeg(data[:3]):
-                log.debug(f"Data for {self} is JPEG")
-                self.data = data
-            else:
-                log.debug(f"Invalid JPEG for {self} (HTTP {resp.status_code} "
-                          f"content-type={resp.headers.get('content-type', '?')} "
-                          f"size={len(data) if data else 0})")
-                bump('chunk_invalid_jpeg')
-                self.data = b''
-
-            bump('bytes_dl', len(self.data))
-                
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout) as err:
-            backoff = min(10.0, 0.5 * (2 ** min(self.attempt, 5)))
-            log.warning(f"{self} connection/timeout error (attempt {self.attempt}), "
-                        f"backoff {backoff:.1f}s: {err}")
-            time.sleep(backoff)
-            return False
+        try:
+            data = response.content
         except Exception as err:
-            log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
-            return False
-        finally:
-            if resp:
-                resp.close()
+            return self._handle_attempt_error(request, err)
+
+        if data and _is_jpeg(data[:3]):
+            log.debug(f"Data for {self} is JPEG")
+            self.data = data
+        else:
+            log.debug(f"Invalid JPEG for {self} (HTTP {status_code} "
+                      f"content-type={response.headers.get('content-type', '?')} "
+                      f"size={len(data) if data else 0})")
+            bump('chunk_invalid_jpeg')
+            self.data = b''
+
+        bump('bytes_dl', len(self.data))
 
         self.fetchtime = time.monotonic() - self.starttime
 
-        # Signal ready IMMEDIATELY - data is in memory for consumers
+        # Cache writers own an immutable bytes reference before consumers are
+        # released, so completed tiles can safely drop Chunk.data immediately.
+        cache_data = self.data
+        if cache_data:
+            if not _submit_bounded_cache_write(
+                _cache_write_executor,
+                _async_cache_write,
+                self,
+                cache_data,
+                byte_count=len(cache_data),
+                kind="local",
+            ):
+                self.save_cache(data=cache_data)
+
+        # Signal ready after persistence owns its snapshot.
         self.ready.set()
-        
+
         # Track slow downloads for visibility in stats
         try:
             duration_ms = int((self.fetchtime or 0) * 1000)
@@ -6307,27 +7303,139 @@ class Chunk(object):
                 bump('chunk_very_slow_download')
         except Exception:
             pass
-        
+
         # Notify tile completion tracker (for predictive DDS generation)
         # MUST happen before async cache write to ensure in-memory data capture
-        try:
-            if tile_completion_tracker is not None and self.tile_id:
-                tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
-        except Exception:
-            pass  # Never block downloads
-        
-        # ASYNC CACHE WRITE: Fire-and-forget background disk write
-        # The in-memory chunk.data is already captured by consumers above.
-        # Disk write is only for future session restarts (cache persistence).
-        # save_cache() snapshots self.data locally, so it's safe even if
-        # chunk.close() clears self.data before the write completes.
-        try:
-            _cache_write_executor.submit(_async_cache_write, self)
-        except Exception:
-            # Executor full or shutdown - fall back to sync write
-            self.save_cache()
-        
-        return True
+        self._notify_ready()
+
+        return _AttemptOutcome(resolved=True)
+
+    def _handle_failed_status(self, request, response, status_code):
+        log.warning(
+            f"Failed with status {status_code} to get chunk {self}"
+            + (" on server " + request.server
+               if self.maptype.upper() in MAPTYPES_WITH_SERVER else "")
+            + "."
+        )
+        bump_many({f"http_{status_code}": 1, "req_err": 1})
+
+        # Check if this is a permanent failure
+        if status_code in PERMANENT_FAILURE_CODES:
+            log.info(f"Chunk {self} permanently failed with {status_code}, marking as failed")
+            self.permanent_failure = True
+            self.failure_reason = str(status_code)
+            self.data = b''  # Empty data
+            self.ready.set()  # Mark as ready (with no data) to unblock waiters
+            bump(f'chunk_permanent_fail_{status_code}')
+            # Notify tile completion tracker even on failure
+            # This allows DDS prebuild to proceed with available chunks
+            # (fallbacks will be applied during build for failed chunks)
+            self._notify_ready()
+            return _AttemptOutcome(resolved=True)  # Stop worker retries
+
+        requeue_delay = 0.0
+
+        # Check if transient failure has exceeded max retries
+        if status_code in TRANSIENT_FAILURE_CODES:
+            self.retry_count += 1
+            max_retries = MAX_TRANSIENT_RETRIES.get(status_code, 5)
+            if self.retry_count >= max_retries:
+                log.warning(f"Chunk {self} exceeded {max_retries} retries for {status_code}, giving up")
+                self.permanent_failure = True
+                self.failure_reason = f"{status_code}_max_retries"
+                self.data = b''
+                self.ready.set()
+                bump(f'chunk_transient_fail_{status_code}_exhausted')
+                # Notify tile completion tracker even on exhausted retries
+                self._notify_ready()
+                return _AttemptOutcome(resolved=True)
+            # Back off for all transient failures, not only rate limits.
+            requeue_delay = min(10.0, 0.5 * (2 ** min(self.retry_count, 5)))
+            if status_code == 429:
+                log.debug(f"Rate limited, backing off for {requeue_delay}s (attempt {self.retry_count}/{max_retries})")
+                bump('chunk_rate_limited')
+            else:
+                log.debug(f"Transient error {status_code}, backing off for {requeue_delay}s (attempt {self.retry_count}/{max_retries})")
+            bump(f'chunk_transient_fail_{status_code}_retry')
+
+        err = get_stat("req_err")
+        if err > 50:
+            ok = get_stat("req_ok")
+            error_rate = err / ( err + ok )
+            if error_rate >= 0.10:
+                log.error(f"Very high network error rate detected : {error_rate * 100 : .2f}%")
+                log.error(f"Check your network connection, DNS, maptype choice, and firewall settings.")
+                # Enhanced circuit breaker: reduce wait times on severe error rates
+                if error_rate >= 0.25:
+                    log.warning("Severe error rate (>=25%%) detected, consider checking configuration")
+        return _AttemptOutcome(requeue_delay=requeue_delay)
+
+    def _handle_attempt_error(self, request, error):
+        # Cancellation is a deliberate outcome, never a transport failure:
+        # no warning, no backoff and no resubmission.
+        if isinstance(error, BrokerCancelledError) or self.cancelled:
+            log.debug(f"Chunk {self} download cancelled: {error}")
+            self.cancel()
+            return _AttemptOutcome(resolved=True)
+
+        if isinstance(error, BrokerShutdownError):
+            _reset_http2_client()
+            backoff = min(5.0, 0.5 * (2 ** min(self.attempt, 4)))
+            log.warning(
+                "Shared HTTP/2 broker became unavailable for %s; "
+                "reconnecting after %.1fs",
+                self,
+                backoff,
+            )
+            return _AttemptOutcome(requeue_delay=backoff)
+
+        if isinstance(error, (requests.exceptions.ConnectionError,
+                              requests.exceptions.Timeout,
+                              BrokerTimeoutError)):
+            backoff = min(10.0, 0.5 * (2 ** min(self.attempt, 5)))
+            log.warning(f"{self} connection/timeout error (attempt {self.attempt}), "
+                        f"backoff {backoff:.1f}s: {error}")
+            return _AttemptOutcome(requeue_delay=backoff)
+
+        log.warning(f"Failed to get chunk {self} on server {request.server}. "
+                    f"Err: {error} URL: {self.url}")
+        return _AttemptOutcome()
+
+    @profiled_stage("chunk.resolve")
+    def get(self, idx=0, session=requests, timeout=None, max_attempts=None):
+        prepared = self.begin_network_attempt(
+            idx=idx, timeout=timeout, max_attempts=max_attempts
+        )
+        if isinstance(prepared, _AttemptOutcome):
+            return prepared.resolved
+
+        request = prepared
+        while True:
+            if request.delay > 0:
+                time.sleep(request.delay)
+                request.delay = 0.0
+
+            resp = None
+            error = None
+            try:
+                resp = _profiled_http_get(
+                    session, request.url, request.headers, request.timeout, self
+                )
+            except Exception as err:
+                error = err
+
+            try:
+                outcome = self.finish_network_attempt(request, resp, error)
+            finally:
+                if resp is not None:
+                    resp.close()
+
+            if outcome.retry_request is not None:
+                request = outcome.retry_request
+                continue
+            if outcome.requeue_delay > 0:
+                time.sleep(outcome.requeue_delay)
+            return outcome.resolved
 
     def close(self):
         """Release all references held by this Chunk so its memory can be reclaimed."""
@@ -6392,11 +7500,6 @@ class Tile(object):
     maxchunk_wait = float(CFG.autoortho.maxwait)
     imgs = None
     
-    # Maximum cached images per tile to prevent unbounded memory growth
-    # Each AoImage holds ~64MB of RGBA data for 4096x4096 textures
-    # 4 images is sufficient for upscaling fallback logic (checks mipmap 1-4)
-    _IMGS_MAX_SIZE = 4
-    
     # Maximum fallback chunks per tile to prevent unbounded memory growth
     # Fallback chunks are shared parent chunks used when child chunks fail
     _FALLBACK_POOL_MAX_SIZE = 100
@@ -6416,6 +7519,24 @@ class Tile(object):
         self.refs = 0
         self.imgs = {}
         self._imgs_order = []  # Track insertion order for LRU eviction
+        self._img_sizes = {}
+        self._cached_image_bytes = 0
+        try:
+            self._image_cache_limit_bytes = max(
+                0,
+                int(
+                    float(
+                        getattr(
+                            CFG.autoortho,
+                            "tile_image_cache_mb",
+                            96,
+                        )
+                    )
+                    * 1048576
+                ),
+            )
+        except (TypeError, ValueError):
+            self._image_cache_limit_bytes = 96 * 1048576
 
         self.bytes_read = 0
         self.lowest_offset = 99999999
@@ -6480,6 +7601,7 @@ class Tile(object):
         # Contains a set of mipmap indices that have real data on disk, or
         # None when all mipmaps are populated (v2 compat / full DDS).
         self._dds_populated_mipmaps = None
+        self._dds_persisted = False
         
         # === BATCH-TO-STREAMING DATA REUSE ===
         # When batch aopipeline collects data but fails (ratio below threshold),
@@ -6573,57 +7695,105 @@ class Tile(object):
                 self._mipmap_build_locks[mipmap] = threading.Lock()
             return self._mipmap_build_locks[mipmap]
 
-    def _cache_image(self, mipmap: int, img_data: tuple):
-        """Cache an image with LRU eviction when limit reached.
-        
-        This prevents unbounded memory growth from accumulating AoImage objects.
-        Each AoImage holds native RGBA pixel buffer (~64MB for 4096x4096).
-        
-        Args:
-            mipmap: Mipmap level (0 = full resolution)
-            img_data: Tuple of (image, col, row, zoom) metadata
-        """
+    def _cache_image(self, mipmap: int, img_data: tuple) -> bool:
+        """Retain fallback imagery within a byte budget, not an image count."""
+        image = img_data[0] if isinstance(img_data, tuple) else img_data
+        image_bytes = max(
+            0,
+            int(getattr(image, "_width", 0))
+            * int(getattr(image, "_height", 0))
+            * 4,
+        )
+        if (
+            image_bytes <= 0
+            or image_bytes > self._image_cache_limit_bytes
+        ):
+            bump("tile_image_cache_oversize_skip")
+            return False
+
         # If already cached, just update (move to end for LRU)
         if mipmap in self.imgs:
-            try:
-                self._imgs_order.remove(mipmap)
-            except ValueError:
-                pass  # Not in order list, that's fine
-            self._imgs_order.append(mipmap)
-            # Close old image before replacing
-            old_data = self.imgs.get(mipmap)
-            if old_data is not None:
-                if isinstance(old_data, tuple):
-                    im = old_data[0]
-                else:
-                    im = old_data
-                if im is not None and hasattr(im, 'close'):
-                    try:
-                        im.close()
-                    except Exception:
-                        pass
-            self.imgs[mipmap] = img_data
-            return
+            # Another build already installed a fallback source. Keep the
+            # existing object alive until the tile is unreferenced; replacing
+            # and closing it here can free native memory still used by a
+            # concurrent mipmap compressor.
+            return False
         
-        # Evict oldest if at limit
-        while len(self.imgs) >= self._IMGS_MAX_SIZE and self._imgs_order:
-            oldest = self._imgs_order.pop(0)
-            old_data = self.imgs.pop(oldest, None)
-            if old_data is not None:
-                # Close the old image to free native memory immediately
-                if isinstance(old_data, tuple):
-                    im = old_data[0]
-                else:
-                    im = old_data
-                if im is not None and hasattr(im, 'close'):
-                    try:
-                        im.close()
-                    except Exception:
-                        pass
+        if (
+            self._cached_image_bytes + image_bytes
+            > self._image_cache_limit_bytes
+        ):
+            bump("tile_image_cache_budget_skip")
+            return False
         
         # Insert new
         self.imgs[mipmap] = img_data
+        self._img_sizes[mipmap] = image_bytes
+        self._cached_image_bytes += image_bytes
         self._imgs_order.append(mipmap)
+        profile_gauge(
+            "tile.cached_image_bytes",
+            self._cached_image_bytes,
+        )
+        return True
+
+    def _release_composition_images(self) -> None:
+        with self._lock:
+            images = list(self.imgs.values())
+            self.imgs.clear()
+            self._imgs_order.clear()
+            self._img_sizes.clear()
+            self._cached_image_bytes = 0
+        for img_data in images:
+            image = img_data[0] if isinstance(img_data, tuple) else img_data
+            if image is not None and hasattr(image, "close"):
+                try:
+                    image.close()
+                except Exception:
+                    pass
+
+    def _release_completed_sources(self) -> bool:
+        """Release source buffers only when no healing path can consume them."""
+        with self._lock:
+            chunks = list(self.chunks.get(self.max_zoom, []))
+            complete = (
+                not self._dds_needs_healing
+                and not self._dds_missing_indices
+                and not self._dds_fallback_indices
+                and self.dds is not None
+                and bool(self.dds.mipmap_list)
+                and self.dds.mipmap_list[0].retrieved
+                and self.refs <= 0
+                and (
+                    dynamic_dds_cache is None
+                    or self._dds_persisted
+                )
+                and bool(chunks)
+                and all(
+                    chunk.ready.is_set() and bool(chunk.data)
+                    for chunk in chunks
+                )
+            )
+            if not complete:
+                return False
+            self._last_collected_jpegs = None
+            self._last_collected_ratio = None
+            self._last_collected_missing = None
+            for chunk in chunks:
+                chunk.data = None
+            images = list(self.imgs.values())
+            self.imgs.clear()
+            self._imgs_order.clear()
+            self._img_sizes.clear()
+            self._cached_image_bytes = 0
+        for img_data in images:
+            image = img_data[0] if isinstance(img_data, tuple) else img_data
+            if image is not None and hasattr(image, "close"):
+                try:
+                    image.close()
+                except Exception:
+                    pass
+        return True
 
     def _create_chunks(self, quick_zoom=0, min_zoom=None):
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom, min_zoom)
@@ -7107,13 +8277,22 @@ class Tile(object):
             build_success = True
             
             # Persist to Dynamic DDS Cache (cross-session, non-blocking)
+            mm0_missing = [i for i, d in enumerate(jpeg_datas) if d is None]
             if dynamic_dds_cache is not None:
                 try:
-                    mm0_missing = [i for i, d in enumerate(jpeg_datas) if d is None]
-                    dynamic_dds_cache.store(self.id, self.max_zoom, dds_bytes, self,
-                                           mm0_missing_indices=mm0_missing or None)
+                    self._dds_persisted = bool(
+                        dynamic_dds_cache.store(
+                            self.id,
+                            self.max_zoom,
+                            dds_bytes,
+                            self,
+                            mm0_missing_indices=mm0_missing or None,
+                        )
+                    )
                 except Exception:
                     pass  # Non-critical, don't block live path
+            if not mm0_missing:
+                self._release_completed_sources()
             
         except Exception as e:
             log.debug(f"_try_aopipeline_build: Exception for {self.id}: {e}")
@@ -7458,12 +8637,27 @@ class Tile(object):
                         # Persist to Dynamic DDS Cache (cross-session, non-blocking)
                         if dynamic_dds_cache is not None:
                             try:
-                                dynamic_dds_cache.store(
-                                    self.id, self.max_zoom, dds_bytes, self,
-                                    mm0_missing_indices=streaming_mm0_missing or None,
-                                    mm0_fallback_indices=streaming_mm0_fallback or None)
+                                self._dds_persisted = bool(
+                                    dynamic_dds_cache.store(
+                                        self.id,
+                                        self.max_zoom,
+                                        dds_bytes,
+                                        self,
+                                        mm0_missing_indices=(
+                                            streaming_mm0_missing or None
+                                        ),
+                                        mm0_fallback_indices=(
+                                            streaming_mm0_fallback or None
+                                        ),
+                                    )
+                                )
                             except Exception:
                                 pass  # Non-critical, don't block live path
+                        if (
+                            not streaming_mm0_missing
+                            and not streaming_mm0_fallback
+                        ):
+                            self._release_completed_sources()
                         
                         return True
                 
@@ -7709,6 +8903,7 @@ class Tile(object):
                       f"populated={sorted(populated) if populated else 'all'})")
             # Mark as prepopulated so bytes_read warning doesn't trigger
             self._prepopulated = True
+            self._dds_persisted = True
             return True
             
         except Exception as e:
@@ -8949,7 +10144,10 @@ class Tile(object):
             # Store image with metadata (col, row, zoom) for coordinate mapping in upscaling
             # Use _cache_image for LRU eviction to prevent unbounded memory growth
             with self._lock:
-                self._cache_image(mipmap, (new_im, col, row, zoom))
+                should_cache = self._cache_image(
+                    mipmap,
+                    (new_im, col, row, zoom),
+                )
 
         # Log budget summary including fallback budget if used
         if fallback_budget is not None:
@@ -10386,6 +11584,7 @@ class Tile(object):
         # Log tile completion when mipmap 0 is done (full tile delivered to X-Plane)
         if mipmap == 0 and not self._completion_reported:
             self._completion_reported = True
+            mm0_missing = None
             if self.first_request_time is not None:
                 tile_completion_time = time.monotonic() - self.first_request_time
             else:
@@ -10410,11 +11609,18 @@ class Tile(object):
                                 mm0_missing = missing
                                 log.debug(f"GET_MIPMAP: Progressive store for {self.id} "
                                           f"recording {len(missing)} missing chunks for healing")
-                        dynamic_dds_cache.store(
-                            self.id, self.max_zoom, dds_bytes, self,
-                            mm0_missing_indices=mm0_missing)
+                        self._dds_persisted = bool(
+                            dynamic_dds_cache.store(
+                                self.id,
+                                self.max_zoom,
+                                dds_bytes,
+                                self,
+                                mm0_missing_indices=mm0_missing,
+                            )
+                        )
                 except Exception:
                     pass
+            self._release_completed_sources()
 
         log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
                  f"(download+compose: {total_creation_time - compress_time:.2f}s, compress: {compress_time:.2f}s)")
@@ -10477,24 +11683,7 @@ class Tile(object):
         # ------------------------------------------------------------------
 
         # 1) Free any cached AoImage instances (RGBA pixel buffers)
-        try:
-            for img_data in list(self.imgs.values()):
-                # Handle both tuple format (new) and plain image (old)
-                if isinstance(img_data, tuple):
-                    im = img_data[0]  # Extract image from tuple
-                else:
-                    im = img_data
-                
-                if im is not None and hasattr(im, "close"):
-                    try:
-                        im.close()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        finally:
-            self.imgs.clear()
-            self._imgs_order = []  # Clear LRU tracking list
+        self._release_composition_images()
 
         # 2) Release DDS mip-map ByteIO buffers so the underlying bytes
         #    are no longer referenced from Python.
@@ -10549,6 +11738,7 @@ class Tile(object):
         self._completion_reported = False
         self._is_live = False
         self._dds_populated_mipmaps = None
+        self._dds_persisted = False
         self._live_transition_event = None
         self._active_streaming_builder = None
 
@@ -11441,6 +12631,7 @@ class TileCacher(object):
     
     def _close_tile(self, row, col, map_type, zoom):
         tile_id = self._to_tile_id(row, col, map_type, zoom)
+        release_completed_sources = None
         with self.tc_lock:
             t = self.tiles.get(tile_id)
             if not t:
@@ -11451,9 +12642,9 @@ class TileCacher(object):
 
             if self.enable_cache: # and not t.should_close():
                 log.debug(f"Cache enabled.  Delay tile close for {tile_id}")
-                return True
-
-            if t.refs <= 0:
+                if t.refs <= 0:
+                    release_completed_sources = t
+            elif t.refs <= 0:
                 log.debug(f"No more refs for {tile_id} closing...")
                 t = self.tiles.pop(tile_id)
                 t.close()
@@ -11461,6 +12652,9 @@ class TileCacher(object):
                 del(t)
             else:
                 log.debug(f"Still have {t.refs} refs for {tile_id}")
+
+        if release_completed_sources is not None:
+            release_completed_sources._release_completed_sources()
 
         return True
     

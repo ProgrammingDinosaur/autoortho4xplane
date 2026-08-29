@@ -260,6 +260,12 @@ class ConfigUI(QMainWindow):
         "pipeline_mode_combo",
         "live_concurrency_slider",
         "buffer_pool_slider",
+        "provider_inflight_spinbox",
+        "provider_connections_spinbox",
+        "download_dispatch_workers_spinbox",
+        "provider_adaptive_check",
+        "live_tile_admission_spinbox",
+        "tile_image_cache_mb_spinbox",
         "fetch_threads_spinbox",
         "seasons_enabled_check",
         "spr_sat_slider",
@@ -274,6 +280,7 @@ class ConfigUI(QMainWindow):
         "file_log_level_combo",
         "performance_profiling_check",
         "performance_sample_interval_spin",
+        "performance_checkpoint_interval_spin",
         "python_allocation_tracing_check",
         "threading_check",
         "winfsp_check",
@@ -319,6 +326,12 @@ class ConfigUI(QMainWindow):
         "pipeline_mode_combo",
         "live_concurrency_slider",
         "buffer_pool_slider",
+        "provider_inflight_spinbox",
+        "provider_connections_spinbox",
+        "download_dispatch_workers_spinbox",
+        "provider_adaptive_check",
+        "live_tile_admission_spinbox",
+        "tile_image_cache_mb_spinbox",
         "fetch_threads_spinbox",
         "seasons_enabled_check",
         "spr_sat_slider",
@@ -329,6 +342,7 @@ class ConfigUI(QMainWindow):
         "format_combo",
         "performance_profiling_check",
         "performance_sample_interval_spin",
+        "performance_checkpoint_interval_spin",
         "python_allocation_tracing_check",
         "threading_check",
         "winfsp_check",
@@ -1106,35 +1120,67 @@ class ConfigUI(QMainWindow):
         presets = {
             "Balanced": {
                 "max_zoom_slider": 16,
-                "tile_budget_slider": 180,
+                "tile_budget_slider": 120,
                 "maxwait_slider": 20,
+                "fallback_timeout_slider": 30,
+                "prefetch_lookahead_slider": 10,
                 "prefetch_max_chunks_slider": 48,
+                "prefetch_radius_slider": 40,
                 "background_workers_slider": 4,
                 "live_concurrency_slider": 8,
+                "provider_inflight_spinbox": 128,
+                "provider_connections_spinbox": 64,
+                "download_dispatch_workers_spinbox": 4,
+                "live_tile_admission_spinbox": 16,
+                "tile_image_cache_mb_spinbox": 96,
             },
             "Quality": {
                 "max_zoom_slider": 17,
                 "tile_budget_slider": 300,
                 "maxwait_slider": 50,
+                "fallback_timeout_slider": 60,
+                "prefetch_lookahead_slider": 30,
                 "prefetch_max_chunks_slider": 96,
+                "prefetch_radius_slider": 50,
                 "background_workers_slider": 6,
                 "live_concurrency_slider": 12,
+                "provider_inflight_spinbox": 192,
+                "provider_connections_spinbox": 64,
+                "download_dispatch_workers_spinbox": 6,
+                "live_tile_admission_spinbox": 20,
+                "tile_image_cache_mb_spinbox": 128,
             },
             "Low Bandwidth": {
                 "max_zoom_slider": 15,
-                "tile_budget_slider": 120,
+                "tile_budget_slider": 60,
                 "maxwait_slider": 30,
+                "fallback_timeout_slider": 30,
+                "prefetch_lookahead_slider": 10,
                 "prefetch_max_chunks_slider": 24,
+                "prefetch_radius_slider": 30,
                 "background_workers_slider": 2,
                 "live_concurrency_slider": 6,
+                "provider_inflight_spinbox": 64,
+                "provider_connections_spinbox": 32,
+                "download_dispatch_workers_spinbox": 3,
+                "live_tile_admission_spinbox": 8,
+                "tile_image_cache_mb_spinbox": 64,
             },
             "Low Resource": {
                 "max_zoom_slider": 15,
-                "tile_budget_slider": 120,
+                "tile_budget_slider": 60,
                 "maxwait_slider": 20,
+                "fallback_timeout_slider": 20,
+                "prefetch_lookahead_slider": 5,
                 "prefetch_max_chunks_slider": 16,
+                "prefetch_radius_slider": 20,
                 "background_workers_slider": 1,
                 "live_concurrency_slider": 4,
+                "provider_inflight_spinbox": 64,
+                "provider_connections_spinbox": 16,
+                "download_dispatch_workers_spinbox": 2,
+                "live_tile_admission_spinbox": 6,
+                "tile_image_cache_mb_spinbox": 64,
             },
         }
         values = presets.get(name)
@@ -1144,6 +1190,15 @@ class ConfigUI(QMainWindow):
             widget = getattr(self, attr, None)
             if widget is not None:
                 widget.setValue(value)
+        if name == "Quality":
+            self.fallback_level_combo.setCurrentIndex(2)
+            self.fallback_extends_budget_check.setChecked(True)
+            self.suspend_maxwait_check.setChecked(True)
+        else:
+            self.fallback_level_combo.setCurrentIndex(1)
+            self.fallback_extends_budget_check.setChecked(False)
+            self.suspend_maxwait_check.setChecked(False)
+        self.provider_adaptive_check.setChecked(True)
         if name in ("Balanced", "Quality", "Low Resource"):
             dynamic_preset = {
                 "Balanced": "Airliner",
@@ -3900,15 +3955,121 @@ class ConfigUI(QMainWindow):
         # Initialize time budget control states
         self._update_time_budget_controls()
 
-        # Fetch threads
+        provider_header = QLabel("Provider Download Transport")
+        provider_header.setStyleSheet(
+            "font-weight: bold; font-size: 12px; color: #8ab4f8; margin-top: 10px;"
+        )
+        autoortho_layout.addWidget(provider_header)
+
+        inflight_layout = QHBoxLayout()
+        inflight_label = QLabel("Maximum requests in flight:")
+        inflight_label.setToolTip(
+            "Strict global limit for outstanding provider requests. HTTP/2 requests\n"
+            "are multiplexed asynchronously, so this no longer requires one Python\n"
+            "thread per request. Higher values need a fast provider and network."
+        )
+        inflight_layout.addWidget(inflight_label)
+        self.provider_inflight_spinbox = ModernSpinBox()
+        self.provider_inflight_spinbox.setRange(8, 1024)
+        self.provider_inflight_spinbox.setValue(
+            int(getattr(self.cfg.autoortho, "provider_max_in_flight", 128))
+        )
+        self.provider_inflight_spinbox.setObjectName("provider_max_in_flight")
+        inflight_layout.addWidget(self.provider_inflight_spinbox)
+        inflight_layout.addStretch()
+        autoortho_layout.addLayout(inflight_layout)
+
+        connections_layout = QHBoxLayout()
+        connections_label = QLabel("Provider connections:")
+        connections_label.setToolTip(
+            "Maximum reusable physical connections. HTTP/2 can carry many streams\n"
+            "per connection; 64 also preserves throughput for HTTP/1.1 providers."
+        )
+        connections_layout.addWidget(connections_label)
+        self.provider_connections_spinbox = ModernSpinBox()
+        self.provider_connections_spinbox.setRange(1, 256)
+        self.provider_connections_spinbox.setValue(
+            int(getattr(self.cfg.autoortho, "provider_max_connections", 64))
+        )
+        self.provider_connections_spinbox.setObjectName(
+            "provider_max_connections"
+        )
+        connections_layout.addWidget(self.provider_connections_spinbox)
+        connections_layout.addStretch()
+        autoortho_layout.addLayout(connections_layout)
+
+        dispatch_layout = QHBoxLayout()
+        dispatch_label = QLabel("Download completion workers:")
+        dispatch_label.setToolTip(
+            "Small coordination pool that applies completed responses. This does\n"
+            "not limit network concurrency; 4 is appropriate for most systems."
+        )
+        dispatch_layout.addWidget(dispatch_label)
+        self.download_dispatch_workers_spinbox = ModernSpinBox()
+        self.download_dispatch_workers_spinbox.setRange(1, 16)
+        self.download_dispatch_workers_spinbox.setValue(
+            int(getattr(self.cfg.autoortho, "download_dispatch_workers", 4))
+        )
+        self.download_dispatch_workers_spinbox.setObjectName(
+            "download_dispatch_workers"
+        )
+        dispatch_layout.addWidget(self.download_dispatch_workers_spinbox)
+        dispatch_layout.addStretch()
+        autoortho_layout.addLayout(dispatch_layout)
+
+        self.provider_adaptive_check = QCheckBox(
+            "Adapt concurrency to each imagery provider"
+        )
+        self.provider_adaptive_check.setChecked(
+            bool(
+                getattr(
+                    self.cfg.autoortho,
+                    "provider_adaptive_concurrency",
+                    True,
+                )
+            )
+        )
+        self.provider_adaptive_check.setObjectName(
+            "provider_adaptive_concurrency"
+        )
+        self.provider_adaptive_check.setToolTip(
+            "Raises concurrency after sustained successful responses and reduces\n"
+            "it when a provider returns overload errors or timeouts."
+        )
+        autoortho_layout.addWidget(self.provider_adaptive_check)
+
+        memory_layout = QHBoxLayout()
+        memory_label = QLabel("Concurrent live tiles:")
+        memory_label.setToolTip(
+            "Bounds complete live tile builds before allocating large ZL17\n"
+            "composition buffers. Downloads remain independently concurrent."
+        )
+        memory_layout.addWidget(memory_label)
+        self.live_tile_admission_spinbox = ModernSpinBox()
+        self.live_tile_admission_spinbox.setRange(1, 128)
+        self.live_tile_admission_spinbox.setValue(
+            int(getattr(self.cfg.autoortho, "live_tile_admission", 16))
+        )
+        self.live_tile_admission_spinbox.setObjectName("live_tile_admission")
+        memory_layout.addWidget(self.live_tile_admission_spinbox)
+        memory_layout.addWidget(QLabel("Fallback image cache/tile:"))
+        self.tile_image_cache_mb_spinbox = ModernSpinBox()
+        self.tile_image_cache_mb_spinbox.setRange(0, 512)
+        self.tile_image_cache_mb_spinbox.setSuffix(" MB")
+        self.tile_image_cache_mb_spinbox.setValue(
+            int(getattr(self.cfg.autoortho, "tile_image_cache_mb", 96))
+        )
+        self.tile_image_cache_mb_spinbox.setObjectName("tile_image_cache_mb")
+        memory_layout.addWidget(self.tile_image_cache_mb_spinbox)
+        memory_layout.addStretch()
+        autoortho_layout.addLayout(memory_layout)
+
+        # HTTP/1.1 fallback threads
         threads_layout = QHBoxLayout()
-        threads_label = QLabel("Fetch threads per mount:" if self.system == "darwin" else "Global fetch threads:")
+        threads_label = QLabel("HTTP/1.1 fallback threads:")
         threads_label.setToolTip(
-            "Number of simultaneous download threads.\n"
-            "More threads = faster downloads but higher CPU/network usage.\n"
-            "Too many threads may cause timeouts or instability.\n"
-            "On macOS, this is the number of threads per mount.\n"
-            "On other systems, fetch threads are shared globally."
+            "Used only when the shared asynchronous broker is unavailable.\n"
+            "Normal network concurrency is controlled by Maximum requests in flight."
         )
         threads_layout.addWidget(threads_label)
         self.fetch_threads_spinbox = ModernSpinBox()
@@ -4285,6 +4446,34 @@ class ConfigUI(QMainWindow):
         sampling_layout.addWidget(self.performance_sample_interval_spin)
         sampling_layout.addStretch()
         diagnostics_layout.addLayout(sampling_layout)
+
+        checkpoint_layout = QHBoxLayout()
+        checkpoint_label = QLabel("Profile checkpoint interval:")
+        checkpoint_label.setToolTip(
+            "How often worker stage histograms and gauges are atomically persisted.\n"
+            "Checkpoints preserve useful diagnostics after a forced worker exit."
+        )
+        checkpoint_layout.addWidget(checkpoint_label)
+        self.performance_checkpoint_interval_spin = QDoubleSpinBox()
+        self.performance_checkpoint_interval_spin.setRange(1.0, 300.0)
+        self.performance_checkpoint_interval_spin.setSingleStep(5.0)
+        self.performance_checkpoint_interval_spin.setDecimals(0)
+        self.performance_checkpoint_interval_spin.setSuffix(" s")
+        self.performance_checkpoint_interval_spin.setValue(
+            float(
+                getattr(
+                    self.cfg.diagnostics,
+                    "checkpoint_interval_seconds",
+                    10.0,
+                )
+            )
+        )
+        self.performance_checkpoint_interval_spin.setObjectName(
+            "checkpoint_interval_seconds"
+        )
+        checkpoint_layout.addWidget(self.performance_checkpoint_interval_spin)
+        checkpoint_layout.addStretch()
+        diagnostics_layout.addLayout(checkpoint_layout)
 
         self.python_allocation_tracing_check = QCheckBox(
             "Trace Python allocation growth (diagnostic flights only)"
@@ -7580,6 +7769,24 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.fetch_threads = str(
                 self.fetch_threads_spinbox.value()
             )
+            self.cfg.autoortho.provider_max_in_flight = str(
+                self.provider_inflight_spinbox.value()
+            )
+            self.cfg.autoortho.provider_max_connections = str(
+                self.provider_connections_spinbox.value()
+            )
+            self.cfg.autoortho.download_dispatch_workers = str(
+                self.download_dispatch_workers_spinbox.value()
+            )
+            self.cfg.autoortho.provider_adaptive_concurrency = (
+                self.provider_adaptive_check.isChecked()
+            )
+            self.cfg.autoortho.live_tile_admission = str(
+                self.live_tile_admission_spinbox.value()
+            )
+            self.cfg.autoortho.tile_image_cache_mb = str(
+                self.tile_image_cache_mb_spinbox.value()
+            )
             self.cfg.autoortho.missing_color = [self.missing_color.red(),
                                                 self.missing_color.green(),
                                                 self.missing_color.blue()]
@@ -7601,6 +7808,9 @@ class ConfigUI(QMainWindow):
             )
             self.cfg.diagnostics.sample_interval_seconds = str(
                 self.performance_sample_interval_spin.value()
+            )
+            self.cfg.diagnostics.checkpoint_interval_seconds = str(
+                self.performance_checkpoint_interval_spin.value()
             )
             self.cfg.diagnostics.python_allocation_tracing = (
                 self.python_allocation_tracing_check.isChecked()

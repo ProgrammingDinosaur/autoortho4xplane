@@ -18,7 +18,7 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 
-DEFAULT_WORKER_STOP_TIMEOUT = 3.0
+DEFAULT_WORKER_STOP_TIMEOUT = 8.0
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 

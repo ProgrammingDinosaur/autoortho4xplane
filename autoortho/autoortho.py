@@ -816,6 +816,7 @@ class AOMount:
     def start_download_broker(self):
         if self._download_broker is not None:
             return
+        self._start_performance_diagnostics()
         enabled = getattr(self.cfg.autoortho, "http2_enabled", True)
         if isinstance(enabled, str):
             enabled = enabled.lower().strip() in ("true", "1", "yes", "on")
@@ -828,36 +829,51 @@ class AOMount:
             )
             return
         try:
-            max_concurrency = max(
-                1,
-                min(
-                    1024,
-                    int(
-                        getattr(
-                            self.cfg.autoortho,
-                            "max_concurrent_downloads",
-                            256,
-                        )
-                    ),
+            max_in_flight = aoconfig.resolve_provider_setting(
+                "provider_max_in_flight", self.cfg
+            )
+            max_connections = min(
+                max_in_flight,
+                aoconfig.resolve_provider_setting(
+                    "provider_max_connections", self.cfg
                 ),
             )
-            max_connections = max(
-                1,
-                min(
-                    max_concurrency,
-                    int(
-                        getattr(
-                            self.cfg.autoortho,
-                            "http2_max_connections",
-                            64,
-                        )
-                    ),
-                ),
+            max_concurrency = max_in_flight
+            origin_max = aoconfig.resolve_provider_setting(
+                "provider_origin_max_concurrency", self.cfg
             )
             broker_kwargs = {
                 "max_concurrency": max_concurrency,
                 "max_connections": max_connections,
+                "max_pending": max_in_flight,
                 "max_response_bytes": 8 * 1024 * 1024,
+                "profile_environment": dict(
+                    getattr(self, "_performance_profiler_env", {})
+                ),
+                "adaptive_concurrency": aoconfig.resolve_provider_setting(
+                    "provider_adaptive_concurrency", self.cfg
+                ),
+                "origin_initial_concurrency": aoconfig.resolve_provider_setting(
+                    "provider_origin_initial_concurrency", self.cfg
+                ),
+                "origin_min_concurrency": aoconfig.resolve_provider_setting(
+                    "provider_origin_min_concurrency", self.cfg
+                ),
+                # 0 means "no separate ceiling"; the broker then clamps to
+                # max_concurrency on its own.
+                "origin_max_concurrency": origin_max or None,
+                "origin_increase_step": aoconfig.resolve_provider_setting(
+                    "provider_origin_increase_step", self.cfg
+                ),
+                "origin_success_threshold": aoconfig.resolve_provider_setting(
+                    "provider_origin_success_threshold", self.cfg
+                ),
+                "origin_decrease_factor": aoconfig.resolve_provider_setting(
+                    "provider_origin_decrease_factor", self.cfg
+                ),
+                "origin_cooldown_seconds": aoconfig.resolve_provider_setting(
+                    "provider_origin_cooldown_seconds", self.cfg
+                ),
             }
             broker = HTTP2Broker(**broker_kwargs)
             try:
@@ -877,6 +893,12 @@ class AOMount:
                 broker_mode = "thread"
             self._download_broker = broker
             self._download_broker_env = broker.client_environment()
+            broker_pid = getattr(broker, "pid", None)
+            if broker_pid and self._performance_profiler is not None:
+                self._performance_profiler.register_process(
+                    broker_pid,
+                    "http2-broker",
+                )
             os.environ.update(self._download_broker_env)
             log.info(
                 "Shared HTTP/2 broker started "

@@ -236,6 +236,15 @@ background_builder_workers = 8
 # Lower values = less resource usage, potential stutters
 # Recommended: 4 (low-end), 8 (mid-range, default), 16-32 (high-end CPU)
 live_builder_concurrency = 8
+# End-to-end live tile requests admitted before allocating composition state.
+# Keep this high enough to saturate downloads while bounding ZL17 working memory.
+live_tile_admission = 16
+# Maximum retained RGBA fallback imagery per tile. ZL17 mipmap 0 alone is
+# 256MB and is therefore composed, compressed, and released instead of cached.
+tile_image_cache_mb = 96
+# Bound immutable JPEG bytes waiting for local and optional long-term cache I/O.
+cache_write_buffer_mb = 256
+long_term_cache_write_buffer_mb = 128
 # Apply fallbacks when pre-building DDS (True/False)
 # True (default): Apply same fallback logic as live requests (cache search, lower zoom, etc.)
 #   - Pro: Prebuilt tiles have best possible quality with fallbacks for failed chunks
@@ -339,9 +348,38 @@ tile_queue_enabled = True
 tile_queue_max_size = 100
 # Shared HTTP/2 transport. The parent owns one broker used by all mount workers.
 http2_enabled = True
-# Maximum outbound requests in flight across all mounted regions.
+# Maximum broker requests that may be in flight (pending a reply) at once.
+# This is the real download-concurrency knob: it is not bounded by the number
+# of downloader threads because broker requests are dispatched asynchronously.
+provider_max_in_flight = 128
+# Maximum reusable HTTP connections owned by the broker. HTTP/2 multiplexes
+# many requests per connection, so this stays well below provider_max_in_flight.
+provider_max_connections = 64
+# Threads used to apply broker responses (cache write, decode hand-off).
+# This is a coordination pool, not a download pool; keep it small.
+download_dispatch_workers = 4
+# Adaptive per-provider concurrency. The broker tracks each origin
+# (scheme://host) separately: it adds provider_origin_increase_step permits
+# after provider_origin_success_threshold consecutive good responses and
+# multiplies the limit by provider_origin_decrease_factor when the origin
+# reports overload (429, 5xx, timeouts). 403/410 are provider policy answers
+# and never shrink the limit.
+provider_adaptive_concurrency = True
+# Starting per-origin limit. 0 means "start at the ceiling", i.e. only react
+# to overload; set a positive value for a gentle ramp-up instead.
+provider_origin_initial_concurrency = 0
+# Floor for a throttled origin, so a bad patch cannot starve it completely.
+provider_origin_min_concurrency = 2
+# Ceiling for one origin. 0 means "use provider_max_in_flight".
+provider_origin_max_concurrency = 0
+provider_origin_increase_step = 1
+provider_origin_success_threshold = 8
+provider_origin_decrease_factor = 0.7
+# Consecutive overload signals inside this window cause a single decrease.
+provider_origin_cooldown_seconds = 2.0
+# Legacy aliases for the two settings above. They are honoured only when the
+# modern setting is still at its packaged default.
 max_concurrent_downloads = 256
-# Maximum reusable HTTP connections owned by the broker.
 http2_max_connections = 64
 fetch_threads = 32
 # Simheaven compatibility mode.
@@ -404,6 +442,8 @@ performance_profiling = True
 # Process resource sampling interval. One second provides useful flight timelines
 # with low overhead.
 sample_interval_seconds = 1.0
+# Persist worker stage/gauge checkpoints so useful profiles survive forced exits.
+checkpoint_interval_seconds = 10.0
 # Keep the slowest operations whose duration exceeds this threshold.
 slow_operation_ms = 250.0
 # Maximum slow operations retained per process. Histograms still include all calls.
@@ -672,6 +712,164 @@ route_prefetch_radius_nm = 40
                 self.config[sect][k] = str(v)
 
 CFG = AOConfig()
+
+
+# ---------------------------------------------------------------------------
+# Provider throughput settings
+# ---------------------------------------------------------------------------
+# Each entry maps a modern setting to its packaged default, its clamp range and
+# the legacy key that used to control the same behaviour.  Legacy keys stay
+# authoritative only while the modern key is untouched, so an explicit new
+# value is never silently overridden by a stale legacy one.
+PROVIDER_SETTINGS = {
+    "provider_max_in_flight": {
+        "default": 128,
+        "range": (8, 1024),
+        "legacy": ("max_concurrent_downloads", 256),
+    },
+    "provider_max_connections": {
+        "default": 64,
+        "range": (1, 256),
+        "legacy": ("http2_max_connections", 64),
+    },
+    "download_dispatch_workers": {
+        "default": 4,
+        "range": (1, 16),
+        "legacy": None,
+    },
+    # Adaptive per-origin concurrency (enforced by the broker server).
+    "provider_adaptive_concurrency": {
+        "type": bool,
+        "default": True,
+        "legacy": None,
+    },
+    "provider_origin_initial_concurrency": {
+        "default": 0,  # 0 => start at the ceiling and only react to overload
+        "range": (0, 1024),
+        "legacy": None,
+    },
+    "provider_origin_min_concurrency": {
+        "default": 2,
+        "range": (1, 256),
+        "legacy": None,
+    },
+    "provider_origin_max_concurrency": {
+        "default": 0,  # 0 => use provider_max_in_flight as the ceiling
+        "range": (0, 1024),
+        "legacy": None,
+    },
+    "provider_origin_increase_step": {
+        "default": 1,
+        "range": (1, 64),
+        "legacy": None,
+    },
+    "provider_origin_success_threshold": {
+        "default": 8,
+        "range": (1, 4096),
+        "legacy": None,
+    },
+    "provider_origin_decrease_factor": {
+        "type": float,
+        "default": 0.7,
+        "range": (0.1, 0.95),
+        "legacy": None,
+    },
+    "provider_origin_cooldown_seconds": {
+        "type": float,
+        "default": 2.0,
+        "range": (0.0, 60.0),
+        "legacy": None,
+    },
+}
+
+
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "y"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off", "n"})
+
+
+def _coerce_setting(value, kind, key):
+    """Parse one configured value, or raise ValueError for a bad one."""
+
+    if kind is bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in _TRUE_VALUES:
+            return True
+        if text in _FALSE_VALUES:
+            return False
+        raise ValueError(f"{value!r} is not a boolean")
+    if kind is float:
+        return float(str(value).strip())
+    return int(str(value).strip())
+
+
+def _read_setting(section, key, default, kind=int):
+    if section is None:
+        return default
+    value = getattr(section, key, None)
+    if value is None:
+        return default
+    try:
+        return _coerce_setting(value, kind, key)
+    except (TypeError, ValueError):
+        log.warning(
+            "Ignoring invalid value for autoortho.%s: %r", key, value
+        )
+        return default
+
+
+def _read_int_setting(section, key, default):
+    return _read_setting(section, key, default, int)
+
+
+def resolve_provider_setting(name, cfg=None):
+    """Resolve a provider throughput setting, honouring legacy aliases.
+
+    ``cfg`` may be any object exposing an ``autoortho`` attribute; it defaults
+    to the process-wide :data:`CFG`.  Unknown or malformed values fall back to
+    the packaged default instead of raising, because this is called from hot
+    startup paths where a bad config must not abort the download stack.
+    """
+
+    spec = PROVIDER_SETTINGS[name]
+    default = spec["default"]
+    kind = spec.get("type", int)
+    section = getattr(cfg if cfg is not None else CFG, "autoortho", None)
+
+    if kind is bool:
+        return _read_setting(section, name, default, bool)
+
+    low, high = spec["range"]
+    value = _read_setting(section, name, default, kind)
+    if value != default:
+        return max(low, min(high, value))
+
+    legacy = spec["legacy"]
+    if legacy is not None:
+        legacy_key, legacy_default = legacy
+        legacy_value = _read_setting(section, legacy_key, legacy_default, kind)
+        if legacy_value != legacy_default:
+            if name == "provider_max_in_flight" and legacy_value > 256:
+                log.warning(
+                    "Clamping legacy autoortho.%s=%s to 256 while migrating "
+                    "to %s; set the modern key explicitly to opt into a "
+                    "higher tested limit",
+                    legacy_key,
+                    legacy_value,
+                    name,
+                )
+                legacy_value = 256
+            log.info(
+                "Using legacy setting autoortho.%s=%s for %s",
+                legacy_key,
+                legacy_value,
+                name,
+            )
+            return max(low, min(high, legacy_value))
+
+    return max(low, min(high, default))
+
 
 # Note: The test code below is obsolete and has been commented out
 # if __name__ == "__main__":

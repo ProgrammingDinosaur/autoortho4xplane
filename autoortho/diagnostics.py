@@ -32,6 +32,7 @@ _PROFILE_ENV_INTERVAL = "AO_PROFILE_INTERVAL"
 _PROFILE_ENV_SLOW_MS = "AO_PROFILE_SLOW_MS"
 _PROFILE_ENV_MAX_EVENTS = "AO_PROFILE_MAX_EVENTS"
 _PROFILE_ENV_ALLOCATIONS = "AO_PROFILE_ALLOCATIONS"
+_PROFILE_ENV_CHECKPOINT_INTERVAL = "AO_PROFILE_CHECKPOINT_INTERVAL"
 
 _HISTOGRAM_BOUNDS_MS = (
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0,
@@ -271,6 +272,7 @@ class PerformanceProfiler:
         slow_operation_ms: float = 250.0,
         max_slow_operations: int = 200,
         trace_python_allocations: bool = False,
+        checkpoint_interval: float = 10.0,
         metadata: Optional[dict] = None,
     ):
         self.session_dir = Path(session_dir)
@@ -280,6 +282,7 @@ class PerformanceProfiler:
         self.slow_operation_ms = slow_operation_ms
         self.max_slow_operations = max_slow_operations
         self.trace_python_allocations = trace_python_allocations
+        self.checkpoint_interval = max(1.0, float(checkpoint_interval))
         self.metadata = _sanitize_json(metadata or {})
         self.pid = os.getpid()
         self.started_wall = time.time()
@@ -294,10 +297,12 @@ class PerformanceProfiler:
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._sampler_thread: Optional[threading.Thread] = None
+        self._profile_write_lock = threading.Lock()
         self._process: Optional[psutil.Process] = None
         self._tracemalloc = None
         self._allocation_start = None
         self._stopped = False
+        self._last_checkpoint = self.started_monotonic
 
     def start(self) -> "PerformanceProfiler":
         self.session_dir.mkdir(parents=True, exist_ok=True)
@@ -400,6 +405,7 @@ class PerformanceProfiler:
             _PROFILE_ENV_SLOW_MS: str(self.slow_operation_ms),
             _PROFILE_ENV_MAX_EVENTS: str(self.max_slow_operations),
             _PROFILE_ENV_ALLOCATIONS: "1" if self.trace_python_allocations else "0",
+            _PROFILE_ENV_CHECKPOINT_INTERVAL: str(self.checkpoint_interval),
         }
 
     def register_process(self, pid: int, role: str) -> None:
@@ -434,11 +440,13 @@ class PerformanceProfiler:
         self._sample_process()
 
         allocation_stats = self._collect_allocation_stats()
-        profile = self._build_process_profile(allocation_stats)
-        process_path = self.session_dir / (
-            f"process-{self.pid}-{_safe_file_component(self.role)}.json"
+        profile = self._build_process_profile(
+            allocation_stats,
+            profile_status="complete",
         )
-        _atomic_json_write(process_path, profile)
+        process_path = self._process_path()
+        with self._profile_write_lock:
+            _atomic_json_write(process_path, profile)
         self._write_observed_process_profiles()
 
         report_path = None
@@ -458,6 +466,32 @@ class PerformanceProfiler:
                 observed = list(self._observed_processes.values())
             for entry in observed:
                 self._sample_observed_process(entry)
+            self._write_checkpoint_if_due()
+
+    def _process_path(self) -> Path:
+        return self.session_dir / (
+            f"process-{self.pid}-{_safe_file_component(self.role)}.json"
+        )
+
+    def _write_checkpoint_if_due(self) -> None:
+        if self._stopped or self._stop_event.is_set():
+            return
+        now = time.monotonic()
+        if now - self._last_checkpoint < self.checkpoint_interval:
+            return
+        self._last_checkpoint = now
+        try:
+            with self._profile_write_lock:
+                if self._stopped or self._stop_event.is_set():
+                    return
+                profile = self._build_process_profile(
+                    [],
+                    profile_status="checkpoint",
+                )
+                _atomic_json_write(self._process_path(), profile)
+                self._write_observed_process_profiles()
+        except Exception as exc:
+            log.debug("Performance checkpoint failed: %s", exc)
 
     def _sample_process(self) -> None:
         process = self._process
@@ -607,7 +641,12 @@ class PerformanceProfiler:
             except Exception:
                 pass
 
-    def _build_process_profile(self, allocation_stats: list[dict]) -> dict:
+    def _build_process_profile(
+        self,
+        allocation_stats: list[dict],
+        *,
+        profile_status: str,
+    ) -> dict:
         with self._lock:
             stages = {
                 name: aggregate.to_dict()
@@ -633,6 +672,7 @@ class PerformanceProfiler:
             "session_id": self.session_id,
             "role": self.role,
             "pid": self.pid,
+            "profile_status": profile_status,
             "started_at": self.started_at,
             "ended_at": _utc_now_iso(),
             "started_wall_time": self.started_wall,
@@ -651,6 +691,7 @@ class PerformanceProfiler:
                 "slow_operation_ms": self.slow_operation_ms,
                 "max_slow_operations": self.max_slow_operations,
                 "python_allocation_tracing": self.trace_python_allocations,
+                "checkpoint_interval_seconds": self.checkpoint_interval,
             },
             "metadata": self.metadata,
             "stages": stages,
@@ -679,7 +720,19 @@ class PerformanceProfiler:
             observed = list(self._observed_processes.values())
         for entry in observed:
             pid = entry["pid"]
-            if list(self.session_dir.glob(f"process-{pid}-*.json")):
+            observed_path = self.session_dir / (
+                f"process-{pid}-{_safe_file_component(entry['role'])}-observed.json"
+            )
+            completed_or_checkpointed = [
+                path
+                for path in self.session_dir.glob(f"process-{pid}-*.json")
+                if not path.name.endswith("-observed.json")
+            ]
+            if completed_or_checkpointed:
+                try:
+                    observed_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 continue
             samples = list(entry["samples"])
             if not samples:
@@ -690,6 +743,7 @@ class PerformanceProfiler:
                 "session_id": self.session_id,
                 "role": entry["role"],
                 "pid": pid,
+                "profile_status": "resource-only",
                 "started_at": datetime.fromtimestamp(
                     entry["started_wall_time"], timezone.utc
                 ).isoformat(),
@@ -737,10 +791,7 @@ class PerformanceProfiler:
                 ],
                 "python_allocations": [],
             }
-            path = self.session_dir / (
-                f"process-{pid}-{_safe_file_component(entry['role'])}-observed.json"
-            )
-            _atomic_json_write(path, profile)
+            _atomic_json_write(observed_path, profile)
 
 
 def get_profiler() -> Optional[PerformanceProfiler]:
@@ -866,6 +917,12 @@ def start_parent_profiler(cfg: Any) -> Optional[PerformanceProfiler]:
         trace_python_allocations=_as_bool(
             getattr(diagnostics_cfg, "python_allocation_tracing", False)
         ),
+        checkpoint_interval=_safe_number(
+            getattr(diagnostics_cfg, "checkpoint_interval_seconds", 10.0),
+            10.0,
+            1.0,
+            300.0,
+        ),
         metadata=metadata,
     )
     return _activate_profiler(profiler)
@@ -894,6 +951,12 @@ def start_worker_profiler_from_env(role: str) -> Optional[PerformanceProfiler]:
         ),
         trace_python_allocations=_as_bool(
             os.getenv(_PROFILE_ENV_ALLOCATIONS), False
+        ),
+        checkpoint_interval=_safe_number(
+            os.getenv(_PROFILE_ENV_CHECKPOINT_INTERVAL),
+            10.0,
+            1.0,
+            300.0,
         ),
     )
     return _activate_profiler(profiler)
@@ -979,16 +1042,42 @@ def finalize_session_report(
     session_id: str,
     stats_snapshot: Optional[dict] = None,
 ) -> Path:
-    process_profiles = []
+    process_profiles_by_pid = {}
+    profile_rank = {
+        "resource-only": 0,
+        "checkpoint": 1,
+        "complete": 2,
+    }
     for path in sorted(Path(session_dir).glob("process-*.json")):
         try:
             with path.open("r", encoding="utf-8") as handle:
                 profile = json.load(handle)
             if profile.get("session_id") == session_id:
-                process_profiles.append(profile)
+                pid = int(profile.get("pid", 0) or 0)
+                process_key = (pid, str(profile.get("role", "")))
+                current = process_profiles_by_pid.get(process_key)
+                current_rank = profile_rank.get(
+                    (current or {}).get("profile_status", "complete"),
+                    0,
+                )
+                candidate_rank = profile_rank.get(
+                    profile.get("profile_status", "complete"),
+                    0,
+                )
+                if (
+                    current is None
+                    or candidate_rank > current_rank
+                    or (
+                        candidate_rank == current_rank
+                        and float(profile.get("ended_wall_time", 0) or 0)
+                        > float(current.get("ended_wall_time", 0) or 0)
+                    )
+                ):
+                    process_profiles_by_pid[process_key] = profile
         except (OSError, ValueError) as exc:
             log.warning("Could not read diagnostics process profile %s: %s", path, exc)
 
+    process_profiles = list(process_profiles_by_pid.values())
     summary = _build_session_summary(
         session_id,
         process_profiles,
@@ -1030,6 +1119,7 @@ def _build_session_summary(
             {
                 "role": profile.get("role"),
                 "pid": profile.get("pid"),
+                "profile_status": profile.get("profile_status", "complete"),
                 "duration_seconds": profile.get("duration_seconds", 0),
                 "peak_rss_bytes": max(rss_values, default=0),
                 "peak_uss_bytes": max(uss_values, default=0),
@@ -1221,6 +1311,18 @@ def _diagnostic_flags(
             f"{len(incomplete_workers)} mount worker profile(s) were reconstructed "
             "from parent process samples after an ungraceful exit; flight-stage "
             "latency and worker gauges are incomplete."
+        )
+
+    recovered_profiles = [
+        profile
+        for profile in (process_profiles or [])
+        if profile.get("profile_status") == "checkpoint"
+    ]
+    if recovered_profiles:
+        flags.append(
+            f"{len(recovered_profiles)} process profile(s) were recovered "
+            "from periodic checkpoints; final shutdown-tail samples and Python "
+            "allocation diffs may be incomplete."
         )
 
     def worst_p95(stage: str, *, worker_only: bool = False) -> float:

@@ -18,6 +18,115 @@ startup latency through:
 If the optional HTTP/2 dependencies cannot start, AutoOrtho reports the error
 and falls back to the existing HTTP/1.1 request path.
 
+## Download Concurrency
+
+Broker-backed downloads are dispatched asynchronously: a single dispatcher
+thread owns the broker client socket and keeps many requests in flight at once.
+Downloader threads no longer block one-per-request, so real concurrency is set
+by the broker budget rather than by the size of the worker pool.
+
+```ini
+[autoortho]
+# Maximum imagery requests in flight against the broker at any moment.
+provider_max_in_flight = 128
+# Upstream HTTP/2 connections the broker keeps open per provider host.
+provider_max_connections = 64
+# Threads used to settle completed downloads (coordination only).
+download_dispatch_workers = 4
+```
+
+| Setting | Default | Range | Notes |
+|---------|---------|-------|-------|
+| `provider_max_in_flight` | `128` | 8-1024 | Strict cap. A reserved slice (25%) is held for live, X-Plane-visible tiles so prefetch and healing can never starve them. |
+| `provider_max_connections` | `64` | 1-256 | Effective value is `min(provider_max_in_flight, provider_max_connections)`. This preserves throughput when a provider negotiates HTTP/1.1 rather than multiplexed HTTP/2. |
+| `download_dispatch_workers` | `4` | 1-16 | Small fixed pool that finalises completed requests; increasing it does not increase download concurrency. |
+
+### Strict admission
+
+The dispatch stage never falls back to a synchronous HTTP request just because
+it is busy. When `provider_max_in_flight` is exhausted, work is parked in a
+bounded, priority-ordered deferred queue and admitted as soon as a slot frees
+up; live tiles jump ahead of queued prefetch work. If the deferred queue itself
+is full, the chunk is quietly requeued onto the normal work queue rather than
+downloaded inline, so the configured concurrency is a hard ceiling on real
+provider load.
+
+Because downloader threads only coordinate (they no longer block on the
+network), the pool is sized by `download_dispatch_workers` whenever a broker is
+configured. `fetch_threads` still sizes the pool when no broker is available.
+
+### Adaptive per-provider concurrency
+
+The broker measures every upstream request, so it enforces an additional
+per-origin (`scheme://host`) limit on top of the global budget. The controller
+is AIMD:
+
+* **Additive increase** — after `provider_origin_success_threshold` consecutive
+  good responses the limit grows by `provider_origin_increase_step`.
+* **Multiplicative decrease** — a `429`, any `5xx`, or a timeout/connection
+  error multiplies the limit by `provider_origin_decrease_factor` (clamped at
+  `provider_origin_min_concurrency`) and starts a cooldown of
+  `provider_origin_cooldown_seconds` during which further failures do not
+  compound the reduction.
+* `403` and `410` are treated as neutral: they are per-tile answers, not
+  overload signals, so they neither raise nor lower the limit.
+
+Requests that cannot get an origin permit are parked in the broker's per-origin
+backlog and resumed in priority order, so a throttled origin never blocks
+another one and low-volume origins keep their own floor
+(`provider_origin_min_concurrency`).
+
+```ini
+[autoortho]
+# Adaptive per-origin concurrency (broker-side).
+provider_adaptive_concurrency = True
+# 0 => start at the ceiling and only react to overload.
+provider_origin_initial_concurrency = 0
+provider_origin_min_concurrency = 2
+# 0 => use provider_max_in_flight as the per-origin ceiling.
+provider_origin_max_concurrency = 0
+provider_origin_increase_step = 1
+provider_origin_success_threshold = 8
+provider_origin_decrease_factor = 0.7
+provider_origin_cooldown_seconds = 2.0
+```
+
+| Setting | Default | Range | Notes |
+|---------|---------|-------|-------|
+| `provider_adaptive_concurrency` | `True` | bool | Disable to use a fixed per-origin limit equal to the ceiling. |
+| `provider_origin_initial_concurrency` | `0` | 0-1024 | `0` starts at the ceiling (react-only), preserving previous throughput. |
+| `provider_origin_min_concurrency` | `2` | 1-256 | Floor the controller will never drop below. Also clamps the initial value upwards. |
+| `provider_origin_max_concurrency` | `0` | 0-1024 | `0` means `provider_max_in_flight`. Always clamped to the global `max_concurrency`. |
+| `provider_origin_increase_step` | `1` | 1-64 | Permits added per successful ramp step. |
+| `provider_origin_success_threshold` | `8` | 1-4096 | Consecutive successes required before a ramp step. |
+| `provider_origin_decrease_factor` | `0.7` | 0.1-0.95 | Multiplier applied on overload. |
+| `provider_origin_cooldown_seconds` | `2.0` | 0-60 | Suppresses repeated cuts while a reduction settles. |
+
+Current limits, active requests and throttle counts are exposed through the
+broker stats endpoint (`HTTP2Broker.server_stats()`) and, when profiling is
+enabled, as the `broker.origin_limit.<origin>` gauge plus
+`broker.origin_limit_change` stage records.
+
+### Transport
+
+Broker replies are multipart: one MessagePack frame with the response metadata
+and a second frame carrying the raw JPEG bytes. The image body is therefore
+never copied into or out of a MessagePack buffer. Requests and control messages
+remain single-frame, and clients still accept a legacy embedded body for
+compatibility.
+
+### Legacy settings
+
+`max_concurrent_downloads` and `http2_max_connections` continue to work as
+aliases for `provider_max_in_flight` and `provider_max_connections`. A legacy
+key is only honoured when the matching modern key is still at its packaged
+default, so an explicit `provider_max_in_flight` is never silently overridden by
+an old `max_concurrent_downloads` value.
+
+`fetch_threads` still sizes the downloader thread pool, but those threads now
+only feed the asynchronous dispatch stage (and serve the direct HTTP/1.1
+fallback path). It no longer caps how many downloads can be in flight.
+
 ## Quick Start: Performance Presets
 
 For most users, the easiest way to configure performance is using the **Performance Preset** dropdown in Settings → Performance Tuning:
@@ -1062,7 +1171,8 @@ This is especially impactful during **initial loading** when 100,000+ chunk requ
 
 #### Apple Maps Fallback
 
-**Apple Maps (`APPLE` imagery source) always uses the Python HTTP client**, not the native client. This is intentional because:
+**Apple Maps (`APPLE` imagery source) uses the shared Python HTTP/2 broker**,
+not the native libcurl client. This preserves:
 
 1. **Dynamic token**: Apple requires a session-specific access token obtained via DuckDuckGo proxy
 2. **Token rotation**: On 403/410 errors, the token must be refreshed and the request retried
@@ -1074,8 +1184,8 @@ This is especially impactful during **initial loading** when 100,000+ chunk requ
 # Native HTTP path (fast):
 BI, EOX, ARC, NAIP, USGS, FIREFLY, YNDX, GO2 → libcurl → parallel downloads
 
-# Python fallback path (full features):
-APPLE → requests library → token rotation on 403/410
+# Shared broker path (full features):
+APPLE → asynchronous HTTP/2 broker → token rotation on 403/410
 ```
 
 #### Platform Support

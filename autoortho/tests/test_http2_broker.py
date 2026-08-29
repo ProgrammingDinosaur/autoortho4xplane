@@ -494,3 +494,764 @@ def test_context_manager_starts_and_stops_broker():
         resp = broker.get("http://example.test/ctx")
         assert resp.content == b"ctx-ok"
     assert broker._started is False
+
+
+# ---------------------------------------------------------------------------
+# Asynchronous / pipelined client
+# ---------------------------------------------------------------------------
+
+def test_async_client_exceeds_legacy_thread_cap():
+    """More than 64 requests may be outstanding without 64 blocked threads."""
+
+    total = 96
+    gate = threading.Event()
+    peak = {"value": 0}
+    live = {"value": 0}
+
+    async def handler(request):
+        live["value"] += 1
+        peak["value"] = max(peak["value"], live["value"])
+        try:
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+        finally:
+            live["value"] -= 1
+        return httpx.Response(200, content=request.url.path.encode())
+
+    broker = make_broker(
+        handler,
+        max_concurrency=total,
+        max_connections=total,
+        max_pending=total,
+    )
+
+    threads_before = threading.active_count()
+    futures = [
+        broker.submit_async(f"http://example.test/tile/{i}") for i in range(total)
+    ]
+
+    deadline = time.monotonic() + 10.0
+    while peak["value"] < total and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert peak["value"] == total, f"only {peak['value']} concurrent requests"
+
+    # The whole batch is in flight, yet no per-request client threads exist.
+    assert threading.active_count() - threads_before < 8
+    assert broker.pending_count() == total
+
+    gate.set()
+
+    for i, future in enumerate(futures):
+        resp = future.result(timeout=10.0)
+        assert resp.status_code == 200
+        assert resp.content == f"/tile/{i}".encode()
+
+    assert broker.pending_count() == 0
+    stats = broker.stats()
+    assert stats["submitted"] == total
+    assert stats["completed"] == total
+    assert stats["peak_pending"] == total
+
+
+def test_max_pending_is_strictly_bounded():
+    gate = threading.Event()
+
+    async def handler(request):
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"ok")
+
+    broker = make_broker(handler, max_pending=4, reserved_live_slots=0)
+
+    futures = [broker.submit_async(f"http://example.test/{i}") for i in range(4)]
+    assert broker.pending_count() == 4
+
+    with pytest.raises(hb.BrokerCapacityError):
+        broker.submit_async("http://example.test/overflow")
+
+    assert broker.pending_count() == 4
+    assert broker.stats()["rejected_capacity"] == 1
+
+    gate.set()
+    for future in futures:
+        assert future.result(timeout=10.0).content == b"ok"
+    assert broker.pending_count() == 0
+
+
+def test_reserved_slots_keep_live_capacity_for_live_requests():
+    gate = threading.Event()
+
+    async def handler(request):
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"ok")
+
+    broker = make_broker(handler, max_pending=4, reserved_live_slots=2)
+
+    background = [
+        broker.submit_async(f"http://example.test/bg/{i}", priority=500)
+        for i in range(2)
+    ]
+    # Background work stops at max_pending - reserved_live_slots ...
+    with pytest.raises(hb.BrokerCapacityError):
+        broker.submit_async("http://example.test/bg/extra", priority=500)
+
+    # ... but the reserved slots are still available to live requests.
+    live = [
+        broker.submit_async(f"http://example.test/live/{i}", priority=0)
+        for i in range(2)
+    ]
+    with pytest.raises(hb.BrokerCapacityError):
+        broker.submit_async("http://example.test/live/extra", priority=0)
+
+    stats = broker.stats()
+    assert stats["pending"] == 4
+    assert stats["pending_live"] == 2
+    assert stats["pending_background"] == 2
+    assert stats["rejected_capacity_live"] == 1
+
+    gate.set()
+    for future in background + live:
+        assert future.result(timeout=10.0).status_code == 200
+
+
+def test_cancelled_future_completes_exactly_once():
+    gate = threading.Event()
+
+    async def handler(request):
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"late")
+
+    broker = make_broker(handler, max_pending=8)
+
+    future = broker.submit_async("http://example.test/slow")
+    calls = []
+    future.add_done_callback(calls.append)
+
+    assert broker.cancel(future.request_id) is True
+    # A redundant cancel must not settle the future a second time.
+    assert broker.cancel(future.request_id) is False
+
+    with pytest.raises(hb.BrokerCancelledError):
+        future.result(timeout=5.0)
+    assert future.cancelled() is True
+
+    gate.set()
+    time.sleep(0.3)
+
+    assert len(calls) == 1
+    assert broker.pending_count() == 0
+    assert broker.stats()["cancelled"] == 1
+
+
+def test_done_callback_runs_once_per_future_under_load():
+    async def handler(request):
+        return httpx.Response(200, content=b"ok")
+
+    broker = make_broker(handler, max_pending=64)
+
+    counts = {}
+    lock = threading.Lock()
+
+    def _record(future):
+        with lock:
+            counts[future.request_id] = counts.get(future.request_id, 0) + 1
+
+    futures = []
+    for i in range(64):
+        future = broker.submit_async(f"http://example.test/{i}")
+        future.add_done_callback(_record)
+        futures.append(future)
+
+    for future in futures:
+        future.result(timeout=10.0)
+
+    time.sleep(0.2)
+    assert len(counts) == 64
+    assert set(counts.values()) == {1}
+
+
+def test_async_timeout_settles_future_with_timeout_error():
+    gate = threading.Event()
+
+    async def handler(request):
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"never")
+
+    broker = make_broker(handler, max_pending=4)
+    future = broker.submit_async(
+        "http://example.test/timeout",
+        timeout=hb.RequestTimeout(connect=0.1, read=0.1, write=0.1, pool=0.1),
+    )
+
+    with pytest.raises(hb.BrokerTimeoutError):
+        future.result(timeout=10.0)
+    assert broker.pending_count() == 0
+
+    gate.set()
+
+
+def test_blocking_get_still_works_alongside_async_submissions():
+    async def handler(request):
+        return httpx.Response(200, content=request.url.path.encode())
+
+    broker = make_broker(handler, max_pending=32)
+
+    pipelined = [broker.submit_async(f"http://example.test/a/{i}") for i in range(8)]
+    resp = broker.get("http://example.test/sync")
+
+    assert resp.status_code == 200
+    assert resp.content == b"/sync"
+    for i, future in enumerate(pipelined):
+        assert future.result(timeout=10.0).content == f"/a/{i}".encode()
+    assert broker.pending_count() == 0
+
+
+def test_shutdown_settles_outstanding_futures():
+    gate = threading.Event()
+
+    async def handler(request):
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"never")
+
+    broker = make_broker(handler, max_pending=8)
+    futures = [broker.submit_async(f"http://example.test/{i}") for i in range(4)]
+
+    gate.set()
+    broker.stop(timeout=5.0)
+
+    for future in futures:
+        assert future.done() is True
+        assert future.exception() is not None
+
+
+# ---------------------------------------------------------------------------
+# Multipart (low-copy) IPC
+# ---------------------------------------------------------------------------
+
+def test_reply_frames_keep_body_out_of_msgpack():
+    """The metadata frame must not carry the JPEG bytes."""
+    payload = b"\xff\xd8\xff\xe0" + b"J" * 4096
+
+    async def handler(request):
+        return httpx.Response(200, content=payload)
+
+    captured = []
+    orig_handle = hb._ClientDispatcher._handle_reply
+
+    def _spy(self, reply, body=None):
+        captured.append((dict(reply), body))
+        return orig_handle(self, reply, body)
+
+    hb._ClientDispatcher._handle_reply = _spy
+    try:
+        broker = make_broker(handler)
+        resp = broker.get("http://example.test/tile.jpg")
+    finally:
+        hb._ClientDispatcher._handle_reply = orig_handle
+
+    assert resp.content == payload
+    assert captured, "no reply was observed"
+    reply, body = captured[-1]
+    assert body == payload
+    assert "content" not in reply
+    assert reply["content_length"] == len(payload)
+
+
+def test_empty_body_round_trips_as_empty_frame():
+    async def handler(request):
+        return httpx.Response(204, content=b"")
+
+    broker = make_broker(handler)
+    resp = broker.get("http://example.test/empty")
+
+    assert resp.status_code == 204
+    assert resp.content == b""
+
+
+def test_build_response_accepts_legacy_embedded_content():
+    """Older servers embedded the body in msgpack; the client still accepts it."""
+    dispatcher = hb._ClientDispatcher.__new__(hb._ClientDispatcher)
+    dispatcher._max_response_bytes = hb.DEFAULT_MAX_RESPONSE_BYTES
+
+    resp = dispatcher._build_response(
+        {"type": "RESPONSE", "id": "x", "status_code": 200, "headers": {},
+         "content": b"legacy", "content_length": 6},
+        None,
+    )
+    assert resp.content == b"legacy"
+
+
+def test_build_response_rejects_truncated_body():
+    dispatcher = hb._ClientDispatcher.__new__(hb._ClientDispatcher)
+    dispatcher._max_response_bytes = hb.DEFAULT_MAX_RESPONSE_BYTES
+
+    with pytest.raises(hb.BrokerProtocolError):
+        dispatcher._build_response(
+            {"type": "RESPONSE", "id": "x", "status_code": 200, "headers": {},
+             "content_length": 99},
+            b"short",
+        )
+
+
+def test_build_response_enforces_client_size_bound():
+    dispatcher = hb._ClientDispatcher.__new__(hb._ClientDispatcher)
+    dispatcher._max_response_bytes = 8
+
+    with pytest.raises(hb.ResponseTooLargeError):
+        dispatcher._build_response(
+            {"type": "RESPONSE", "id": "x", "status_code": 200, "headers": {},
+             "content_length": 16},
+            b"0123456789abcdef",
+        )
+
+
+def test_large_body_survives_multipart_round_trip():
+    payload = bytes(range(256)) * 2048  # 512 KiB
+
+    async def handler(request):
+        return httpx.Response(200, content=payload)
+
+    broker = make_broker(handler)
+    resp = broker.get("http://example.test/big.jpg")
+
+    assert resp.content == payload
+    assert len(resp.content) == len(payload)
+
+
+def test_coalescing_still_delivers_body_to_every_waiter():
+    gate = threading.Event()
+    payload = b"shared-body" * 512
+
+    async def handler(request):
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return httpx.Response(200, content=payload)
+
+    broker = make_broker(handler, max_pending=16)
+    futures = [broker.submit_async("http://example.test/same.jpg") for _ in range(5)]
+    time.sleep(0.1)
+    gate.set()
+
+    for future in futures:
+        assert future.result(timeout=10.0).content == payload
+
+
+def test_server_response_bound_still_enforced_over_multipart():
+    async def handler(request):
+        return httpx.Response(200, content=b"x" * 4096)
+
+    broker = make_broker(handler, max_response_bytes=1024)
+
+    with pytest.raises(hb.ResponseTooLargeError):
+        broker.get("http://example.test/toobig")
+
+
+# ---------------------------------------------------------------------------
+# Adaptive per-origin concurrency: controller unit tests
+# ---------------------------------------------------------------------------
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _controller(**kwargs):
+    clock = _FakeClock()
+    kwargs.setdefault("initial", 4)
+    kwargs.setdefault("minimum", 2)
+    kwargs.setdefault("maximum", 16)
+    kwargs.setdefault("success_threshold", 3)
+    kwargs.setdefault("cooldown", 1.0)
+    return hb._AdaptiveConcurrencyController(clock=clock, **kwargs), clock
+
+
+def test_controller_starts_at_ceiling_when_initial_is_zero():
+    ctl, _ = _controller(initial=0)
+    assert ctl.limit_for("https://a.test") == 16
+
+
+def test_controller_additive_increase_after_sustained_success():
+    ctl, _ = _controller()
+    origin = "https://tiles.test"
+
+    assert ctl.limit_for(origin) == 4
+    for _ in range(2):
+        ctl.on_outcome(origin, status_code=200)
+    assert ctl.limit_for(origin) == 4, "must not grow before the threshold"
+
+    ctl.on_outcome(origin, status_code=200)
+    assert ctl.limit_for(origin) == 5
+
+    for _ in range(3):
+        ctl.on_outcome(origin, status_code=200)
+    assert ctl.limit_for(origin) == 6
+
+
+def test_controller_never_exceeds_maximum():
+    ctl, _ = _controller(initial=15, maximum=16, success_threshold=1)
+    origin = "https://tiles.test"
+    for _ in range(20):
+        ctl.on_outcome(origin, status_code=200)
+    assert ctl.limit_for(origin) == 16
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_controller_multiplicative_decrease_on_overload(status):
+    ctl, clock = _controller(initial=10, decrease_factor=0.5)
+    origin = "https://tiles.test"
+
+    ctl.on_outcome(origin, status_code=status)
+    assert ctl.limit_for(origin) == 5
+
+    clock.advance(2.0)
+    ctl.on_outcome(origin, status_code=status)
+    assert ctl.limit_for(origin) == 2
+
+
+def test_controller_decreases_on_timeout_and_transport_error():
+    ctl, clock = _controller(initial=10, decrease_factor=0.5)
+    origin = "https://tiles.test"
+
+    assert ctl.on_outcome(origin, error=hb.BrokerTimeoutError("slow")) == "throttle"
+    assert ctl.limit_for(origin) == 5
+
+    clock.advance(2.0)
+    assert ctl.on_outcome(
+        origin, error=httpx.ConnectError("boom")
+    ) == "throttle"
+    assert ctl.limit_for(origin) == 2
+
+
+@pytest.mark.parametrize("status", [403, 410])
+def test_controller_ignores_provider_policy_statuses(status):
+    ctl, _ = _controller(initial=8)
+    origin = "https://tiles.test"
+
+    for _ in range(10):
+        assert ctl.on_outcome(origin, status_code=status) == "neutral"
+    assert ctl.limit_for(origin) == 8
+
+
+def test_controller_cooldown_collapses_a_failure_burst():
+    ctl, clock = _controller(initial=16, decrease_factor=0.5, cooldown=5.0)
+    origin = "https://tiles.test"
+
+    for _ in range(6):
+        ctl.on_outcome(origin, status_code=503)
+    assert ctl.limit_for(origin) == 8, "burst must produce a single decrease"
+
+    clock.advance(5.0)
+    ctl.on_outcome(origin, status_code=503)
+    assert ctl.limit_for(origin) == 4
+
+
+def test_controller_floor_protects_low_volume_origins():
+    ctl, clock = _controller(initial=8, minimum=3, decrease_factor=0.5)
+    origin = "https://tiles.test"
+    for _ in range(10):
+        ctl.on_outcome(origin, status_code=503)
+        clock.advance(2.0)
+    assert ctl.limit_for(origin) == 3
+
+
+def test_controller_recovers_after_a_decrease():
+    ctl, _ = _controller(initial=8, decrease_factor=0.5, success_threshold=2)
+    origin = "https://tiles.test"
+
+    ctl.on_outcome(origin, status_code=503)
+    assert ctl.limit_for(origin) == 4
+
+    for _ in range(4):
+        ctl.on_outcome(origin, status_code=200)
+    assert ctl.limit_for(origin) == 6
+
+
+def test_controller_keeps_origins_independent():
+    ctl, _ = _controller(initial=8, decrease_factor=0.5)
+    bad, good = "https://bad.test", "https://good.test"
+
+    ctl.on_outcome(bad, status_code=503)
+    assert ctl.limit_for(bad) == 4
+    assert ctl.limit_for(good) == 8
+
+    assert ctl.try_acquire(good) is True
+    assert ctl.active_for(bad) == 0
+
+
+def test_controller_permits_are_bounded_and_released():
+    ctl, _ = _controller(initial=2)
+    origin = "https://tiles.test"
+
+    assert ctl.try_acquire(origin) is True
+    assert ctl.try_acquire(origin) is True
+    assert ctl.try_acquire(origin) is False
+
+    ctl.release(origin)
+    assert ctl.try_acquire(origin) is True
+    assert ctl.snapshot()[origin]["peak_active"] == 2
+
+
+def test_controller_disabled_is_a_passthrough():
+    ctl, _ = _controller(enabled=False, initial=1, maximum=16)
+    origin = "https://tiles.test"
+    for _ in range(10):
+        assert ctl.try_acquire(origin) is True
+    ctl.on_outcome(origin, status_code=503)
+    assert ctl.limit_for(origin) == 16
+
+
+def test_controller_rejects_invalid_decrease_factor():
+    with pytest.raises(ValueError):
+        hb._AdaptiveConcurrencyController(decrease_factor=1.0)
+    with pytest.raises(ValueError):
+        hb._AdaptiveConcurrencyController(decrease_factor=0.0)
+
+
+def test_origin_key_normalizes_scheme_and_host():
+    assert hb._origin_key("https://Tiles.Test:443/a/b?c=1") == "https://tiles.test:443"
+    assert hb._origin_key("http://a.test/x") == "http://a.test"
+    assert hb._origin_key("not a url") == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Adaptive per-origin concurrency: end-to-end through the broker
+# ---------------------------------------------------------------------------
+
+def test_origin_concurrency_never_exceeds_limit():
+    limit = 4
+    gate = threading.Event()
+    state = {"live": 0, "peak": 0}
+    lock = threading.Lock()
+
+    async def handler(request):
+        with lock:
+            state["live"] += 1
+            state["peak"] = max(state["peak"], state["live"])
+        try:
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+        finally:
+            with lock:
+                state["live"] -= 1
+        return httpx.Response(200, content=b"ok")
+
+    broker = make_broker(
+        handler,
+        max_concurrency=32,
+        max_connections=32,
+        max_pending=64,
+        origin_initial_concurrency=limit,
+        origin_success_threshold=10_000,  # never ramp up during the test
+    )
+    futures = [broker.submit_async(f"http://one.test/{i}") for i in range(24)]
+
+    deadline = time.monotonic() + 3.0
+    while state["peak"] < limit and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.3)
+    assert state["peak"] == limit
+
+    gate.set()
+    for future in futures:
+        assert future.result(timeout=10.0).status_code == 200
+    assert state["peak"] == limit
+
+
+def test_saturated_origin_does_not_starve_another_origin():
+    gate = threading.Event()
+    served_fast = threading.Event()
+
+    async def handler(request):
+        if request.url.host == "slow.test":
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+            return httpx.Response(200, content=b"slow")
+        served_fast.set()
+        return httpx.Response(200, content=b"fast")
+
+    broker = make_broker(
+        handler,
+        max_concurrency=8,
+        max_connections=8,
+        max_pending=64,
+        origin_initial_concurrency=2,
+        origin_success_threshold=10_000,
+    )
+    slow = [broker.submit_async(f"http://slow.test/{i}") for i in range(24)]
+    time.sleep(0.2)
+
+    fast = broker.submit_async("http://fast.test/now")
+    assert fast.result(timeout=5.0).content == b"fast"
+    assert served_fast.is_set()
+
+    gate.set()
+    for future in slow:
+        assert future.result(timeout=10.0).status_code == 200
+
+
+def test_server_stats_reports_origin_table():
+    async def handler(request):
+        return httpx.Response(200, content=b"ok")
+
+    broker = make_broker(
+        handler,
+        origin_initial_concurrency=5,
+        origin_min_concurrency=2,
+    )
+    broker.get("http://stats.test/tile")
+
+    stats = broker.server_stats(timeout=5.0)
+
+    assert stats["adaptive"]["enabled"] is True
+    assert stats["adaptive"]["initial"] == 5
+    assert stats["adaptive"]["minimum"] == 2
+    assert "http://stats.test" in stats["origins"]
+    entry = stats["origins"]["http://stats.test"]
+    assert entry["limit"] == 5
+    assert entry["active"] == 0
+    assert entry["peak_active"] >= 1
+    assert entry["throttles"] == 0
+
+
+def test_server_stats_shows_throttle_reduction():
+    async def handler(request):
+        return httpx.Response(503, content=b"busy")
+
+    broker = make_broker(
+        handler,
+        origin_initial_concurrency=8,
+        origin_min_concurrency=2,
+        origin_decrease_factor=0.5,
+        origin_cooldown_seconds=0.0,
+    )
+    for i in range(3):
+        assert broker.get(f"http://busy.test/{i}").status_code == 503
+
+    stats = broker.server_stats(timeout=5.0)
+    entry = stats["origins"]["http://busy.test"]
+    assert entry["throttles"] == 3
+    assert entry["decreases"] >= 1
+    assert entry["limit"] < 8
+
+
+def test_adaptive_limit_is_clamped_to_global_max_concurrency():
+    async def handler(request):
+        return httpx.Response(200, content=b"ok")
+
+    broker = make_broker(
+        handler,
+        max_concurrency=3,
+        max_connections=3,
+        origin_initial_concurrency=99,
+    )
+    broker.get("http://clamp.test/tile")
+    stats = broker.server_stats(timeout=5.0)
+
+    assert stats["adaptive"]["maximum"] == 3
+    assert stats["origins"]["http://clamp.test"]["limit"] == 3
+
+
+def test_parked_requests_are_settled_on_shutdown():
+    gate = threading.Event()
+
+    async def handler(request):
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"ok")
+
+    broker = make_broker(
+        handler,
+        max_concurrency=8,
+        max_pending=32,
+        origin_initial_concurrency=1,
+        origin_min_concurrency=1,
+    )
+    futures = [broker.submit_async(f"http://park.test/{i}") for i in range(6)]
+    time.sleep(0.2)
+
+    gate.set()
+    broker.stop(timeout=5.0)
+
+    for future in futures:
+        assert future.done() is True
+
+
+def _wait_for_backlog(broker, expected, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    depth = None
+    while time.monotonic() < deadline:
+        depth = broker.server_stats(timeout=2.0)["backlog_depth"]
+        if depth == expected:
+            return depth
+        time.sleep(0.02)
+    raise AssertionError(f"backlog stayed at {depth}, expected {expected}")
+
+
+def test_saturated_origin_parks_instead_of_holding_workers():
+    gate = threading.Event()
+
+    async def handler(request):
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return httpx.Response(200, content=request.url.path.encode())
+
+    broker = make_broker(
+        handler,
+        max_concurrency=8,
+        max_pending=32,
+        origin_initial_concurrency=1,
+        origin_min_concurrency=1,
+        origin_success_threshold=10_000,
+    )
+    futures = [broker.submit_async(f"http://park2.test/p{i}") for i in range(5)]
+
+    _wait_for_backlog(broker, 4)
+    stats = broker.server_stats(timeout=2.0)
+    assert stats["origins"]["http://park2.test"]["active"] == 1
+    assert stats["origins"]["http://park2.test"]["deferred"] >= 4
+
+    gate.set()
+    for future in futures:
+        assert future.result(timeout=15.0).status_code == 200
+    assert broker.server_stats(timeout=2.0)["backlog_depth"] == 0
+
+
+def test_cancelling_parked_requests_does_not_strand_the_origin():
+    gate = threading.Event()
+
+    async def handler(request):
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return httpx.Response(200, content=request.url.path.encode())
+
+    broker = make_broker(
+        handler,
+        max_concurrency=8,
+        max_pending=32,
+        origin_initial_concurrency=1,
+        origin_min_concurrency=1,
+        origin_success_threshold=10_000,
+    )
+    futures = [broker.submit_async(f"http://cancel.test/p{i}") for i in range(5)]
+    _wait_for_backlog(broker, 4)
+
+    for future in futures:
+        broker.cancel(future.request_id)
+    for future in futures:
+        with pytest.raises(hb.BrokerCancelledError):
+            future.result(timeout=5.0)
+
+    _wait_for_backlog(broker, 0)
+
+    gate.set()
+    assert broker.get("http://cancel.test/after").content == b"/after"

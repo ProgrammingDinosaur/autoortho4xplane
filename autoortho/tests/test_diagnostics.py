@@ -8,6 +8,7 @@ from autoortho.diagnostics import (
     StageAggregate,
     _append_bounded_sample,
     _aggregate_memory_timeline,
+    finalize_session_report,
 )
 
 
@@ -179,3 +180,103 @@ def test_memory_samples_are_compacted_without_losing_peaks():
     assert len(samples) <= 4
     assert max(sample[2] for sample in samples) == 100
     assert samples[-1][0] == 40
+
+
+def test_checkpoint_preserves_worker_stages_before_graceful_stop(tmp_path):
+    session_dir = tmp_path / "performance-checkpoint"
+    worker = PerformanceProfiler(
+        session_dir=session_dir,
+        session_id="checkpoint-session",
+        role="mount-worker:test",
+        sample_interval=60.0,
+        checkpoint_interval=10.0,
+    ).start()
+    try:
+        worker.record("fuse.dds_read", 1_250.0, tile_id="1_2_BI_16")
+        worker.set_gauge("chunk_queue.live_depth", 42)
+        worker._last_checkpoint = 0.0
+        worker._write_checkpoint_if_due()
+
+        process_path = worker._process_path()
+        checkpoint = json.loads(process_path.read_text(encoding="utf-8"))
+        assert checkpoint["profile_status"] == "checkpoint"
+        assert checkpoint["stages"]["fuse.dds_read"]["count"] == 1
+        assert checkpoint["gauges"]["chunk_queue.live_depth"]["max"] == 42
+
+        report_path = finalize_session_report(
+            session_dir,
+            "checkpoint-session",
+        )
+        report = json.loads(
+            report_path.with_name("report.json").read_text(encoding="utf-8")
+        )
+        process = next(
+            row for row in report["processes"]
+            if row["role"] == "mount-worker:test"
+        )
+        assert process["profile_status"] == "checkpoint"
+        assert any(
+            row["stage"] == "fuse.dds_read"
+            for row in report["stages"]
+        )
+        assert any(
+            "recovered from periodic checkpoints" in flag
+            for flag in report["diagnostic_flags"]
+        )
+    finally:
+        worker.stop()
+
+
+def test_report_prefers_checkpoint_over_observed_profile(tmp_path):
+    session_dir = tmp_path / "performance-profile-precedence"
+    session_dir.mkdir()
+    common = {
+        "schema_version": 1,
+        "session_id": "precedence",
+        "role": "mount-worker:test",
+        "pid": 42,
+        "started_wall_time": 1.0,
+        "ended_wall_time": 2.0,
+        "duration_seconds": 1.0,
+        "host": {},
+        "gauges": {},
+        "slow_operations": [],
+        "memory_samples": [],
+        "python_allocations": [],
+        "settings": {},
+        "metadata": {},
+    }
+    observed = {
+        **common,
+        "profile_status": "resource-only",
+        "stages": {},
+    }
+    checkpoint = {
+        **common,
+        "profile_status": "checkpoint",
+        "stages": {
+            "fuse.dds_read": StageAggregate(
+                count=1,
+                total_ms=10.0,
+                min_ms=10.0,
+                max_ms=10.0,
+            ).to_dict(),
+        },
+    }
+    (session_dir / "process-42-worker-observed.json").write_text(
+        json.dumps(observed),
+        encoding="utf-8",
+    )
+    (session_dir / "process-42-worker.json").write_text(
+        json.dumps(checkpoint),
+        encoding="utf-8",
+    )
+
+    report_path = finalize_session_report(session_dir, "precedence")
+    report = json.loads(
+        report_path.with_name("report.json").read_text(encoding="utf-8")
+    )
+
+    assert report["process_count"] == 1
+    assert report["processes"][0]["profile_status"] == "checkpoint"
+    assert [row["stage"] for row in report["stages"]] == ["fuse.dds_read"]

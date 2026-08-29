@@ -104,6 +104,37 @@ Key settings include:
 
 For detailed configuration options and recommended settings for different use cases, see the [Performance Tuning Guide](performance.md).
 
+### Provider transport and working memory
+
+The shared provider transport uses asynchronous HTTP/2 requests. Network and
+tile-build concurrency are bounded independently:
+
+```ini
+provider_max_in_flight = 128
+provider_max_connections = 64
+download_dispatch_workers = 4
+provider_adaptive_concurrency = True
+live_tile_admission = 16
+tile_image_cache_mb = 96
+cache_write_buffer_mb = 256
+long_term_cache_write_buffer_mb = 128
+```
+
+- `provider_max_in_flight` is the strict global pending-request limit. A
+  reserved slice remains available for live X-Plane requests.
+- `provider_max_connections` bounds physical connections. HTTP/2 can multiplex
+  multiple requests over each connection.
+- `download_dispatch_workers` applies completed responses; it does not limit
+  network concurrency.
+- Adaptive concurrency raises a provider's limit after sustained successes and
+  reduces it after overload responses or timeouts.
+- `live_tile_admission` bounds expensive concurrent tile construction while
+  allowing JPEG retrieval to continue independently.
+- `tile_image_cache_mb` is a per-tile byte budget for temporary fallback RGBA
+  images. Oversized ZL17 mipmap-zero images are compressed and released.
+- Cache-write byte budgets prevent slow storage from retaining an unbounded
+  number of downloaded JPEGs.
+
 ### Performance Diagnostics
 
 The Settings tab can create an end-of-flight performance report containing
@@ -112,6 +143,11 @@ tile operations, and per-process memory/CPU timelines. Reports are written to
 `~/.autoortho-data/reports` by default. See
 [Flight Performance Reports](performance.md#flight-performance-reports) for
 the metric reference and analysis workflow.
+
+`checkpoint_interval_seconds` controls periodic atomic worker snapshots
+(10 seconds by default). If a worker is force-stopped, the report recovers its
+most recent stage histograms and gauges instead of retaining resource samples
+only.
 
 For troubleshooting missing tiles or stuttering issues, see the [FAQ](faq.md#missing-color-tiles).
 

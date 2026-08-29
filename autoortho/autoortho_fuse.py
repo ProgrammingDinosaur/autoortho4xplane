@@ -1051,9 +1051,12 @@ class AutoOrtho(Operations):
             # - Any processing overhead
             # - Margin of safety to prevent premature lock timeout
             build_timeout = self._calculate_build_timeout()
+            request_deadline = request_started + build_timeout
 
             lock_started = time.monotonic()
-            if not lock.acquire(timeout=build_timeout):
+            if not lock.acquire(
+                timeout=max(0.0, request_deadline - time.monotonic())
+            ):
                 lock_wait_ms = (time.monotonic() - lock_started) * 1000.0
                 record_stage(
                     "fuse.tile_lock_wait",
@@ -1108,7 +1111,19 @@ class AutoOrtho(Operations):
                 tile_id=tile_id,
             )
             read_outcome = "ok"
+            admitted = False
             try:
+                admitted = getortho.acquire_live_tile_slot(
+                    max(0.0, request_deadline - time.monotonic())
+                )
+                if not admitted:
+                    read_outcome = "fallback"
+                    log.error(
+                        "Live tile admission timeout for %s after %ss",
+                        key,
+                        build_timeout,
+                    )
+                    return _generate_fallback_dds_bytes(offset, length)
                 with profile_span(
                     "tile.cache_lookup",
                     tile_id=tile_id,
@@ -1130,6 +1145,8 @@ class AutoOrtho(Operations):
                 log.exception("cause:", exc_info=e)
                 return _generate_fallback_dds_bytes(offset, length)
             finally:
+                if admitted:
+                    getortho.release_live_tile_slot()
                 lock.release()
                 record_stage(
                     "fuse.dds_read",
