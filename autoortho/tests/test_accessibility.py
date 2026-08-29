@@ -69,6 +69,21 @@ def test_settings_controls_and_shortcuts_are_accessible(config_ui):
     assert first.nextInFocusChain() is second
 
 
+def test_provider_concurrency_control_is_on_visible_performance_page(config_ui):
+    performance = next(
+        entry
+        for entry in config_ui.categorized_settings_page.entries
+        if entry.name == "Performance"
+    )
+
+    assert performance.page.isAncestorOf(config_ui.provider_transport_group)
+    assert config_ui.provider_transport_group.isAncestorOf(
+        config_ui.provider_inflight_spinbox
+    )
+    assert config_ui.provider_inflight_spinbox.minimum() == 8
+    assert config_ui.provider_inflight_spinbox.maximum() == 1024
+
+
 def test_dynamic_zoom_table_exposes_context(qt_app):
     manager = DynamicZoomManager()
     manager.set_base_zoom(16, 18)

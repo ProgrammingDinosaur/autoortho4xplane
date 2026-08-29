@@ -962,7 +962,10 @@ class ConfigUI(QMainWindow):
         )
         self.categorized_settings_page.add_category(
             "Performance",
-            [self.performance_settings_group],
+            [
+                self.performance_settings_group,
+                self.provider_transport_group,
+            ],
             recommendation=(
                 "Change timeout and fallback behavior only when diagnosing "
                 "loading stalls or missing imagery."
@@ -3955,11 +3958,11 @@ class ConfigUI(QMainWindow):
         # Initialize time budget control states
         self._update_time_budget_controls()
 
-        provider_header = QLabel("Provider Download Transport")
-        provider_header.setStyleSheet(
-            "font-weight: bold; font-size: 12px; color: #8ab4f8; margin-top: 10px;"
+        self.provider_transport_group = QGroupBox(
+            "Provider Download Transport"
         )
-        autoortho_layout.addWidget(provider_header)
+        provider_layout = QVBoxLayout(self.provider_transport_group)
+        autoortho_layout.addWidget(self.provider_transport_group)
 
         inflight_layout = QHBoxLayout()
         inflight_label = QLabel("Maximum requests in flight:")
@@ -3977,7 +3980,7 @@ class ConfigUI(QMainWindow):
         self.provider_inflight_spinbox.setObjectName("provider_max_in_flight")
         inflight_layout.addWidget(self.provider_inflight_spinbox)
         inflight_layout.addStretch()
-        autoortho_layout.addLayout(inflight_layout)
+        provider_layout.addLayout(inflight_layout)
 
         connections_layout = QHBoxLayout()
         connections_label = QLabel("Provider connections:")
@@ -3996,7 +3999,7 @@ class ConfigUI(QMainWindow):
         )
         connections_layout.addWidget(self.provider_connections_spinbox)
         connections_layout.addStretch()
-        autoortho_layout.addLayout(connections_layout)
+        provider_layout.addLayout(connections_layout)
 
         dispatch_layout = QHBoxLayout()
         dispatch_label = QLabel("Download completion workers:")
@@ -4015,7 +4018,7 @@ class ConfigUI(QMainWindow):
         )
         dispatch_layout.addWidget(self.download_dispatch_workers_spinbox)
         dispatch_layout.addStretch()
-        autoortho_layout.addLayout(dispatch_layout)
+        provider_layout.addLayout(dispatch_layout)
 
         self.provider_adaptive_check = QCheckBox(
             "Adapt concurrency to each imagery provider"
@@ -4036,7 +4039,7 @@ class ConfigUI(QMainWindow):
             "Raises concurrency after sustained successful responses and reduces\n"
             "it when a provider returns overload errors or timeouts."
         )
-        autoortho_layout.addWidget(self.provider_adaptive_check)
+        provider_layout.addWidget(self.provider_adaptive_check)
 
         memory_layout = QHBoxLayout()
         memory_label = QLabel("Concurrent live tiles:")
@@ -4062,7 +4065,7 @@ class ConfigUI(QMainWindow):
         self.tile_image_cache_mb_spinbox.setObjectName("tile_image_cache_mb")
         memory_layout.addWidget(self.tile_image_cache_mb_spinbox)
         memory_layout.addStretch()
-        autoortho_layout.addLayout(memory_layout)
+        provider_layout.addLayout(memory_layout)
 
         # HTTP/1.1 fallback threads
         threads_layout = QHBoxLayout()
@@ -4092,7 +4095,7 @@ class ConfigUI(QMainWindow):
 
         threads_layout.addWidget(self.fetch_threads_spinbox)
         threads_layout.addStretch()
-        autoortho_layout.addLayout(threads_layout)
+        provider_layout.addLayout(threads_layout)
 
         missing_color_layout = QHBoxLayout()
         missing_color_layout.setSpacing(10)
