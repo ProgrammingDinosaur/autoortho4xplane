@@ -358,6 +358,9 @@ provider_max_connections = 64
 # Threads used to apply broker responses (cache write, decode hand-off).
 # This is a coordination pool, not a download pool; keep it small.
 download_dispatch_workers = 4
+# Maximum time a request may wait for broker/provider admission before its
+# network timeout begins. Queue time is deliberately separate from HTTP time.
+provider_queue_timeout = 60.0
 # Adaptive per-provider concurrency. The broker tracks each origin
 # (scheme://host) separately: it adds provider_origin_increase_step permits
 # after provider_origin_success_threshold consecutive good responses and
@@ -365,8 +368,8 @@ download_dispatch_workers = 4
 # reports overload (429, 5xx, timeouts). 403/410 are provider policy answers
 # and never shrink the limit.
 provider_adaptive_concurrency = True
-# Starting per-origin limit. 0 means "start at the ceiling", i.e. only react
-# to overload; set a positive value for a gentle ramp-up instead.
+# Starting per-origin limit. 0 starts at provider_max_connections and ramps
+# toward provider_origin_max_concurrency after successful responses.
 provider_origin_initial_concurrency = 0
 # Floor for a throttled origin, so a bad patch cannot starve it completely.
 provider_origin_min_concurrency = 2
@@ -735,6 +738,12 @@ PROVIDER_SETTINGS = {
     "download_dispatch_workers": {
         "default": 4,
         "range": (1, 16),
+        "legacy": None,
+    },
+    "provider_queue_timeout": {
+        "type": float,
+        "default": 60.0,
+        "range": (5.0, 600.0),
         "legacy": None,
     },
     # Adaptive per-origin concurrency (enforced by the broker server).

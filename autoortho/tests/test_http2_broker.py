@@ -338,6 +338,80 @@ def test_request_times_out_when_response_takes_too_long():
     assert elapsed < 1.5  # must not wait for the full 2s handler delay
 
 
+def test_queue_wait_does_not_consume_network_timeout():
+    gate = threading.Event()
+
+    async def handler(request):
+        if request.url.path == "/gate":
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+        return httpx.Response(200, content=request.url.path.encode())
+
+    broker = make_broker(
+        handler,
+        max_concurrency=1,
+        queue_timeout=3.0,
+    )
+    gate_future = broker.submit_async(
+        "http://example.test/gate",
+        timeout=hb.RequestTimeout(
+            connect=5.0,
+            read=5.0,
+            write=5.0,
+            pool=5.0,
+        ),
+    )
+    time.sleep(0.1)
+    queued = broker.submit_async(
+        "http://example.test/queued",
+        timeout=hb.RequestTimeout(
+            connect=0.1,
+            read=0.1,
+            write=0.1,
+            pool=0.1,
+        ),
+    )
+
+    # This exceeds the queued request's complete HTTP timeout budget. It must
+    # remain pending because that budget is armed only after STARTED.
+    time.sleep(1.1)
+    assert queued.done() is False
+
+    gate.set()
+    assert gate_future.result(timeout=5.0).content == b"/gate"
+    assert queued.result(timeout=5.0).content == b"/queued"
+
+
+def test_queue_timeout_is_reported_separately():
+    gate = threading.Event()
+
+    async def handler(request):
+        if request.url.path == "/gate":
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"ok")
+
+    broker = make_broker(
+        handler,
+        max_concurrency=1,
+        queue_timeout=0.2,
+    )
+    first = broker.submit_async("http://example.test/gate")
+    time.sleep(0.05)
+    queued = broker.submit_async("http://example.test/queued")
+
+    try:
+        with pytest.raises(
+            hb.BrokerTimeoutError,
+            match="broker queue",
+        ):
+            queued.result(timeout=2.0)
+    finally:
+        gate.set()
+
+    assert first.result(timeout=5.0).status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # Bounded payload / response size
 # ---------------------------------------------------------------------------

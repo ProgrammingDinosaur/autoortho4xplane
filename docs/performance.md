@@ -33,6 +33,8 @@ provider_max_in_flight = 128
 provider_max_connections = 64
 # Threads used to settle completed downloads (coordination only).
 download_dispatch_workers = 4
+# Queue watchdog; HTTP timeouts begin only after the broker sends STARTED.
+provider_queue_timeout = 60
 ```
 
 | Setting | Default | Range | Notes |
@@ -40,6 +42,7 @@ download_dispatch_workers = 4
 | `provider_max_in_flight` | `128` | 8-1024 | Strict cap. A reserved slice (25%) is held for live, X-Plane-visible tiles so prefetch and healing can never starve them. |
 | `provider_max_connections` | `64` | 1-256 | Effective value is `min(provider_max_in_flight, provider_max_connections)`. This preserves throughput when a provider negotiates HTTP/1.1 rather than multiplexed HTTP/2. |
 | `download_dispatch_workers` | `4` | 1-16 | Small fixed pool that finalises completed requests; increasing it does not increase download concurrency. |
+| `provider_queue_timeout` | `60` | 5-600 seconds | Maximum broker/adaptive queue wait. It is separate from provider connect/read/pool timeouts. |
 
 ### Strict admission
 
@@ -80,7 +83,7 @@ another one and low-volume origins keep their own floor
 [autoortho]
 # Adaptive per-origin concurrency (broker-side).
 provider_adaptive_concurrency = True
-# 0 => start at the ceiling and only react to overload.
+# 0 => start at provider_max_connections and ramp toward the ceiling.
 provider_origin_initial_concurrency = 0
 provider_origin_min_concurrency = 2
 # 0 => use provider_max_in_flight as the per-origin ceiling.
@@ -94,7 +97,7 @@ provider_origin_cooldown_seconds = 2.0
 | Setting | Default | Range | Notes |
 |---------|---------|-------|-------|
 | `provider_adaptive_concurrency` | `True` | bool | Disable to use a fixed per-origin limit equal to the ceiling. |
-| `provider_origin_initial_concurrency` | `0` | 0-1024 | `0` starts at the ceiling (react-only), preserving previous throughput. |
+| `provider_origin_initial_concurrency` | `0` | 0-1024 | `0` starts at the effective connection budget, preventing an initial request flood while still ramping after successful responses. |
 | `provider_origin_min_concurrency` | `2` | 1-256 | Floor the controller will never drop below. Also clamps the initial value upwards. |
 | `provider_origin_max_concurrency` | `0` | 0-1024 | `0` means `provider_max_in_flight`. Always clamped to the global `max_concurrency`. |
 | `provider_origin_increase_step` | `1` | 1-64 | Permits added per successful ramp step. |

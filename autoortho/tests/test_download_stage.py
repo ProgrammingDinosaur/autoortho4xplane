@@ -697,6 +697,7 @@ def test_provider_settings_defaults():
     assert aoconfig.resolve_provider_setting("provider_max_in_flight", cfg) == 128
     assert aoconfig.resolve_provider_setting("provider_max_connections", cfg) == 64
     assert aoconfig.resolve_provider_setting("download_dispatch_workers", cfg) == 4
+    assert aoconfig.resolve_provider_setting("provider_queue_timeout", cfg) == 60.0
 
 
 def test_legacy_aliases_apply_only_when_new_setting_is_default():

@@ -113,6 +113,7 @@ tile-build concurrency are bounded independently:
 provider_max_in_flight = 128
 provider_max_connections = 64
 download_dispatch_workers = 4
+provider_queue_timeout = 60
 provider_adaptive_concurrency = True
 live_tile_admission = 16
 tile_image_cache_mb = 96

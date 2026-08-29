@@ -882,6 +882,9 @@ def _get_http2_client():
                 address,
                 token,
                 max_pending=resolve_provider_setting("provider_max_in_flight"),
+                queue_timeout=resolve_provider_setting(
+                    "provider_queue_timeout"
+                ),
             )
         except Exception as exc:
             _http2_client_failed = True

@@ -263,6 +263,7 @@ class ConfigUI(QMainWindow):
         "provider_inflight_spinbox",
         "provider_connections_spinbox",
         "download_dispatch_workers_spinbox",
+        "provider_queue_timeout_spinbox",
         "provider_adaptive_check",
         "live_tile_admission_spinbox",
         "tile_image_cache_mb_spinbox",
@@ -329,6 +330,7 @@ class ConfigUI(QMainWindow):
         "provider_inflight_spinbox",
         "provider_connections_spinbox",
         "download_dispatch_workers_spinbox",
+        "provider_queue_timeout_spinbox",
         "provider_adaptive_check",
         "live_tile_admission_spinbox",
         "tile_image_cache_mb_spinbox",
@@ -1131,6 +1133,7 @@ class ConfigUI(QMainWindow):
                 "provider_inflight_spinbox": 128,
                 "provider_connections_spinbox": 64,
                 "download_dispatch_workers_spinbox": 4,
+                "provider_queue_timeout_spinbox": 60,
                 "live_tile_admission_spinbox": 16,
                 "tile_image_cache_mb_spinbox": 96,
             },
@@ -1147,6 +1150,7 @@ class ConfigUI(QMainWindow):
                 "provider_inflight_spinbox": 192,
                 "provider_connections_spinbox": 64,
                 "download_dispatch_workers_spinbox": 6,
+                "provider_queue_timeout_spinbox": 90,
                 "live_tile_admission_spinbox": 20,
                 "tile_image_cache_mb_spinbox": 128,
             },
@@ -1163,6 +1167,7 @@ class ConfigUI(QMainWindow):
                 "provider_inflight_spinbox": 64,
                 "provider_connections_spinbox": 32,
                 "download_dispatch_workers_spinbox": 3,
+                "provider_queue_timeout_spinbox": 90,
                 "live_tile_admission_spinbox": 8,
                 "tile_image_cache_mb_spinbox": 64,
             },
@@ -1179,6 +1184,7 @@ class ConfigUI(QMainWindow):
                 "provider_inflight_spinbox": 64,
                 "provider_connections_spinbox": 16,
                 "download_dispatch_workers_spinbox": 2,
+                "provider_queue_timeout_spinbox": 60,
                 "live_tile_admission_spinbox": 6,
                 "tile_image_cache_mb_spinbox": 64,
             },
@@ -4016,6 +4022,26 @@ class ConfigUI(QMainWindow):
         dispatch_layout.addWidget(self.download_dispatch_workers_spinbox)
         dispatch_layout.addStretch()
         autoortho_layout.addLayout(dispatch_layout)
+
+        queue_timeout_layout = QHBoxLayout()
+        queue_timeout_label = QLabel("Broker queue timeout:")
+        queue_timeout_label.setToolTip(
+            "Maximum time a request may wait for broker/provider admission.\n"
+            "The HTTP network timeout starts only after the broker begins it."
+        )
+        queue_timeout_layout.addWidget(queue_timeout_label)
+        self.provider_queue_timeout_spinbox = ModernSpinBox()
+        self.provider_queue_timeout_spinbox.setRange(5, 600)
+        self.provider_queue_timeout_spinbox.setSuffix(" s")
+        self.provider_queue_timeout_spinbox.setValue(
+            int(getattr(self.cfg.autoortho, "provider_queue_timeout", 60))
+        )
+        self.provider_queue_timeout_spinbox.setObjectName(
+            "provider_queue_timeout"
+        )
+        queue_timeout_layout.addWidget(self.provider_queue_timeout_spinbox)
+        queue_timeout_layout.addStretch()
+        autoortho_layout.addLayout(queue_timeout_layout)
 
         self.provider_adaptive_check = QCheckBox(
             "Adapt concurrency to each imagery provider"
@@ -7777,6 +7803,9 @@ class ConfigUI(QMainWindow):
             )
             self.cfg.autoortho.download_dispatch_workers = str(
                 self.download_dispatch_workers_spinbox.value()
+            )
+            self.cfg.autoortho.provider_queue_timeout = str(
+                self.provider_queue_timeout_spinbox.value()
             )
             self.cfg.autoortho.provider_adaptive_concurrency = (
                 self.provider_adaptive_check.isChecked()

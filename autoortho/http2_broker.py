@@ -484,6 +484,8 @@ class BrokerFuture:
         "reserved_live",
         "created_at",
         "deadline",
+        "network_timeout",
+        "started",
         "_lock",
         "_event",
         "_result",
@@ -499,12 +501,15 @@ class BrokerFuture:
         priority: int,
         reserved_live: bool,
         deadline: float,
+        network_timeout: float,
     ):
         self.request_id = request_id
         self.priority = priority
         self.reserved_live = reserved_live
         self.created_at = time.monotonic()
         self.deadline = deadline
+        self.network_timeout = max(0.1, float(network_timeout))
+        self.started = False
         self._lock = threading.Lock()
         self._event = threading.Event()
         self._result: Optional[BrokerResponse] = None
@@ -690,7 +695,14 @@ class _ClientDispatcher:
     def is_live_priority(self, priority: int) -> bool:
         return int(priority) < self._live_priority_threshold
 
-    def submit(self, envelope: Dict[str, Any], *, priority: int, deadline: float) -> BrokerFuture:
+    def submit(
+        self,
+        envelope: Dict[str, Any],
+        *,
+        priority: int,
+        deadline: float,
+        network_timeout: float,
+    ) -> BrokerFuture:
         payload = _encode(envelope)
         if len(payload) > self._max_request_bytes:
             raise BrokerProtocolError(
@@ -705,6 +717,7 @@ class _ClientDispatcher:
             priority=int(priority),
             reserved_live=reserved_live,
             deadline=deadline,
+            network_timeout=network_timeout,
         )
 
         with self._lock:
@@ -858,7 +871,8 @@ class _ClientDispatcher:
     def _peek_deadline_locked(self) -> Optional[float]:
         while self._deadlines:
             deadline, request_id = self._deadlines[0]
-            if request_id in self._pending:
+            future = self._pending.get(request_id)
+            if future is not None and future.deadline == deadline:
                 return deadline
             heapq.heappop(self._deadlines)
         return None
@@ -956,6 +970,25 @@ class _ClientDispatcher:
         request_id = str(request_id)
 
         msg_type = reply.get("type")
+        if msg_type == "STARTED":
+            with self._lock:
+                future = self._pending.get(request_id)
+                if future is None or future.started:
+                    return
+                future.started = True
+                future.deadline = (
+                    time.monotonic()
+                    + future.network_timeout
+                    + CLIENT_TIMEOUT_GRACE_SECONDS
+                )
+                heapq.heappush(
+                    self._deadlines,
+                    (future.deadline, request_id),
+                )
+                self._stats.setdefault("started", 0)
+                self._stats["started"] += 1
+            return
+
         result: Optional[BrokerResponse] = None
         error: Optional[BaseException] = None
         if msg_type == "RESPONSE":
@@ -999,7 +1032,12 @@ class _ClientDispatcher:
                 if cancel_payload is not None:
                     self._outbox.append(cancel_payload)
             future._settle(
-                None, BrokerTimeoutError("timed out waiting for broker response")
+                None,
+                BrokerTimeoutError(
+                    "timed out after broker started provider request"
+                    if future.started
+                    else "timed out waiting in broker queue"
+                ),
             )
 
     def _drain_pending(self, error: BaseException) -> None:
@@ -1029,6 +1067,7 @@ class _CoalescedEntry:
     task: Optional["asyncio.Task"] = None
     cancelled: bool = False
     parked: bool = False
+    started: bool = False
     queued_at: float = field(default_factory=time.monotonic)
 
 
@@ -1375,6 +1414,11 @@ class _BrokerCore:
             entry.waiters[request_id] = identity
             self._by_request_id[request_id] = entry
             log.debug("Coalesced request %s into existing entry for %s", request_id, url)
+            if entry.started:
+                await self._reply_cb(
+                    identity,
+                    {"type": "STARTED", "id": request_id},
+                )
             return
 
         entry = _CoalescedEntry(
@@ -1495,6 +1539,14 @@ class _BrokerCore:
                         "origin": entry.origin,
                     },
                 )
+                entry.started = True
+                for request_id, identity in list(entry.waiters.items()):
+                    if request_id not in entry.waiters:
+                        continue
+                    await self._reply_cb(
+                        identity,
+                        {"type": "STARTED", "id": request_id},
+                    )
                 entry.task = asyncio.create_task(self._execute(entry))
                 try:
                     await entry.task
@@ -2106,6 +2158,7 @@ class HTTP2Broker:
         origin_success_threshold: int = DEFAULT_ORIGIN_SUCCESS_THRESHOLD,
         origin_decrease_factor: float = DEFAULT_ORIGIN_DECREASE_FACTOR,
         origin_cooldown_seconds: float = DEFAULT_ORIGIN_COOLDOWN_SECONDS,
+        queue_timeout: float = 60.0,
     ):
         if transport is not None and not in_process:
             raise ValueError("transport injection is only supported with in_process=True")
@@ -2118,6 +2171,7 @@ class HTTP2Broker:
         self._max_request_bytes = max_request_bytes
         self._max_response_bytes = max_response_bytes
         self._handshake_timeout = handshake_timeout
+        self._queue_timeout = max(0.1, min(600.0, float(queue_timeout)))
         self._max_pending = max(1, min(MAX_PENDING_LIMIT, int(max_pending)))
         if reserved_live_slots is None:
             reserved_live_slots = int(
@@ -2289,6 +2343,7 @@ class HTTP2Broker:
         reserved_live_slots: Optional[int] = None,
         live_priority_threshold: int = DEFAULT_LIVE_PRIORITY_THRESHOLD,
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
+        queue_timeout: float = 60.0,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> "HTTP2Broker":
         """Attach a client-only handle to an existing broker process."""
@@ -2304,6 +2359,7 @@ class HTTP2Broker:
             reserved_live_slots=reserved_live_slots,
             live_priority_threshold=live_priority_threshold,
             max_request_bytes=max_request_bytes,
+            queue_timeout=queue_timeout,
             max_response_bytes=max_response_bytes,
         )
         broker._token = token
@@ -2360,10 +2416,14 @@ class HTTP2Broker:
         }
         deadline = (
             time.monotonic()
-            + req_timeout.total_seconds()
-            + CLIENT_TIMEOUT_GRACE_SECONDS
+            + self._queue_timeout
         )
-        return dispatcher.submit(envelope, priority=int(priority), deadline=deadline)
+        return dispatcher.submit(
+            envelope,
+            priority=int(priority),
+            deadline=deadline,
+            network_timeout=req_timeout.total_seconds(),
+        )
 
     def get(
         self,
@@ -2391,7 +2451,12 @@ class HTTP2Broker:
         )
         # The dispatcher already enforces the same deadline; the extra second
         # only covers scheduling jitter before it settles the future.
-        wait_seconds = req_timeout.total_seconds() + CLIENT_TIMEOUT_GRACE_SECONDS + 1.0
+        wait_seconds = (
+            self._queue_timeout
+            + req_timeout.total_seconds()
+            + CLIENT_TIMEOUT_GRACE_SECONDS
+            + 1.0
+        )
         try:
             return future.result(timeout=wait_seconds)
         except BrokerTimeoutError:
@@ -2433,6 +2498,7 @@ class HTTP2Broker:
             envelope,
             priority=0,
             deadline=time.monotonic() + timeout,
+            network_timeout=timeout,
         )
         response = future.result(timeout=timeout + CLIENT_TIMEOUT_GRACE_SECONDS)
         return _decode(response.content)

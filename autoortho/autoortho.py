@@ -842,6 +842,11 @@ class AOMount:
             origin_max = aoconfig.resolve_provider_setting(
                 "provider_origin_max_concurrency", self.cfg
             )
+            origin_initial = aoconfig.resolve_provider_setting(
+                "provider_origin_initial_concurrency", self.cfg
+            )
+            if origin_initial <= 0:
+                origin_initial = min(max_in_flight, max_connections)
             broker_kwargs = {
                 "max_concurrency": max_concurrency,
                 "max_connections": max_connections,
@@ -874,7 +879,11 @@ class AOMount:
                 "origin_cooldown_seconds": aoconfig.resolve_provider_setting(
                     "provider_origin_cooldown_seconds", self.cfg
                 ),
+                "queue_timeout": aoconfig.resolve_provider_setting(
+                    "provider_queue_timeout", self.cfg
+                ),
             }
+            broker_kwargs["origin_initial_concurrency"] = origin_initial
             broker = HTTP2Broker(**broker_kwargs)
             try:
                 broker.start()
