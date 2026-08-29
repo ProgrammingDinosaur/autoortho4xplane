@@ -1278,8 +1278,21 @@ class _AdaptiveConcurrencyController:
         *,
         status_code: Optional[int] = None,
         error: Optional[BaseException] = None,
+        latency_seconds: Optional[float] = None,
+        slow_threshold_seconds: Optional[float] = None,
     ) -> str:
         verdict = _classify_origin_outcome(status_code, error)
+        if (
+            verdict == "success"
+            and latency_seconds is not None
+            and slow_threshold_seconds is not None
+            and latency_seconds >= slow_threshold_seconds
+        ):
+            # A technically successful but slow request is not evidence that
+            # the origin can accept more concurrency. Keep the current limit
+            # and discard any partial ramp window.
+            self._state(origin).successes = 0
+            return "slow"
         if verdict == "success":
             self._on_success(origin)
         elif verdict == "throttle":
@@ -1288,8 +1301,15 @@ class _AdaptiveConcurrencyController:
 
     def _on_success(self, origin: str) -> None:
         state = self._state(origin)
+        if self._clock() - state.last_decrease < self._cooldown:
+            state.successes = 0
+            return
         state.successes += 1
-        if state.successes < self._success_threshold:
+        required_successes = max(
+            self._success_threshold,
+            state.limit,
+        )
+        if state.successes < required_successes:
             return
         state.successes = 0
         if state.limit >= state.ceiling:
@@ -1710,7 +1730,15 @@ class _BrokerCore:
                     )
                     body = b"".join(chunks)
                     self._limiter.on_outcome(
-                        entry.origin, status_code=resp.status_code
+                        entry.origin,
+                        status_code=resp.status_code,
+                        latency_seconds=(
+                            time.monotonic() - request_started
+                        ),
+                        slow_threshold_seconds=max(
+                            1.0,
+                            entry.timeout.read,
+                        ),
                     )
                     # The body travels in its own zmq frame; only the (small)
                     # metadata is msgpack-encoded.

@@ -991,16 +991,53 @@ def test_controller_additive_increase_after_sustained_success():
     origin = "https://tiles.test"
 
     assert ctl.limit_for(origin) == 4
-    for _ in range(2):
+    for _ in range(3):
         ctl.on_outcome(origin, status_code=200)
     assert ctl.limit_for(origin) == 4, "must not grow before the threshold"
 
     ctl.on_outcome(origin, status_code=200)
     assert ctl.limit_for(origin) == 5
 
-    for _ in range(3):
+    for _ in range(5):
         ctl.on_outcome(origin, status_code=200)
     assert ctl.limit_for(origin) == 6
+
+
+def test_controller_does_not_ramp_on_slow_success():
+    ctl, _ = _controller(initial=4, success_threshold=1)
+    origin = "https://tiles.test"
+
+    for _ in range(20):
+        verdict = ctl.on_outcome(
+            origin,
+            status_code=200,
+            latency_seconds=5.0,
+            slow_threshold_seconds=4.0,
+        )
+        assert verdict == "slow"
+
+    assert ctl.limit_for(origin) == 4
+
+
+def test_controller_holds_ramp_during_overload_cooldown():
+    ctl, clock = _controller(
+        initial=8,
+        success_threshold=1,
+        cooldown=5.0,
+        decrease_factor=0.5,
+    )
+    origin = "https://tiles.test"
+    ctl.on_outcome(origin, status_code=503)
+    assert ctl.limit_for(origin) == 4
+
+    for _ in range(20):
+        ctl.on_outcome(origin, status_code=200)
+    assert ctl.limit_for(origin) == 4
+
+    clock.advance(5.0)
+    for _ in range(4):
+        ctl.on_outcome(origin, status_code=200)
+    assert ctl.limit_for(origin) == 5
 
 
 def test_controller_caps_http1_to_connection_limit():
@@ -1056,7 +1093,7 @@ def test_controller_allows_http2_to_ramp_to_global_ceiling():
     origin = "https://tiles.test"
 
     ctl.note_http_version(origin, "HTTP/2", connection_limit=2)
-    for _ in range(20):
+    for _ in range(200):
         ctl.on_outcome(origin, status_code=200)
 
     assert ctl.limit_for(origin) == 16
@@ -1130,13 +1167,14 @@ def test_controller_floor_protects_low_volume_origins():
 
 
 def test_controller_recovers_after_a_decrease():
-    ctl, _ = _controller(initial=8, decrease_factor=0.5, success_threshold=2)
+    ctl, clock = _controller(initial=8, decrease_factor=0.5, success_threshold=2)
     origin = "https://tiles.test"
 
     ctl.on_outcome(origin, status_code=503)
     assert ctl.limit_for(origin) == 4
 
-    for _ in range(4):
+    clock.advance(1.0)
+    for _ in range(9):
         ctl.on_outcome(origin, status_code=200)
     assert ctl.limit_for(origin) == 6
 

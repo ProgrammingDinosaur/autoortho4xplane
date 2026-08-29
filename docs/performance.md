@@ -64,8 +64,10 @@ The broker measures every upstream request, so it enforces an additional
 per-origin (`scheme://host`) limit on top of the global budget. The controller
 is AIMD:
 
-* **Additive increase** — after `provider_origin_success_threshold` consecutive
-  good responses the limit grows by `provider_origin_increase_step`.
+* **Additive increase** — after at least one full concurrency window of fast,
+  successful responses (and never fewer than
+  `provider_origin_success_threshold`) the limit grows by
+  `provider_origin_increase_step`.
 * **Multiplicative decrease** — a `429`, any `5xx`, or a timeout/connection
   error multiplies the limit by `provider_origin_decrease_factor` (clamped at
   `provider_origin_min_concurrency`) and starts a cooldown of
@@ -73,6 +75,9 @@ is AIMD:
   compound the reduction.
 * `403` and `410` are treated as neutral: they are per-tile answers, not
   overload signals, so they neither raise nor lower the limit.
+* Slow successful responses do not raise the limit, and ramp-up pauses during
+  the overload cooldown. This prevents the controller from oscillating back
+  into saturation immediately after reducing concurrency.
 
 Requests that cannot get an origin permit are parked in the broker's per-origin
 backlog and resumed in priority order, so a throttled origin never blocks
