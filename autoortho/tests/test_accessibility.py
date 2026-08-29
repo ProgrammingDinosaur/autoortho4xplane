@@ -69,6 +69,26 @@ def test_settings_controls_and_shortcuts_are_accessible(config_ui):
     assert first.nextInFocusChain() is second
 
 
+def test_advanced_adaptive_tuning_is_collapsed_and_explained(config_ui):
+    assert config_ui.advanced_adaptive_widget.isHidden()
+    assert config_ui.advanced_adaptive_toggle.isCheckable()
+
+    config_ui.advanced_adaptive_toggle.setChecked(True)
+    assert not config_ui.advanced_adaptive_widget.isHidden()
+
+    assert "start more cautiously" in (
+        config_ui.provider_initial_concurrency_spinbox.toolTip()
+    )
+    assert "128 requests" in (
+        config_ui.provider_decrease_factor_spinbox.toolTip()
+    )
+    assert "correlated" in config_ui.provider_cooldown_spinbox.toolTip()
+
+    config_ui.provider_adaptive_check.setChecked(False)
+    assert config_ui.advanced_adaptive_widget.isHidden()
+    assert not config_ui.advanced_adaptive_toggle.isEnabled()
+
+
 def test_dynamic_zoom_table_exposes_context(qt_app):
     manager = DynamicZoomManager()
     manager.set_base_zoom(16, 18)

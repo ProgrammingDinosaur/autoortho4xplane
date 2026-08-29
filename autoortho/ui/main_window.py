@@ -265,6 +265,9 @@ class ConfigUI(QMainWindow):
         "download_dispatch_workers_spinbox",
         "provider_queue_timeout_spinbox",
         "provider_adaptive_check",
+        "provider_initial_concurrency_spinbox",
+        "provider_decrease_factor_spinbox",
+        "provider_cooldown_spinbox",
         "live_tile_admission_spinbox",
         "tile_image_cache_mb_spinbox",
         "fetch_threads_spinbox",
@@ -332,6 +335,9 @@ class ConfigUI(QMainWindow):
         "download_dispatch_workers_spinbox",
         "provider_queue_timeout_spinbox",
         "provider_adaptive_check",
+        "provider_initial_concurrency_spinbox",
+        "provider_decrease_factor_spinbox",
+        "provider_cooldown_spinbox",
         "live_tile_admission_spinbox",
         "tile_image_cache_mb_spinbox",
         "fetch_threads_spinbox",
@@ -1134,6 +1140,9 @@ class ConfigUI(QMainWindow):
                 "provider_connections_spinbox": 64,
                 "download_dispatch_workers_spinbox": 4,
                 "provider_queue_timeout_spinbox": 60,
+                "provider_initial_concurrency_spinbox": 64,
+                "provider_decrease_factor_spinbox": 0.7,
+                "provider_cooldown_spinbox": 5.0,
                 "live_tile_admission_spinbox": 16,
                 "tile_image_cache_mb_spinbox": 96,
             },
@@ -1151,6 +1160,9 @@ class ConfigUI(QMainWindow):
                 "provider_connections_spinbox": 64,
                 "download_dispatch_workers_spinbox": 6,
                 "provider_queue_timeout_spinbox": 90,
+                "provider_initial_concurrency_spinbox": 64,
+                "provider_decrease_factor_spinbox": 0.7,
+                "provider_cooldown_spinbox": 5.0,
                 "live_tile_admission_spinbox": 20,
                 "tile_image_cache_mb_spinbox": 128,
             },
@@ -1168,6 +1180,9 @@ class ConfigUI(QMainWindow):
                 "provider_connections_spinbox": 32,
                 "download_dispatch_workers_spinbox": 3,
                 "provider_queue_timeout_spinbox": 90,
+                "provider_initial_concurrency_spinbox": 32,
+                "provider_decrease_factor_spinbox": 0.5,
+                "provider_cooldown_spinbox": 5.0,
                 "live_tile_admission_spinbox": 8,
                 "tile_image_cache_mb_spinbox": 64,
             },
@@ -1185,6 +1200,9 @@ class ConfigUI(QMainWindow):
                 "provider_connections_spinbox": 16,
                 "download_dispatch_workers_spinbox": 2,
                 "provider_queue_timeout_spinbox": 60,
+                "provider_initial_concurrency_spinbox": 32,
+                "provider_decrease_factor_spinbox": 0.5,
+                "provider_cooldown_spinbox": 5.0,
                 "live_tile_admission_spinbox": 6,
                 "tile_image_cache_mb_spinbox": 64,
             },
@@ -4060,9 +4078,173 @@ class ConfigUI(QMainWindow):
         )
         self.provider_adaptive_check.setToolTip(
             "Raises concurrency after sustained successful responses and reduces\n"
-            "it when a provider returns overload errors or timeouts."
+            "it when a provider returns overload errors or timeouts.\n\n"
+            "Recommended: Enabled. Advanced controls below determine the starting\n"
+            "limit and how quickly AutoOrtho backs away from provider overload."
         )
         autoortho_layout.addWidget(self.provider_adaptive_check)
+
+        self.advanced_adaptive_toggle = QPushButton(
+            "Advanced adaptive tuning ▸"
+        )
+        self.advanced_adaptive_toggle.setCheckable(True)
+        self.advanced_adaptive_toggle.setChecked(False)
+        self.advanced_adaptive_toggle.setObjectName(
+            "advanced_adaptive_tuning"
+        )
+        self.advanced_adaptive_toggle.setToolTip(
+            "Show expert controls for the per-provider concurrency controller.\n"
+            "The defaults are recommended unless profiling shows repeated broker\n"
+            "timeouts, 429 responses, or provider-side 5xx errors."
+        )
+        self.advanced_adaptive_toggle.setAccessibleName(
+            "Show advanced adaptive concurrency settings"
+        )
+        autoortho_layout.addWidget(self.advanced_adaptive_toggle)
+
+        self.advanced_adaptive_widget = QWidget()
+        advanced_adaptive_layout = QVBoxLayout(
+            self.advanced_adaptive_widget
+        )
+        advanced_adaptive_layout.setContentsMargins(16, 4, 0, 4)
+
+        initial_layout = QHBoxLayout()
+        initial_label = QLabel("Initial provider concurrency:")
+        initial_label.setToolTip(
+            "Requests initially allowed for each imagery provider before adaptive\n"
+            "ramp-up begins.\n\n"
+            "Lower values start more cautiously and reduce startup timeout risk,\n"
+            "but take longer to reach maximum throughput. Higher values start\n"
+            "faster but can flood a provider before AutoOrtho has measured it.\n\n"
+            "0 = start at the Provider connections value. Recommended for a fast\n"
+            "PC and connection: 64."
+        )
+        initial_layout.addWidget(initial_label)
+        self.provider_initial_concurrency_spinbox = ModernSpinBox()
+        self.provider_initial_concurrency_spinbox.setRange(0, 1024)
+        self.provider_initial_concurrency_spinbox.setSpecialValueText(
+            "Auto (connections)"
+        )
+        self.provider_initial_concurrency_spinbox.setValue(
+            int(
+                getattr(
+                    self.cfg.autoortho,
+                    "provider_origin_initial_concurrency",
+                    0,
+                )
+            )
+        )
+        self.provider_initial_concurrency_spinbox.setObjectName(
+            "provider_origin_initial_concurrency"
+        )
+        self.provider_initial_concurrency_spinbox.setToolTip(
+            initial_label.toolTip()
+        )
+        initial_layout.addWidget(
+            self.provider_initial_concurrency_spinbox
+        )
+        initial_layout.addStretch()
+        advanced_adaptive_layout.addLayout(initial_layout)
+
+        decrease_layout = QHBoxLayout()
+        decrease_label = QLabel("Overload decrease factor:")
+        decrease_label.setToolTip(
+            "Multiplier applied to this provider's current concurrency after a\n"
+            "429, 5xx response, connection failure, or provider timeout.\n\n"
+            "Lower values back off more aggressively: 0.5 changes 128 requests\n"
+            "to 64. This stabilizes timeout-heavy providers but may temporarily\n"
+            "underuse a fast connection. Higher values retain more throughput\n"
+            "but can prolong overload.\n\n"
+            "Recommended for timeout-heavy workloads: 0.50."
+        )
+        decrease_layout.addWidget(decrease_label)
+        self.provider_decrease_factor_spinbox = QDoubleSpinBox()
+        self.provider_decrease_factor_spinbox.setRange(0.10, 0.95)
+        self.provider_decrease_factor_spinbox.setSingleStep(0.05)
+        self.provider_decrease_factor_spinbox.setDecimals(2)
+        self.provider_decrease_factor_spinbox.setValue(
+            float(
+                getattr(
+                    self.cfg.autoortho,
+                    "provider_origin_decrease_factor",
+                    0.7,
+                )
+            )
+        )
+        self.provider_decrease_factor_spinbox.setObjectName(
+            "provider_origin_decrease_factor"
+        )
+        self.provider_decrease_factor_spinbox.setToolTip(
+            decrease_label.toolTip()
+        )
+        decrease_layout.addWidget(
+            self.provider_decrease_factor_spinbox
+        )
+        decrease_layout.addStretch()
+        advanced_adaptive_layout.addLayout(decrease_layout)
+
+        cooldown_layout = QHBoxLayout()
+        cooldown_label = QLabel("Overload cooldown:")
+        cooldown_label.setToolTip(
+            "Minimum time between concurrency reductions for the same provider.\n\n"
+            "A short cooldown reacts repeatedly and can collapse throughput when\n"
+            "many requests fail in one burst. A longer cooldown treats correlated\n"
+            "failures as one event, but reacts more slowly to sustained overload.\n\n"
+            "Recommended: 5 seconds."
+        )
+        cooldown_layout.addWidget(cooldown_label)
+        self.provider_cooldown_spinbox = QDoubleSpinBox()
+        self.provider_cooldown_spinbox.setRange(0.0, 60.0)
+        self.provider_cooldown_spinbox.setSingleStep(1.0)
+        self.provider_cooldown_spinbox.setDecimals(1)
+        self.provider_cooldown_spinbox.setSuffix(" s")
+        self.provider_cooldown_spinbox.setValue(
+            float(
+                getattr(
+                    self.cfg.autoortho,
+                    "provider_origin_cooldown_seconds",
+                    2.0,
+                )
+            )
+        )
+        self.provider_cooldown_spinbox.setObjectName(
+            "provider_origin_cooldown_seconds"
+        )
+        self.provider_cooldown_spinbox.setToolTip(
+            cooldown_label.toolTip()
+        )
+        cooldown_layout.addWidget(self.provider_cooldown_spinbox)
+        cooldown_layout.addStretch()
+        advanced_adaptive_layout.addLayout(cooldown_layout)
+
+        self.advanced_adaptive_widget.setVisible(False)
+        autoortho_layout.addWidget(self.advanced_adaptive_widget)
+
+        def _toggle_advanced_adaptive(checked):
+            enabled = self.provider_adaptive_check.isChecked()
+            self.advanced_adaptive_widget.setVisible(
+                bool(checked and enabled)
+            )
+            self.advanced_adaptive_toggle.setText(
+                "Advanced adaptive tuning ▾"
+                if checked and enabled
+                else "Advanced adaptive tuning ▸"
+            )
+
+        def _adaptive_enabled_changed(enabled):
+            self.advanced_adaptive_toggle.setEnabled(enabled)
+            if not enabled:
+                self.advanced_adaptive_toggle.setChecked(False)
+
+        self.advanced_adaptive_toggle.toggled.connect(
+            _toggle_advanced_adaptive
+        )
+        self.provider_adaptive_check.toggled.connect(
+            _adaptive_enabled_changed
+        )
+        self.advanced_adaptive_toggle.setEnabled(
+            self.provider_adaptive_check.isChecked()
+        )
 
         memory_layout = QHBoxLayout()
         memory_label = QLabel("Concurrent live tiles:")
@@ -7809,6 +7991,15 @@ class ConfigUI(QMainWindow):
             )
             self.cfg.autoortho.provider_adaptive_concurrency = (
                 self.provider_adaptive_check.isChecked()
+            )
+            self.cfg.autoortho.provider_origin_initial_concurrency = str(
+                self.provider_initial_concurrency_spinbox.value()
+            )
+            self.cfg.autoortho.provider_origin_decrease_factor = str(
+                self.provider_decrease_factor_spinbox.value()
+            )
+            self.cfg.autoortho.provider_origin_cooldown_seconds = str(
+                self.provider_cooldown_spinbox.value()
             )
             self.cfg.autoortho.live_tile_admission = str(
                 self.live_tile_admission_spinbox.value()

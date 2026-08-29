@@ -105,6 +105,11 @@ provider_origin_cooldown_seconds = 2.0
 | `provider_origin_decrease_factor` | `0.7` | 0.1-0.95 | Multiplier applied on overload. |
 | `provider_origin_cooldown_seconds` | `2.0` | 0-60 | Suppresses repeated cuts while a reduction settles. |
 
+The three most useful expert controls—initial concurrency, decrease factor, and
+cooldown—are available in **Settings → Performance Tuning → Provider Download
+Transport → Advanced adaptive tuning**. The section is collapsed by default to
+keep unsafe tuning away from normal users.
+
 Current limits, active requests and throttle counts are exposed through the
 broker stats endpoint (`HTTP2Broker.server_stats()`) and, when profiling is
 enabled, as the `broker.origin_limit.<origin>` gauge plus
