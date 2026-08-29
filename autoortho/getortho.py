@@ -6829,6 +6829,7 @@ MAX_TRANSIENT_RETRIES = {
 # This prevents infinite retry loops for persistent failures (e.g., network issues,
 # invalid responses) that don't return specific HTTP error codes
 MAX_TOTAL_ATTEMPTS = 15
+MAX_BROKER_TIMEOUT_ATTEMPTS = 3
 
 # Maptypes whose URL embeds a rotating server number; used only for logging.
 MAPTYPES_WITH_SERVER = ("YNDX", "EOX", "GO2")
@@ -6926,6 +6927,7 @@ class Chunk(object):
         self.permanent_failure = False
         self.failure_reason = None
         self.retry_count = 0
+        self.broker_timeout_count = 0
 
         # Coalescing flags to prevent duplicate submissions
         self.in_queue = False
@@ -7395,6 +7397,27 @@ class Chunk(object):
         if isinstance(error, (requests.exceptions.ConnectionError,
                               requests.exceptions.Timeout,
                               BrokerTimeoutError)):
+            if (
+                isinstance(error, BrokerTimeoutError)
+            ):
+                self.broker_timeout_count += 1
+            if (
+                isinstance(error, BrokerTimeoutError)
+                and self.broker_timeout_count
+                >= MAX_BROKER_TIMEOUT_ATTEMPTS
+            ):
+                self.permanent_failure = True
+                self.failure_reason = "broker_timeout"
+                self.data = b''
+                self.ready.set()
+                self._notify_ready()
+                bump("chunk_broker_timeout_exhausted")
+                log.warning(
+                    "%s exceeded %d broker timeout attempts; using fallback",
+                    self,
+                    MAX_BROKER_TIMEOUT_ATTEMPTS,
+                )
+                return _AttemptOutcome(resolved=True)
             backoff = min(10.0, 0.5 * (2 ** min(self.attempt, 5)))
             log.warning(f"{self} connection/timeout error (attempt {self.attempt}), "
                         f"backoff {backoff:.1f}s: {error}")

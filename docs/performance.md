@@ -79,6 +79,11 @@ backlog and resumed in priority order, so a throttled origin never blocks
 another one and low-volume origins keep their own floor
 (`provider_origin_min_concurrency`).
 
+After the first response identifies the negotiated protocol, HTTP/1.x origins
+are capped at `provider_max_connections`. This prevents hundreds of broker tasks
+from timing out while waiting for a smaller HTTP/1.1 connection pool. HTTP/2
+origins may continue ramping toward `provider_max_in_flight`.
+
 ```ini
 [autoortho]
 # Adaptive per-origin concurrency (broker-side).
@@ -90,8 +95,8 @@ provider_origin_min_concurrency = 2
 provider_origin_max_concurrency = 0
 provider_origin_increase_step = 1
 provider_origin_success_threshold = 8
-provider_origin_decrease_factor = 0.7
-provider_origin_cooldown_seconds = 2.0
+provider_origin_decrease_factor = 0.5
+provider_origin_cooldown_seconds = 5.0
 ```
 
 | Setting | Default | Range | Notes |
@@ -102,8 +107,8 @@ provider_origin_cooldown_seconds = 2.0
 | `provider_origin_max_concurrency` | `0` | 0-1024 | `0` means `provider_max_in_flight`. Always clamped to the global `max_concurrency`. |
 | `provider_origin_increase_step` | `1` | 1-64 | Permits added per successful ramp step. |
 | `provider_origin_success_threshold` | `8` | 1-4096 | Consecutive successes required before a ramp step. |
-| `provider_origin_decrease_factor` | `0.7` | 0.1-0.95 | Multiplier applied on overload. |
-| `provider_origin_cooldown_seconds` | `2.0` | 0-60 | Suppresses repeated cuts while a reduction settles. |
+| `provider_origin_decrease_factor` | `0.5` | 0.1-0.95 | Multiplier applied on overload. |
+| `provider_origin_cooldown_seconds` | `5.0` | 0-60 | Suppresses repeated cuts while a reduction settles. |
 
 The three most useful expert controls—initial concurrency, decrease factor, and
 cooldown—are available in **Settings → Performance Tuning → Provider Download

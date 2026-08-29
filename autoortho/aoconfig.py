@@ -377,9 +377,9 @@ provider_origin_min_concurrency = 2
 provider_origin_max_concurrency = 0
 provider_origin_increase_step = 1
 provider_origin_success_threshold = 8
-provider_origin_decrease_factor = 0.7
+provider_origin_decrease_factor = 0.5
 # Consecutive overload signals inside this window cause a single decrease.
-provider_origin_cooldown_seconds = 2.0
+provider_origin_cooldown_seconds = 5.0
 # Legacy aliases for the two settings above. They are honoured only when the
 # modern setting is still at its packaged default.
 max_concurrent_downloads = 256
@@ -779,13 +779,13 @@ PROVIDER_SETTINGS = {
     },
     "provider_origin_decrease_factor": {
         "type": float,
-        "default": 0.7,
+        "default": 0.5,
         "range": (0.1, 0.95),
         "legacy": None,
     },
     "provider_origin_cooldown_seconds": {
         "type": float,
-        "default": 2.0,
+        "default": 5.0,
         "range": (0.0, 60.0),
         "legacy": None,
     },

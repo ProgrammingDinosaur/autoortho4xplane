@@ -4167,7 +4167,7 @@ class ConfigUI(QMainWindow):
                 getattr(
                     self.cfg.autoortho,
                     "provider_origin_decrease_factor",
-                    0.7,
+                    0.5,
                 )
             )
         )
@@ -4203,7 +4203,7 @@ class ConfigUI(QMainWindow):
                 getattr(
                     self.cfg.autoortho,
                     "provider_origin_cooldown_seconds",
-                    2.0,
+                    5.0,
                 )
             )
         )

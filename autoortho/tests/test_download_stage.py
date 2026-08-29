@@ -218,6 +218,38 @@ def test_connection_error_requests_backoff(chunk):
     assert chunk.cancelled is False
 
 
+def test_broker_timeouts_stop_retrying_and_use_fallback(chunk):
+    request = _prepare(chunk)
+    outcome = None
+    for _ in range(getortho.MAX_BROKER_TIMEOUT_ATTEMPTS):
+        outcome = chunk.finish_network_attempt(
+            request,
+            error=getortho.BrokerTimeoutError(
+                "provider request timed out"
+            ),
+        )
+
+    assert outcome.resolved is True
+    assert outcome.requeue_delay == 0.0
+    assert chunk.permanent_failure is True
+    assert chunk.failure_reason == "broker_timeout"
+    assert chunk.ready.is_set()
+
+
+def test_unrelated_retries_do_not_consume_broker_timeout_budget(chunk):
+    request = _prepare(chunk)
+    chunk.attempt = 10
+
+    outcome = chunk.finish_network_attempt(
+        request,
+        error=getortho.BrokerTimeoutError("provider request timed out"),
+    )
+
+    assert outcome.resolved is False
+    assert chunk.broker_timeout_count == 1
+    assert chunk.permanent_failure is False
+
+
 def test_unexpected_error_does_not_backoff(chunk):
     request = _prepare(chunk)
     outcome = chunk.finish_network_attempt(request, error=ValueError("weird"))

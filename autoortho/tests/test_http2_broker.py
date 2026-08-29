@@ -338,6 +338,38 @@ def test_request_times_out_when_response_takes_too_long():
     assert elapsed < 1.5  # must not wait for the full 2s handler delay
 
 
+def test_coalesced_trickling_request_has_absolute_timeout():
+    class TricklingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.05)
+                yield b"x"
+
+    async def handler(request):
+        return httpx.Response(200, stream=TricklingStream())
+
+    broker = make_broker(handler)
+    timeout = hb.RequestTimeout(
+        connect=0.1,
+        read=0.1,
+        write=0.1,
+        pool=0.1,
+    )
+    first = broker.submit_async(
+        "http://example.test/trickle",
+        timeout=timeout,
+    )
+    time.sleep(0.1)
+    second = broker.submit_async(
+        "http://example.test/trickle",
+        timeout=timeout,
+    )
+
+    for future in (first, second):
+        with pytest.raises(hb.BrokerTimeoutError):
+            future.result(timeout=2.0)
+
+
 def test_queue_wait_does_not_consume_network_timeout():
     gate = threading.Event()
 
@@ -969,6 +1001,65 @@ def test_controller_additive_increase_after_sustained_success():
     for _ in range(3):
         ctl.on_outcome(origin, status_code=200)
     assert ctl.limit_for(origin) == 6
+
+
+def test_controller_caps_http1_to_connection_limit():
+    ctl, _ = _controller(initial=16, maximum=64, success_threshold=1)
+    origin = "https://tiles.test"
+
+    ctl.note_http_version(origin, "HTTP/1.1", connection_limit=8)
+
+    assert ctl.limit_for(origin) == 8
+    for _ in range(20):
+        ctl.on_outcome(origin, status_code=200)
+    assert ctl.limit_for(origin) == 8
+    snapshot = ctl.snapshot()[origin]
+    assert snapshot["ceiling"] == 8
+    assert snapshot["http_version"] == "HTTP/1.1"
+
+
+def test_controller_shares_http1_connections_across_origins():
+    ctl, _ = _controller(
+        initial=8,
+        maximum=16,
+        connection_limit=4,
+    )
+    first = "http://mts0.test"
+    second = "http://mts1.test"
+    ctl.note_http_version(first, "HTTP/1.1", connection_limit=4)
+    ctl.note_http_version(second, "HTTP/1.1", connection_limit=4)
+
+    assert ctl.try_acquire(first)
+    assert ctl.try_acquire(first)
+    assert ctl.try_acquire(second)
+    assert ctl.try_acquire(second)
+    assert not ctl.try_acquire(first)
+    assert not ctl.try_acquire(second)
+
+    ctl.release(first)
+    assert ctl.try_acquire(second)
+
+
+def test_http1_observation_is_not_lifted_by_redirect_target_http2():
+    ctl, _ = _controller(initial=16, maximum=64)
+    origin = "http://redirecting.test"
+
+    ctl.note_http_version(origin, "HTTP/1.1", connection_limit=8)
+    ctl.note_http_version(origin, "HTTP/2", connection_limit=8)
+
+    assert ctl.limit_for(origin) == 8
+    assert ctl.snapshot()[origin]["http_version"] == "HTTP/1.1"
+
+
+def test_controller_allows_http2_to_ramp_to_global_ceiling():
+    ctl, _ = _controller(initial=4, maximum=16, success_threshold=1)
+    origin = "https://tiles.test"
+
+    ctl.note_http_version(origin, "HTTP/2", connection_limit=2)
+    for _ in range(20):
+        ctl.on_outcome(origin, status_code=200)
+
+    assert ctl.limit_for(origin) == 16
 
 
 def test_controller_never_exceeds_maximum():

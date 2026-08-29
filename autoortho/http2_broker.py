@@ -201,8 +201,8 @@ DEFAULT_ORIGIN_MIN_CONCURRENCY = 2
 DEFAULT_ORIGIN_INITIAL_CONCURRENCY = 0
 DEFAULT_ORIGIN_INCREASE_STEP = 1
 DEFAULT_ORIGIN_SUCCESS_THRESHOLD = 8
-DEFAULT_ORIGIN_DECREASE_FACTOR = 0.7
-DEFAULT_ORIGIN_COOLDOWN_SECONDS = 2.0
+DEFAULT_ORIGIN_DECREASE_FACTOR = 0.5
+DEFAULT_ORIGIN_COOLDOWN_SECONDS = 5.0
 
 # HTTP statuses that are provider policy answers rather than overload
 # signals. They must never shrink an origin's concurrency budget.
@@ -278,6 +278,7 @@ _ERROR_TYPE_MAP: Dict[str, type] = {
     "WriteTimeout": BrokerTimeoutError,
     "PoolTimeout": BrokerTimeoutError,
     "TimeoutException": BrokerTimeoutError,
+    "TimeoutError": BrokerTimeoutError,
 }
 
 
@@ -1079,6 +1080,7 @@ class _OriginState:
     """Mutable AIMD state for one origin."""
 
     limit: int
+    ceiling: int
     active: int = 0
     peak_active: int = 0
     successes: int = 0
@@ -1086,6 +1088,7 @@ class _OriginState:
     increases: int = 0
     decreases: int = 0
     deferred: int = 0
+    http_version: str = "unknown"
     last_decrease: float = float("-inf")
 
 
@@ -1144,6 +1147,7 @@ class _AdaptiveConcurrencyController:
         success_threshold: int = DEFAULT_ORIGIN_SUCCESS_THRESHOLD,
         decrease_factor: float = DEFAULT_ORIGIN_DECREASE_FACTOR,
         cooldown: float = DEFAULT_ORIGIN_COOLDOWN_SECONDS,
+        connection_limit: Optional[int] = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.enabled = bool(enabled)
@@ -1165,6 +1169,15 @@ class _AdaptiveConcurrencyController:
             )
         self._decrease_factor = factor
         self._cooldown = max(0.0, float(cooldown))
+        self._connection_limit = max(
+            1,
+            int(
+                connection_limit
+                if connection_limit is not None
+                else self._maximum
+            ),
+        )
+        self._http1_active = 0
         self._clock = clock
         self._origins: Dict[str, _OriginState] = {}
 
@@ -1173,35 +1186,85 @@ class _AdaptiveConcurrencyController:
     def _state(self, origin: str) -> _OriginState:
         state = self._origins.get(origin)
         if state is None:
-            state = _OriginState(limit=self._initial)
+            state = _OriginState(
+                limit=self._initial,
+                ceiling=self._maximum,
+            )
             self._origins[origin] = state
         return state
 
+    def note_http_version(
+        self,
+        origin: str,
+        http_version: str,
+        connection_limit: int,
+    ) -> None:
+        """Prevent HTTP/1.x work from queueing behind the connection pool."""
+        state = self._state(origin)
+        version = str(http_version or "unknown").upper()
+        if state.http_version.startswith("HTTP/1"):
+            return
+        state.http_version = version
+        if version.startswith("HTTP/1"):
+            state.ceiling = max(
+                self._minimum,
+                min(self._maximum, int(connection_limit)),
+            )
+            if state.limit > state.ceiling:
+                state.limit = state.ceiling
+                state.successes = 0
+                self._report(origin, state, "protocol_cap")
+            self._http1_active = sum(
+                candidate.active
+                for candidate in self._origins.values()
+                if candidate.http_version.startswith("HTTP/1")
+            )
+        elif version.startswith("HTTP/2"):
+            state.ceiling = self._maximum
+
     def limit_for(self, origin: str) -> int:
-        return self._maximum if not self.enabled else self._state(origin).limit
+        state = self._state(origin)
+        configured = state.limit if self.enabled else self._maximum
+        return min(configured, state.ceiling)
 
     def active_for(self, origin: str) -> int:
         return self._state(origin).active
 
     def available(self, origin: str) -> int:
         state = self._state(origin)
-        if not self.enabled:
-            return self._maximum
-        return max(0, state.limit - state.active)
+        available = max(0, self.limit_for(origin) - state.active)
+        if state.http_version.startswith("HTTP/1"):
+            available = min(
+                available,
+                max(0, self._connection_limit - self._http1_active),
+            )
+        return available
 
     # -- permits --------------------------------------------------------
 
     def try_acquire(self, origin: str) -> bool:
         state = self._state(origin)
-        if self.enabled and state.active >= state.limit:
+        if state.active >= self.limit_for(origin):
+            return False
+        if (
+            state.http_version.startswith("HTTP/1")
+            and self._http1_active >= self._connection_limit
+        ):
             return False
         state.active += 1
+        if state.http_version.startswith("HTTP/1"):
+            self._http1_active += 1
         if state.active > state.peak_active:
             state.peak_active = state.active
         return True
 
     def release(self, origin: str) -> None:
         state = self._state(origin)
+        if (
+            state.active > 0
+            and state.http_version.startswith("HTTP/1")
+        ):
+            self._http1_active = max(0, self._http1_active - 1)
         state.active = max(0, state.active - 1)
 
     def note_deferred(self, origin: str) -> None:
@@ -1229,9 +1292,9 @@ class _AdaptiveConcurrencyController:
         if state.successes < self._success_threshold:
             return
         state.successes = 0
-        if state.limit >= self._maximum:
+        if state.limit >= state.ceiling:
             return
-        state.limit = min(self._maximum, state.limit + self._step)
+        state.limit = min(state.ceiling, state.limit + self._step)
         state.increases += 1
         self._report(origin, state, "increase")
 
@@ -1271,6 +1334,8 @@ class _AdaptiveConcurrencyController:
                 "origin": origin,
                 "limit": state.limit,
                 "active": state.active,
+                "ceiling": state.ceiling,
+                "http_version": state.http_version,
                 "throttles": state.throttles,
             },
         )
@@ -1281,6 +1346,8 @@ class _AdaptiveConcurrencyController:
         return {
             origin: {
                 "limit": state.limit,
+                "ceiling": state.ceiling,
+                "http_version": state.http_version,
                 "active": state.active,
                 "peak_active": state.peak_active,
                 "throttles": state.throttles,
@@ -1301,6 +1368,8 @@ class _AdaptiveConcurrencyController:
             "success_threshold": self._success_threshold,
             "decrease_factor": self._decrease_factor,
             "cooldown": self._cooldown,
+            "http1_connection_limit": self._connection_limit,
+            "http1_active": self._http1_active,
         }
 
 
@@ -1332,6 +1401,7 @@ class _BrokerCore:
         self._client = httpx.AsyncClient(**client_kwargs)
         self._max_response_bytes = max_response_bytes
         self._max_concurrency = max(1, int(max_concurrency))
+        self._max_connections = max(1, int(max_connections))
         self._reply_cb = reply_cb
         self._queue: "asyncio.PriorityQueue" = asyncio.PriorityQueue()
         self._seq = itertools.count()
@@ -1343,6 +1413,7 @@ class _BrokerCore:
 
         adaptive_kwargs = dict(adaptive or {})
         adaptive_kwargs.setdefault("maximum", self._max_concurrency)
+        adaptive_kwargs.setdefault("connection_limit", self._max_connections)
         adaptive_kwargs["maximum"] = min(
             self._max_concurrency, max(1, int(adaptive_kwargs["maximum"]))
         )
@@ -1504,6 +1575,12 @@ class _BrokerCore:
         if not backlog:
             self._backlog.pop(origin, None)
 
+    def _resume_waiting_origins(self, preferred_origin: str) -> None:
+        self._resume_origin(preferred_origin)
+        for origin in list(self._backlog):
+            if origin != preferred_origin:
+                self._resume_origin(origin)
+
     def _backlog_depth(self) -> int:
         return sum(len(items) for items in self._backlog.values())
 
@@ -1559,7 +1636,7 @@ class _BrokerCore:
                 entry.task = None
                 if acquired:
                     self._limiter.release(entry.origin)
-                    self._resume_origin(entry.origin)
+                    self._resume_waiting_origins(entry.origin)
                 self._queue.task_done()
 
     async def _execute(self, entry: _CoalescedEntry) -> None:
@@ -1576,52 +1653,73 @@ class _BrokerCore:
                 write=entry.timeout.write,
                 pool=entry.timeout.pool,
             )
-            async with self._client.stream(entry.method, entry.url, headers=entry.headers, timeout=timeout) as resp:
-                headers_received = time.monotonic()
-                record_stage(
-                    "broker.time_to_first_byte",
-                    (headers_received - request_started) * 1000.0,
-                    outcome="ok" if resp.status_code < 400 else "failed",
-                    details={
-                        "status_code": resp.status_code,
-                        "http_version": resp.http_version,
-                    },
-                )
-                content_length = resp.headers.get("content-length")
-                if content_length is not None and int(content_length) > self._max_response_bytes:
-                    raise ResponseTooLargeError(
-                        f"response Content-Length {content_length} exceeds bound {self._max_response_bytes}"
-                    )
-                chunks = []
-                total = 0
-                body_started = time.monotonic()
-                async for chunk in resp.aiter_bytes():
-                    total += len(chunk)
-                    if total > self._max_response_bytes:
-                        raise ResponseTooLargeError(
-                            f"response body exceeded bound of {self._max_response_bytes} bytes"
+            # httpx timeouts are inactivity limits for individual socket phases.
+            # A server that continuously trickles bytes can otherwise keep a
+            # coalesced request alive indefinitely as new waiters join it.
+            async with asyncio.timeout(entry.timeout.total_seconds()):
+                async with self._client.stream(entry.method, entry.url, headers=entry.headers, timeout=timeout) as resp:
+                    headers_received = time.monotonic()
+                    observed_versions = [
+                        history.http_version
+                        for history in resp.history
+                    ] + [resp.http_version]
+                    observed_version = (
+                        "HTTP/1.1"
+                        if any(
+                            str(version).upper().startswith("HTTP/1")
+                            for version in observed_versions
                         )
-                    chunks.append(chunk)
-                record_stage(
-                    "broker.body_read",
-                    (time.monotonic() - body_started) * 1000.0,
-                    details={
-                        "response_bytes": total,
-                        "http_version": resp.http_version,
-                    },
-                )
-                body = b"".join(chunks)
-                self._limiter.on_outcome(
-                    entry.origin, status_code=resp.status_code
-                )
-                # The body travels in its own zmq frame; only the (small)
-                # metadata is msgpack-encoded.
-                message = {
-                    "type": "RESPONSE",
-                    "status_code": resp.status_code,
-                    "headers": dict(resp.headers),
-                    "content_length": len(body),
-                }
+                        else resp.http_version
+                    )
+                    self._limiter.note_http_version(
+                        entry.origin,
+                        observed_version,
+                        self._max_connections,
+                    )
+                    record_stage(
+                        "broker.time_to_first_byte",
+                        (headers_received - request_started) * 1000.0,
+                        outcome="ok" if resp.status_code < 400 else "failed",
+                        details={
+                            "status_code": resp.status_code,
+                            "http_version": resp.http_version,
+                        },
+                    )
+                    content_length = resp.headers.get("content-length")
+                    if content_length is not None and int(content_length) > self._max_response_bytes:
+                        raise ResponseTooLargeError(
+                            f"response Content-Length {content_length} exceeds bound {self._max_response_bytes}"
+                        )
+                    chunks = []
+                    total = 0
+                    body_started = time.monotonic()
+                    async for chunk in resp.aiter_bytes():
+                        total += len(chunk)
+                        if total > self._max_response_bytes:
+                            raise ResponseTooLargeError(
+                                f"response body exceeded bound of {self._max_response_bytes} bytes"
+                            )
+                        chunks.append(chunk)
+                    record_stage(
+                        "broker.body_read",
+                        (time.monotonic() - body_started) * 1000.0,
+                        details={
+                            "response_bytes": total,
+                            "http_version": resp.http_version,
+                        },
+                    )
+                    body = b"".join(chunks)
+                    self._limiter.on_outcome(
+                        entry.origin, status_code=resp.status_code
+                    )
+                    # The body travels in its own zmq frame; only the (small)
+                    # metadata is msgpack-encoded.
+                    message = {
+                        "type": "RESPONSE",
+                        "status_code": resp.status_code,
+                        "headers": dict(resp.headers),
+                        "content_length": len(body),
+                    }
         except asyncio.CancelledError:
             outcome = "cancelled"
             # Cancelled either because the last waiter unsubscribed (waiters
@@ -1632,6 +1730,19 @@ class _BrokerCore:
             )
             self._entries.pop(entry.key, None)
             raise
+        except TimeoutError:
+            outcome = "failed"
+            error = BrokerTimeoutError(
+                "provider request exceeded its absolute timeout"
+            )
+            self._limiter.on_outcome(entry.origin, error=error)
+            message = {
+                "type": "ERROR",
+                "error": {
+                    "type": "BrokerTimeoutError",
+                    "message": str(error),
+                },
+            }
         except Exception as exc:
             outcome = "failed"
             self._limiter.on_outcome(entry.origin, error=exc)
@@ -2184,7 +2295,14 @@ class HTTP2Broker:
         self._profile_environment = dict(profile_environment or {})
         self._adaptive = _adaptive_config(
             enabled=adaptive_concurrency,
-            initial=origin_initial_concurrency,
+            initial=min(
+                max(1, int(max_connections)),
+                (
+                    int(origin_initial_concurrency)
+                    if int(origin_initial_concurrency) > 0
+                    else int(max_connections)
+                ),
+            ),
             minimum=origin_min_concurrency,
             maximum=origin_max_concurrency,
             step=origin_increase_step,
