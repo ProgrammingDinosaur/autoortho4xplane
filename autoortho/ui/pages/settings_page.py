@@ -126,6 +126,10 @@ class SettingsPage(QWidget):
                     )
                     spin.setValue(slider.value() / scale)
                 spin.setSuffix(suffix)
+                spin.setProperty(
+                    "boundSliderObjectName",
+                    slider.objectName(),
+                )
                 self._bind_slider(slider, spin, scale)
                 exact_form.addRow(label, spin)
             content_layout.addWidget(exact_group)
@@ -252,9 +256,7 @@ class SettingsPage(QWidget):
         def spin_changed(value):
             target = round(value * scale)
             if slider.value() != target:
-                blocked = slider.blockSignals(True)
                 slider.setValue(target)
-                slider.blockSignals(blocked)
 
         slider.valueChanged.connect(slider_changed)
         spin.valueChanged.connect(spin_changed)
