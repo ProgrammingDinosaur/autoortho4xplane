@@ -81,6 +81,13 @@ fallback_extends_budget = True
 
 **Trade-off Warning:** Higher time budgets and extended fallbacks may cause longer loading times and occasional stuttering. See the [Performance Tuning Guide](performance.md) for a detailed explanation of the quality vs. speed trade-off.
 
+For ZL17, **Allow incomplete native partial builds** is an additional opt-in
+trade-off. Disabled (the default) preserves strict quality and uses the normal
+fallback path if any requested chunk misses its deadline. Enabled, it completes
+the row with cache/lower-ZL imagery and finally the configured missing color, so
+loading may finish sooner but X-Plane can retain a degraded patch for that
+flight.
+
 ---
 
 ### Why are there so many missing tiles even with "Full" fallback enabled?
@@ -134,6 +141,9 @@ At startup, X-Plane requests the initial scenery tiles. Loading time depends on:
 - Keep the shared HTTP/2 downloader and DSF-driven prefetch enabled
 - Use the 60-second tile-wide default unless you explicitly want longer waits
 - Keep the persistent compiled DDS cache enabled for repeat visits
+- Enable **Persist partial DDS rows** if you repeatedly load the same ZL17 areas;
+  the first visit still downloads imagery, while later visits can reuse each
+  validated row independently
 - Choose the fallback policy that matches your initial-quality requirement
 
 **Zoom Level Resource Scaling:**

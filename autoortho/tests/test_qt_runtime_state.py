@@ -90,6 +90,22 @@ def test_runtime_state_controls(config_ui):
     assert not config_ui.apply_button.isEnabled()
 
 
+def test_partial_loading_controls_are_safe_and_persist(config_ui):
+    assert not config_ui.native_partial_allow_incomplete_check.isChecked()
+    assert not config_ui.persist_partial_dds_cache_check.isChecked()
+
+    config_ui.native_partial_allow_incomplete_check.setChecked(True)
+    config_ui.persist_partial_dds_cache_check.setChecked(True)
+    config_ui.save_config(persist=False, refresh_scenery=False)
+
+    assert config_ui.cfg.autoortho.native_partial_allow_incomplete is True
+    assert config_ui.cfg.autoortho.persist_partial_dds_cache is True
+
+    config_ui._apply_settings_preset("Balanced")
+    assert not config_ui.native_partial_allow_incomplete_check.isChecked()
+    assert config_ui.persist_partial_dds_cache_check.isChecked()
+
+
 def test_settings_change_enables_apply_and_revert(
     qt_app,
     config_ui,

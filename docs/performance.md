@@ -18,6 +18,37 @@ startup latency through:
 If the optional HTTP/2 dependencies cannot start, AutoOrtho reports the error
 and falls back to the existing HTTP/1.1 request path.
 
+### ZL17 partial loading
+
+Mipmap-zero reads materialize and probe only the requested chunk rows. Sequential
+reads may schedule one low-priority row ahead after a pattern is established;
+live X-Plane work always takes priority. Partial rows use sparse compressed
+storage, so a one-row BC1 request uses about 1 MiB instead of allocating the
+entire 32 MiB mipmap buffer.
+
+```ini
+[autoortho]
+# Strict quality remains the default.
+native_partial_allow_incomplete = False
+# Optional repeat-load cache for compressed partial rows.
+persist_partial_dds_cache = False
+```
+
+**Allow incomplete native partial builds** finishes a row after its shared
+deadline with correctly cropped cache/lower-ZL imagery where available and
+`missing_color` elsewhere. This can shorten a cold load, but X-Plane may retain
+those degraded areas for the current flight. Leave it disabled for strict
+quality.
+
+**Persist partial DDS rows** writes completed compressed rows through a bounded
+background queue. First-load behavior is unchanged; repeat visits can serve
+covered rows immediately and fetch only missing rows. Partial metadata never
+advertises mipmap zero as complete, corrupt records are ignored, and complete
+textures are promoted to the normal DDS cache. The row cache consumes additional
+space within the DDS disk budget. The Balanced, Quality, and Low Bandwidth
+presets enable row persistence; existing configurations retain the conservative
+disabled default.
+
 ## Download Concurrency
 
 Broker-backed downloads are dispatched asynchronously: a single dispatcher
@@ -43,6 +74,12 @@ provider_queue_timeout = 60
 | `provider_max_connections` | `64` | 1-256 | Effective value is `min(provider_max_in_flight, provider_max_connections)`. This preserves throughput when a provider negotiates HTTP/1.1 rather than multiplexed HTTP/2. |
 | `download_dispatch_workers` | `4` | 1-16 | Small fixed pool that finalises completed requests; increasing it does not increase download concurrency. |
 | `provider_queue_timeout` | `60` | 5-600 seconds | Maximum broker/adaptive queue wait. It is separate from provider connect/read/pool timeouts. |
+
+For connection tuning, keep
+`provider_max_in_flight` near twice `provider_max_connections`. Test 80
+connections first, then 96, repeating cold-cache runs before choosing a value.
+Counts beyond the provider's throughput knee increase queueing, timeouts, and
+throttling without improving completed JPEGs per second.
 
 ### Strict admission
 
@@ -135,11 +172,11 @@ compatibility.
 
 ### Legacy settings
 
-`max_concurrent_downloads` and `http2_max_connections` continue to work as
-aliases for `provider_max_in_flight` and `provider_max_connections`. A legacy
-key is only honoured when the matching modern key is still at its packaged
-default, so an explicit `provider_max_in_flight` is never silently overridden by
-an old `max_concurrent_downloads` value.
+`max_concurrent_downloads` and `http2_max_connections` are migrated to
+`provider_max_in_flight` and `provider_max_connections` only when the modern
+key is absent from the user's file. A present modern key is always
+authoritative, even when its value equals the packaged default. Deprecated
+keys are normalized during the next save so migration messages do not recur.
 
 `fetch_threads` still sizes the downloader thread pool, but those threads now
 only feed the asynchronous dispatch stage (and serve the direct HTTP/1.1

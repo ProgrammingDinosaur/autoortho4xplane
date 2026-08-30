@@ -119,6 +119,8 @@ live_tile_admission = 16
 tile_image_cache_mb = 96
 cache_write_buffer_mb = 256
 long_term_cache_write_buffer_mb = 128
+native_partial_allow_incomplete = False
+persist_partial_dds_cache = False
 ```
 
 - `provider_max_in_flight` is the strict global pending-request limit. A
@@ -135,6 +137,10 @@ long_term_cache_write_buffer_mb = 128
   images. Oversized ZL17 mipmap-zero images are compressed and released.
 - Cache-write byte budgets prevent slow storage from retaining an unbounded
   number of downloaded JPEGs.
+- `native_partial_allow_incomplete` trades strict row quality for shorter
+  deadline stalls by using child-cropped lower-ZL imagery and `missing_color`.
+- `persist_partial_dds_cache` stores completed compressed rows asynchronously
+  for faster repeat loads. It uses additional space inside the DDS disk budget.
 
 ### Performance Diagnostics
 

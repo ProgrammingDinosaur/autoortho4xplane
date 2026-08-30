@@ -248,6 +248,8 @@ class ConfigUI(QMainWindow):
         "fallback_level_combo",
         "fallback_extends_budget_check",
         "fallback_timeout_slider",
+        "native_partial_allow_incomplete_check",
+        "persist_partial_dds_cache_check",
         "prefetch_enabled_check",
         "prefetch_lookahead_slider",
         "prefetch_interval_slider",
@@ -318,6 +320,8 @@ class ConfigUI(QMainWindow):
         "fallback_level_combo",
         "fallback_extends_budget_check",
         "fallback_timeout_slider",
+        "native_partial_allow_incomplete_check",
+        "persist_partial_dds_cache_check",
         "prefetch_enabled_check",
         "prefetch_lookahead_slider",
         "prefetch_interval_slider",
@@ -1223,6 +1227,10 @@ class ConfigUI(QMainWindow):
             self.fallback_extends_budget_check.setChecked(False)
             self.suspend_maxwait_check.setChecked(False)
         self.provider_adaptive_check.setChecked(True)
+        self.native_partial_allow_incomplete_check.setChecked(False)
+        self.persist_partial_dds_cache_check.setChecked(
+            name != "Low Resource"
+        )
         if name in ("Balanced", "Quality", "Low Resource"):
             dynamic_preset = {
                 "Balanced": "Airliner",
@@ -1256,6 +1264,8 @@ class ConfigUI(QMainWindow):
                 "use_time_budget_check": True,
                 "tile_budget_slider": 180,
                 "maxwait_slider": 20,
+                "native_partial_allow_incomplete_check": False,
+                "persist_partial_dds_cache_check": False,
             },
             "Compression & Pipeline": {
                 "pipeline_mode_combo": "auto",
@@ -3554,6 +3564,68 @@ class ConfigUI(QMainWindow):
         
         # Initially update the enabled state
         self._update_fallback_extends_control()
+
+        partial_quality_layout = QHBoxLayout()
+        self.native_partial_allow_incomplete_check = QCheckBox(
+            "Allow incomplete native partial builds"
+        )
+        native_partial_value = getattr(
+            self.cfg.autoortho,
+            "native_partial_allow_incomplete",
+            False,
+        )
+        if isinstance(native_partial_value, str):
+            native_partial_value = (
+                native_partial_value.lower().strip()
+                in ("true", "1", "yes", "on")
+            )
+        self.native_partial_allow_incomplete_check.setChecked(
+            bool(native_partial_value)
+        )
+        self.native_partial_allow_incomplete_check.setObjectName(
+            "native_partial_allow_incomplete"
+        )
+        self.native_partial_allow_incomplete_check.setToolTip(
+            "After a row deadline, finish with cached lower-resolution imagery\n"
+            "and the configured missing color. This can reduce stalls, but X-Plane\n"
+            "may retain lower-quality areas for the current flight."
+        )
+        partial_quality_layout.addWidget(
+            self.native_partial_allow_incomplete_check
+        )
+        partial_quality_layout.addStretch()
+        autoortho_layout.addLayout(partial_quality_layout)
+
+        partial_cache_layout = QHBoxLayout()
+        self.persist_partial_dds_cache_check = QCheckBox(
+            "Persist partial DDS rows"
+        )
+        persist_partial_value = getattr(
+            self.cfg.autoortho,
+            "persist_partial_dds_cache",
+            False,
+        )
+        if isinstance(persist_partial_value, str):
+            persist_partial_value = (
+                persist_partial_value.lower().strip()
+                in ("true", "1", "yes", "on")
+            )
+        self.persist_partial_dds_cache_check.setChecked(
+            bool(persist_partial_value)
+        )
+        self.persist_partial_dds_cache_check.setObjectName(
+            "persist_partial_dds_cache"
+        )
+        self.persist_partial_dds_cache_check.setToolTip(
+            "Save compressed mipmap rows in a bounded background queue so\n"
+            "repeat loads can reuse completed ZL17 rows. This uses additional\n"
+            "disk cache space and never blocks a live scenery read."
+        )
+        partial_cache_layout.addWidget(
+            self.persist_partial_dds_cache_check
+        )
+        partial_cache_layout.addStretch()
+        autoortho_layout.addLayout(partial_cache_layout)
 
         # Prefetch Settings Sub-section
         prefetch_header = QLabel("Prefetching")
@@ -7935,6 +8007,12 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.fallback_extends_budget = self.fallback_extends_budget_check.isChecked()
             self.cfg.autoortho.fallback_timeout = str(
                 self.fallback_timeout_slider.value()
+            )
+            self.cfg.autoortho.native_partial_allow_incomplete = (
+                self.native_partial_allow_incomplete_check.isChecked()
+            )
+            self.cfg.autoortho.persist_partial_dds_cache = (
+                self.persist_partial_dds_cache_check.isChecked()
             )
             
             # Prefetch settings

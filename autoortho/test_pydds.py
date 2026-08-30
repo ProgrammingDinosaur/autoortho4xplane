@@ -191,4 +191,5 @@ def test_gen_mipmap_len(tmpdir):
         h.seek(262144)
         data = h.read(16)
         assert data
-        assert data == b'\x00'*16
+        expected_bc1_block = b'fBfB\x00\x00\x00\x00'
+        assert data == expected_bc1_block * 2

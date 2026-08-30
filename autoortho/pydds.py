@@ -93,6 +93,310 @@ def get_fallback_bytes(length: int, blocksize: int = 8) -> bytes:
     num_blocks = (length + blocksize - 1) // blocksize
     return (block * num_blocks)[:length]
 
+
+def _get_fallback_slice(offset: int, length: int, blocksize: int = 8) -> bytes:
+    """Return fallback bytes aligned to the compressed block stream."""
+    if length <= 0:
+        return b""
+    prefix = offset % blocksize
+    return get_fallback_bytes(prefix + length, blocksize)[prefix:]
+
+
+class MipmapBuffer:
+    """Thread-safe random-access storage for one logical mipmap."""
+
+    def read_at(self, offset, length):
+        raise NotImplementedError
+
+    def write_at(self, offset, data):
+        raise NotImplementedError
+
+    def replace_dense(self, data):
+        raise NotImplementedError
+
+    def coverage(self):
+        raise NotImplementedError
+
+    def is_complete(self):
+        raise NotImplementedError
+
+    def allocated_bytes(self):
+        raise NotImplementedError
+
+    def iter_segments(self):
+        raise NotImplementedError
+
+    def close(self):
+        raise NotImplementedError
+
+
+class _CursorCompatibilityMixin:
+    """Locked seek/read/write compatibility for legacy internal callers."""
+
+    def _init_cursor(self):
+        self._cursor = 0
+        self._cursor_lock = threading.Lock()
+
+    def seek(self, offset, whence=0):
+        with self._cursor_lock:
+            if whence == 0:
+                new_pos = offset
+            elif whence == 1:
+                new_pos = self._cursor + offset
+            elif whence == 2:
+                new_pos = self.logical_length + offset
+            else:
+                raise ValueError(f"invalid whence: {whence}")
+            self._cursor = max(0, int(new_pos))
+            return self._cursor
+
+    def tell(self):
+        with self._cursor_lock:
+            return self._cursor
+
+    def read(self, length=-1):
+        with self._cursor_lock:
+            if length is None or length < 0:
+                length = max(0, self.logical_length - self._cursor)
+            data = self.read_at(self._cursor, length)
+            self._cursor += len(data)
+            return data
+
+    def write(self, data):
+        with self._cursor_lock:
+            written = self.write_at(self._cursor, data)
+            self._cursor += written
+            return written
+
+    def getvalue(self):
+        return self.read_at(0, self.logical_length)
+
+    def getbuffer(self):
+        return memoryview(self.getvalue())
+
+
+class DenseMipmapBuffer(_CursorCompatibilityMixin, MipmapBuffer):
+    """Copy-on-write dense mipmap storage with stateless reads."""
+
+    def __init__(self, logical_length, data=b"", blocksize=8):
+        self.logical_length = max(0, int(logical_length))
+        self.blocksize = blocksize
+        self._lock = threading.Lock()
+        self._closed = False
+        self._data = bytes(data[:self.logical_length])
+        self._init_cursor()
+
+    def read_at(self, offset, length):
+        offset = max(0, int(offset))
+        length = max(0, int(length))
+        with self._lock:
+            data = self._data
+            closed = self._closed
+        if closed:
+            return _get_fallback_slice(offset, length, self.blocksize)
+        available = data[offset:min(len(data), offset + length)]
+        if len(available) < length:
+            available += _get_fallback_slice(
+                offset + len(available),
+                length - len(available),
+                self.blocksize,
+            )
+        return available
+
+    def write_at(self, offset, data):
+        if not data:
+            return 0
+        offset = int(offset)
+        if offset < 0 or offset + len(data) > self.logical_length:
+            raise ValueError("mipmap write is outside the logical buffer")
+        with self._lock:
+            if self._closed:
+                raise ValueError("mipmap buffer is closed")
+            current = bytearray(self._data)
+            if len(current) < self.logical_length:
+                current.extend(
+                    _get_fallback_slice(
+                        len(current),
+                        self.logical_length - len(current),
+                        self.blocksize,
+                    )
+                )
+            current[offset:offset + len(data)] = data
+            self._data = bytes(current)
+        return len(data)
+
+    def replace_dense(self, data):
+        data = bytes(data)
+        if len(data) != self.logical_length:
+            raise ValueError(
+                f"dense mipmap length mismatch: {len(data)} != {self.logical_length}"
+            )
+        with self._lock:
+            if self._closed:
+                raise ValueError("mipmap buffer is closed")
+            self._data = data
+
+    def coverage(self):
+        with self._lock:
+            return {0} if len(self._data) == self.logical_length else set()
+
+    def is_complete(self):
+        with self._lock:
+            return len(self._data) == self.logical_length
+
+    def allocated_bytes(self):
+        with self._lock:
+            return len(self._data)
+
+    def iter_segments(self):
+        with self._lock:
+            data = self._data
+        return ((0, data),) if data else ()
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._data = b""
+
+
+class SparseMipmapBuffer(_CursorCompatibilityMixin, MipmapBuffer):
+    """Copy-on-write sparse segments with aligned fallback reads."""
+
+    def __init__(
+        self,
+        logical_length,
+        *,
+        blocksize=8,
+        unit_size=None,
+        total_units=None,
+    ):
+        self.logical_length = max(0, int(logical_length))
+        self.blocksize = blocksize
+        self.unit_size = int(unit_size or self.logical_length or 1)
+        self.total_units = int(
+            total_units
+            if total_units is not None
+            else math.ceil(self.logical_length / self.unit_size)
+        )
+        self._segments = ()
+        self._lock = threading.Lock()
+        self._closed = False
+        self._init_cursor()
+
+    def read_at(self, offset, length):
+        offset = max(0, int(offset))
+        length = max(0, int(length))
+        with self._lock:
+            segments = self._segments
+            closed = self._closed
+        result = bytearray(
+            _get_fallback_slice(offset, length, self.blocksize)
+        )
+        if closed or not result:
+            return bytes(result)
+        end = offset + length
+        for seg_start, seg_data in segments:
+            seg_end = seg_start + len(seg_data)
+            overlap_start = max(offset, seg_start)
+            overlap_end = min(end, seg_end)
+            if overlap_start >= overlap_end:
+                continue
+            result_start = overlap_start - offset
+            data_start = overlap_start - seg_start
+            result[result_start:result_start + overlap_end - overlap_start] = (
+                seg_data[data_start:data_start + overlap_end - overlap_start]
+            )
+        return bytes(result)
+
+    @staticmethod
+    def _merge_segments(segments):
+        merged = []
+        for start, data in sorted(segments, key=lambda item: item[0]):
+            if not data:
+                continue
+            if merged and merged[-1][0] + len(merged[-1][1]) == start:
+                prev_start, prev_data = merged[-1]
+                merged[-1] = (prev_start, prev_data + data)
+            else:
+                merged.append((start, data))
+        return tuple(merged)
+
+    def write_at(self, offset, data):
+        data = bytes(data)
+        if not data:
+            return 0
+        offset = int(offset)
+        end = offset + len(data)
+        if offset < 0 or end > self.logical_length:
+            raise ValueError("mipmap write is outside the logical buffer")
+        with self._lock:
+            if self._closed:
+                raise ValueError("mipmap buffer is closed")
+            updated = []
+            for seg_start, seg_data in self._segments:
+                seg_end = seg_start + len(seg_data)
+                if seg_end <= offset or seg_start >= end:
+                    updated.append((seg_start, seg_data))
+                    continue
+                if seg_start < offset:
+                    updated.append(
+                        (seg_start, seg_data[:offset - seg_start])
+                    )
+                if seg_end > end:
+                    updated.append(
+                        (end, seg_data[end - seg_start:])
+                    )
+            updated.append((offset, data))
+            self._segments = self._merge_segments(updated)
+        return len(data)
+
+    def replace_dense(self, data):
+        data = bytes(data)
+        if len(data) != self.logical_length:
+            raise ValueError(
+                f"dense mipmap length mismatch: {len(data)} != {self.logical_length}"
+            )
+        with self._lock:
+            if self._closed:
+                raise ValueError("mipmap buffer is closed")
+            self._segments = ((0, data),)
+
+    def coverage(self):
+        with self._lock:
+            segments = self._segments
+        covered = set()
+        for unit in range(self.total_units):
+            start = unit * self.unit_size
+            end = min(self.logical_length, start + self.unit_size)
+            cursor = start
+            for seg_start, seg_data in segments:
+                seg_end = seg_start + len(seg_data)
+                if seg_end <= cursor:
+                    continue
+                if seg_start > cursor:
+                    break
+                cursor = max(cursor, min(end, seg_end))
+                if cursor >= end:
+                    covered.add(unit)
+                    break
+        return covered
+
+    def is_complete(self):
+        return len(self.coverage()) == self.total_units
+
+    def allocated_bytes(self):
+        with self._lock:
+            return sum(len(data) for _, data in self._segments)
+
+    def iter_segments(self):
+        with self._lock:
+            return self._segments
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._segments = ()
+
 # Define rgba_surface structure BEFORE it's referenced in library setup
 class rgba_surface(Structure):
     _fields_ = [
@@ -226,8 +530,69 @@ class MipMap(object):
         self.endpos = endpos
         self.length = length
         self.retrieved = retrieved
+        self._buffer = None
         self.databuffer = databuffer
-        #self.databuffer = BytesIO()
+
+    @property
+    def buffer(self):
+        return self._buffer
+
+    @buffer.setter
+    def buffer(self, value):
+        self.databuffer = value
+
+    @property
+    def databuffer(self):
+        """Compatibility alias; new code should use the random-access methods."""
+        return self._buffer
+
+    @databuffer.setter
+    def databuffer(self, value):
+        if value is None or isinstance(value, MipmapBuffer):
+            self._buffer = value
+            return
+        if hasattr(value, "getvalue"):
+            value = value.getvalue()
+        self._buffer = DenseMipmapBuffer(self.length or len(value), value)
+
+    def ensure_sparse(self, blocksize, unit_size, total_units):
+        if isinstance(self._buffer, SparseMipmapBuffer):
+            return self._buffer
+        sparse = SparseMipmapBuffer(
+            self.length,
+            blocksize=blocksize,
+            unit_size=unit_size,
+            total_units=total_units,
+        )
+        if self._buffer is not None:
+            for offset, data in self._buffer.iter_segments():
+                sparse.write_at(offset, data)
+            self._buffer.close()
+        self._buffer = sparse
+        return sparse
+
+    def read_at(self, offset, length, blocksize):
+        if self._buffer is None:
+            return _get_fallback_slice(offset, length, blocksize)
+        return self._buffer.read_at(offset, length)
+
+    def write_at(self, offset, data, blocksize):
+        if self._buffer is None:
+            self._buffer = SparseMipmapBuffer(
+                self.length,
+                blocksize=blocksize,
+            )
+        return self._buffer.write_at(offset, data)
+
+    def replace_dense(self, data, blocksize):
+        replacement = DenseMipmapBuffer(self.length, data, blocksize)
+        old = self._buffer
+        self._buffer = replacement
+        if old is not None:
+            old.close()
+
+    def allocated_bytes(self):
+        return self._buffer.allocated_bytes() if self._buffer is not None else 0
 
     def __repr__(self):
         return f"MipMap({self.idx}, {self.startpos}, {self.endpos}, {self.length}, {self.retrieved}, {self.databuffer})"
@@ -358,12 +723,12 @@ class DDS(Structure):
         # Close all mipmap databuffers
         if hasattr(self, 'mipmap_list'):
             for mm in self.mipmap_list:
-                if mm is not None and mm.databuffer is not None:
+                if mm is not None and mm.buffer is not None:
                     try:
-                        mm.databuffer.close()
+                        mm.buffer.close()
                     except Exception:
                         pass
-                    mm.databuffer = None
+                    mm.buffer = None
 
     def __del__(self):
         """Safety net - attempt cleanup if close() was never called."""
@@ -390,10 +755,21 @@ class DDS(Structure):
                 #if mipmap.retrieved:
                 log.debug(f"Writing {mipmap.startpos}")
                 h.seek(mipmap.startpos)
-                if mipmap.databuffer is not None:
-                    buf = mipmap.databuffer.getbuffer()
-                    # Write no more than the declared mipmap length to avoid misalignment
-                    h.write(buf[:mipmap.length])
+                if isinstance(mipmap.buffer, SparseMipmapBuffer):
+                    chunk_size = 1024 * 1024
+                    for offset in range(0, mipmap.length, chunk_size):
+                        h.seek(mipmap.startpos + offset)
+                        h.write(
+                            mipmap.read_at(
+                                offset,
+                                min(chunk_size, mipmap.length - offset),
+                                self.blocksize,
+                            )
+                        )
+                elif mipmap.buffer is not None:
+                    for offset, data in mipmap.buffer.iter_segments():
+                        h.seek(mipmap.startpos + offset)
+                        h.write(data[:mipmap.length - offset])
                 log.debug(f"Wrote {h.tell()-mipmap.startpos} bytes")
 
             # Make sure we complete the full file size
@@ -404,95 +780,88 @@ class DDS(Structure):
 
 
     def tell(self):
-        return self.position
+        with self.lock:
+            return self.position
 
     def seek(self, offset):
         log.debug(f"SEEK: {offset}")
-        self.position = offset
+        with self.lock:
+            self.position = offset
+
+    def read_at(self, offset, length):
+        """Read exactly ``length`` bytes without mutating shared cursor state."""
+        offset = max(0, int(offset))
+        length = max(0, int(length))
+        if length == 0:
+            return b""
+
+        out = bytearray()
+        position = offset
+        remaining = length
+        header = self.header.getvalue() if self.header is not None else bytes(self)
+
+        if position < 128:
+            take = min(remaining, 128 - position)
+            out.extend(header[position:position + take])
+            position += take
+            remaining -= take
+
+        while remaining > 0:
+            mipmap = next(
+                (
+                    candidate
+                    for candidate in self.mipmap_list
+                    if candidate.startpos <= position < candidate.endpos
+                ),
+                None,
+            )
+            if mipmap is None:
+                out.extend(
+                    _get_fallback_slice(position, remaining, self.blocksize)
+                )
+                break
+            mipmap_offset = position - mipmap.startpos
+            take = min(remaining, mipmap.endpos - position)
+            out.extend(mipmap.read_at(mipmap_offset, take, self.blocksize))
+            position += take
+            remaining -= take
+
+        if len(out) < length:
+            out.extend(
+                _get_fallback_slice(
+                    offset + len(out),
+                    length - len(out),
+                    self.blocksize,
+                )
+            )
+        return bytes(out)
 
     def read(self, length):
         log.debug(f"PYDDS: READ: {self.position} {length} bytes")
+        with self.lock:
+            offset = self.position
+            data = self.read_at(offset, length)
+            self.position += len(data)
+        return data
 
-        outdata = b''
+    def ensure_sparse_mipmap(self, mipmap, unit_size, total_units):
+        return self.mipmap_list[mipmap].ensure_sparse(
+            self.blocksize,
+            unit_size,
+            total_units,
+        )
 
-        if self.position < 128:
-            log.debug("Read the header")
-            outdata = self.header.getvalue()
-            self.position = 128
-            length -= 128
+    def write_mipmap_at(self, mipmap, offset, data):
+        return self.mipmap_list[mipmap].write_at(
+            offset,
+            data,
+            self.blocksize,
+        )
 
-        for mipmap in self.mipmap_list:
-           
-            #if mipmap.databuffer is None:
-            #    continue
-
-            if mipmap.endpos > self.position >= mipmap.startpos:
-                #
-                # Requested read starts before end of this mipmap and before or equal to the starting position
-                #
-                log.debug(f"PYDDS: We are reading from mipmap {mipmap.idx}")
-                
-                log.debug(f"PYDDS: {mipmap} , Pos: {self.position} , Len: {length}")
-                # Get position in mipmap
-                mipmap_pos = self.position - mipmap.startpos
-                #remaining_mipmap_len = mipmap.length - mipmap_pos
-                remaining_mipmap_len = mipmap.endpos - self.position
-
-                log.debug(f"Len: {length}, remain: {remaining_mipmap_len}, mipmap_pos {mipmap_pos}")
-                if length <= remaining_mipmap_len: 
-                    #
-                    # Mipmap has more than enough remaining length for request
-                    # ~We have remaining length in current mipmap~
-                    #
-                    if mipmap.databuffer is None:
-                        log.debug(f"PYDDS: No buffer for mipmap {mipmap.idx}, using fallback.")
-                        data = get_fallback_bytes(length, self.blocksize)
-                    else:
-                        log.debug("We have a mipmap and adequated remaining length")
-                        mipmap.databuffer.seek(mipmap_pos)
-                        data = mipmap.databuffer.read(length)
-                        ret_len = length - len(data)
-                        if ret_len != 0:
-                            # This should be impossible but handle gracefully
-                            log.error(f"PYDDS: Didn't retrieve full length from buffer! mmpos: {mipmap_pos} missing: {ret_len} requested: {length} mipmap: {mipmap.idx}")
-                            # Use proper BC1/BC3 blocks with missing_color instead of garbage
-                            data += get_fallback_bytes(ret_len, self.blocksize)
-                                
-                    outdata += data
-                    self.position += length
-                    break
-
-                elif length > remaining_mipmap_len:
-                    #
-                    # Requested length is greater than what's available in this mipmap
-                    #
-                    log.debug(f"PYDDS: In mipmap {mipmap.idx} not enough length")
-
-                    #if not mipmap.retrieved:
-                    if mipmap.databuffer is None:
-                        log.debug(f"PYDDS: No buffer for mipmap {mipmap.idx}, using fallback ({remaining_mipmap_len} bytes).")
-                        data = get_fallback_bytes(remaining_mipmap_len, self.blocksize)
-                    else:    
-                        # Mipmap is retrieved
-                        mipmap.databuffer.seek(mipmap_pos)
-                        data = mipmap.databuffer.read(remaining_mipmap_len)
-                    
-                    # Make sure we retrieved all the expected data from the mipmap we can.
-                    ret_len = remaining_mipmap_len - len(data)
-                    if ret_len != 0:
-                        log.error(f"PYDDS: ERROR! Didn't retrieve full length of mipmap {mipmap.idx}! Filling {ret_len} bytes with missing_color.")
-                        # Use proper BC1/BC3 blocks with missing_color instead of garbage
-                        data += get_fallback_bytes(ret_len, self.blocksize)
-
-                    outdata += data
-
-                    length -= remaining_mipmap_len
-                    #self.position += remaining_mipmap_len
-                    self.position = mipmap.endpos
-
-
-        log.debug(f"PYDDS: END READ: At {self.position} returning {len(outdata)} bytes")
-        return outdata
+    def replace_mipmap_dense(self, mipmap, data, complete=True):
+        mm = self.mipmap_list[mipmap]
+        mm.replace_dense(data, self.blocksize)
+        mm.retrieved = bool(complete)
 
 
     def dump_header(self):
@@ -718,28 +1087,33 @@ class DDS(Structure):
 
                 # Assign databuffer (still within mipmap_lock)
                 if dxtdata is not None:
-                    # Close old buffer before creating new one to prevent BytesIO accumulation
-                    if self.mipmap_list[mipmap].databuffer is not None:
-                        try:
-                            self.mipmap_list[mipmap].databuffer.close()
-                        except Exception:
-                            pass
-                    self.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=dxtdata)
-                    if not compress_bytes:
-                        self.mipmap_list[mipmap].retrieved = True
+                    raw_dxt = bytes(dxtdata)
+                    target = self.mipmap_list[mipmap]
+                    if len(raw_dxt) == target.length:
+                        target.replace_dense(raw_dxt, self.blocksize)
+                        if not compress_bytes:
+                            target.retrieved = True
+                    else:
+                        sparse = target.ensure_sparse(
+                            self.blocksize,
+                            max(1, len(raw_dxt)),
+                            max(1, math.ceil(target.length / len(raw_dxt))),
+                        )
+                        sparse.write_at(0, raw_dxt)
+                        target.retrieved = False
 
                     # we are already at 4x4 so push result forward to
                     # remaining MMs
-                    if mipmap == self.smallest_mm:
+                    if mipmap == self.smallest_mm and target.retrieved:
                         log.debug(f"At MM {mipmap}.  Set the remaining MMs..")
                         for mm in self.mipmap_list[self.smallest_mm:]:
                             # Close old buffer before creating new one
-                            if mm.databuffer is not None:
+                            if mm.buffer is not None:
                                 try:
-                                    mm.databuffer.close()
+                                    mm.buffer.close()
                                 except Exception:
                                     pass
-                            mm.databuffer = BytesIO(initial_bytes=dxtdata)
+                            mm.replace_dense(bytes(dxtdata), self.blocksize)
                             mm.retrieved = True
                             mipmap += 1
 

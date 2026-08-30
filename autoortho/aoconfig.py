@@ -197,6 +197,10 @@ fallback_extends_budget = False
 # Range: 10 - 120 seconds
 # Recommended: 3.0 (balanced), 5.0 (quality), 1.5 (fast)
 fallback_timeout = 30.0
+# Allow a native row build to finish after its shared deadline by using
+# cache/lower-ZL fallbacks and finally missing_color for unresolved positions.
+# Disabled by default to preserve strict 100% native partial-build quality.
+native_partial_allow_incomplete = False
 # Spatial prefetching - proactively downloads tiles ahead of aircraft
 # Enable/disable prefetching (True/False)
 prefetch_enabled = True
@@ -260,6 +264,9 @@ ephemeral_dds_cache_mb = 4096
 # Eliminates JPEG decode + DXT compress on subsequent loads (~1-2ms read vs ~390ms rebuild)
 # Set to 0 for unlimited cache (recommended). Uses disk budget manager for cleanup.
 persistent_dds_cache_mb = 0
+# Persist compressed mipmap-0 chunk rows asynchronously for repeat ZL17 loads.
+# The conservative default keeps existing installations unchanged.
+persist_partial_dds_cache = False
 # Delete source JPEG chunks only after a complete DDS is durably stored. Keeping
 # sources improves rebuild resilience when compiled DDS entries are evicted.
 cleanup_source_jpegs_after_dds = False
@@ -514,6 +521,11 @@ route_prefetch_radius_nm = 40
 """
 
     def __init__(self, conf_file=None):
+        self.config = configparser.ConfigParser(
+            strict=False,
+            allow_no_value=True,
+            comment_prefixes='/',
+        )
         if not conf_file:
             self.conf_file = os.path.join(os.path.expanduser("~"), ".autoortho")
         else:
@@ -532,12 +544,23 @@ route_prefetch_radius_nm = 40
 
     def load(self):
         self.config.read_string(self._defaults)
+        user_config = configparser.ConfigParser(
+            strict=False,
+            allow_no_value=True,
+            comment_prefixes='/',
+        )
         if os.path.isfile(self.conf_file):
             log.info(f"Config file found {self.conf_file} reading...")
+            user_config.read(self.conf_file)
             self.config.read(self.conf_file)
         else:
             log.info("No config file found. Using defaults...")
 
+        self._explicit_options = {
+            section: set(user_config.options(section))
+            for section in user_config.sections()
+        }
+        _migrate_legacy_provider_options(self, user_config)
         self.get_config()
         return True
 
@@ -714,9 +737,6 @@ route_prefetch_radius_nm = 40
                     continue
                 self.config[sect][k] = str(v)
 
-CFG = AOConfig()
-
-
 # ---------------------------------------------------------------------------
 # Provider throughput settings
 # ---------------------------------------------------------------------------
@@ -844,14 +864,20 @@ def resolve_provider_setting(name, cfg=None):
     spec = PROVIDER_SETTINGS[name]
     default = spec["default"]
     kind = spec.get("type", int)
-    section = getattr(cfg if cfg is not None else CFG, "autoortho", None)
+    config_object = cfg if cfg is not None else CFG
+    section = getattr(config_object, "autoortho", None)
+    explicit_options = getattr(
+        config_object,
+        "_explicit_options",
+        {},
+    ).get("autoortho", set())
 
     if kind is bool:
         return _read_setting(section, name, default, bool)
 
     low, high = spec["range"]
     value = _read_setting(section, name, default, kind)
-    if value != default:
+    if name in explicit_options or value != default:
         return max(low, min(high, value))
 
     legacy = spec["legacy"]
@@ -878,6 +904,75 @@ def resolve_provider_setting(name, cfg=None):
             return max(low, min(high, legacy_value))
 
     return max(low, min(high, default))
+
+
+def _migrate_legacy_provider_options(cfg, user_config):
+    """Persist deprecated provider aliases once instead of resolving per call."""
+    section_name = "autoortho"
+    explicit = cfg._explicit_options.setdefault(section_name, set())
+    if not user_config.has_section(section_name):
+        return
+
+    for modern_name, spec in PROVIDER_SETTINGS.items():
+        legacy = spec.get("legacy")
+        if legacy is None:
+            continue
+        legacy_name, legacy_default = legacy
+        if legacy_name not in explicit:
+            continue
+
+        kind = spec.get("type", int)
+        parsed_section = SectionParser(
+            **dict(cfg.config.items(section_name))
+        )
+        legacy_value = _read_setting(
+            parsed_section,
+            legacy_name,
+            legacy_default,
+            kind,
+        )
+        if legacy_value == legacy_default:
+            continue
+
+        if modern_name in explicit:
+            cfg.config.set(
+                section_name,
+                legacy_name,
+                str(legacy_default),
+            )
+            log.debug(
+                "Normalized deprecated autoortho.%s because modern %s is "
+                "present",
+                legacy_name,
+                modern_name,
+            )
+            continue
+
+        low, high = spec["range"]
+        migrated_value = max(low, min(high, legacy_value))
+        if modern_name == "provider_max_in_flight":
+            migrated_value = min(256, migrated_value)
+        cfg.config.set(
+            section_name,
+            modern_name,
+            str(migrated_value),
+        )
+        cfg.config.set(
+            section_name,
+            legacy_name,
+            str(legacy_default),
+        )
+        explicit.add(modern_name)
+        log.warning(
+            "Migrated deprecated autoortho.%s=%s to %s=%s",
+            legacy_name,
+            legacy_value,
+            modern_name,
+            migrated_value,
+        )
+
+
+CFG = AOConfig()
 
 
 # Note: The test code below is obsolete and has been commented out

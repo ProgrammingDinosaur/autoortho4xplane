@@ -402,7 +402,7 @@ class TestDynamicDDSCache:
         with open(ddm_path, 'r') as f:
             meta = json.load(f)
         
-        assert meta['v'] == 3
+        assert meta['v'] == 4
         assert meta['w'] == 4096
         assert meta['h'] == 4096
         assert meta['max_zl'] == 16
@@ -783,7 +783,7 @@ class TestDDMv2:
         with open(ddm_path, 'r') as f:
             meta = json.load(f)
 
-        assert meta['v'] == 3
+        assert meta['v'] == 4
         assert meta['needs_healing'] is False
         assert meta['healing_chunks'] == 0
         assert meta['missing_indices'] == []
@@ -801,7 +801,7 @@ class TestDDMv2:
         with open(ddm_path, 'r') as f:
             meta = json.load(f)
 
-        assert meta['v'] == 3
+        assert meta['v'] == 4
         assert meta['needs_healing'] is True
         assert meta['healing_chunks'] == 3
         assert meta['missing_indices'] == [0, 3, 7]
@@ -1491,3 +1491,243 @@ class TestZstdCompression:
         assert 0 in meta2['populated_mipmaps']
         assert 1 in meta2['populated_mipmaps']
         assert meta2.get('disk_compression') == 'zstd'
+
+
+# ============================================================================
+# DDM v4 partial-row persistence tests
+# ============================================================================
+
+class TestDDMv4PartialRows:
+    def test_v2_and_v3_metadata_remain_loadable(
+        self, dds_cache, mock_tile, sample_dds_bytes
+    ):
+        """Old metadata schemas remain valid cache entries."""
+        assert dds_cache.store(
+            mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom)
+        with open(ddm_path) as metadata_file:
+            current = json.load(metadata_file)
+
+        for version in (2, 3):
+            legacy = dict(current)
+            legacy["v"] = version
+            legacy.pop("partial_mipmaps", None)
+            if version == 2:
+                legacy.pop("populated_mipmaps", None)
+            with open(ddm_path, "w") as metadata_file:
+                json.dump(legacy, metadata_file)
+            assert dds_cache.load_metadata(
+                mock_tile.id, mock_tile.max_zoom, mock_tile)["v"] == version
+            assert dds_cache.load(
+                mock_tile.id, mock_tile.max_zoom, mock_tile) == sample_dds_bytes
+
+    def test_future_metadata_is_a_cache_miss(
+        self, dds_cache, mock_tile, sample_dds_bytes
+    ):
+        assert dds_cache.store(
+            mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        dds_path, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom)
+        with open(ddm_path) as metadata_file:
+            metadata = json.load(metadata_file)
+        metadata["v"] = 99
+        with open(ddm_path, "w") as metadata_file:
+            json.dump(metadata, metadata_file)
+
+        assert os.path.exists(dds_path)
+        assert dds_cache.load_metadata(
+            mock_tile.id, mock_tile.max_zoom, mock_tile) is None
+        assert dds_cache.load(mock_tile.id, mock_tile.max_zoom, mock_tile) is None
+        assert not dds_cache.contains(mock_tile.id, mock_tile.max_zoom, mock_tile)
+
+    def test_partial_rows_are_v4_and_old_reader_safe(self, dds_cache, mock_tile):
+        assert dds_cache.append_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 0, b"first", 2,
+            degraded=True, revision=7)
+        metadata = dds_cache.load_metadata(
+            mock_tile.id, mock_tile.max_zoom, mock_tile)
+
+        assert metadata["v"] == 4
+        assert 0 not in metadata["populated_mipmaps"]
+        assert metadata["partial_mipmaps"]["0"] == {
+            "unit": "chunk_row",
+            "total": 2,
+            "covered": [0],
+            "degraded": [0],
+            "revision": 7,
+            "row_revisions": {"0": 7},
+        }
+        assert dds_cache.load_partial_rows(
+            mock_tile.id, mock_tile.max_zoom, mock_tile) == {0: b"first"}
+
+        assert dds_cache.append_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 1, b"second", 2)
+        metadata = dds_cache.load_metadata(
+            mock_tile.id, mock_tile.max_zoom, mock_tile)
+        assert 0 not in metadata["populated_mipmaps"]
+        assert metadata["partial_mipmaps"]["0"]["covered"] == [0, 1]
+        assert dds_cache.load_partial_rows(
+            mock_tile.id, mock_tile.max_zoom, mock_tile
+        ) == {0: b"first", 1: b"second"}
+
+    def test_complete_store_serializes_against_partial_append(
+        self,
+        dds_cache,
+        mock_tile,
+        sample_dds_bytes,
+        monkeypatch,
+    ):
+        entered = threading.Event()
+        release = threading.Event()
+        original_append = dds_cache._append_row_record
+
+        def blocked_append(*args, **kwargs):
+            entered.set()
+            release.wait(1)
+            return original_append(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dds_cache,
+            "_append_row_record",
+            blocked_append,
+        )
+        append_result = []
+        store_result = []
+        append_thread = threading.Thread(
+            target=lambda: append_result.append(
+                dds_cache.append_partial_row(
+                    mock_tile.id,
+                    mock_tile.max_zoom,
+                    mock_tile,
+                    0,
+                    b"row",
+                    2,
+                )
+            )
+        )
+        append_thread.start()
+        assert entered.wait(1)
+        store_thread = threading.Thread(
+            target=lambda: store_result.append(
+                dds_cache.store(
+                    mock_tile.id,
+                    mock_tile.max_zoom,
+                    sample_dds_bytes,
+                    mock_tile,
+                )
+            )
+        )
+        store_thread.start()
+        time.sleep(0.02)
+        release.set()
+        append_thread.join()
+        store_thread.join()
+
+        metadata = dds_cache.load_metadata(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+        )
+        assert append_result == [True]
+        assert store_result == [True]
+        assert 0 in metadata["populated_mipmaps"]
+        assert metadata["partial_mipmaps"] == {}
+
+    def test_enqueue_store_transfers_snapshot_without_blocking(
+        self,
+        dds_cache,
+        mock_tile,
+        sample_dds_bytes,
+        monkeypatch,
+    ):
+        entered = threading.Event()
+        release = threading.Event()
+        original_store = dds_cache.store
+
+        def blocked_store(*args, **kwargs):
+            entered.set()
+            release.wait(1)
+            return original_store(*args, **kwargs)
+
+        monkeypatch.setattr(dds_cache, "store", blocked_store)
+        started = time.monotonic()
+        assert dds_cache.enqueue_store(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            sample_dds_bytes,
+            mock_tile,
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.1
+        assert entered.wait(1)
+        release.set()
+
+    def test_partial_row_reader_ignores_corrupt_and_truncated_records(
+        self, dds_cache, mock_tile
+    ):
+        from autoortho.aopipeline import dynamic_dds_cache as cache_module
+
+        assert dds_cache.append_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 0, b"good", 2,
+            revision=1)
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom)
+        record_path = dds_cache._row_records_path(ddm_path)
+        bad_header = cache_module._ROW_RECORD_HEADER.pack(
+            cache_module._ROW_RECORD_MAGIC, cache_module._ROW_RECORD_SCHEMA,
+            0, 2, 3, b"\0" * 32)
+        with open(record_path, "ab") as records:
+            records.write(bad_header + b"bad")
+            records.write(b"truncated")
+
+        assert dds_cache.load_partial_rows(
+            mock_tile.id, mock_tile.max_zoom, mock_tile) == {0: b"good"}
+
+    def test_newest_referenced_row_revision_wins(self, dds_cache, mock_tile):
+        assert dds_cache.append_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 0, b"old", 2,
+            revision=1)
+        assert dds_cache.append_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 0, b"new", 2,
+            revision=2)
+        assert dds_cache.load_partial_rows(
+            mock_tile.id, mock_tile.max_zoom, mock_tile) == {0: b"new"}
+
+    def test_async_partial_row_queue_coalesces_and_drops(self, cache_dir, mock_tile):
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+
+        cache = DynamicDDSCache(
+            cache_dir, max_size_mb=10, partial_row_queue_bytes=3)
+        started = threading.Event()
+        release = threading.Event()
+        persisted = []
+
+        def blocked_append(*args, **kwargs):
+            started.set()
+            release.wait(2)
+            persisted.append((args[3], args[4]))
+            return True
+
+        cache.append_partial_row = blocked_append
+        assert cache.enqueue_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 0, b"a", 3)
+        assert started.wait(2)
+        assert cache.enqueue_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 1, b"b", 3)
+        assert cache.enqueue_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 1, b"cc", 3)
+        assert not cache.enqueue_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 2, b"dd", 3)
+        release.set()
+        assert cache.flush_partial_rows(2)
+
+        stats = cache.stats
+        assert stats["partial_row_coalesced"] == 1
+        assert stats["partial_row_dropped"] == 1
+        assert sorted(persisted) == [(0, b"a"), (1, b"cc")]
+        cache.close()

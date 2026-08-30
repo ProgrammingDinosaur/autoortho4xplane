@@ -780,3 +780,90 @@ def test_provider_settings_are_clamped_and_fault_tolerant():
 
     junk = SimpleNamespace(autoortho=SimpleNamespace(provider_max_in_flight="nope"))
     assert aoconfig.resolve_provider_setting("provider_max_in_flight", junk) == 128
+
+
+def test_explicit_modern_provider_setting_wins_over_legacy(tmp_path):
+    path = tmp_path / ".autoortho"
+    path.write_text(
+        "[autoortho]\n"
+        "provider_max_in_flight = 128\n"
+        "max_concurrent_downloads = 2000\n",
+        encoding="utf-8",
+    )
+
+    cfg = aoconfig.AOConfig(str(path))
+
+    assert aoconfig.resolve_provider_setting(
+        "provider_max_in_flight",
+        cfg,
+    ) == 128
+    assert cfg.autoortho.max_concurrent_downloads == 256
+
+
+def test_legacy_provider_setting_is_migrated_once(tmp_path):
+    path = tmp_path / ".autoortho"
+    path.write_text(
+        "[autoortho]\n"
+        "max_concurrent_downloads = 2000\n",
+        encoding="utf-8",
+    )
+
+    cfg = aoconfig.AOConfig(str(path))
+
+    assert cfg.autoortho.provider_max_in_flight == 256
+    assert cfg.autoortho.max_concurrent_downloads == 256
+    assert aoconfig.resolve_provider_setting(
+        "provider_max_in_flight",
+        cfg,
+    ) == 256
+
+    reloaded = aoconfig.AOConfig(str(path))
+    assert reloaded.autoortho.provider_max_in_flight == 256
+    assert reloaded.autoortho.max_concurrent_downloads == 256
+
+
+def test_saved_modern_default_remains_authoritative(tmp_path):
+    path = tmp_path / ".autoortho"
+    original = aoconfig.AOConfig(str(path))
+    assert original.autoortho.provider_max_in_flight == 128
+
+    text = path.read_text(encoding="utf-8")
+    text = text.replace(
+        "max_concurrent_downloads = 256",
+        "max_concurrent_downloads = 2000",
+    )
+    path.write_text(text, encoding="utf-8")
+
+    reloaded = aoconfig.AOConfig(str(path))
+
+    assert reloaded.autoortho.provider_max_in_flight == 128
+    assert reloaded.autoortho.max_concurrent_downloads == 256
+    assert aoconfig.resolve_provider_setting(
+        "provider_max_in_flight",
+        reloaded,
+    ) == 128
+
+
+def test_worker_reload_uses_fresh_legacy_value(tmp_path, monkeypatch):
+    path = tmp_path / ".autoortho"
+    path.write_text(
+        "[autoortho]\n"
+        "max_concurrent_downloads = 64\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AO_RUN_MODE", "mount_worker")
+    cfg = aoconfig.AOConfig(str(path))
+    assert cfg.autoortho.provider_max_in_flight == 64
+
+    path.write_text(
+        "[autoortho]\n"
+        "max_concurrent_downloads = 96\n",
+        encoding="utf-8",
+    )
+    cfg.load()
+
+    assert cfg.autoortho.provider_max_in_flight == 96
+    assert aoconfig.resolve_provider_setting(
+        "provider_max_in_flight",
+        cfg,
+    ) == 96
