@@ -10,6 +10,8 @@ import ctypes
 import threading
 import inspect
 import queue
+import heapq
+import itertools
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
@@ -325,7 +327,9 @@ class DSFPrefetchScheduler:
         self._live_demand = live_demand or (lambda: False)
         self._before_submit = before_submit
         self._worker_count = max(1, min(2, int(worker_count)))
-        self._queue = queue.Queue(maxsize=max(1, int(queue_size)))
+        self._queue_size = max(1, int(queue_size))
+        self._queue = queue.Queue(maxsize=self._queue_size)
+        self._max_entries = max(self._queue_size, self._queue_size * 4)
         self._grace_period = max(0.0, float(grace_period))
         self._retry_delay = max(0.0, float(retry_delay))
         self._max_retry_delay = max(
@@ -338,6 +342,11 @@ class DSFPrefetchScheduler:
         self._stop = threading.Event()
         self._workers = []
         self._entries = {}
+        self._deferred_heap = []
+        self._deferred_sequence = itertools.count()
+        self._completed = OrderedDict()
+        self._completed_ttl = 600.0
+        self._completed_limit = max(64, self._queue_size * 4)
         self._allowed_since = None
         self._cursor_arg = self._find_cursor_arg()
 
@@ -377,25 +386,31 @@ class DSFPrefetchScheduler:
 
     def schedule(self, path):
         """Schedule a path once; duplicate pending/running paths are coalesced."""
+        path = os.path.normcase(os.path.abspath(path))
         with self._lock:
             if self._stop.is_set():
                 return False
-            if path in self._entries:
+            now = self._clock()
+            self._purge_completed_locked(now)
+            if path in self._entries or path in self._completed:
                 self._bump("dsf_prefetch_coalesced")
+                return False
+            if len(self._entries) >= self._max_entries:
+                self._bump("dsf_prefetch_backpressure")
                 return False
             entry = {
                 "state": self.PENDING,
                 "cursor": None,
                 "retries": 0,
                 "pressure_retries": 0,
-                "next_attempt": self._clock(),
+                "next_attempt": now,
+                "revision": 0,
             }
             self._entries[path] = entry
             try:
                 self._queue.put_nowait(path)
             except queue.Full:
-                entry["state"] = self.DEFERRED
-                self._bump("dsf_prefetch_backpressure")
+                self._defer(entry, self._poll_interval, pressure=True, path=path)
             self._start_workers_locked()
             self._report_depth()
             return True
@@ -404,7 +419,10 @@ class DSFPrefetchScheduler:
         """Return a path state for diagnostics and focused tests."""
         with self._lock:
             entry = self._entries.get(path)
-            return entry["state"] if entry else None
+            if entry:
+                return entry["state"]
+            self._purge_completed_locked(self._clock())
+            return self.COMPLETE if path in self._completed else None
 
     def worker_count(self):
         return len(self._workers)
@@ -414,6 +432,8 @@ class DSFPrefetchScheduler:
         self._stop.set()
         with self._lock:
             self._entries.clear()
+            self._deferred_heap.clear()
+            self._completed.clear()
             workers = tuple(self._workers)
         for _worker in workers:
             try:
@@ -437,9 +457,29 @@ class DSFPrefetchScheduler:
             self._workers.append(worker)
             worker.start()
 
-    def _defer(self, entry, delay, pressure=False):
+    def _defer(self, entry, delay, pressure=False, path=None):
         entry["state"] = self.DEFERRED
         entry["next_attempt"] = self._clock() + max(0.0, delay)
+        entry["revision"] += 1
+        if path is None:
+            path = next(
+                (
+                    candidate
+                    for candidate, current in self._entries.items()
+                    if current is entry
+                ),
+                None,
+            )
+        if path is not None:
+            heapq.heappush(
+                self._deferred_heap,
+                (
+                    entry["next_attempt"],
+                    next(self._deferred_sequence),
+                    path,
+                    entry["revision"],
+                ),
+            )
         if pressure:
             entry["pressure_retries"] += 1
             self._bump("dsf_prefetch_backpressure")
@@ -454,30 +494,53 @@ class DSFPrefetchScheduler:
     def _promote_deferred(self):
         now = self._clock()
         with self._lock:
-            for path, entry in self._entries.items():
+            while self._deferred_heap and self._deferred_heap[0][0] <= now:
+                next_attempt, sequence, path, revision = heapq.heappop(
+                    self._deferred_heap
+                )
+                entry = self._entries.get(path)
                 if (
-                    entry["state"] == self.DEFERRED
-                    and entry["next_attempt"] <= now
+                    entry is None
+                    or entry["state"] != self.DEFERRED
+                    or entry["revision"] != revision
                 ):
-                    try:
-                        self._queue.put_nowait(path)
-                    except queue.Full:
-                        self._bump("dsf_prefetch_backpressure")
-                        return
-                    entry["state"] = self.PENDING
-                    self._report_depth()
+                    continue
+                try:
+                    self._queue.put_nowait(path)
+                except queue.Full:
+                    heapq.heappush(
+                        self._deferred_heap,
+                        (next_attempt, sequence, path, revision),
+                    )
+                    self._bump("dsf_prefetch_backpressure")
+                    return
+                entry["state"] = self.PENDING
+                self._report_depth()
 
     def _next_wait(self):
         now = self._clock()
         with self._lock:
-            due = [
-                entry["next_attempt"]
-                for entry in self._entries.values()
-                if entry["state"] == self.DEFERRED
-            ]
-        if not due:
-            return self._poll_interval
-        return min(self._poll_interval, max(0.0, min(due) - now))
+            while self._deferred_heap:
+                deadline, _sequence, path, revision = self._deferred_heap[0]
+                entry = self._entries.get(path)
+                if (
+                    entry is not None
+                    and entry["state"] == self.DEFERRED
+                    and entry["revision"] == revision
+                ):
+                    return min(
+                        self._poll_interval,
+                        max(0.0, deadline - now),
+                    )
+                heapq.heappop(self._deferred_heap)
+        return self._poll_interval
+
+    def _purge_completed_locked(self, now):
+        while self._completed:
+            path, deadline = next(iter(self._completed.items()))
+            if deadline > now:
+                break
+            self._completed.pop(path, None)
 
     def _can_run(self):
         if not self._runtime_allowed() or self._live_demand():
@@ -591,7 +654,11 @@ class DSFPrefetchScheduler:
             if not allowed:
                 with self._lock:
                     if path in self._entries:
-                        self._defer(entry, delay or self._poll_interval)
+                        self._defer(
+                            entry,
+                            delay or self._poll_interval,
+                            path=path,
+                        )
                 continue
             try:
                 if self._before_submit:
@@ -615,7 +682,9 @@ class DSFPrefetchScheduler:
                         )
                     else:
                         self._defer(
-                            entry, self._defer_delay(entry["retries"])
+                            entry,
+                            self._defer_delay(entry["retries"]),
+                            path=path,
                         )
                 continue
 
@@ -624,7 +693,13 @@ class DSFPrefetchScheduler:
                 if not entry:
                     continue
                 if complete:
-                    entry["state"] = self.COMPLETE
+                    self._entries.pop(path, None)
+                    self._completed[path] = (
+                        self._clock() + self._completed_ttl
+                    )
+                    self._completed.move_to_end(path)
+                    while len(self._completed) > self._completed_limit:
+                        self._completed.popitem(last=False)
                     log.info(
                         "DSF prefetch queued %d chunks for %s", submitted, path
                     )
@@ -636,6 +711,7 @@ class DSFPrefetchScheduler:
                         entry,
                         self._defer_delay(entry["pressure_retries"] + 1),
                         pressure=pressure,
+                        path=path,
                     )
 
 
@@ -673,6 +749,7 @@ class AutoOrtho(Operations):
         # Critical for predictive DDS: ensures we prefetch the exact tiles X-Plane will request
         terrain_folder = os.path.join(self.root, "terrain")
         scenery_name = os.path.basename(self.root)
+        self._scenery_name = scenery_name
         self._terrain_lookup = getortho.register_terrain_index(
             terrain_folder, scenery_name
         )
@@ -729,7 +806,7 @@ class AutoOrtho(Operations):
         with self._runtime_services_lock:
             if self._runtime_services_started:
                 return
-            getortho.start_prefetcher(self.tc)
+            getortho.start_prefetcher(self.tc, self._scenery_name)
             getortho.start_predictive_dds(self.tc)
             self._runtime_services_started = True
 

@@ -1064,6 +1064,7 @@ class _CoalescedEntry:
     timeout: RequestTimeout
     origin: str = "unknown"
     seq: int = 0
+    priority_revision: int = 0
     waiters: Dict[str, bytes] = field(default_factory=dict)  # request_id -> zmq identity
     task: Optional["asyncio.Task"] = None
     cancelled: bool = False
@@ -1073,6 +1074,73 @@ class _CoalescedEntry:
 
 
 ReplyCallback = Callable[..., "asyncio.Future"]
+
+
+class _AsyncIndexedPriorityQueue:
+    """Event-loop-local revisioned queue with bounded tombstones."""
+
+    def __init__(self):
+        self._heap = []
+        self._entries = {}
+        self._event = asyncio.Event()
+        self._tombstones = 0
+
+    def put_nowait(self, item):
+        priority, sequence, revision, entry = item
+        key = entry.key
+        if key in self._entries:
+            self._tombstones += 1
+        self._entries[key] = item
+        heapq.heappush(
+            self._heap,
+            (priority, sequence, revision, key),
+        )
+        if self._tombstones > max(32, len(self._entries)):
+            self._compact()
+        self._event.set()
+
+    async def get(self):
+        while True:
+            while self._heap:
+                priority, sequence, revision, key = heapq.heappop(
+                    self._heap
+                )
+                item = self._entries.get(key)
+                if (
+                    item is None
+                    or item[1] != sequence
+                    or item[2] != revision
+                ):
+                    self._tombstones = max(0, self._tombstones - 1)
+                    continue
+                self._entries.pop(key, None)
+                return priority, sequence, revision, item[3]
+            self._event.clear()
+            if self._heap:
+                continue
+            await self._event.wait()
+
+    def remove(self, key):
+        if self._entries.pop(key, None) is not None:
+            self._tombstones += 1
+            if self._tombstones > max(32, len(self._entries)):
+                self._compact()
+
+    def qsize(self):
+        return len(self._entries)
+
+    def task_done(self):
+        return None
+
+    def _compact(self):
+        self._heap = [
+            (priority, sequence, revision, key)
+            for key, (priority, sequence, revision, _entry) in (
+                self._entries.items()
+            )
+        ]
+        heapq.heapify(self._heap)
+        self._tombstones = 0
 
 
 @dataclass
@@ -1423,7 +1491,7 @@ class _BrokerCore:
         self._max_concurrency = max(1, int(max_concurrency))
         self._max_connections = max(1, int(max_connections))
         self._reply_cb = reply_cb
-        self._queue: "asyncio.PriorityQueue" = asyncio.PriorityQueue()
+        self._queue = _AsyncIndexedPriorityQueue()
         self._seq = itertools.count()
         self._entries: Dict[tuple, _CoalescedEntry] = {}
         self._by_request_id: Dict[str, _CoalescedEntry] = {}
@@ -1441,7 +1509,7 @@ class _BrokerCore:
         # Entries waiting for a permit on their origin. They are parked here
         # rather than blocking a worker, so a saturated (or throttled)
         # provider can never starve the other origins.
-        self._backlog: Dict[str, "collections.deque"] = {}
+        self._backlog: Dict[str, list] = {}
 
     async def start(self) -> None:
         self._workers = [asyncio.create_task(self._worker_loop()) for _ in range(self._max_concurrency)]
@@ -1504,6 +1572,23 @@ class _BrokerCore:
         if entry is not None and not entry.cancelled:
             entry.waiters[request_id] = identity
             self._by_request_id[request_id] = entry
+            if priority < entry.priority and not entry.started:
+                entry.priority = priority
+                entry.priority_revision += 1
+                queued = (
+                    entry.priority,
+                    entry.seq,
+                    entry.priority_revision,
+                    entry,
+                )
+                if entry.parked:
+                    heapq.heappush(
+                        self._backlog.setdefault(entry.origin, []),
+                        queued,
+                    )
+                    self._compact_backlog(entry.origin)
+                else:
+                    self._queue.put_nowait(queued)
             log.debug("Coalesced request %s into existing entry for %s", request_id, url)
             if entry.started:
                 await self._reply_cb(
@@ -1525,7 +1610,9 @@ class _BrokerCore:
         entry.waiters[request_id] = identity
         self._entries[key] = entry
         self._by_request_id[request_id] = entry
-        self._queue.put_nowait((priority, entry.seq, entry))
+        self._queue.put_nowait(
+            (priority, entry.seq, entry.priority_revision, entry)
+        )
 
     async def cancel(self, request_id: Optional[str]) -> None:
         if not request_id:
@@ -1546,10 +1633,44 @@ class _BrokerCore:
             return
 
         entry.cancelled = True
+        self._queue.remove(entry.key)
         self._unpark(entry)
         if entry.task is not None and not entry.task.done():
             entry.task.cancel()
         self._entries.pop(entry.key, None)
+
+    async def reprioritize(
+        self,
+        request_id: Optional[str],
+        priority: int,
+    ) -> bool:
+        if not request_id:
+            return False
+        entry = self._by_request_id.get(request_id)
+        if (
+            entry is None
+            or entry.cancelled
+            or entry.started
+            or int(priority) >= entry.priority
+        ):
+            return False
+        entry.priority = int(priority)
+        entry.priority_revision += 1
+        queued = (
+            entry.priority,
+            entry.seq,
+            entry.priority_revision,
+            entry,
+        )
+        if entry.parked:
+            heapq.heappush(
+                self._backlog.setdefault(entry.origin, []),
+                queued,
+            )
+            self._compact_backlog(entry.origin)
+        else:
+            self._queue.put_nowait(queued)
+        return True
 
     # -- per-origin admission --------------------------------------------
 
@@ -1562,7 +1683,16 @@ class _BrokerCore:
         origin is what re-queues this entry.
         """
         entry.parked = True
-        self._backlog.setdefault(entry.origin, collections.deque()).append(entry)
+        heapq.heappush(
+            self._backlog.setdefault(entry.origin, []),
+            (
+                entry.priority,
+                entry.seq,
+                entry.priority_revision,
+                entry,
+            ),
+        )
+        self._compact_backlog(entry.origin)
         self._limiter.note_deferred(entry.origin)
         profile_gauge("broker.origin_backlog", self._backlog_depth())
 
@@ -1573,11 +1703,13 @@ class _BrokerCore:
         backlog = self._backlog.get(entry.origin)
         if backlog is None:
             return
-        try:
-            backlog.remove(entry)
-        except ValueError:
-            pass
-        if not backlog:
+        if not any(
+            queued_entry is not entry
+            and queued_entry.parked
+            and not queued_entry.cancelled
+            for _priority, _seq, revision, queued_entry in backlog
+            if revision == queued_entry.priority_revision
+        ):
             self._backlog.pop(entry.origin, None)
 
     def _resume_origin(self, origin: str) -> None:
@@ -1586,11 +1718,23 @@ class _BrokerCore:
             return
         slots = self._limiter.available(origin)
         while backlog and slots > 0:
-            entry = backlog.popleft()
-            entry.parked = False
-            if entry.cancelled or not entry.waiters:
+            _priority, _seq, revision, entry = heapq.heappop(backlog)
+            if (
+                revision != entry.priority_revision
+                or not entry.parked
+                or entry.cancelled
+                or not entry.waiters
+            ):
                 continue
-            self._queue.put_nowait((entry.priority, entry.seq, entry))
+            entry.parked = False
+            self._queue.put_nowait(
+                (
+                    entry.priority,
+                    entry.seq,
+                    entry.priority_revision,
+                    entry,
+                )
+            )
             slots -= 1
         if not backlog:
             self._backlog.pop(origin, None)
@@ -1601,13 +1745,69 @@ class _BrokerCore:
             if origin != preferred_origin:
                 self._resume_origin(origin)
 
+    def _compact_backlog(self, origin: str) -> None:
+        backlog = self._backlog.get(origin)
+        if not backlog:
+            return
+        active = sum(
+            entry.parked
+            and not entry.cancelled
+            and bool(entry.waiters)
+            and revision == entry.priority_revision
+            for _priority, _seq, revision, entry in backlog
+        )
+        if len(backlog) <= max(32, active * 2):
+            return
+        backlog[:] = [
+            item
+            for item in backlog
+            if (
+                item[2] == item[3].priority_revision
+                and item[3].parked
+                and not item[3].cancelled
+                and item[3].waiters
+            )
+        ]
+        heapq.heapify(backlog)
+
     def _backlog_depth(self) -> int:
-        return sum(len(items) for items in self._backlog.values())
+        return sum(
+            entry.parked and not entry.cancelled and bool(entry.waiters)
+            for entry in self._entries.values()
+        )
 
     def stats(self) -> Dict[str, Any]:
         """Server-side counters, returned to clients via the STATS message."""
+        entries = tuple(self._entries.values())
+        active_live = sum(
+            entry.started
+            and entry.priority < DEFAULT_LIVE_PRIORITY_THRESHOLD
+            for entry in entries
+        )
+        active_background = sum(
+            entry.started
+            and entry.priority >= DEFAULT_LIVE_PRIORITY_THRESHOLD
+            for entry in entries
+        )
+        parked_live = sum(
+            entry.parked
+            and entry.priority < DEFAULT_LIVE_PRIORITY_THRESHOLD
+            for entry in entries
+        )
+        parked_background = sum(
+            entry.parked
+            and entry.priority >= DEFAULT_LIVE_PRIORITY_THRESHOLD
+            for entry in entries
+        )
         return {
             "active_requests": self._active_requests,
+            "active_live_requests": active_live,
+            "active_background_requests": active_background,
+            "parked_live_requests": parked_live,
+            "parked_background_requests": parked_background,
+            "available_background_permits": max(
+                0, self._max_concurrency - self._active_requests
+            ),
             "queue_depth": self._queue.qsize(),
             "backlog_depth": self._backlog_depth(),
             "entries": len(self._entries),
@@ -1618,10 +1818,15 @@ class _BrokerCore:
 
     async def _worker_loop(self) -> None:
         while True:
-            _priority, _seq, entry = await self._queue.get()
+            _priority, _seq, revision, entry = await self._queue.get()
             acquired = False
             try:
-                if entry.cancelled or not entry.waiters:
+                if (
+                    revision != entry.priority_revision
+                    or entry.cancelled
+                    or not entry.waiters
+                    or entry.started
+                ):
                     continue
                 if not self._limiter.try_acquire(entry.origin):
                     self._park(entry)
@@ -1898,6 +2103,10 @@ class _RouterServer:
             await self._handle_stats(identity, msg)
         elif mtype == "CANCEL":
             await self._core.cancel(msg.get("id"))
+        elif mtype == "REPRIORITIZE":
+            await self._core.reprioritize(
+                msg.get("id"), int(msg.get("priority", DEFAULT_PRIORITY))
+            )
         elif mtype == "SHUTDOWN":
             self._stop_event.set()
         else:
@@ -2622,6 +2831,23 @@ class HTTP2Broker:
         if dispatcher is None:
             return False
         return dispatcher.cancel(request_id)
+
+    def reprioritize(self, request_id: str, priority: int) -> bool:
+        """Best-effort priority update for queued or origin-parked work."""
+        if not request_id or not self._started or self._stopped:
+            return False
+        dispatcher = self._dispatcher
+        if dispatcher is None:
+            return False
+        dispatcher.send_control(
+            {
+                "type": "REPRIORITIZE",
+                "token": self._token,
+                "id": request_id,
+                "priority": int(priority),
+            }
+        )
+        return True
 
     def server_stats(self, *, timeout: float = 5.0) -> Dict[str, Any]:
         """Ask the broker server for its counters (blocking round trip).

@@ -18,6 +18,7 @@ import concurrent.futures
 import uuid
 import math
 import tracemalloc
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple, List
 
 from io import BytesIO
@@ -27,6 +28,31 @@ from queue import PriorityQueue, Empty, Full
 from functools import wraps, lru_cache
 from pathlib import Path
 from collections import OrderedDict
+
+try:
+    from autoortho.prefetch import (
+        CandidateState,
+        IndexedPriorityQueue,
+        PrefetchBatchReason,
+        PrefetchCapacitySnapshot,
+        PrefetchCoordinator,
+        PrefetchKey,
+        PrefetchQualityMode,
+        PrefetchSource,
+        PrefetchSubmitStatus,
+    )
+except ImportError:
+    from prefetch import (
+        CandidateState,
+        IndexedPriorityQueue,
+        PrefetchBatchReason,
+        PrefetchCapacitySnapshot,
+        PrefetchCoordinator,
+        PrefetchKey,
+        PrefetchQualityMode,
+        PrefetchSource,
+        PrefetchSubmitStatus,
+    )
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
@@ -1201,7 +1227,14 @@ def _sync_shared_flight_state() -> bool:
 
 def is_prefetch_runtime_allowed() -> bool:
     """Allow speculative work only after X-Plane has entered the flight."""
-    return bool(_sync_shared_flight_state() and not is_live_building())
+    enabled = getattr(CFG.autoortho, "prefetch_enabled", True)
+    if isinstance(enabled, str):
+        enabled = enabled.lower().strip() in ("true", "1", "yes", "on")
+    return bool(
+        enabled
+        and _sync_shared_flight_state()
+        and not is_live_building()
+    )
 
 
 def _thread_budget_for(active: int) -> int:
@@ -1833,8 +1866,18 @@ class _BrokerDownloadStage(object):
         if max_deferred is None:
             max_deferred = min(4096, max(64, 4 * self._max_outstanding))
         self._max_deferred = max(1, int(max_deferred))
-        self._deferred = []
-        self._deferred_seq = itertools.count()
+        self._deferred = IndexedPriorityQueue(
+            maxsize=self._max_deferred,
+            key=lambda pending: (
+                getattr(pending.obj, "chunk_id", None) or id(pending.obj)
+            ),
+            priority=lambda pending: int(
+                getattr(pending.obj, "priority", 0)
+            ),
+            on_compact=lambda count: bump(
+                "download_stage_heap_compactions"
+            ),
+        )
         self._drain_scheduled = False
 
         self._completions = queue.Queue()
@@ -1869,7 +1912,10 @@ class _BrokerDownloadStage(object):
     def _try_admit(self, obj):
         background = self._is_background(obj)
         with self._lock:
-            return self._try_admit_locked(background)
+            admitted = self._try_admit_locked(background)
+            if admitted:
+                obj._stage_background_admitted = background
+            return admitted
 
     def _try_admit_locked(self, background):
         if self._stopping.is_set():
@@ -1892,14 +1938,17 @@ class _BrokerDownloadStage(object):
         return True
 
     def _release(self, obj):
-        background = self._is_background(obj)
+        background = getattr(obj, "_stage_background_admitted", None)
+        if background is None:
+            background = self._is_background(obj)
+        obj._stage_background_admitted = None
         with self._admit_cv:
             self._outstanding = max(0, self._outstanding - 1)
             if background:
                 self._background_outstanding = max(
                     0, self._background_outstanding - 1
                 )
-            has_deferred = bool(self._deferred)
+            has_deferred = not self._deferred.empty()
             self._admit_cv.notify()
         if has_deferred:
             self._request_drain()
@@ -1913,8 +1962,65 @@ class _BrokerDownloadStage(object):
             return self._peak_outstanding
 
     def deferred_depth(self):
+        return self._deferred.qsize()
+
+    def prefetch_capacity_snapshot(self, queue_available, live_queued):
         with self._lock:
-            return len(self._deferred)
+            outstanding = self._outstanding
+            background_outstanding = self._background_outstanding
+        deferred = self._deferred.items()
+        live_deferred = sum(
+            not self._is_background(pending.obj) for pending in deferred
+        )
+        stage_available = max(
+            0,
+            self._max_outstanding - self._reserved_live - outstanding,
+        )
+        broker_live = 0
+        broker_background = 0
+        broker_available = stage_available
+        broker = _get_http2_client()
+        if broker is not None:
+            try:
+                stats = broker.stats()
+                pending = int(stats.get("pending", 0))
+                broker_live = int(stats.get("pending_live", 0))
+                broker_background = int(
+                    stats.get(
+                        "pending_background",
+                        max(0, pending - broker_live),
+                    )
+                )
+                max_pending = int(
+                    stats.get("max_pending", broker.max_pending)
+                )
+                reserved = int(
+                    stats.get(
+                        "reserved_live_slots",
+                        broker.reserved_live_slots,
+                    )
+                )
+                broker_available = max(
+                    0, max_pending - reserved - pending
+                )
+            except Exception:
+                broker_available = stage_available
+        return PrefetchCapacitySnapshot(
+            queue_available=max(0, int(queue_available)),
+            stage_available=stage_available,
+            deferred_available=max(
+                0, self._max_deferred - self._deferred.qsize()
+            ),
+            live_queued=max(0, int(live_queued)),
+            live_deferred=live_deferred,
+            live_outstanding=max(
+                0, outstanding - background_outstanding
+            ),
+            background_outstanding=background_outstanding,
+            broker_live_pending=broker_live,
+            broker_background_pending=broker_background,
+            broker_background_available=broker_available,
+        )
 
     # -- dispatch ----------------------------------------------------------
 
@@ -1955,37 +2061,32 @@ class _BrokerDownloadStage(object):
                     stopping = True
                     queued = False
                     expired = False
-                elif len(self._deferred) < self._max_deferred:
-                    heapq.heappush(
-                        self._deferred,
-                        (
-                            int(getattr(pending.obj, "priority", 0)),
-                            next(self._deferred_seq),
-                            pending,
+                elif self._deferred.qsize() < self._max_deferred:
+                    self._deferred.put_nowait(
+                        pending,
+                        item_key=(
+                            getattr(pending.obj, "chunk_id", None)
+                            or id(pending.obj)
+                        ),
+                        item_priority=int(
+                            getattr(pending.obj, "priority", 0)
                         ),
                     )
                     bump("download_stage_deferred")
                     queued = True
                 elif not pending_is_background:
-                    background_entries = [
-                        (index, item)
-                        for index, item in enumerate(self._deferred)
-                        if self._is_background(item[2].obj)
-                    ]
-                    if background_entries:
-                        evict_index, evicted_item = max(
-                            background_entries,
-                            key=lambda pair: pair[1][0],
-                        )
-                        evicted_background = evicted_item[2]
-                        self._deferred.pop(evict_index)
-                        heapq.heapify(self._deferred)
-                        heapq.heappush(
-                            self._deferred,
-                            (
-                                int(getattr(pending.obj, "priority", 0)),
-                                next(self._deferred_seq),
-                                pending,
+                    evicted_background = self._deferred.pop_worst(
+                        lambda item: self._is_background(item.obj)
+                    )
+                    if evicted_background is not None:
+                        self._deferred.put_nowait(
+                            pending,
+                            item_key=(
+                                getattr(pending.obj, "chunk_id", None)
+                                or id(pending.obj)
+                            ),
+                            item_priority=int(
+                                getattr(pending.obj, "priority", 0)
                             ),
                         )
                         bump("download_stage_live_displaced_prefetch")
@@ -2074,7 +2175,7 @@ class _BrokerDownloadStage(object):
         """
 
         with self._lock:
-            if self._drain_scheduled or not self._deferred:
+            if self._drain_scheduled or self._deferred.empty():
                 return
             self._drain_scheduled = True
         self._schedule(0.0, self._drain_deferred)
@@ -2102,22 +2203,30 @@ class _BrokerDownloadStage(object):
         even while prefetch saturates the stage.
         """
 
-        if not self._deferred:
+        if self._deferred.empty():
             return None
-        head_background = self._is_background(self._deferred[0][2].obj)
+        head = self._deferred.peek()
+        if head is None:
+            return None
+        head_background = self._is_background(head.obj)
         if self._try_admit_locked(head_background):
-            return heapq.heappop(self._deferred)[2]
+            pending = self._deferred.get_nowait()
+            self._deferred.task_done()
+            pending.obj._stage_background_admitted = head_background
+            return pending
         if not head_background:
             return None
-        for index, item in enumerate(self._deferred):
-            if self._is_background(item[2].obj):
-                continue
-            if not self._try_admit_locked(False):
-                return None
-            self._deferred.pop(index)
-            heapq.heapify(self._deferred)
-            return item[2]
-        return None
+        live = self._deferred.peek(
+            lambda pending: not self._is_background(pending.obj)
+        )
+        if live is None or not self._try_admit_locked(False):
+            return None
+        pending = self._deferred.get_nowait(
+            predicate=lambda item: not self._is_background(item.obj)
+        )
+        self._deferred.task_done()
+        pending.obj._stage_background_admitted = False
+        return pending
 
     def _requeue_deferred(self, pending):
         """Hand a still-unstarted chunk back to the work queue, quietly."""
@@ -2359,8 +2468,7 @@ class _BrokerDownloadStage(object):
         broker = _get_http2_client()
         with self._admit_cv:
             active = list(self._active.keys())
-            deferred = [item[2] for item in self._deferred]
-            self._deferred = []
+            deferred = self._deferred.drain()
             self._admit_cv.notify_all()
         if broker is not None:
             for request_id in active:
@@ -2407,21 +2515,55 @@ class _BrokerDownloadStage(object):
 
     def cancel_deferred(self, prefetch_only=True):
         """Remove deferred work before it reaches provider admission."""
-        removed = []
         with self._admit_cv:
-            kept = []
-            for item in self._deferred:
-                pending = item[2]
-                if (not prefetch_only) or self._is_background(pending.obj):
-                    removed.append(pending)
-                else:
-                    kept.append(item)
-            self._deferred = kept
-            heapq.heapify(self._deferred)
+            removed = self._deferred.drain(
+                lambda pending: (not prefetch_only)
+                or self._is_background(pending.obj)
+            )
             self._admit_cv.notify_all()
         for pending in removed:
             self._retire_deferred(pending)
         return len(removed)
+
+    def cancel_deferred_chunks(self, chunk_ids):
+        chunk_ids = set(chunk_ids)
+        with self._admit_cv:
+            removed = self._deferred.drain(
+                lambda pending: getattr(
+                    pending.obj, "chunk_id", None
+                )
+                in chunk_ids
+                and self._is_background(pending.obj)
+            )
+            self._admit_cv.notify_all()
+        for pending in removed:
+            self._retire_deferred(pending)
+        return len(removed)
+
+    def reprioritize_deferred(self):
+        for pending in self._deferred.items():
+            key = getattr(pending.obj, "chunk_id", None) or id(pending.obj)
+            self._deferred.reprioritize(
+                key,
+                int(getattr(pending.obj, "priority", 0)),
+            )
+        broker = _get_http2_client()
+        if broker is None:
+            return
+        with self._lock:
+            active = tuple(self._active.items())
+        for request_id, state in active:
+            try:
+                broker.reprioritize(
+                    request_id,
+                    int(getattr(state.obj, "priority", 0)),
+                )
+            except BrokerError:
+                log.debug(
+                    "Broker reprioritization failed for %s",
+                    request_id,
+                    exc_info=True,
+                )
 
 
 class Getter(object):
@@ -2431,23 +2573,40 @@ class Getter(object):
     session = None
 
     def __init__(self, num_workers):
-        
         self.count = 0
-        # Live work is never capacity-rejected. Prefetch has a separate,
-        # bounded lane and cannot occupy or block live admission.
-        self.live_queue = PriorityQueue()
-        self.prefetch_queue = PriorityQueue(
-            maxsize=max(
-                32,
-                min(
-                    4096,
-                    int(
-                        getattr(
-                            CFG.autoortho, "prefetch_max_chunks", 512
-                        )
-                    ),
-                ),
+        try:
+            provider_connections = int(
+                resolve_provider_setting("provider_max_connections")
             )
+        except Exception:
+            try:
+                provider_connections = int(
+                    resolve_provider_setting("provider_max_in_flight")
+                )
+            except Exception:
+                provider_connections = 32
+        self._prefetch_queue_capacity = max(
+            64, min(512, 2 * max(1, provider_connections))
+        )
+
+        def work_key(item):
+            obj = item[0]
+            return getattr(obj, "chunk_id", None) or id(obj)
+
+        def work_priority(item):
+            obj = item[0]
+            return int(getattr(obj, "priority", 0))
+
+        # Active capacity is independent from the user-facing admission burst.
+        # Tombstoned queue revisions do not consume this bound.
+        self.live_queue = IndexedPriorityQueue(
+            key=work_key,
+            priority=work_priority,
+        )
+        self.prefetch_queue = IndexedPriorityQueue(
+            maxsize=self._prefetch_queue_capacity,
+            key=work_key,
+            priority=work_priority,
         )
         # Compatibility alias for diagnostics that inspect the live lane.
         self.queue = self.live_queue
@@ -2482,11 +2641,7 @@ class Getter(object):
             stage.stop()
 
         for work_queue in (self.live_queue, self.prefetch_queue):
-            try:
-                while True:
-                    work_queue.get_nowait()
-            except Empty:
-                pass
+            work_queue.drain()
         
         # Join workers with timeout to prevent hanging on shutdown
         for t in self.workers:
@@ -2665,7 +2820,11 @@ class Getter(object):
         else:
             target = self.live_queue
         try:
-            target.put_nowait((obj, args, kwargs))
+            target.put_nowait(
+                (obj, args, kwargs),
+                item_key=getattr(obj, "chunk_id", None) or id(obj),
+                item_priority=int(getattr(obj, "priority", 0)),
+            )
             return True
         except Full:
             # Only the prefetch lane is bounded.
@@ -2677,6 +2836,22 @@ class Getter(object):
             "live": self.live_queue.qsize(),
             "prefetch": self.prefetch_queue.qsize(),
         }
+
+    def prefetch_capacity_snapshot(self):
+        stage = self._async_stage
+        if stage is not None:
+            return stage.prefetch_capacity_snapshot(
+                queue_available=self.prefetch_queue.available(),
+                live_queued=self.live_queue.qsize(),
+            )
+        queue_available = self.prefetch_queue.available()
+        return PrefetchCapacitySnapshot(
+            queue_available=queue_available,
+            stage_available=queue_available,
+            deferred_available=queue_available,
+            live_queued=self.live_queue.qsize(),
+            broker_background_available=queue_available,
+        )
 
     def get(obj, *args, **kwargs):
         raise NotImplementedError
@@ -2706,6 +2881,25 @@ class Getter(object):
             obj.in_queue = False
             return False
 
+    def submit_prefetch(self, obj, *args, **kwargs):
+        if not self.WORKING.is_set():
+            return PrefetchSubmitStatus.STOPPING
+        if not is_prefetch_runtime_allowed():
+            return PrefetchSubmitStatus.DISABLED
+        if getattr(obj, "cancelled", False) or obj.permanent_failure:
+            return PrefetchSubmitStatus.CANCELLED
+        if obj.ready.is_set():
+            return PrefetchSubmitStatus.ALREADY_READY
+        if obj.in_queue:
+            return PrefetchSubmitStatus.ALREADY_QUEUED
+        if obj.in_flight:
+            return PrefetchSubmitStatus.ALREADY_ACTIVE
+        return (
+            PrefetchSubmitStatus.ACCEPTED
+            if self.submit(obj, *args, **kwargs)
+            else PrefetchSubmitStatus.NO_CAPACITY
+        )
+
 class ChunkGetter(Getter):
     # Track in-progress chunk_ids GLOBALLY to prevent queueing duplicates
     _queued_chunk_ids = set()
@@ -2714,26 +2908,26 @@ class ChunkGetter(Getter):
     _queued_lock = threading.Lock()
 
     def reprioritize_queue(self) -> None:
-        """Rebuild both heaps and move promoted prefetch into the live lane."""
-        promoted = []
-        try:
-            with self.prefetch_queue.mutex:
-                kept = []
-                for item in self.prefetch_queue.queue:
-                    if getattr(item[0], "prefetch", False):
-                        kept.append(item)
-                    else:
-                        promoted.append(item)
-                self.prefetch_queue.queue[:] = kept
-                heapq.heapify(self.prefetch_queue.queue)
-                self.prefetch_queue.not_full.notify_all()
-            for item in promoted:
-                self.live_queue.put_nowait(item)
-            with self.live_queue.mutex:
-                heapq.heapify(self.live_queue.queue)
-                self.live_queue.not_empty.notify_all()
-        except Exception:
-            pass
+        """Re-key queued work and move promoted prefetch into the live lane."""
+        with self._queued_lock:
+            queued = tuple(self._queued_chunk_objs.items())
+        for chunk_id, obj in queued:
+            priority = int(getattr(obj, "priority", 0))
+            if getattr(obj, "prefetch", False):
+                self.prefetch_queue.reprioritize(chunk_id, priority)
+            else:
+                item = self.prefetch_queue.remove(chunk_id)
+                if item is not None:
+                    self.live_queue.put_nowait(
+                        item,
+                        item_key=chunk_id,
+                        item_priority=priority,
+                    )
+                else:
+                    self.live_queue.reprioritize(chunk_id, priority)
+        stage = self._async_stage
+        if stage is not None:
+            stage.reprioritize_deferred()
 
     def _cancel_work(self, reason="", prefetch_only=True,
                      include_inflight=False) -> int:
@@ -2756,22 +2950,11 @@ class ChunkGetter(Getter):
             else (self.live_queue, self.prefetch_queue)
         )
         for work_queue in queues:
-            with work_queue.mutex:
-                kept = []
-                removed = []
-                for item in list(work_queue.queue):
-                    obj = item[0]
-                    if (not prefetch_only) or getattr(
-                        obj, 'prefetch', False
-                    ):
-                        removed.append(obj)
-                    else:
-                        kept.append(item)
-                if removed:
-                    work_queue.queue[:] = kept
-                    heapq.heapify(work_queue.queue)
-                    work_queue.not_full.notify_all()
-                    cancelled.extend(removed)
+            removed = work_queue.drain(
+                lambda item: (not prefetch_only)
+                or getattr(item[0], "prefetch", False)
+            )
+            cancelled.extend(item[0] for item in removed)
 
         for obj in cancelled:
             try:
@@ -2785,10 +2968,18 @@ class ChunkGetter(Getter):
                         waiters = self._queued_chunk_waiters.pop(
                             chunk_id, [])
                 obj.cancel()
+                mark_settled = getattr(obj, "mark_settled", None)
+                if mark_settled is not None:
+                    mark_settled()
                 for waiter in waiters:
                     try:
                         waiter.in_queue = False
                         waiter.cancel()
+                        mark_waiter_settled = getattr(
+                            waiter, "mark_settled", None
+                        )
+                        if mark_waiter_settled is not None:
+                            mark_waiter_settled()
                     except Exception:
                         pass
             except Exception:
@@ -2819,6 +3010,50 @@ class ChunkGetter(Getter):
     def cancel_prefetch_work(self, reason="") -> int:
         return self._cancel_work(reason, prefetch_only=True,
                                  include_inflight=False)
+
+    def cancel_chunks(self, chunks, reason="") -> int:
+        """Cancel a specific queued/deferred background set, not active I/O."""
+        by_id = {
+            chunk.chunk_id: chunk
+            for chunk in chunks
+            if getattr(chunk, "chunk_id", None)
+        }
+        if not by_id:
+            return 0
+        stage = self._async_stage
+        if stage is not None:
+            stage.cancel_deferred_chunks(by_id)
+        cancelled = []
+        for chunk_id, chunk in by_id.items():
+            item = self.prefetch_queue.remove(chunk_id)
+            if item is None:
+                continue
+            chunk.in_queue = False
+            with self._queued_lock:
+                self._queued_chunk_ids.discard(chunk_id)
+                self._queued_chunk_objs.pop(chunk_id, None)
+                waiters = self._queued_chunk_waiters.pop(chunk_id, [])
+            chunk.cancel()
+            mark_settled = getattr(chunk, "mark_settled", None)
+            if mark_settled is not None:
+                mark_settled()
+            for waiter in waiters:
+                waiter.in_queue = False
+                waiter.cancel()
+                mark_waiter_settled = getattr(
+                    waiter, "mark_settled", None
+                )
+                if mark_waiter_settled is not None:
+                    mark_waiter_settled()
+            cancelled.append(chunk)
+        if cancelled:
+            bump("prefetch_cancelled", len(cancelled))
+            log.debug(
+                "Cancelled %d stale prefetch chunks%s",
+                len(cancelled),
+                f" ({reason})" if reason else "",
+            )
+        return len(cancelled)
 
     def cancel_all_work(self, reason="") -> int:
         return self._cancel_work(reason, prefetch_only=False,
@@ -2878,7 +3113,7 @@ class ChunkGetter(Getter):
                 if reprioritize:
                     self.reprioritize_queue()
                 return True
-        
+
         obj.in_queue = True
         
         # Add to queue
@@ -2898,6 +3133,43 @@ class ChunkGetter(Getter):
             return False
         return True
 
+    def submit_prefetch(self, obj, *args, **kwargs):
+        """Typed prefetch admission preserving duplicate coalescing semantics."""
+        if not self.WORKING.is_set():
+            return PrefetchSubmitStatus.STOPPING
+        if not is_prefetch_runtime_allowed():
+            return PrefetchSubmitStatus.DISABLED
+        if obj.permanent_failure or getattr(obj, "cancelled", False):
+            return PrefetchSubmitStatus.CANCELLED
+        if obj.ready.is_set():
+            return PrefetchSubmitStatus.ALREADY_READY
+        if obj.in_queue:
+            return PrefetchSubmitStatus.ALREADY_QUEUED
+        if obj.in_flight:
+            return PrefetchSubmitStatus.ALREADY_ACTIVE
+
+        chunk_id = getattr(obj, "chunk_id", None)
+        queued_obj = None
+        if chunk_id:
+            with self._queued_lock:
+                queued_obj = self._queued_chunk_objs.get(chunk_id)
+                if queued_obj is not None:
+                    status = (
+                        PrefetchSubmitStatus.ALREADY_ACTIVE
+                        if getattr(queued_obj, "in_flight", False)
+                        else PrefetchSubmitStatus.ALREADY_QUEUED
+                    )
+            if queued_obj is not None:
+                # The compatibility path registers the waiter and re-keys it.
+                self.submit(obj, *args, **kwargs)
+                return status
+
+        return (
+            PrefetchSubmitStatus.ACCEPTED
+            if self.submit(obj, *args, **kwargs)
+            else PrefetchSubmitStatus.NO_CAPACITY
+        )
+
     def _complete_duplicate_waiters(self, obj, waiters):
         """Fan out one downloaded chunk result to duplicate Chunk objects."""
         if not waiters:
@@ -2913,6 +3185,9 @@ class ChunkGetter(Getter):
             waiter.in_queue = False
             waiter.in_flight = False
             waiter.ready.set()
+            mark_settled = getattr(waiter, "mark_settled", None)
+            if mark_settled is not None:
+                mark_settled()
             try:
                 if tile_completion_tracker is not None and waiter.tile_id:
                     tile_completion_tracker.notify_chunk_ready(waiter.tile_id, waiter)
@@ -2926,11 +3201,19 @@ class ChunkGetter(Getter):
         with self._queued_lock:
             waiters = self._queued_chunk_waiters.pop(chunk_id, [])
         obj.cancel()
+        mark_settled = getattr(obj, "mark_settled", None)
+        if mark_settled is not None:
+            mark_settled()
         for waiter in waiters:
             try:
                 waiter.in_queue = False
                 waiter.in_flight = False
                 waiter.cancel()
+                mark_waiter_settled = getattr(
+                    waiter, "mark_settled", None
+                )
+                if mark_waiter_settled is not None:
+                    mark_waiter_settled()
             except Exception:
                 pass
 
@@ -2967,6 +3250,11 @@ class ChunkGetter(Getter):
 
         if result:
             self._complete_duplicate_waiters(obj, waiters)
+
+        if result:
+            mark_settled = getattr(obj, "mark_settled", None)
+            if mark_settled is not None:
+                mark_settled()
 
         return result
 
@@ -4217,6 +4505,47 @@ def get_terrain_index_stats() -> List[dict]:
 # 4. Non-blocking: Runs in background, never blocks main processing
 # ============================================================================
 
+prefetch_coordinator = None
+
+
+def _prefetch_v2_enabled():
+    value = getattr(CFG.autoortho, "prefetch_pipeline_v2", True)
+    if isinstance(value, str):
+        return value.lower().strip() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+def _prefetch_quality_mode():
+    value = str(
+        getattr(
+            CFG.autoortho,
+            "prefetch_quality_mode",
+            PrefetchQualityMode.RESPONSIVE.value,
+        )
+    ).lower()
+    try:
+        return PrefetchQualityMode(value)
+    except ValueError:
+        return PrefetchQualityMode.RESPONSIVE
+
+
+def _active_mount_worker_count():
+    """Best-effort shared worker count with a conservative local fallback."""
+    now = time.time()
+    try:
+        active = sum(
+            1
+            for key in STATS
+            if (
+                isinstance(key, str)
+                and key.startswith("proc_alive_ts:")
+                and now - float(get_stat(key)) <= 30.0
+            )
+        )
+        return max(1, active)
+    except Exception:
+        return 1
+
 class SpatialPrefetcher:
     """
     Background prefetcher that anticipates tile needs based on aircraft movement.
@@ -4239,6 +4568,13 @@ class SpatialPrefetcher:
         self._running = False
         self._prefetch_count = 0
         self._tile_cacher = None
+        self._coordinator = None
+        self._velocity_generation = 0
+        self._simbrief_generation = 0
+        self._last_velocity_evidence = None
+        self._last_velocity_signature = None
+        self._last_simbrief_signature = None
+        self._shared_simbrief_generation = None
         
         # Track recently prefetched to avoid duplicates
         # Use an LRU-like structure with max size
@@ -4277,6 +4613,9 @@ class SpatialPrefetcher:
     def set_tile_cacher(self, tile_cacher):
         """Set the tile cacher reference for accessing tiles."""
         self._tile_cacher = tile_cacher
+
+    def set_coordinator(self, coordinator):
+        self._coordinator = coordinator
         
     def start(self):
         """Start the background prefetcher thread."""
@@ -4336,8 +4675,8 @@ class SpatialPrefetcher:
 
         Falls back to velocity-based prefetching if aircraft deviates from route.
         """
-        # Yield all resources to live tile reads when X-Plane is active
-        if is_live_building():
+        # Legacy submission has no admission coordinator and must fully yield.
+        if is_live_building() and self._coordinator is None:
             return
 
         # Check if tile_cacher is available
@@ -4355,6 +4694,8 @@ class SpatialPrefetcher:
         if lat < -90 or lat > 90 or lon < -180 or lon > 180:
             return
 
+        self._sync_shared_simbrief()
+
         # Check if SimBrief flight path prefetching should be used
         if self._should_use_simbrief_prefetch(lat, lon):
             chunks_submitted = self._prefetch_along_flight_plan(lat, lon)
@@ -4366,6 +4707,18 @@ class SpatialPrefetcher:
         
         # Fall back to velocity-based prefetching
         self._do_velocity_prefetch_cycle(lat, lon)
+
+    def _sync_shared_simbrief(self):
+        generation = get_stat("simbrief_route_generation")
+        if not generation or generation == self._shared_simbrief_generation:
+            return
+        self._shared_simbrief_generation = generation
+        snapshot = get_stat("simbrief_route_snapshot")
+        if snapshot:
+            if not simbrief_flight_manager.load_flight_data(snapshot):
+                log.warning("Worker rejected shared SimBrief route snapshot")
+        else:
+            simbrief_flight_manager.clear()
     
     def _should_use_simbrief_prefetch(self, lat: float, lon: float) -> bool:
         """
@@ -4381,7 +4734,12 @@ class SpatialPrefetcher:
         if not hasattr(CFG, 'simbrief'):
             return False
         
-        use_flight_data = getattr(CFG.simbrief, 'use_flight_data', False)
+        shared_enabled = get_stat("simbrief_route_enabled")
+        use_flight_data = (
+            shared_enabled
+            if shared_enabled in (True, False)
+            else getattr(CFG.simbrief, 'use_flight_data', False)
+        )
         if isinstance(use_flight_data, str):
             use_flight_data = use_flight_data.lower() in ('true', '1', 'yes', 'on')
         
@@ -4438,16 +4796,20 @@ class SpatialPrefetcher:
         # Use unified prefetch radius from config
         prefetch_radius_nm = self.prefetch_radius_nm
         
-        # Get interpolated path points with time-to-encounter
+        # Get interpolated path points with time-to-encounter. Unlimited route
+        # discovery is incremental: retain only a bounded near-term horizon.
         # Uses SimBrief's pre-calculated times (accounts for winds, climb/descent, etc.)
         # Spacing determines how frequently we sample the path
         # Smaller spacing = more uniform coverage, but more computation
         spacing_nm = min(prefetch_radius_nm / 2, 15.0)  # Sample at half the radius or 15nm
         
+        route_horizon = self.lookahead_sec
+        if self.lookahead_unlimited and self._coordinator is not None:
+            route_horizon = 30 * 60
         path_points = simbrief_flight_manager.get_path_points_with_time(
             aircraft_lat=lat,
             aircraft_lon=lon,
-            lookahead_sec=self.lookahead_sec,
+            lookahead_sec=route_horizon,
             spacing_nm=spacing_nm
         )
         
@@ -4506,6 +4868,45 @@ class SpatialPrefetcher:
 
         # Sort tiles by time-to-encounter (earliest first = nearest in time)
         sorted_tiles = sorted(tile_times.items(), key=lambda x: x[1][0])
+
+        if self._coordinator is not None:
+            evidence = []
+            max_candidates = self._coordinator.max_candidates
+            for (row, col, zoom), (time_sec, _alt_agl) in sorted_tiles[
+                :max_candidates
+            ]:
+                target_zoom = self._tile_cacher._get_target_zoom_level(
+                    zoom, row=row, col=col
+                )
+                key = self._coordinator.make_key(
+                    row,
+                    col,
+                    zoom,
+                    target_zoom,
+                    default_maptype,
+                )
+                evidence.append(
+                    {
+                        "key": key,
+                        "eta_seconds": time_sec,
+                        "distance_meters": max(0.0, time_sec) * max(
+                            self.MIN_SPEED_MPS, float(datareftracker.spd)
+                        ),
+                        "quality_class": 2 if time_sec <= 600 else 3,
+                        "source_confidence": 1.0,
+                    }
+                )
+            signature = tuple(item["key"] for item in evidence)
+            if signature == self._last_simbrief_signature:
+                return 0
+            self._last_simbrief_signature = signature
+            self._simbrief_generation += 1
+            self._coordinator.replace_generation(
+                PrefetchSource.SIMBRIEF,
+                self._simbrief_generation,
+                evidence,
+            )
+            return len(evidence)
         
         log.debug(f"Path prefetch: {len(path_points)} path points, {len(sorted_tiles)} unique tiles to prefetch")
         
@@ -4562,7 +4963,60 @@ class SpatialPrefetcher:
         if not upcoming_fixes:
             return 0
         
-        # Prefetch around each upcoming fix, stopping when we hit max chunks
+        if self._coordinator is not None:
+            evidence = {}
+            default_maptype = self._get_maptype_filter() or "EOX"
+            for fix_index, fix in enumerate(upcoming_fixes):
+                zoom_level = self._get_zoom_for_altitude(
+                    fix.altitude_agl_ft
+                )
+                eta = float(getattr(fix, "time_to_reach_sec", fix_index * 300))
+                for row, col in self._get_tiles_in_radius(
+                    fix.lat,
+                    fix.lon,
+                    prefetch_radius_nm,
+                    zoom_level,
+                ):
+                    target_zoom = self._tile_cacher._get_target_zoom_level(
+                        zoom_level, row=row, col=col
+                    )
+                    key = self._coordinator.make_key(
+                        row,
+                        col,
+                        zoom_level,
+                        target_zoom,
+                        default_maptype,
+                    )
+                    previous = evidence.get(key)
+                    if previous is None or eta < previous["eta_seconds"]:
+                        evidence[key] = {
+                            "key": key,
+                            "eta_seconds": eta,
+                            "distance_meters": eta
+                            * max(
+                                self.MIN_SPEED_MPS,
+                                float(datareftracker.spd),
+                            ),
+                            "quality_class": 3,
+                            "source_confidence": 0.8,
+                        }
+            ordered = sorted(
+                evidence.values(),
+                key=lambda item: item["eta_seconds"],
+            )[: self._coordinator.max_candidates]
+            signature = tuple(item["key"] for item in ordered)
+            if signature == self._last_simbrief_signature:
+                return 0
+            self._last_simbrief_signature = signature
+            self._simbrief_generation += 1
+            self._coordinator.replace_generation(
+                PrefetchSource.SIMBRIEF,
+                self._simbrief_generation,
+                ordered,
+            )
+            return len(ordered)
+
+        # Legacy rollback path directly submits around upcoming fixes.
         for fix in upcoming_fixes:
             if chunks_submitted >= self.max_chunks:
                 break
@@ -4796,8 +5250,38 @@ class SpatialPrefetcher:
         if spd < self.MIN_SPEED_MPS:
             return
 
+        if self._coordinator is not None:
+            target_signature = (
+                int(getattr(CFG.autoortho, "max_zoom", 16)),
+                str(getattr(CFG.autoortho, "maptype_override", "")),
+            )
+            previous = self._last_velocity_evidence
+            if previous is not None:
+                old_lat, old_lon, old_hdg, old_spd = previous
+                dlat = (lat - old_lat) * 111320
+                dlon = (
+                    (lon - old_lon)
+                    * 111320
+                    * max(0.01, math.cos(math.radians(lat)))
+                )
+                moved = math.hypot(dlat, dlon)
+                heading_delta = abs((hdg - old_hdg + 180) % 360 - 180)
+                speed_delta = abs(spd - old_spd) / max(1.0, old_spd)
+                if (
+                    moved < self.prefetch_radius_nm * 1852 * 0.25
+                    and heading_delta < 10.0
+                    and speed_delta < 0.15
+                    and target_signature == self._last_velocity_signature
+                ):
+                    return
+            self._last_velocity_evidence = (lat, lon, hdg, spd)
+            self._last_velocity_signature = target_signature
+
         # Calculate max distance based on lookahead time
-        max_distance_m = spd * self.lookahead_sec
+        discovery_lookahead = self.lookahead_sec
+        if self.lookahead_unlimited and self._coordinator is not None:
+            discovery_lookahead = 30 * 60
+        max_distance_m = spd * discovery_lookahead
         
         # Sample spacing: half the radius or 15nm max (like SimBrief approach)
         spacing_nm = min(self.prefetch_radius_nm / 2, 15.0)
@@ -4886,6 +5370,34 @@ class SpatialPrefetcher:
 
         # Sort tiles by distance (nearest first - gradient from player outward)
         sorted_tiles = sorted(tile_distances.items(), key=lambda x: x[1])
+
+        if self._coordinator is not None:
+            evidence = []
+            for (row, col, maptype, zoom), distance in sorted_tiles[
+                : self._coordinator.max_candidates
+            ]:
+                target_zoom = self._tile_cacher._get_target_zoom_level(
+                    zoom, row=row, col=col
+                )
+                key = self._coordinator.make_key(
+                    row, col, zoom, target_zoom, maptype
+                )
+                evidence.append(
+                    {
+                        "key": key,
+                        "eta_seconds": distance / max(spd, 1.0),
+                        "distance_meters": distance,
+                        "quality_class": 2 if distance <= 20 * 1852 else 3,
+                        "source_confidence": 0.9,
+                    }
+                )
+            self._velocity_generation += 1
+            self._coordinator.replace_generation(
+                PrefetchSource.VELOCITY,
+                self._velocity_generation,
+                evidence,
+            )
+            return len(evidence)
         
         # Prefetch tiles in order of proximity
         chunks_submitted = 0
@@ -5106,14 +5618,60 @@ class SpatialPrefetcher:
 spatial_prefetcher = SpatialPrefetcher()
 
 
-def start_prefetcher(tile_cacher):
+def start_prefetcher(tile_cacher, scenery_id="default"):
     """Start the spatial prefetcher with the given tile cacher."""
+    global prefetch_coordinator
     clear_shutdown_request()
     spatial_prefetcher.set_tile_cacher(tile_cacher)
+    if _prefetch_v2_enabled() and spatial_prefetcher.enabled:
+        if prefetch_coordinator is None:
+            try:
+                memory_limit = int(
+                    float(getattr(CFG.cache, "cache_mem_limit", 4))
+                    * 1024
+                    * 1024
+                    * 1024
+                    * 0.125
+                ) // _active_mount_worker_count()
+            except (TypeError, ValueError):
+                memory_limit = 512 * 1024 * 1024
+            try:
+                provider_capacity = int(
+                    resolve_provider_setting("provider_max_in_flight")
+                )
+            except Exception:
+                provider_capacity = 64
+            prefetch_coordinator = PrefetchCoordinator(
+                tile_cacher=tile_cacher,
+                chunk_getter=chunk_getter,
+                scenery_id=scenery_id,
+                admission_burst=int(
+                    getattr(CFG.autoortho, "prefetch_max_chunks", 64)
+                ),
+                max_candidates=256,
+                max_tile_leases=min(96, max(16, provider_capacity)),
+                max_materialized_chunks=max(
+                    64, min(512, 2 * provider_capacity)
+                ),
+                max_jpeg_bytes=max(
+                    64 * 1024 * 1024,
+                    min(512 * 1024 * 1024, memory_limit),
+                ),
+                metric=bump,
+                gauge=profile_gauge,
+            )
+            prefetch_coordinator.start()
+        spatial_prefetcher.set_coordinator(prefetch_coordinator)
+    else:
+        spatial_prefetcher.set_coordinator(None)
     spatial_prefetcher.start()
 
 
-def prefetch_dsf(dsf_path: str, max_chunks: Optional[int] = None) -> int:
+def prefetch_dsf(
+    dsf_path: str,
+    max_chunks: Optional[int] = None,
+    cursor: Optional[int] = None,
+):
     if not is_prefetch_runtime_allowed():
         return 0
     tiles = get_tiles_for_dsf(dsf_path)
@@ -5123,6 +5681,44 @@ def prefetch_dsf(dsf_path: str, max_chunks: Optional[int] = None) -> int:
             (row, col, maptype_override, zoom)
             for row, col, _terrain_maptype, zoom in tiles
         ]
+    if prefetch_coordinator is not None:
+        start = max(0, int(cursor or 0))
+        batch_size = max(1, min(64, int(max_chunks or 64)))
+        end = min(len(tiles), start + batch_size)
+        submitted = 0
+        next_cursor = start
+        pressure = False
+        generation = os.path.normcase(os.path.abspath(dsf_path))
+        for row, col, maptype, zoom in tiles[start:end]:
+            target_zoom = spatial_prefetcher._tile_cacher._get_target_zoom_level(
+                zoom, row=row, col=col
+            )
+            key = prefetch_coordinator.make_key(
+                row,
+                col,
+                zoom,
+                target_zoom,
+                maptype,
+            )
+            created = prefetch_coordinator.publish(
+                key,
+                source=PrefetchSource.DSF,
+                generation=generation,
+                quality_class=4,
+                source_confidence=0.7,
+            )
+            if not created and not prefetch_coordinator.is_known(key):
+                pressure = True
+                break
+            submitted += int(created)
+            next_cursor += 1
+        complete = next_cursor >= len(tiles)
+        return {
+            "submitted": submitted,
+            "complete": complete,
+            "pressure": pressure,
+            "cursor": None if complete else next_cursor,
+        }
     return spatial_prefetcher.prefetch_tiles(
         tiles, max_chunks=max_chunks
     )
@@ -5130,7 +5726,12 @@ def prefetch_dsf(dsf_path: str, max_chunks: Optional[int] = None) -> int:
 
 def stop_prefetcher():
     """Stop the spatial prefetcher."""
+    global prefetch_coordinator
     spatial_prefetcher.stop()
+    spatial_prefetcher.set_coordinator(None)
+    if prefetch_coordinator is not None:
+        prefetch_coordinator.stop()
+        prefetch_coordinator = None
 
 
 # ============================================================================
@@ -5370,6 +5971,16 @@ class TileCompletionTracker:
 
 
 
+@dataclass
+class _DDSBuildRequest:
+    tile: object
+    priority: tuple
+    estimated_bytes: int
+    exact_target: bool = False
+    callbacks: list = field(default_factory=list)
+    active: bool = False
+
+
 class BackgroundDDSBuilder:
     
     # Maximum queue depth (prevents unbounded memory growth)
@@ -5384,11 +5995,34 @@ class BackgroundDDSBuilder:
             build_interval_sec: Minimum time between submissions (rate limiting)
             max_workers: Number of parallel build workers
         """
-        self._queue = PriorityQueue(maxsize=self.MAX_QUEUE_SIZE)
-        self._queue_sequence = itertools.count()
+        self._queue = IndexedPriorityQueue(
+            maxsize=self.MAX_QUEUE_SIZE,
+            key=lambda request: request.tile.id,
+            priority=lambda request: request.priority,
+            on_compact=lambda count: bump(
+                "background_dds_heap_compactions"
+            ),
+        )
         self._dds_cache = dds_cache
         self._build_interval = build_interval_sec
         self._max_workers = max_workers
+        try:
+            configured_mb = int(
+                getattr(
+                    CFG.autoortho,
+                    "predictive_dds_memory_mb",
+                    512,
+                )
+            )
+        except (TypeError, ValueError):
+            configured_mb = 512
+        configured_mb = max(
+            64, configured_mb // _active_mount_worker_count()
+        )
+        self._byte_budget = configured_mb * 1024 * 1024
+        self._queued_bytes = 0
+        self._active_bytes = 0
+        self._requests = {}
         
         # Worker pool for parallel builds
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
@@ -5432,19 +6066,18 @@ class BackgroundDDSBuilder:
         self._stop_event.set()
         self._work_event.set()  # Wake coordinator so it sees stop_event
 
-        # Drain queue
-        try:
-            while True:
-                self._queue.get_nowait()
-        except Empty:
-            pass
+        pending = self._queue.drain()
+        with self._active_lock:
+            for request in pending:
+                self._queued_bytes = max(
+                    0, self._queued_bytes - request.estimated_bytes
+                )
+                self._requests.pop(request.tile.id, None)
+        for request in pending:
+            self._notify_build_callbacks(request, False)
 
         # Stop coordinator
         if self._coordinator_thread is not None:
-            try:
-                self._queue.put_nowait((float('inf'), next(self._queue_sequence), None))  # Sentinel
-            except Full:
-                pass
             self._coordinator_thread.join(timeout=2.0)
             self._coordinator_thread = None
 
@@ -5459,7 +6092,45 @@ class BackgroundDDSBuilder:
         log.info(f"BackgroundDDSBuilder stopped "
                 f"(built={self._builds_completed}, failed={self._builds_failed})")
     
-    def submit(self, tile, priority: float = PRIORITY_BACKGROUND_DDS) -> bool:
+    @staticmethod
+    def _priority_tuple(priority):
+        return priority if isinstance(priority, tuple) else (priority,)
+
+    @staticmethod
+    def _estimate_working_set(tile):
+        grid = tile.chunks.get(tile.max_zoom)
+        chunk_count = getattr(grid, "logical_length", 0)
+        if not chunk_count:
+            chunk_count = len(grid or ())
+        return max(32 * 1024 * 1024, int(chunk_count) * 256 * 1024)
+
+    @staticmethod
+    def _target_is_exact(tile):
+        grid = tile.chunks.get(tile.max_zoom)
+        if grid is None:
+            return False
+        chunks = (
+            grid.materialized()
+            if hasattr(grid, "materialized")
+            else tuple(grid)
+        )
+        logical_length = getattr(grid, "logical_length", len(chunks))
+        return (
+            len(chunks) == logical_length
+            and bool(chunks)
+            and all(
+                chunk.ready.is_set() and bool(chunk.data)
+                for chunk in chunks
+            )
+        )
+
+    def submit(
+        self,
+        tile,
+        priority: float = PRIORITY_BACKGROUND_DDS,
+        completion_callback=None,
+        exact_target: bool = False,
+    ) -> bool:
         """
         Submit a tile for background DDS building.
         
@@ -5473,23 +6144,85 @@ class BackgroundDDSBuilder:
         """
         if tile is None:
             return False
+
+        if not exact_target and not self._target_is_exact(tile):
+            bump("degraded_dds_builds_rejected")
+            return False
         
         # Skip if already in DDS cache (allow through if healing needed)
         if self._dds_cache is not None and self._dds_cache.contains(tile.id, tile.max_zoom, tile):
             if not getattr(tile, '_dds_needs_healing', False):
                 log.debug(f"BackgroundDDSBuilder: Skipping {tile.id} - already cached")
+                if completion_callback is not None:
+                    completion_callback(True)
+                    return True
                 return False
             log.debug(f"BackgroundDDSBuilder: healing tile {tile.id} passed through")
         
+        normalized_priority = self._priority_tuple(priority)
+        estimated_bytes = self._estimate_working_set(tile)
+        with self._active_lock:
+            existing = self._requests.get(tile.id)
+            if existing is not None:
+                if completion_callback is not None:
+                    existing.callbacks.append(completion_callback)
+                if normalized_priority < existing.priority:
+                    existing.priority = normalized_priority
+                    if not existing.active:
+                        self._queue.reprioritize(
+                            tile.id,
+                            normalized_priority,
+                        )
+                return True
+            if (
+                self._queued_bytes
+                + self._active_bytes
+                + estimated_bytes
+                > self._byte_budget
+            ):
+                bump("background_dds_byte_budget_full")
+                return False
+            request = _DDSBuildRequest(
+                tile=tile,
+                priority=normalized_priority,
+                estimated_bytes=estimated_bytes,
+                exact_target=bool(exact_target),
+                callbacks=(
+                    [completion_callback]
+                    if completion_callback is not None
+                    else []
+                ),
+            )
+            self._requests[tile.id] = request
+            self._queued_bytes += estimated_bytes
         try:
-            self._queue.put_nowait((priority, next(self._queue_sequence), tile))
+            self._queue.put_nowait(
+                request,
+                item_key=tile.id,
+                item_priority=normalized_priority,
+            )
             self._work_event.set()  # Wake coordinator immediately
             log.debug(f"BackgroundDDSBuilder: Queued {tile.id} "
                      f"(queue size: {self._queue.qsize()})")
             return True
         except Full:
+            with self._active_lock:
+                self._requests.pop(tile.id, None)
+                self._queued_bytes = max(
+                    0, self._queued_bytes - estimated_bytes
+                )
             log.debug(f"BackgroundDDSBuilder: Queue full, skipping {tile.id}")
             return False
+
+    def reprioritize(self, tile, priority) -> bool:
+        with self._active_lock:
+            request = self._requests.get(tile.id)
+            if request is None or request.active:
+                return False
+            request.priority = self._priority_tuple(priority)
+            return self._queue.reprioritize(
+                tile.id, request.priority
+            )
     
     def _coordinator_loop(self) -> None:
         """
@@ -5523,31 +6256,42 @@ class BackgroundDDSBuilder:
                 except Empty:
                     break  # Queue exhausted
 
-                # Sentinel value signals shutdown
-                if item is None:
-                    continue
-
-                priority, _seq, tile = item
-                if tile is None:
-                    continue
+                request = item
+                self._queue.task_done()
+                tile = request.tile
 
                 # Drop evicted tiles early to avoid holding
                 # references longer than necessary
                 if getattr(tile, '_closed', False):
                     bump('prebuilt_dds_skip_closed')
+                    with self._active_lock:
+                        self._queued_bytes = max(
+                            0,
+                            self._queued_bytes - request.estimated_bytes,
+                        )
+                        self._requests.pop(tile.id, None)
+                    self._notify_build_callbacks(request, False)
                     continue
 
                 if self._executor is not None:
                     with self._active_lock:
+                        request.active = True
+                        self._queued_bytes = max(
+                            0,
+                            self._queued_bytes - request.estimated_bytes,
+                        )
+                        self._active_bytes += request.estimated_bytes
                         self._active_builds += 1
                     self._executor.submit(
-                        self._build_tile_wrapper, priority, tile
+                        self._build_tile_wrapper, request
                     )
                     batch_submitted += 1
     
-    def _build_tile_wrapper(self, priority, tile) -> None:
+    def _build_tile_wrapper(self, request) -> None:
         """Wrapper for _build_tile_dds that handles exceptions and stats."""
+        tile = request.tile
         deferred = False
+        success = False
         try:
             if is_shutdown_requested():
                 bump('prebuilt_dds_skip_shutdown')
@@ -5562,19 +6306,93 @@ class BackgroundDDSBuilder:
                 bump('prebuilt_dds_skip_closed')
                 return
             _defer_background_build_if_live(tile)
+            if request.exact_target:
+                tile._get_chunk_grid(tile.max_zoom).ensure_all()
+                if not self._target_is_exact(tile):
+                    bump("degraded_dds_builds_rejected")
+                    return
             self._build_tile_dds(tile)
+            success = bool(
+                not getattr(tile, "_dds_needs_healing", False)
+                and not getattr(tile, "_dds_missing_indices", ())
+                and not getattr(tile, "_dds_fallback_indices", ())
+                and (
+                    getattr(tile, "_dds_persisted", False)
+                    or getattr(tile, "_dds_persistence_accepted", False)
+                    or (
+                        self._dds_cache is not None
+                        and self._dds_cache.contains(
+                            tile.id, tile.max_zoom, tile
+                        )
+                    )
+                )
+            )
         except _BackgroundBuildDeferred:
             bump('background_build_deferred_live')
-            deferred = self.submit(tile, priority=priority)
+            deferred = True
+        except Exception:
+            log.exception(
+                "BackgroundDDSBuilder failed for %s",
+                getattr(tile, "id", tile),
+            )
         finally:
-            if not deferred:
+            if not deferred and not success:
                 try:
                     tile._clear_mm0_promotion_pin()
                 except Exception:
                     pass
             with self._active_lock:
+                request.active = False
+                self._active_bytes = max(
+                    0, self._active_bytes - request.estimated_bytes
+                )
                 self._active_builds -= 1
+                if not deferred:
+                    self._requests.pop(tile.id, None)
+            if deferred and not self._stop_event.is_set():
+                with self._active_lock:
+                    if (
+                        self._queued_bytes
+                        + self._active_bytes
+                        + request.estimated_bytes
+                        <= self._byte_budget
+                    ):
+                        self._queued_bytes += request.estimated_bytes
+                        request.active = False
+                        can_requeue = True
+                    else:
+                        self._requests.pop(tile.id, None)
+                        can_requeue = False
+                if can_requeue:
+                    try:
+                        self._queue.put_nowait(
+                            request,
+                            item_key=tile.id,
+                            item_priority=request.priority,
+                        )
+                    except Full:
+                        with self._active_lock:
+                            self._queued_bytes = max(
+                                0,
+                                self._queued_bytes
+                                - request.estimated_bytes,
+                            )
+                            self._requests.pop(tile.id, None)
+                        can_requeue = False
+                if not can_requeue:
+                    deferred = False
+            if not deferred:
+                self._notify_build_callbacks(request, success)
             self._work_event.set()  # Signal coordinator a slot freed up
+
+    @staticmethod
+    def _notify_build_callbacks(request, success):
+        callbacks, request.callbacks = request.callbacks, []
+        for callback in callbacks:
+            try:
+                callback(bool(success))
+            except Exception:
+                log.exception("Background DDS completion callback failed")
     
     def _try_streaming_prefetch_build(self, tile, tile_id: str, build_start: float) -> bool:
         """
@@ -6318,11 +7136,17 @@ class BackgroundDDSBuilder:
     @property
     def stats(self) -> dict:
         """Return builder statistics."""
+        with self._active_lock:
+            queued_bytes = self._queued_bytes
+            active_bytes = self._active_bytes
         return {
             'queue_size': self._queue.qsize(),
             'builds_completed': self._builds_completed,
             'builds_failed': self._builds_failed,
-            'interval_ms': self._build_interval * 1000
+            'interval_ms': self._build_interval * 1000,
+            'queued_bytes': queued_bytes,
+            'active_bytes': active_bytes,
+            'byte_budget': self._byte_budget,
         }
 
 
@@ -6655,6 +7479,8 @@ def start_predictive_dds(tile_cacher=None) -> None:
     if isinstance(prefetch_enabled, str):
         prefetch_enabled = prefetch_enabled.lower() in ('true', '1', 'yes', 'on')
     if not prefetch_enabled:
+        if prefetch_coordinator is not None:
+            prefetch_coordinator.set_builder(False)
         log.info("Predictive DDS generation disabled because spatial prefetching is disabled")
         return
 
@@ -6663,6 +7489,8 @@ def start_predictive_dds(tile_cacher=None) -> None:
         enabled = enabled.lower() in ('true', '1', 'yes', 'on')
     
     if not enabled:
+        if prefetch_coordinator is not None:
+            prefetch_coordinator.set_builder(False)
         log.info("Predictive DDS generation disabled by configuration")
         return
     
@@ -6720,7 +7548,16 @@ def start_predictive_dds(tile_cacher=None) -> None:
         # Wire network healing callback so cache can trigger downloads
         dynamic_dds_cache._network_heal_callback = _dispatch_network_healing
 
-        size_desc = f"max={persistent_dds_mb}MB" if persistent_dds_mb > 0 else "unlimited"
+        if persistent_dds_mb > 0:
+            size_desc = f"max={persistent_dds_mb}MB"
+        elif _get_bool_config(
+            CFG.autoortho,
+            "disk_budget_enabled",
+            True,
+        ):
+            size_desc = "shared-disk-budget managed"
+        else:
+            size_desc = "unlimited"
         log.info(f"Dynamic DDS cache initialized ({size_desc})")
     except Exception as e:
         log.warning(f"Failed to initialize Dynamic DDS cache: {e}")
@@ -6790,6 +7627,8 @@ def start_predictive_dds(tile_cacher=None) -> None:
 
     # Start the builder thread
     background_dds_builder.start()
+    if prefetch_coordinator is not None:
+        prefetch_coordinator.set_builder(background_dds_builder)
     
     size_desc = (
         f"{persistent_dds_mb}MB"
@@ -7032,12 +7871,34 @@ class _ChunkReadyEvent(threading.Event):
     def __init__(self, condition=None):
         super().__init__()
         self._condition = condition
+        self._callbacks = []
+        self._callbacks_lock = threading.Lock()
 
     def set(self):
+        was_set = self.is_set()
         super().set()
         if self._condition is not None:
             with self._condition:
                 self._condition.notify_all()
+        if was_set:
+            return
+        with self._callbacks_lock:
+            callbacks, self._callbacks = self._callbacks, []
+        for callback in callbacks:
+            try:
+                callback(self)
+            except Exception:
+                log.exception("Chunk completion callback failed")
+
+    def add_callback(self, callback):
+        run_now = False
+        with self._callbacks_lock:
+            if self.is_set():
+                run_now = True
+            else:
+                self._callbacks.append(callback)
+        if run_now:
+            callback(self)
 
 
 class ChunkGrid:
@@ -7242,6 +8103,9 @@ class Chunk(object):
         self.cancelled = False
         self.prefetch = False
         self._broker_request_id = None
+        self._settled = False
+        self._settled_callbacks = []
+        self._settled_callbacks_lock = threading.Lock()
 
         self.cache_path = os.path.join(self.cache_dir, f"{self.chunk_id}.jpg")
 
@@ -7783,6 +8647,31 @@ class Chunk(object):
 
         # Remove raw JPEG bytes
         self.data = None
+
+    def add_settled_callback(self, callback):
+        run_now = False
+        with self._settled_callbacks_lock:
+            if self._settled:
+                run_now = True
+            else:
+                self._settled_callbacks.append(callback)
+        if run_now:
+            callback(self)
+
+    def mark_settled(self):
+        with self._settled_callbacks_lock:
+            if self._settled:
+                return
+            self._settled = True
+            callbacks, self._settled_callbacks = (
+                self._settled_callbacks,
+                [],
+            )
+        for callback in callbacks:
+            try:
+                callback(self)
+            except Exception:
+                log.exception("Chunk settlement callback failed")
 
     def cancel(self):
         """Cancel this chunk's download.
@@ -9476,6 +10365,8 @@ class Tile(object):
             1 = cache (disk cache + mipmap scaling)  
             2 = full (all fallbacks including network)
         """
+        if _prefetch_quality_mode() == PrefetchQualityMode.STRICT_TARGET:
+            return 0
         level_str = str(getattr(CFG.autoortho, 'fallback_level', 'cache')).lower()
         if level_str == 'none':
             return 0
@@ -9502,10 +10393,50 @@ class Tile(object):
         is stored here specifically for the streaming builder which runs in a separate
         context and needs access to the request's budget.
         """
+        coordinator = prefetch_coordinator
+        if coordinator is not None:
+            coordinator.promote_tile(self)
+
         if self._is_live:
             return  # Already live
         
         self._is_live = True
+
+        quality_mode = _prefetch_quality_mode()
+        if time_budget is not None:
+            if quality_mode == PrefetchQualityMode.PREFER_TARGET:
+                try:
+                    grace = max(
+                        0.0,
+                        float(
+                            getattr(
+                                CFG.autoortho,
+                                "prefetch_quality_grace_sec",
+                                5.0,
+                            )
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    grace = 5.0
+                time_budget.max_seconds += grace
+            elif quality_mode == PrefetchQualityMode.STRICT_TARGET:
+                try:
+                    deadline = max(
+                        1.0,
+                        float(
+                            getattr(
+                                CFG.autoortho,
+                                "strict_target_deadline_sec",
+                                120.0,
+                            )
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    deadline = 120.0
+                time_budget.max_seconds = min(
+                    max(time_budget.max_seconds, deadline),
+                    deadline,
+                )
         
         # Store time budget for streaming builder (which runs in separate context)
         if time_budget is not None:
@@ -9901,6 +10832,19 @@ class Tile(object):
             log.debug(f"GET_BYTES: DDS is None for {self}, likely closing; skipping")
             return True
 
+        transition_budget = time_budget
+        if not self._is_live and transition_budget is None:
+            transition_budget = TimeBudget(
+                float(
+                    getattr(
+                        CFG.autoortho,
+                        'tile_time_budget',
+                        30.0,
+                    )
+                )
+            )
+        self.mark_live(transition_budget)
+
         requested_mipmap = self.find_mipmap_pos(offset)
 
         # ═══════════════════════════════════════════════════════════════════
@@ -9961,20 +10905,22 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════
         # PREFETCH-TO-LIVE TRANSITION: Check if tile is being prebuilt
         # ═══════════════════════════════════════════════════════════════════
-        # If BackgroundDDSBuilder is currently processing this tile, trigger
-        # transition to live mode: apply time budget and boost priorities.
-        if self._active_streaming_builder is not None and not self._is_live:
-            # Use the passed-in request budget for live transition
-            transition_budget = time_budget
+        # If BackgroundDDSBuilder is currently processing this tile, briefly
+        # wait for a safely promoted build before falling through to live work.
+        if self._active_streaming_builder is not None:
+            transition_budget = (
+                self._tile_time_budget or time_budget
+            )
             if transition_budget is None:
-                # Fallback: create a budget if caller didn't provide one
-                # Default 30s is responsive for flight sims - config can override for quality
-                budget_seconds = float(getattr(CFG.autoortho, 'tile_time_budget', 30.0))
-                transition_budget = TimeBudget(budget_seconds)
-            
-            # Trigger transition (boosts priorities, applies budget)
-            self.mark_live(transition_budget)
-            
+                transition_budget = TimeBudget(
+                    float(
+                        getattr(
+                            CFG.autoortho,
+                            'tile_time_budget',
+                            30.0,
+                        )
+                    )
+                )
             # Wait briefly for prefetch to complete with boosted priority
             if self._live_transition_event is not None:
                 wait_time = min(transition_budget.remaining, 2.0)
@@ -11618,6 +12564,8 @@ class Tile(object):
         For backwards compatibility, also accepts integer strings '0', '1', '2'
         and boolean True/False (legacy config parsing artifacts).
         """
+        if _prefetch_quality_mode() == PrefetchQualityMode.STRICT_TARGET:
+            return 0
         fb_value = getattr(CFG.autoortho, 'fallback_level', 'cache')
         
         # Handle string values
@@ -13697,6 +14645,7 @@ class TileCacher(object):
     def _close_tile(self, row, col, map_type, zoom):
         tile_id = self._to_tile_id(row, col, map_type, zoom)
         release_completed_sources = None
+        release_live_owner = None
         with self.tc_lock:
             t = self.tiles.get(tile_id)
             if not t:
@@ -13709,9 +14658,11 @@ class TileCacher(object):
                 log.debug(f"Cache enabled.  Delay tile close for {tile_id}")
                 if t.refs <= 0:
                     release_completed_sources = t
+                    release_live_owner = t
             elif t.refs <= 0:
                 log.debug(f"No more refs for {tile_id} closing...")
                 t = self.tiles.pop(tile_id)
+                release_live_owner = t
                 t.close()
                 t = None
                 del(t)
@@ -13720,7 +14671,31 @@ class TileCacher(object):
 
         if release_completed_sources is not None:
             release_completed_sources._release_completed_sources()
+        if (
+            release_live_owner is not None
+            and prefetch_coordinator is not None
+        ):
+            prefetch_coordinator.release_live_tile(release_live_owner)
 
+        return True
+
+    def _close_prefetch_tile(self, row, col, map_type, zoom):
+        """Release a background lease and evict it unless live code owns it."""
+        tile_id = self._to_tile_id(row, col, map_type, zoom)
+        tile = None
+        with self.tc_lock:
+            current = self.tiles.get(tile_id)
+            if current is None:
+                return False
+            current.refs -= 1
+            if current.refs <= 0:
+                tile = self.tiles.pop(tile_id, None)
+        if tile is not None:
+            if tile_completion_tracker is not None:
+                tile_completion_tracker.stop_tracking(tile_id)
+            tile.close()
+            if prefetch_coordinator is not None:
+                prefetch_coordinator.release_live_tile(tile)
         return True
     
     def is_tile_opened_by_xplane(self, row: int, col: int, map_type: str, zoom: int) -> bool:

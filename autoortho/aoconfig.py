@@ -204,20 +204,30 @@ native_partial_allow_incomplete = False
 # Spatial prefetching - proactively downloads tiles ahead of aircraft
 # Enable/disable prefetching (True/False)
 prefetch_enabled = True
+# Unified bounded candidate/admission pipeline. Disable only as a temporary
+# rollback while diagnosing a provider- or scenery-specific regression.
+prefetch_pipeline_v2 = True
 # How far ahead to prefetch in minutes of flight time (1-60)
 # Higher = more tiles prefetched ahead, uses more bandwidth and memory
 # Lower = fewer tiles prefetched, less resource usage
-# Recommended: 15 (fast aircraft), 30 (balanced), 60 (slow internet or long haul)
-# Set to 0 for Unlimited lookahead (continues until max_chunks or other limits)
-prefetch_lookahead = 0
+# Set to 0 for unlimited route discovery. Retained candidates and admitted work
+# remain bounded even in unlimited mode.
+prefetch_lookahead = 10
 # How often to check for prefetch opportunities in seconds (0.5-10)
 prefetch_interval = 1.0
-# Maximum chunks to prefetch per cycle (32-4096)
-prefetch_max_chunks = 512
+# Maximum chunks admitted in one coordinator cycle. This does not size queues.
+prefetch_max_chunks = 64
 # Prefetch radius in nautical miles (10-150)
 # Tiles within this radius of the flight path are prefetched
 # Used by both velocity-based and SimBrief prefetching
-prefetch_radius_nm = 40
+prefetch_radius_nm = 30
+# Live imagery quality policy:
+# responsive = bounded wait with lower-ZL fallback (existing behavior)
+# prefer_target = pause distant work and grant a short exact-quality grace period
+# strict_target = never substitute lower-ZL data into mipmap zero
+prefetch_quality_mode = responsive
+prefetch_quality_grace_sec = 5.0
+strict_target_deadline_sec = 120.0
 # Predictive DDS generation - pre-build DDS textures in background after prefetch
 # When enabled, tiles are compressed to DDS in the background, eliminating stutters
 # when X-Plane loads new scenery areas. Falls back gracefully on cache miss.
@@ -232,8 +242,10 @@ predictive_dds_build_interval_ms = 250
 # These run in the background to pre-build tiles ahead of where you're flying
 # Higher values = faster prefetch throughput, but more CPU usage during flight
 # Lower values = less CPU impact, slower prefetch
-# Recommended: 2 (low-end CPU or battery saving), 8 (balanced, default), 12-16 (fast CPU)
-background_builder_workers = 8
+# This is a maximum; the predictive byte budget may admit fewer concurrently.
+background_builder_workers = 2
+# Estimated decoded/native working-set budget for predictive builds.
+predictive_dds_memory_mb = 512
 # Number of concurrent tile build workers (1-32)
 # Controls how many tiles can be built simultaneously by the native pipeline
 # Higher values = faster tile processing, more CPU/RAM usage
@@ -265,8 +277,8 @@ ephemeral_dds_cache_mb = 4096
 # Set to 0 for unlimited cache (recommended). Uses disk budget manager for cleanup.
 persistent_dds_cache_mb = 0
 # Persist compressed mipmap-0 chunk rows asynchronously for repeat ZL17 loads.
-# The conservative default keeps existing installations unchanged.
-persist_partial_dds_cache = False
+# Exact compressed rows are safe to reuse across sessions.
+persist_partial_dds_cache = True
 # Delete source JPEG chunks only after a complete DDS is durably stored. Keeping
 # sources improves rebuild resilience when compiled DDS entries are evicted.
 cleanup_source_jpegs_after_dds = False
@@ -276,7 +288,8 @@ dds_cache_maintenance_workers = 2
 # When total cache exceeds file_cache_size, oldest data is evicted
 # Categories: DDS cache (compiled textures), JPEGs (source images)
 disk_budget_enabled = True
-# Percentage of file_cache_size allocated to persistent DDS cache (10-90)
+# Literal percentage of file_cache_size allocated to persistent DDS cache
+# (10-90). JPEG source files receive the remainder.
 dds_budget_pct = 80
 # Maximum threads for native pipeline operations (per concurrent build)
 # 0 = auto (dynamically divides CPU cores across concurrent builds)

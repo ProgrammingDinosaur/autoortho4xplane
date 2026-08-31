@@ -375,6 +375,38 @@ def test_stage_releases_slots():
         stage.stop(timeout=2.0)
 
 
+def test_stage_release_uses_admission_class_after_live_promotion():
+    _, stage = _make_stage(max_outstanding=4)
+    try:
+        obj = _fake_chunk(prefetch=True, priority=100)
+        assert stage._try_admit(obj) is True
+        assert stage._background_outstanding == 1
+        obj.prefetch = False
+        obj.priority = 0
+        stage._release(obj)
+        assert stage._background_outstanding == 0
+        assert stage.outstanding() == 0
+    finally:
+        stage.stop(timeout=2.0)
+
+
+def test_targeted_stale_cancel_keeps_promoted_deferred_work():
+    _, stage = _make_stage(max_outstanding=4)
+    try:
+        obj = _fake_chunk(prefetch=False, priority=0)
+        obj.chunk_id = "promoted"
+        pending = getortho._DeferredDispatch(obj, (), {}, 0)
+        stage._deferred.put_nowait(
+            pending,
+            item_key=obj.chunk_id,
+            item_priority=obj.priority,
+        )
+        assert stage.cancel_deferred_chunks({obj.chunk_id}) == 0
+        assert stage.deferred_depth() == 1
+    finally:
+        stage.stop(timeout=2.0)
+
+
 def test_stage_classifies_healing_priority_as_background():
     _, stage = _make_stage(max_outstanding=4)
     try:

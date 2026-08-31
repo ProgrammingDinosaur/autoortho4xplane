@@ -251,6 +251,7 @@ class ConfigUI(QMainWindow):
         "native_partial_allow_incomplete_check",
         "persist_partial_dds_cache_check",
         "prefetch_enabled_check",
+        "prefetch_quality_mode_combo",
         "prefetch_lookahead_slider",
         "prefetch_interval_slider",
         "prefetch_max_chunks_slider",
@@ -323,6 +324,7 @@ class ConfigUI(QMainWindow):
         "native_partial_allow_incomplete_check",
         "persist_partial_dds_cache_check",
         "prefetch_enabled_check",
+        "prefetch_quality_mode_combo",
         "prefetch_lookahead_slider",
         "prefetch_interval_slider",
         "prefetch_max_chunks_slider",
@@ -367,6 +369,40 @@ class ConfigUI(QMainWindow):
         "dynamic_zoom_steps",
         "missing_color",
     }
+
+    @staticmethod
+    def _publish_simbrief_to_workers(data, enabled=None):
+        try:
+            if __package__ and __package__.startswith("autoortho."):
+                from autoortho import aostats
+            else:
+                import aostats
+            snapshot = None
+            if data:
+                snapshot = {
+                    "origin": dict(data.get("origin", {})),
+                    "destination": dict(data.get("destination", {})),
+                    "general": {
+                        "initial_altitude": data.get("general", {}).get(
+                            "initial_altitude", 0
+                        )
+                    },
+                    "navlog": {
+                        "fix": list(
+                            data.get("navlog", {}).get("fix", [])
+                        )[:512]
+                    },
+                }
+            aostats.set_stat("simbrief_route_snapshot", snapshot)
+            aostats.set_stat(
+                "simbrief_route_generation", int(time.time() * 1000)
+            )
+            if enabled is not None:
+                aostats.set_stat(
+                    "simbrief_route_enabled", bool(enabled)
+                )
+        except Exception:
+            log.exception("Could not publish SimBrief route to mount workers")
 
     status_update = Signal(str)
     log_update = Signal(str)
@@ -3129,7 +3165,10 @@ class ConfigUI(QMainWindow):
         )
         self.file_cache_slider.setObjectName('file_cache_size')
         self.file_cache_slider.setToolTip(
-            "Drag to adjust the cache clean limit in gigabytes"
+            "Maximum combined disk cache size for compiled DDS textures,\n"
+            "DDS metadata/partial rows, and source JPEG imagery.\n"
+            "Background cleanup evicts the oldest entries after this soft\n"
+            "limit is exceeded."
         )
         self.file_cache_label = QLabel(f"{self.cfg.cache.file_cache_size} GB")
         self.file_cache_slider.valueChanged.connect(
@@ -3603,7 +3642,7 @@ class ConfigUI(QMainWindow):
         persist_partial_value = getattr(
             self.cfg.autoortho,
             "persist_partial_dds_cache",
-            False,
+            True,
         )
         if isinstance(persist_partial_value, str):
             persist_partial_value = (
@@ -3619,7 +3658,8 @@ class ConfigUI(QMainWindow):
         self.persist_partial_dds_cache_check.setToolTip(
             "Save compressed mipmap rows in a bounded background queue so\n"
             "repeat loads can reuse completed ZL17 rows. This uses additional\n"
-            "disk cache space and never blocks a live scenery read."
+            "disk cache space, counts toward the shared disk cache limit,\n"
+            "and never blocks a live scenery read."
         )
         partial_cache_layout.addWidget(
             self.persist_partial_dds_cache_check
@@ -3646,6 +3686,42 @@ class ConfigUI(QMainWindow):
         prefetch_enable_layout.addWidget(self.prefetch_enabled_check)
         prefetch_enable_layout.addStretch()
         autoortho_layout.addLayout(prefetch_enable_layout)
+
+        quality_mode_layout = QHBoxLayout()
+        quality_mode_label = QLabel("Live quality mode:")
+        self.prefetch_quality_mode_combo = QComboBox()
+        self.prefetch_quality_mode_combo.addItem("Responsive", "responsive")
+        self.prefetch_quality_mode_combo.addItem(
+            "Prefer target quality", "prefer_target"
+        )
+        self.prefetch_quality_mode_combo.addItem(
+            "Strict target quality", "strict_target"
+        )
+        quality_mode = str(
+            getattr(
+                self.cfg.autoortho,
+                "prefetch_quality_mode",
+                "responsive",
+            )
+        ).lower()
+        quality_index = self.prefetch_quality_mode_combo.findData(
+            quality_mode
+        )
+        self.prefetch_quality_mode_combo.setCurrentIndex(
+            max(0, quality_index)
+        )
+        self.prefetch_quality_mode_combo.setObjectName(
+            "prefetch_quality_mode"
+        )
+        self.prefetch_quality_mode_combo.setToolTip(
+            "Responsive may use lower-resolution cached imagery after the normal wait.\n"
+            "Prefer target pauses distant prefetch and grants a short quality grace period.\n"
+            "Strict target never substitutes lower-resolution mipmap-zero imagery and may\n"
+            "show missing areas or stall until the hard tile deadline."
+        )
+        quality_mode_layout.addWidget(quality_mode_label)
+        quality_mode_layout.addWidget(self.prefetch_quality_mode_combo)
+        autoortho_layout.addLayout(quality_mode_layout)
         
         # Prefetch lookahead slider (in minutes, 0 = Unlimited)
         lookahead_layout = QHBoxLayout()
@@ -3726,7 +3802,7 @@ class ConfigUI(QMainWindow):
         self.prefetch_max_chunks_slider = ModernSlider(Qt.Orientation.Horizontal)
         self.prefetch_max_chunks_slider.setRange(8, 512)
         self.prefetch_max_chunks_slider.setValue(
-            int(getattr(self.cfg.autoortho, 'prefetch_max_chunks', 48))
+            int(getattr(self.cfg.autoortho, 'prefetch_max_chunks', 64))
         )
         self.prefetch_max_chunks_slider.setObjectName('prefetch_max_chunks')
         self.prefetch_max_chunks_value = QLabel(
@@ -3758,7 +3834,7 @@ class ConfigUI(QMainWindow):
         self.prefetch_radius_slider = ModernSlider(Qt.Orientation.Horizontal)
         self.prefetch_radius_slider.setRange(10, 150)  # 10-150 nm
         self.prefetch_radius_slider.setValue(
-            int(float(getattr(self.cfg.autoortho, 'prefetch_radius_nm', 40)))
+            int(float(getattr(self.cfg.autoortho, 'prefetch_radius_nm', 30)))
         )
         self.prefetch_radius_slider.setObjectName('prefetch_radius_nm')
         self.prefetch_radius_value = QLabel(
@@ -5942,6 +6018,7 @@ class ConfigUI(QMainWindow):
     def _update_prefetch_controls(self):
         """Update enabled state of prefetch controls based on enable checkbox."""
         enabled = self.prefetch_enabled_check.isChecked()
+        self.prefetch_quality_mode_combo.setEnabled(enabled)
         
         # Existing controls
         self.prefetch_lookahead_slider.setEnabled(enabled)
@@ -6327,6 +6404,7 @@ class ConfigUI(QMainWindow):
             
             # Clear the flight manager
             simbrief_flight_manager.clear()
+            self._publish_simbrief_to_workers(None, enabled=False)
         else:
             # If we have a userid and use_flight_data was previously enabled in config,
             # show the checkbox and route settings so user can see the current state
@@ -6386,6 +6464,10 @@ class ConfigUI(QMainWindow):
         # Load flight data into the global flight manager for use by dynamic zoom and prefetcher
         if simbrief_flight_manager.load_flight_data(data):
             log.info(f"SimBrief flight loaded into manager: {simbrief_flight_manager.origin} -> {simbrief_flight_manager.destination}")
+            self._publish_simbrief_to_workers(
+                data,
+                enabled=self.simbrief_use_flight_data_check.isChecked(),
+            )
         else:
             log.warning("Failed to load SimBrief flight data into manager")
         
@@ -6408,6 +6490,7 @@ class ConfigUI(QMainWindow):
         
         # Clear the flight manager
         simbrief_flight_manager.clear()
+        self._publish_simbrief_to_workers(None, enabled=False)
         
         log.warning(f"SimBrief fetch error: {error_msg}")
 
@@ -6426,6 +6509,7 @@ class ConfigUI(QMainWindow):
         
         # Clear the global flight manager
         simbrief_flight_manager.clear()
+        self._publish_simbrief_to_workers(None, enabled=False)
         
         # Hide flight info UI
         self.simbrief_info_frame.hide()
@@ -6456,6 +6540,10 @@ class ConfigUI(QMainWindow):
         if hasattr(self.cfg, 'simbrief'):
             self.cfg.simbrief.use_flight_data = is_checked
             log.debug(f"SimBrief use_flight_data toggled: {self.cfg.simbrief.use_flight_data}")
+        self._publish_simbrief_to_workers(
+            self.simbrief_flight_data,
+            enabled=is_checked,
+        )
         if self.phase3_active:
             self.flight_plan_page.set_influence(
                 is_checked and self.simbrief_flight_data is not None
@@ -8017,6 +8105,9 @@ class ConfigUI(QMainWindow):
             
             # Prefetch settings
             self.cfg.autoortho.prefetch_enabled = self.prefetch_enabled_check.isChecked()
+            self.cfg.autoortho.prefetch_quality_mode = (
+                self.prefetch_quality_mode_combo.currentData()
+            )
             # Slider value 61 = Unlimited, save as 0 to config
             lookahead_val = self.prefetch_lookahead_slider.value()
             self.cfg.autoortho.prefetch_lookahead = str(

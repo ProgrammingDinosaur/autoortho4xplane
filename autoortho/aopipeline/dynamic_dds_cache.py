@@ -140,7 +140,8 @@ class DynamicDDSCache:
         """
         Args:
             cache_dir: Base cache directory (same as CFG.paths.cache_dir).
-            max_size_mb: Maximum disk usage in MB for the DDS cache.
+            max_size_mb: Maximum combined disk usage in MB for DDS data,
+                         DDM metadata, and partial-row sidecars.
                          Set to 0 for unlimited cache size.
             enabled: Master enable flag. When False, all methods are no-ops.
         """
@@ -217,13 +218,34 @@ class DynamicDDSCache:
             log.info(f"DynamicDDSCache initialized: {self._dds_root} "
                      f"(max={max_size_mb}MB, compression={self._compression})")
 
+    @staticmethod
+    def _safe_file_size(path: str) -> int:
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    @classmethod
+    def _entry_disk_size(cls, dds_path: str, ddm_path: str) -> int:
+        """Return the complete logical size of one compiled-cache entry."""
+        return sum(
+            cls._safe_file_size(path)
+            for path in (
+                dds_path,
+                ddm_path,
+                cls._row_records_path(ddm_path),
+            )
+        )
+
     def _record_store(
         self,
         key,
         dds_path: str,
         ddm_path: str,
-        size: int,
+        *,
+        count_store: bool = True,
     ) -> None:
+        size = self._entry_disk_size(dds_path, ddm_path)
         old_size = 0
         with self._lock:
             if key in self._entries:
@@ -232,7 +254,8 @@ class DynamicDDSCache:
             self._entries[key] = (dds_path, ddm_path, size, time.time())
             self._entries.move_to_end(key)
             self._current_size += size
-            self._stores += 1
+            if count_store:
+                self._stores += 1
             over_limit = (
                 self._max_size > 0 and self._current_size > self._max_size
             )
@@ -240,6 +263,42 @@ class DynamicDDSCache:
             self._budget_manager.account_dds(size - old_size)
         if over_limit:
             self._evict_lru_async()
+
+    def _remove_entry_files(
+        self,
+        key,
+        dds_path: str,
+        ddm_path: str,
+    ) -> int:
+        """Delete one entry and keep both accounting layers synchronized."""
+        with self._lock:
+            tracked = self._entries.pop(key, None)
+            if tracked is not None:
+                self._current_size = max(
+                    0,
+                    self._current_size - tracked[2],
+                )
+
+        before = self._entry_disk_size(dds_path, ddm_path)
+        with self._tile_file_lock(ddm_path):
+            self._delete_pair(dds_path, ddm_path)
+        remaining = self._entry_disk_size(dds_path, ddm_path)
+        freed = max(0, before - remaining)
+
+        if remaining:
+            with self._lock:
+                self._entries[key] = (
+                    dds_path,
+                    ddm_path,
+                    remaining,
+                    time.time(),
+                )
+                self._entries.move_to_end(key, last=False)
+                self._current_size += remaining
+
+        if freed and self._budget_manager is not None:
+            self._budget_manager.account_dds(-freed)
+        return freed
 
     def wait_for_scan(self, timeout: Optional[float] = None) -> bool:
         return self._scan_complete.wait(timeout)
@@ -639,6 +698,7 @@ class DynamicDDSCache:
                 tile.row, tile.col, tile.maptype,
                 tile.tilename_zoom, max_zoom
             )
+            key = self._tile_key(tile_id, max_zoom)
 
             # Check if DDM exists for the requested ZL
             meta = self._read_ddm(ddm_path)
@@ -651,7 +711,7 @@ class DynamicDDSCache:
 
             # Staleness checks (excludes ZL mismatch, handled separately)
             if self._is_stale(meta, tile, dds_path):
-                self._delete_pair(dds_path, ddm_path)
+                self._remove_entry_files(key, dds_path, ddm_path)
                 self._misses += 1
                 return None
 
@@ -669,7 +729,7 @@ class DynamicDDSCache:
                     log.debug(f"DDS cache: ZL downgrade available {tile_id} "
                               f"z{cached_zl} -> z{max_zoom}")
                 else:
-                    self._delete_pair(dds_path, ddm_path)
+                    self._remove_entry_files(key, dds_path, ddm_path)
                 self._misses += 1
                 return None
 
@@ -696,7 +756,7 @@ class DynamicDDSCache:
                 with open(dds_path, "rb") as f:
                     raw_bytes = f.read()
             except (FileNotFoundError, OSError):
-                self._delete_pair(dds_path, ddm_path)
+                self._remove_entry_files(key, dds_path, ddm_path)
                 self._misses += 1
                 return None
 
@@ -705,7 +765,7 @@ class DynamicDDSCache:
                 dds_bytes = self._decompress_dds(raw_bytes, meta)
             except Exception:
                 log.debug(f"DDS cache: decompression failed for {tile_id}, removing")
-                self._delete_pair(dds_path, ddm_path)
+                self._remove_entry_files(key, dds_path, ddm_path)
                 self._misses += 1
                 return None
 
@@ -713,7 +773,7 @@ class DynamicDDSCache:
             if tile.dds is not None and len(dds_bytes) != tile.dds.total_size:
                 log.debug(f"DDS cache: size mismatch for {tile_id} "
                           f"({len(dds_bytes)} vs {tile.dds.total_size})")
-                self._delete_pair(dds_path, ddm_path)
+                self._remove_entry_files(key, dds_path, ddm_path)
                 self._misses += 1
                 return None
 
@@ -731,9 +791,8 @@ class DynamicDDSCache:
                 tile._dds_populated_mipmaps = None  # v2 compat: all populated
 
             # Update LRU tracking
-            key = self._tile_key(tile_id, max_zoom)
             with self._lock:
-                size = len(dds_bytes)
+                size = self._entry_disk_size(dds_path, ddm_path)
                 if key in self._entries:
                     self._entries.move_to_end(key)
                     # Update access time
@@ -843,7 +902,7 @@ class DynamicDDSCache:
             return False
 
         try:
-            _, ddm_path = self._paths_for(
+            dds_path, ddm_path = self._paths_for(
                 tile.row, tile.col, tile.maptype, tile.tilename_zoom, max_zoom)
             records_path = self._row_records_path(ddm_path)
             os.makedirs(os.path.dirname(ddm_path), exist_ok=True)
@@ -903,6 +962,13 @@ class DynamicDDSCache:
                 if meta.get("mipmaps"):
                     meta["mipmaps"][0]["complete"] = False
                 self._write_ddm(ddm_path, meta)
+            key = self._tile_key(tile_id, max_zoom)
+            self._record_store(
+                key,
+                dds_path,
+                ddm_path,
+                count_store=False,
+            )
             return True
         except (OSError, ValueError, struct.error) as exc:
             log.debug("DDS partial-row append failed for %s: %s", tile_id, exc)
@@ -1242,12 +1308,16 @@ class DynamicDDSCache:
                         tile_id,
                     )
 
-            # Update LRU tracking (use on-disk size for accurate budget)
+            # Update LRU tracking using the DDS, metadata, and row sidecar.
             key = self._tile_key(tile_id, max_zoom)
-            size = len(disk_bytes)
-            self._record_store(key, dds_path, ddm_path, size)
+            self._record_store(key, dds_path, ddm_path)
 
-            log.debug(f"DDS cache STORE: {tile_id} z{max_zoom} ({size} bytes)")
+            log.debug(
+                "DDS cache STORE: %s z%s (%d bytes)",
+                tile_id,
+                max_zoom,
+                self._entry_disk_size(dds_path, ddm_path),
+            )
 
             if not mm0_missing_indices and not mm0_fallback_indices:
                 try:
@@ -1418,10 +1488,20 @@ class DynamicDDSCache:
                         {},
                     )
                 self._write_ddm(ddm_path, meta)
+                if 0 in merged_populated:
+                    try:
+                        os.remove(self._row_records_path(ddm_path))
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        log.debug(
+                            "Could not remove promoted partial rows for %s",
+                            tile_id,
+                        )
 
-            # 5. LRU tracking (use actual on-disk size)
+            # 5. LRU tracking includes DDS metadata and partial-row records.
             key = self._tile_key(tile_id, max_zoom)
-            self._record_store(key, dds_path, ddm_path, disk_size)
+            self._record_store(key, dds_path, ddm_path)
 
             log.debug(f"DDS cache STORE_INCR: {tile_id} z{max_zoom} "
                       f"mipmaps={sorted(new_mipmaps.keys())} "
@@ -1516,7 +1596,7 @@ class DynamicDDSCache:
 
             os.replace(tmp_dds, dds_path)
 
-            # Write DDM metadata
+            # Write DDM metadata and retire any superseded partial rows.
             dds_format, compressor = self._get_format_and_compressor()
             mm0_missing_indices = self._filter_healable_missing(
                 mm0_missing_indices, tile, max_zoom)
@@ -1525,11 +1605,21 @@ class DynamicDDSCache:
                                    mm0_missing_indices=mm0_missing_indices,
                                    mm0_fallback_indices=mm0_fallback_indices,
                                    disk_compression=disk_compression)
-            self._write_ddm(ddm_path, meta)
+            with self._tile_file_lock(ddm_path):
+                self._write_ddm(ddm_path, meta)
+                try:
+                    os.remove(self._row_records_path(ddm_path))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    log.debug(
+                        "Could not remove promoted partial rows for %s",
+                        tile_id,
+                    )
 
-            # Update LRU tracking (use on-disk size for accurate budget)
+            # Update LRU tracking using the complete cache-entry footprint.
             key = self._tile_key(tile_id, max_zoom)
-            self._record_store(key, dds_path, ddm_path, disk_size)
+            self._record_store(key, dds_path, ddm_path)
 
             log.debug(f"DDS cache STORE (from file): {tile_id} z{max_zoom} "
                       f"({disk_size} bytes, compression={disk_compression})")
@@ -1601,7 +1691,12 @@ class DynamicDDSCache:
                 old_dds_bytes = self._decompress_dds(old_raw, old_meta)
             except Exception:
                 log.debug(f"DDS upgrade: decompression failed for {old_dds_path}")
-                self._delete_pair(old_dds_path, old_ddm_path)
+                old_key = self._tile_key(tile_id, old_max_zoom)
+                self._remove_entry_files(
+                    old_key,
+                    old_dds_path,
+                    old_ddm_path,
+                )
                 return None
 
             old_width = old_meta.get("w", 0)
@@ -1662,13 +1757,13 @@ class DynamicDDSCache:
             # Store the upgraded DDS
             if self.store(tile_id, new_max_zoom, new_dds_bytes, tile):
                 # Remove old entry
-                self._delete_pair(old_dds_path, old_ddm_path)
                 old_key = self._tile_key(tile_id, old_max_zoom)
+                self._remove_entry_files(
+                    old_key,
+                    old_dds_path,
+                    old_ddm_path,
+                )
                 with self._lock:
-                    if old_key in self._entries:
-                        old_size = self._entries[old_key][2]
-                        del self._entries[old_key]
-                        self._current_size -= old_size
                     self._upgrades += 1
 
                 log.info(f"DDS upgrade: {tile_id} z{old_max_zoom} -> z{new_max_zoom} "
@@ -1725,7 +1820,12 @@ class DynamicDDSCache:
                 old_dds_bytes = self._decompress_dds(old_raw, old_meta)
             except Exception:
                 log.debug(f"DDS downgrade: decompression failed for {old_dds_path}")
-                self._delete_pair(old_dds_path, old_ddm_path)
+                old_key = self._tile_key(tile_id, old_max_zoom)
+                self._remove_entry_files(
+                    old_key,
+                    old_dds_path,
+                    old_ddm_path,
+                )
                 return None
 
             old_width = old_meta.get("w", 0)
@@ -1766,13 +1866,12 @@ class DynamicDDSCache:
             new_dds_bytes = bytes(new_dds)
 
             if self.store(tile_id, new_max_zoom, new_dds_bytes, tile):
-                self._delete_pair(old_dds_path, old_ddm_path)
                 old_key = self._tile_key(tile_id, old_max_zoom)
-                with self._lock:
-                    if old_key in self._entries:
-                        old_size = self._entries[old_key][2]
-                        del self._entries[old_key]
-                        self._current_size -= old_size
+                self._remove_entry_files(
+                    old_key,
+                    old_dds_path,
+                    old_ddm_path,
+                )
 
                 log.info(f"DDS downgrade: {tile_id} z{old_max_zoom} -> z{new_max_zoom} "
                          f"({old_width}x{old_height} -> {new_width}x{new_height})")
@@ -1799,15 +1898,12 @@ class DynamicDDSCache:
 
         key = self._tile_key(tile_id, max_zoom)
         with self._lock:
-            entry = self._entries.pop(key, None)
-            if entry is not None:
-                self._current_size -= entry[2]
-                dds_path, ddm_path = entry[0], entry[1]
-            else:
-                return False
-
-        self._delete_pair(dds_path, ddm_path)
-        return True
+            entry = self._entries.get(key)
+        if entry is None:
+            return False
+        dds_path, ddm_path = entry[0], entry[1]
+        self._remove_entry_files(key, dds_path, ddm_path)
+        return self._entry_disk_size(dds_path, ddm_path) == 0
 
     def evict_lru(self, bytes_to_free: int) -> int:
         """
@@ -1898,24 +1994,50 @@ class DynamicDDSCache:
         count = 0
         try:
             for dirpath, _dirnames, filenames in os.walk(self._dds_root):
+                filename_set = set(filenames)
                 for fname in filenames:
-                    if not fname.endswith(".dds"):
+                    if fname.endswith(".dds"):
+                        ddm_name = fname[:-4] + ".ddm"
+                        if ddm_name not in filename_set:
+                            try:
+                                os.remove(os.path.join(dirpath, fname))
+                            except OSError:
+                                pass
+                    elif fname.endswith(".ddm.rows"):
+                        ddm_name = fname[:-5]
+                        if ddm_name not in filename_set:
+                            try:
+                                os.remove(os.path.join(dirpath, fname))
+                            except OSError:
+                                pass
+
+                for fname in filenames:
+                    if not fname.endswith(".ddm"):
                         continue
 
-                    dds_path = os.path.join(dirpath, fname)
-                    ddm_path = dds_path[:-4] + ".ddm"
-
-                    # Need DDM to track properly
-                    if not os.path.exists(ddm_path):
-                        # Orphan DDS without metadata - remove it
-                        try:
-                            os.remove(dds_path)
-                        except OSError:
-                            pass
-                        continue
-
+                    ddm_path = os.path.join(dirpath, fname)
+                    dds_path = ddm_path[:-4] + ".dds"
+                    rows_path = self._row_records_path(ddm_path)
                     meta = self._read_ddm(ddm_path)
                     if meta is None:
+                        self._delete_pair(dds_path, ddm_path)
+                        continue
+
+                    has_dds = os.path.isfile(dds_path)
+                    if (
+                        os.path.isfile(rows_path)
+                        and not meta.get("partial_mipmaps")
+                    ):
+                        try:
+                            os.remove(rows_path)
+                        except OSError:
+                            pass
+                    has_partial_rows = (
+                        os.path.isfile(rows_path)
+                        and bool(meta.get("partial_mipmaps"))
+                    )
+                    if not has_dds and not has_partial_rows:
+                        self._delete_pair(dds_path, ddm_path)
                         continue
 
                     # Reconstruct the tile key from metadata
@@ -1931,22 +2053,32 @@ class DynamicDDSCache:
                     tile_id = f"{row}_{col}_{maptype}_{zl}"
                     key = self._tile_key(tile_id, max_zl)
 
-                    try:
-                        size = os.path.getsize(dds_path)
-                    except OSError:
+                    size = self._entry_disk_size(dds_path, ddm_path)
+                    if size <= 0:
                         continue
 
                     # Use file mtime as access time for initial ordering
-                    try:
-                        atime = os.path.getmtime(dds_path)
-                    except OSError:
-                        atime = time.time()
+                    mtimes = []
+                    for path in (dds_path, ddm_path, rows_path):
+                        try:
+                            mtimes.append(os.path.getmtime(path))
+                        except OSError:
+                            pass
+                    atime = max(mtimes) if mtimes else time.time()
 
                     with self._lock:
-                        if key not in self._entries:
-                            self._entries[key] = (dds_path, ddm_path, size, atime)
-                            self._current_size += size
+                        old = self._entries.get(key)
+                        if old is None:
                             count += 1
+                        else:
+                            self._current_size -= old[2]
+                        self._entries[key] = (
+                            dds_path,
+                            ddm_path,
+                            size,
+                            atime,
+                        )
+                        self._current_size += size
 
         except Exception as e:
             log.warning(f"DDS cache scan error: {e}")
@@ -2027,14 +2159,12 @@ class DynamicDDSCache:
                         if row is not None and col is not None:
                             tile_id = f"{row}_{col}_{maptype}_{zl}"
                             key = self._tile_key(tile_id, max_zl)
-                            new_size = len(compressed)
-                            with self._lock:
-                                if key in self._entries:
-                                    old_entry = self._entries[key]
-                                    self._current_size -= old_entry[2]
-                                    self._entries[key] = (
-                                        dds_path, ddm_path, new_size, old_entry[3])
-                                    self._current_size += new_size
+                            self._record_store(
+                                key,
+                                dds_path,
+                                ddm_path,
+                                count_store=False,
+                            )
 
                         saved_bytes += original_size - len(compressed)
                         migrated += 1

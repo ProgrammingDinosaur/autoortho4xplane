@@ -572,8 +572,22 @@ class TestDiskBudgetManager:
         )
         
         report = mgr.usage_report
-        total_budget = report['dds_budget_mb'] + report['jpeg_budget_mb']
-        assert abs(total_budget - 1000) < 1  # Allow rounding
+        assert report['dds_budget_mb'] == pytest.approx(800)
+        assert report['jpeg_budget_mb'] == pytest.approx(200)
+
+    def test_dds_percentage_is_literal(self, cache_dir):
+        """A configured DDS percentage must not be normalized as a weight."""
+        from autoortho.aopipeline.disk_budget_manager import DiskBudgetManager
+
+        mgr = DiskBudgetManager(
+            cache_dir=cache_dir,
+            total_budget_mb=1000,
+            dds_budget_pct=40,
+        )
+
+        report = mgr.usage_report
+        assert report['dds_budget_mb'] == pytest.approx(400)
+        assert report['jpeg_budget_mb'] == pytest.approx(600)
 
     def test_account_dds(self, cache_dir):
         """Test DDS accounting updates usage."""
@@ -602,13 +616,18 @@ class TestDiskBudgetManager:
         
         dds_dir = os.path.join(cache_dir, "dds_cache", "+50+010", "+50+010", "BI")
         os.makedirs(dds_dir, exist_ok=True)
-        with open(os.path.join(dds_dir, "21728_34432_z16.dds"), 'wb') as f:
+        base = os.path.join(dds_dir, "21728_34432_z16")
+        with open(base + ".dds", 'wb') as f:
             f.write(b'\x00' * 20000)
+        with open(base + ".ddm", 'wb') as f:
+            f.write(b'\x00' * 300)
+        with open(base + ".ddm.rows", 'wb') as f:
+            f.write(b'\x00' * 500)
         
         mgr = DiskBudgetManager(cache_dir=cache_dir, total_budget_mb=1000)
         report = mgr.scan_disk_usage()
         
-        assert report.dds_bytes == 20000
+        assert report.dds_bytes == 20800
 
     def test_usage_report_format(self, cache_dir):
         """Test usage_report returns expected keys."""
@@ -639,9 +658,8 @@ class TestDiskBudgetManager:
         )
         
         report = mgr.usage_report
-        # After clamping (90 + 5 = 95) normalized to sum to 1000MB
-        assert report['dds_budget_mb'] > 0
-        assert report['jpeg_budget_mb'] > 0
+        assert report['dds_budget_mb'] == pytest.approx(900)
+        assert report['jpeg_budget_mb'] == pytest.approx(100)
 
 
 # ============================================================================
@@ -1314,18 +1332,21 @@ class TestZstdCompression:
             meta = json.load(f)
         assert meta.get('disk_compression') == 'none'
 
-    def test_lru_tracks_compressed_size(self, dds_cache, mock_tile, sample_dds_bytes):
-        """Test that LRU disk usage tracks compressed (on-disk) size, not uncompressed."""
+    def test_lru_tracks_complete_compressed_entry(
+        self, dds_cache, mock_tile, sample_dds_bytes
+    ):
+        """LRU usage includes compressed DDS data and its metadata sidecar."""
         dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
 
-        dds_path, _ = dds_cache._paths_for(
+        dds_path, ddm_path = dds_cache._paths_for(
             mock_tile.row, mock_tile.col, mock_tile.maptype,
             mock_tile.tilename_zoom, mock_tile.max_zoom
         )
         disk_size = os.path.getsize(dds_path)
 
         disk_usage = dds_cache.get_disk_usage()
-        assert disk_usage == disk_size
+        assert disk_usage == dds_cache._entry_disk_size(dds_path, ddm_path)
+        assert disk_usage > disk_size
 
     def test_store_from_file_compressed(self, dds_cache, mock_tile, sample_dds_bytes, cache_dir):
         """Test store_from_file compresses the source file."""
@@ -1635,6 +1656,14 @@ class TestDDMv4PartialRows:
         assert store_result == [True]
         assert 0 in metadata["populated_mipmaps"]
         assert metadata["partial_mipmaps"] == {}
+        _dds_path, ddm_path = dds_cache._paths_for(
+            mock_tile.row,
+            mock_tile.col,
+            mock_tile.maptype,
+            mock_tile.tilename_zoom,
+            mock_tile.max_zoom,
+        )
+        assert not os.path.exists(dds_cache._row_records_path(ddm_path))
 
     def test_enqueue_store_transfers_snapshot_without_blocking(
         self,
@@ -1697,6 +1726,105 @@ class TestDDMv4PartialRows:
             revision=2)
         assert dds_cache.load_partial_rows(
             mock_tile.id, mock_tile.max_zoom, mock_tile) == {0: b"new"}
+
+    def test_partial_rows_update_complete_entry_accounting(
+        self, dds_cache, mock_tile
+    ):
+        class Budget:
+            def __init__(self):
+                self.changes = []
+
+            def account_dds(self, amount):
+                self.changes.append(amount)
+
+        budget = Budget()
+        dds_cache._budget_manager = budget
+
+        assert dds_cache.append_partial_row(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+            0,
+            b"row-data",
+            2,
+        )
+        dds_path, ddm_path = dds_cache._paths_for(
+            mock_tile.row,
+            mock_tile.col,
+            mock_tile.maptype,
+            mock_tile.tilename_zoom,
+            mock_tile.max_zoom,
+        )
+        expected = dds_cache._entry_disk_size(dds_path, ddm_path)
+
+        assert expected > len(b"row-data")
+        assert dds_cache.get_disk_usage() == expected
+        assert sum(budget.changes) == expected
+
+    def test_scan_existing_discovers_partial_row_only_entry(
+        self, cache_dir, mock_tile
+    ):
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+
+        writer = DynamicDDSCache(cache_dir, max_size_mb=10)
+        assert writer.append_partial_row(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+            0,
+            b"row-data",
+            2,
+        )
+        writer.close()
+
+        reader = DynamicDDSCache(cache_dir, max_size_mb=10)
+        try:
+            assert reader.scan_existing() == 1
+            dds_path, ddm_path = reader._paths_for(
+                mock_tile.row,
+                mock_tile.col,
+                mock_tile.maptype,
+                mock_tile.tilename_zoom,
+                mock_tile.max_zoom,
+            )
+            assert reader.get_disk_usage() == reader._entry_disk_size(
+                dds_path,
+                ddm_path,
+            )
+        finally:
+            reader.close()
+
+    def test_partial_row_eviction_removes_and_counts_sidecars(
+        self, cache_dir, mock_tile
+    ):
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+
+        cache = DynamicDDSCache(cache_dir, max_size_mb=10)
+        try:
+            assert cache.append_partial_row(
+                mock_tile.id,
+                mock_tile.max_zoom,
+                mock_tile,
+                0,
+                b"row-data",
+                2,
+            )
+            tracked = cache.get_disk_usage()
+            assert tracked > 0
+
+            assert cache.evict_lru(1) == tracked
+            assert cache.get_disk_usage() == 0
+            _dds_path, ddm_path = cache._paths_for(
+                mock_tile.row,
+                mock_tile.col,
+                mock_tile.maptype,
+                mock_tile.tilename_zoom,
+                mock_tile.max_zoom,
+            )
+            assert not os.path.exists(ddm_path)
+            assert not os.path.exists(cache._row_records_path(ddm_path))
+        finally:
+            cache.close()
 
     def test_async_partial_row_queue_coalesces_and_drops(self, cache_dir, mock_tile):
         from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache

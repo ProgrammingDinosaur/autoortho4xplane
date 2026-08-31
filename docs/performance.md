@@ -31,7 +31,7 @@ entire 32 MiB mipmap buffer.
 # Strict quality remains the default.
 native_partial_allow_incomplete = False
 # Optional repeat-load cache for compressed partial rows.
-persist_partial_dds_cache = False
+persist_partial_dds_cache = True
 ```
 
 **Allow incomplete native partial builds** finishes a row after its shared
@@ -1171,6 +1171,12 @@ live_aopipeline_min_chunk_ratio = 1.0
 # 0 delegates retention to the shared disk budget.
 persistent_dds_cache_mb = 0
 ```
+
+The persistent DDS cache is implemented by `DynamicDDSCache`. When its
+independent limit is `0`, `file_cache_size` remains the overall disk limit and
+`dds_budget_pct` is the literal DDS share; JPEG source files receive the
+remainder. DDS data, DDM metadata, and partial-row sidecars are all included in
+that accounting.
 
 #### Thread Configuration
 

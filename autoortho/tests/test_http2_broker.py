@@ -204,6 +204,42 @@ def test_priority_queue_services_lower_numbers_first():
     assert order == ["gate", "c", "b", "d"]
 
 
+def test_indexed_broker_queue_rejects_same_key_tombstone():
+    work = hb._AsyncIndexedPriorityQueue()
+    old = hb._CoalescedEntry(
+        key=("GET", "same", ()),
+        method="GET",
+        url="http://example.test/same",
+        headers={},
+        priority=0,
+        timeout=hb.RequestTimeout(),
+        seq=1,
+    )
+    replacement = hb._CoalescedEntry(
+        key=old.key,
+        method="GET",
+        url=old.url,
+        headers={},
+        priority=100,
+        timeout=hb.RequestTimeout(),
+        seq=2,
+    )
+    middle = hb._CoalescedEntry(
+        key=("GET", "middle", ()),
+        method="GET",
+        url="http://example.test/middle",
+        headers={},
+        priority=50,
+        timeout=hb.RequestTimeout(),
+        seq=3,
+    )
+    work.put_nowait((0, old.seq, 0, old))
+    work.remove(old.key)
+    work.put_nowait((100, replacement.seq, 0, replacement))
+    work.put_nowait((50, middle.seq, 0, middle))
+    assert asyncio.run(work.get())[3] is middle
+
+
 # ---------------------------------------------------------------------------
 # Deduplication / coalescing
 # ---------------------------------------------------------------------------
@@ -1427,6 +1463,101 @@ def test_saturated_origin_parks_instead_of_holding_workers():
     for future in futures:
         assert future.result(timeout=15.0).status_code == 200
     assert broker.server_stats(timeout=2.0)["backlog_depth"] == 0
+
+
+def test_coalesced_live_waiter_reprioritizes_parked_origin_entry():
+    gate = threading.Event()
+    order = []
+
+    async def handler(request):
+        order.append(request.url.path)
+        if request.url.path == "/gate":
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+        return httpx.Response(200, content=request.url.path.encode())
+
+    broker = make_broker(
+        handler,
+        max_concurrency=4,
+        max_pending=16,
+        origin_initial_concurrency=1,
+        origin_min_concurrency=1,
+        origin_success_threshold=10_000,
+    )
+    gate_future = broker.submit_async(
+        "http://priority-park.test/gate", priority=100
+    )
+    first_background = broker.submit_async(
+        "http://priority-park.test/first", priority=100
+    )
+    promoted_background = broker.submit_async(
+        "http://priority-park.test/promoted", priority=100
+    )
+    _wait_for_backlog(broker, 2)
+
+    live_waiter = broker.submit_async(
+        "http://priority-park.test/promoted", priority=0
+    )
+    stats = broker.server_stats(timeout=2.0)
+    assert stats["parked_live_requests"] == 1
+    assert stats["parked_background_requests"] == 1
+
+    gate.set()
+    for future in (
+        gate_future,
+        first_background,
+        promoted_background,
+        live_waiter,
+    ):
+        assert future.result(timeout=10.0).status_code == 200
+    assert order == ["/gate", "/promoted", "/first"]
+
+
+def test_explicit_reprioritize_promotes_parked_origin_entry():
+    gate = threading.Event()
+    order = []
+
+    async def handler(request):
+        order.append(request.url.path)
+        if request.url.path == "/gate":
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+        return httpx.Response(200, content=request.url.path.encode())
+
+    broker = make_broker(
+        handler,
+        max_concurrency=4,
+        max_pending=16,
+        origin_initial_concurrency=1,
+        origin_min_concurrency=1,
+        origin_success_threshold=10_000,
+    )
+    gate_future = broker.submit_async(
+        "http://explicit-priority.test/gate", priority=100
+    )
+    first = broker.submit_async(
+        "http://explicit-priority.test/first", priority=100
+    )
+    promoted = broker.submit_async(
+        "http://explicit-priority.test/promoted",
+        priority=100,
+        request_id="promote-me",
+    )
+    _wait_for_backlog(broker, 2)
+    assert broker.reprioritize("promote-me", 0)
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        stats = broker.server_stats(timeout=2.0)
+        if stats["parked_live_requests"] == 1:
+            break
+        time.sleep(0.02)
+    assert stats["parked_live_requests"] == 1
+
+    gate.set()
+    for future in (gate_future, first, promoted):
+        assert future.result(timeout=10.0).status_code == 200
+    assert order == ["/gate", "/promoted", "/first"]
 
 
 def test_cancelling_parked_requests_does_not_strand_the_origin():

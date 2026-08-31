@@ -120,7 +120,7 @@ tile_image_cache_mb = 96
 cache_write_buffer_mb = 256
 long_term_cache_write_buffer_mb = 128
 native_partial_allow_incomplete = False
-persist_partial_dds_cache = False
+persist_partial_dds_cache = True
 ```
 
 - `provider_max_in_flight` is the strict global pending-request limit. A
@@ -141,6 +141,28 @@ persist_partial_dds_cache = False
   deadline stalls by using child-cropped lower-ZL imagery and `missing_color`.
 - `persist_partial_dds_cache` stores completed compressed rows asynchronously
   for faster repeat loads. It uses additional space inside the DDS disk budget.
+
+### Bounded prefetch pipeline
+
+```ini
+prefetch_pipeline_v2 = True
+prefetch_lookahead = 10
+prefetch_max_chunks = 64
+prefetch_radius_nm = 30
+background_builder_workers = 2
+predictive_dds_memory_mb = 512
+persist_partial_dds_cache = True
+prefetch_quality_mode = responsive
+```
+
+`prefetch_max_chunks` controls only the admission burst. Queue, candidate, tile,
+JPEG, and predictive-build limits are derived independently from provider and
+memory capacity. A lookahead of `0` permits unlimited route discovery, while
+retained candidates and admitted work remain bounded.
+
+Quality modes are `responsive` (lower-resolution fallback after the normal
+wait), `prefer_target` (a short exact-quality grace period), and
+`strict_target` (no lower-ZL substitution in mipmap zero, with a hard deadline).
 
 ### Performance Diagnostics
 
@@ -185,6 +207,12 @@ Controls how many CPU threads the native pipeline uses for parallel operations (
 Size of the cross-session cache for compiled DDS textures. The deprecated
 `ephemeral_dds_cache_mb` key is accepted for compatibility but no longer
 creates a separate cache.
+
+Set this to `0` to remove the cache's independent DDS-only cap and delegate
+retention to the shared `file_cache_size` budget. With disk-budget enforcement
+enabled, complete DDS files, DDM metadata, and partial-row sidecars all count
+toward the DDS percentage; JPEG source files receive the remaining percentage.
+If disk-budget enforcement is disabled, `0` is genuinely unlimited.
 
 | Value | Behavior |
 |-------|----------|

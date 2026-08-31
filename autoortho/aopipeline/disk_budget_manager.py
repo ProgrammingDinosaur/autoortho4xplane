@@ -2,7 +2,7 @@
 disk_budget_manager.py - Unified disk space management for AutoOrtho
 
 Provides centralized disk accounting and eviction across cache types:
-- DDS cache (.dds + .ddm) - compiled textures
+- DDS cache (.dds + .ddm + .ddm.rows) - compiled textures
 - JPEGs (.jpg) - source tile images
 
 Budget enforcement is soft: writes are never blocked. Instead, when a
@@ -56,27 +56,40 @@ class DiskBudgetManager:
 
     def __init__(self, cache_dir: str, total_budget_mb: int,
                  dds_budget_pct: int = 80,
-                 jpeg_budget_pct: int = 20,
+                 jpeg_budget_pct: Optional[int] = None,
                  dds_cache=None):
         """
         Args:
             cache_dir: Base cache directory.
             total_budget_mb: Total disk budget in MB across all categories.
             dds_budget_pct: Percentage allocated to DDS cache (10-90).
-            jpeg_budget_pct: Percentage allocated to JPEGs (5-50).
+            jpeg_budget_pct: Deprecated compatibility value. DDS allocation is
+                authoritative and JPEGs receive the remaining percentage.
             dds_cache: Optional DynamicDDSCache instance for DDS eviction.
         """
         self._cache_dir = cache_dir
         self._total_budget = total_budget_mb * 1024 * 1024  # bytes
 
-        # Clamp percentages to valid ranges
+        # dds_budget_pct is a literal percentage of the total cache. Older
+        # versions normalized it against a fixed 20% JPEG weight, so 40 meant
+        # 66.7% DDS rather than the documented 40%.
         dds_budget_pct = max(10, min(90, dds_budget_pct))
-        jpeg_budget_pct = max(5, min(50, jpeg_budget_pct))
-
-        # Normalize percentages to sum to 100
-        total_pct = dds_budget_pct + jpeg_budget_pct
-        self._dds_budget = int(self._total_budget * dds_budget_pct / total_pct)
-        self._jpeg_budget = int(self._total_budget * jpeg_budget_pct / total_pct)
+        expected_jpeg_pct = 100 - dds_budget_pct
+        if (
+            jpeg_budget_pct is not None
+            and int(jpeg_budget_pct) != expected_jpeg_pct
+        ):
+            log.warning(
+                "Ignoring jpeg_budget_pct=%s; dds_budget_pct=%s is an "
+                "absolute percentage and JPEGs receive the remaining %s%%",
+                jpeg_budget_pct,
+                dds_budget_pct,
+                expected_jpeg_pct,
+            )
+        self._dds_budget = int(
+            self._total_budget * dds_budget_pct / 100
+        )
+        self._jpeg_budget = self._total_budget - self._dds_budget
 
         # Current usage tracking (updated by scan and accounting calls)
         self._dds_usage = 0
@@ -183,10 +196,13 @@ class DiskBudgetManager:
         start = time.monotonic()
 
         try:
-            # Scan DDS cache
+            # Include compiled DDS data, metadata, and partial-row sidecars.
             dds_dir = os.path.join(self._cache_dir, "dds_cache")
             if os.path.isdir(dds_dir):
-                report.dds_bytes = self._scan_dir_size(dds_dir, ".dds")
+                report.dds_bytes = self._scan_dir_size(
+                    dds_dir,
+                    (".dds", ".ddm", ".ddm.rows"),
+                )
 
             # Scan JPEG files
             report.jpeg_bytes = self._scan_jpegs_size()
@@ -247,13 +263,17 @@ class DiskBudgetManager:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _scan_dir_size(root: str, extension: str) -> int:
-        """Sum file sizes under ``root`` matching ``extension``."""
+    def _scan_dir_size(root: str, extensions) -> int:
+        """Sum file sizes under ``root`` matching one or more extensions."""
+        if isinstance(extensions, str):
+            extensions = (extensions,)
+        else:
+            extensions = tuple(extensions)
         total = 0
         try:
             for dirpath, _dirnames, filenames in os.walk(root):
                 for fname in filenames:
-                    if fname.endswith(extension):
+                    if fname.endswith(extensions):
                         try:
                             total += os.path.getsize(os.path.join(dirpath, fname))
                         except OSError:

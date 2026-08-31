@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -134,7 +135,7 @@ def test_live_admission_is_not_bounded_by_prefetch_capacity(monkeypatch):
     assert getter.queue_depths()["live"] == 2_000
 
 
-def test_prefetch_has_its_own_global_bound(monkeypatch):
+def test_prefetch_queue_capacity_is_independent_from_admission_burst(monkeypatch):
     monkeypatch.setattr(
         getortho, "is_prefetch_runtime_allowed", lambda: True
     )
@@ -143,17 +144,22 @@ def test_prefetch_has_its_own_global_bound(monkeypatch):
     )
     getter = getortho.ChunkGetter(0)
 
+    capacity = getter._prefetch_queue_capacity
     accepted = [
         getter.submit(
             FakeChunk(f"prefetch-{index}", prefetch=True, priority=100)
         )
-        for index in range(33)
+        for index in range(capacity + 1)
     ]
 
-    assert accepted.count(True) == 32
+    assert capacity != 32
+    assert accepted.count(True) == capacity
     assert accepted[-1] is False
     assert getter.submit(FakeChunk("live")) is True
-    assert getter.queue_depths() == {"live": 1, "prefetch": 32}
+    assert getter.queue_depths() == {
+        "live": 1,
+        "prefetch": capacity,
+    }
 
 
 def test_live_work_is_selected_before_prefetch(monkeypatch):
@@ -224,3 +230,119 @@ def test_cancelling_prefetch_does_not_remove_live_work(monkeypatch):
     assert prefetch.cancelled is True
     assert live.cancelled is False
     assert getter.queue_depths() == {"live": 1, "prefetch": 0}
+
+
+def test_strict_target_disables_live_lower_zoom_fallback(monkeypatch):
+    monkeypatch.setattr(
+        getortho.CFG.autoortho,
+        "prefetch_quality_mode",
+        "strict_target",
+        raising=False,
+    )
+    tile = getortho.Tile.__new__(getortho.Tile)
+    assert tile._get_fallback_level() == 0
+    assert tile.get_fallback_level() == 0
+
+
+def test_predictive_builder_rejects_degraded_target_data():
+    ready = FakeChunk("ready")
+    ready.data = b"exact"
+    ready.ready.set()
+    missing = FakeChunk("missing")
+    missing.ready.set()
+
+    class FakeTile:
+        id = "degraded"
+        max_zoom = 17
+        chunks = {17: [ready, missing]}
+
+    builder = getortho.BackgroundDDSBuilder(None)
+    assert builder.submit(FakeTile()) is False
+    assert builder.queue_size == 0
+
+
+def test_coordinator_exact_build_is_admitted_before_full_grid_materialization():
+    class SparseGrid:
+        logical_length = 4
+
+        @staticmethod
+        def materialized():
+            return ()
+
+    class FakeTile:
+        id = "exact-from-cache"
+        max_zoom = 17
+        chunks = {17: SparseGrid()}
+
+    builder = getortho.BackgroundDDSBuilder(None)
+    assert builder.submit(FakeTile()) is False
+    assert builder.submit(FakeTile(), exact_target=True) is True
+    assert builder.queue_size == 1
+    builder.stop()
+
+
+def test_dsf_prefetch_reports_pressure_without_advancing_cursor(monkeypatch):
+    class RejectingCoordinator:
+        max_candidates = 2
+
+        @staticmethod
+        def make_key(*args):
+            return args
+
+        @staticmethod
+        def publish(*args, **kwargs):
+            return False
+
+        @staticmethod
+        def is_known(key):
+            return False
+
+    monkeypatch.setattr(
+        getortho, "is_prefetch_runtime_allowed", lambda: True
+    )
+    monkeypatch.setattr(
+        getortho,
+        "get_tiles_for_dsf",
+        lambda path: [(1, 2, "BI", 17), (3, 4, "BI", 17)],
+    )
+    monkeypatch.setattr(
+        getortho, "prefetch_coordinator", RejectingCoordinator()
+    )
+    monkeypatch.setattr(
+        getortho.spatial_prefetcher,
+        "_tile_cacher",
+        SimpleNamespace(
+            _get_target_zoom_level=lambda zoom, row, col: zoom
+        ),
+    )
+    monkeypatch.setattr(
+        getortho.spatial_prefetcher,
+        "_get_maptype_filter",
+        lambda: None,
+    )
+
+    result = getortho.prefetch_dsf("/tmp/+00+000.dsf")
+
+    assert result == {
+        "submitted": 0,
+        "complete": False,
+        "pressure": True,
+        "cursor": 0,
+    }
+
+
+def test_mark_live_checks_coordinator_even_when_tile_is_already_live(
+    monkeypatch,
+):
+    promoted = []
+    monkeypatch.setattr(
+        getortho,
+        "prefetch_coordinator",
+        SimpleNamespace(promote_tile=lambda tile: promoted.append(tile)),
+    )
+    tile = getortho.Tile.__new__(getortho.Tile)
+    tile._is_live = True
+
+    tile.mark_live()
+
+    assert promoted == [tile]
