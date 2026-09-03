@@ -1195,6 +1195,7 @@ def _build_session_summary(
         parent_metadata,
         process_profiles,
     )
+    delivery = _build_delivery_summary(stats_snapshot or {})
 
     started = min(
         (profile.get("started_wall_time", math.inf) for profile in process_profiles),
@@ -1231,7 +1232,65 @@ def _build_session_summary(
         "stats_snapshot": _sanitize_json(stats_snapshot or {}),
         "metadata": parent_metadata,
         "diagnostic_flags": diagnostics,
+        "delivery": delivery,
         "process_profiles": process_profiles,
+    }
+
+
+def _build_delivery_summary(stats_snapshot: dict) -> dict:
+    def dimensions(prefix):
+        marker = f"{prefix}:"
+        return [
+            {"value": str(key)[len(marker):], "count": int(value or 0)}
+            for key, value in stats_snapshot.items()
+            if str(key).startswith(marker)
+        ]
+
+    return {
+        "effective_target_zoom": sorted(
+            dimensions("effective_target_zoom"),
+            key=lambda row: row["value"],
+        ),
+        "mipmap_zero_sources": [
+            {
+                "source": source,
+                "bytes": int(stats_snapshot.get(counter, 0) or 0),
+            }
+            for source, counter in (
+                ("Exact target", "mm0_served_exact_bytes"),
+                ("Lower ZL / derived", "mm0_served_lower_zl_bytes"),
+                ("Missing color", "mm0_served_missing_bytes"),
+                ("Unknown", "mm0_served_unknown_bytes"),
+            )
+        ],
+        "live_exact_coverage": sorted(
+            dimensions("prefetch_live_exact_coverage_pct"),
+            key=lambda row: row["value"],
+        ),
+        "candidate_eta_at_promotion": sorted(
+            dimensions("prefetch_promotion_eta_seconds"),
+            key=lambda row: row["value"],
+        ),
+        "rows_served": [
+            {
+                "phase": "Before predictive completion",
+                "rows": int(
+                    stats_snapshot.get(
+                        "mm0_rows_served_before_predictive_complete", 0
+                    )
+                    or 0
+                ),
+            },
+            {
+                "phase": "After predictive completion",
+                "rows": int(
+                    stats_snapshot.get(
+                        "mm0_rows_served_after_predictive_complete", 0
+                    )
+                    or 0
+                ),
+            },
+        ],
     }
 
 
@@ -1381,6 +1440,21 @@ def _diagnostic_flags(
             "Observed aggregate peak RSS exceeded the configured memory cache "
             "limit; the limit does not cover all process/native overhead."
         )
+    autoortho_config = metadata.get("config", {}).get("autoortho", {})
+    try:
+        unsafe_prefetch = (
+            float(autoortho_config.get("prefetch_lookahead", 10)) <= 0
+            and int(autoortho_config.get("prefetch_max_chunks", 64)) >= 256
+            and float(autoortho_config.get("prefetch_radius_nm", 30)) >= 50
+        )
+    except (TypeError, ValueError):
+        unsafe_prefetch = False
+    if unsafe_prefetch:
+        flags.append(
+            "Legacy prefetch settings combine unlimited lookahead, at least "
+            "256 chunks per cycle, and a radius of 50 nm or more; use the UI "
+            "recommended-default action unless this pressure is intentional."
+        )
     if not flags:
         flags.append(
             "No built-in threshold fired; rank stages by p95/max and inspect the "
@@ -1422,6 +1496,77 @@ def _render_markdown(summary: dict) -> str:
         "",
     ]
     lines.extend(f"- {flag}" for flag in summary["diagnostic_flags"])
+
+    delivery = summary.get("delivery", {})
+    lines.extend(
+        [
+            "",
+            "## Mipmap-zero delivery",
+            "",
+            "| Source | Bytes served | Share |",
+            "|---|---:|---:|",
+        ]
+    )
+    source_rows = delivery.get("mipmap_zero_sources", [])
+    source_total = sum(row["bytes"] for row in source_rows)
+    for row in source_rows:
+        share = (
+            100.0 * row["bytes"] / source_total if source_total else 0.0
+        )
+        lines.append(
+            f"| {_markdown_escape(row['source'])} | "
+            f"{row['bytes']:,} | {share:,.1f}% |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "### Effective target zoom",
+            "",
+            "| Zoom | Tiles |",
+            "|---:|---:|",
+        ]
+    )
+    for row in delivery.get("effective_target_zoom", []):
+        lines.append(f"| {row['value']} | {row['count']:,} |")
+
+    lines.extend(
+        [
+            "",
+            "### Exact coverage when a prefetched tile became live",
+            "",
+            "| Exact coverage | Promotions |",
+            "|---:|---:|",
+        ]
+    )
+    for row in delivery.get("live_exact_coverage", []):
+        lines.append(f"| {row['value']}% | {row['count']:,} |")
+
+    lines.extend(
+        [
+            "",
+            "### Candidate ETA at promotion",
+            "",
+            "| ETA bucket (seconds) | Promotions |",
+            "|---:|---:|",
+        ]
+    )
+    for row in delivery.get("candidate_eta_at_promotion", []):
+        lines.append(f"| {row['value']} | {row['count']:,} |")
+
+    lines.extend(
+        [
+            "",
+            "### Mipmap-zero rows served",
+            "",
+            "| Phase | Rows |",
+            "|---|---:|",
+        ]
+    )
+    for row in delivery.get("rows_served", []):
+        lines.append(
+            f"| {_markdown_escape(row['phase'])} | {row['rows']:,} |"
+        )
 
     lines.extend(
         [

@@ -92,18 +92,39 @@ def test_runtime_state_controls(config_ui):
 
 def test_partial_loading_controls_are_safe_and_persist(config_ui):
     assert not config_ui.native_partial_allow_incomplete_check.isChecked()
-    assert not config_ui.persist_partial_dds_cache_check.isChecked()
+    assert config_ui.persist_partial_dds_cache_check.isChecked()
 
     config_ui.native_partial_allow_incomplete_check.setChecked(True)
-    config_ui.persist_partial_dds_cache_check.setChecked(True)
+    config_ui.persist_partial_dds_cache_check.setChecked(False)
+    config_ui.prefetch_quality_grace_spinbox.setValue(7.5)
+    config_ui.prefetch_admission_burst_spinbox.setValue(32)
     config_ui.save_config(persist=False, refresh_scenery=False)
 
     assert config_ui.cfg.autoortho.native_partial_allow_incomplete is True
-    assert config_ui.cfg.autoortho.persist_partial_dds_cache is True
+    assert config_ui.cfg.autoortho.persist_partial_dds_cache is False
+    assert float(config_ui.cfg.autoortho.prefetch_quality_grace_sec) == 7.5
+    assert int(config_ui.cfg.autoortho.prefetch_admission_burst) == 32
 
     config_ui._apply_settings_preset("Balanced")
     assert not config_ui.native_partial_allow_incomplete_check.isChecked()
     assert config_ui.persist_partial_dds_cache_check.isChecked()
+
+
+def test_recommended_prefetch_action_replaces_only_unsafe_values(config_ui):
+    config_ui.prefetch_lookahead_slider.setValue(61)
+    config_ui.prefetch_max_chunks_slider.setValue(256)
+    config_ui.prefetch_radius_slider.setValue(50)
+    assert not config_ui.prefetch_defaults_warning.isHidden()
+    assert not config_ui.apply_prefetch_defaults_button.isHidden()
+
+    config_ui._apply_recommended_prefetch_defaults()
+
+    assert config_ui.prefetch_lookahead_slider.value() == 10
+    assert config_ui.prefetch_max_chunks_slider.value() == 64
+    assert config_ui.prefetch_admission_burst_spinbox.value() == 64
+    assert config_ui.prefetch_radius_slider.value() == 30
+    assert config_ui.prefetch_quality_grace_spinbox.value() == 5.0
+    assert config_ui.prefetch_defaults_warning.isHidden()
 
 
 def test_settings_change_enables_apply_and_revert(

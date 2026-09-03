@@ -465,6 +465,20 @@ class DynamicDDSCache:
             if any(not isinstance(revision, int) or revision < 0
                    for revision in revisions.values()):
                 return False
+            provenance = entry.get("provenance", {})
+            if (
+                not isinstance(provenance, dict)
+                or any(
+                    row not in revisions
+                    or not isinstance(values, list)
+                    or any(
+                        not isinstance(value, int) or not 0 <= value <= 255
+                        for value in values
+                    )
+                    for row, values in provenance.items()
+                )
+            ):
+                return False
             if int(mipmap) in populated:
                 return False
         return True
@@ -883,7 +897,8 @@ class DynamicDDSCache:
     def append_partial_row(self, tile_id: str, max_zoom: int, tile,
                            row_index: int, data: bytes, total: int,
                            *, degraded: bool = False,
-                           revision: Optional[int] = None) -> bool:
+                           revision: Optional[int] = None,
+                           provenance: Optional[bytes] = None) -> bool:
         """Append one mipmap-0 chunk row and atomically expose it in DDM v4.
 
         ``total`` is the number of chunk rows in mipmap 0.  A row becomes
@@ -951,6 +966,9 @@ class DynamicDDSCache:
                 entry["degraded"] = sorted(degraded_rows)
                 entry["revision"] = max(entry["revision"], row_revision)
                 entry["row_revisions"][str(row_index)] = row_revision
+                if provenance is not None:
+                    encoded = [int(value) for value in bytes(provenance)]
+                    entry.setdefault("provenance", {})[str(row_index)] = encoded
 
                 # Row records are not a normal DDS file. Keep mipmap 0 out of
                 # populated_mipmaps until the live tile promotes and stores a
@@ -1000,7 +1018,9 @@ class DynamicDDSCache:
     def enqueue_partial_row(self, tile_id: str, max_zoom: int, tile,
                             row_index: int, data: bytes, total: int,
                             *, degraded: bool = False,
-                            revision: Optional[int] = None) -> bool:
+                            revision: Optional[int] = None,
+                            provenance: Optional[bytes] = None,
+                            completion_callback=None) -> bool:
         """Queue a row for non-blocking, coalesced background persistence."""
         if not self._enabled or self._partial_row_queue_limit <= 0:
             return False
@@ -1032,6 +1052,10 @@ class DynamicDDSCache:
             pending["rows"][row_index] = {
                 "data": row_data, "total": total, "degraded": degraded,
                 "revision": revision,
+                "provenance": (
+                    bytes(provenance) if provenance is not None else None
+                ),
+                "completion_callback": completion_callback,
             }
             self._partial_row_queue_bytes = queued_bytes + len(row_data)
             self._partial_row_condition.notify()
@@ -1049,12 +1073,20 @@ class DynamicDDSCache:
                     len(item["data"]) for item in pending["rows"].values())
                 self._partial_row_active = True
             for row_index, item in pending["rows"].items():
-                if self.append_partial_row(
+                success = self.append_partial_row(
                         _key[0], _key[1], pending["tile"], row_index,
                         item["data"], item["total"], degraded=item["degraded"],
-                        revision=item["revision"]):
+                        revision=item["revision"],
+                        provenance=item["provenance"])
+                if success:
                     with self._partial_row_condition:
                         self._partial_row_persisted += 1
+                callback = item.get("completion_callback")
+                if callback is not None:
+                    try:
+                        callback(bool(success), row_index)
+                    except Exception:
+                        log.exception("Partial-row completion callback failed")
             with self._partial_row_condition:
                 self._partial_row_active = False
                 self._partial_row_condition.notify_all()

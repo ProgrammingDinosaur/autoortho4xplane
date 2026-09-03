@@ -1583,7 +1583,6 @@ class TestDDMv4PartialRows:
         }
         assert dds_cache.load_partial_rows(
             mock_tile.id, mock_tile.max_zoom, mock_tile) == {0: b"first"}
-
         assert dds_cache.append_partial_row(
             mock_tile.id, mock_tile.max_zoom, mock_tile, 1, b"second", 2)
         metadata = dds_cache.load_metadata(
@@ -1593,6 +1592,49 @@ class TestDDMv4PartialRows:
         assert dds_cache.load_partial_rows(
             mock_tile.id, mock_tile.max_zoom, mock_tile
         ) == {0: b"first", 1: b"second"}
+
+    def test_partial_row_provenance_round_trips(self, dds_cache, mock_tile):
+        provenance = bytes([1, 1, 2, 5])
+        assert dds_cache.append_partial_row(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+            0,
+            b"row",
+            2,
+            provenance=provenance,
+        )
+
+        metadata = dds_cache.load_metadata(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+        )
+
+        assert metadata["partial_mipmaps"]["0"]["provenance"] == {
+            "0": [1, 1, 2, 5]
+        }
+
+    def test_partial_row_completion_reports_persistence_result(
+        self,
+        dds_cache,
+        mock_tile,
+    ):
+        completed = []
+        assert dds_cache.enqueue_partial_row(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+            0,
+            b"row",
+            2,
+            provenance=bytes([1, 1]),
+            completion_callback=lambda success, row: completed.append(
+                (success, row)
+            ),
+        )
+        assert dds_cache.flush_partial_rows(timeout=2)
+        assert completed == [(True, 0)]
 
     def test_complete_store_serializes_against_partial_append(
         self,

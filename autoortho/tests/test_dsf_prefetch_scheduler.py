@@ -167,3 +167,95 @@ def test_shutdown_cancels_deferred_work_and_joins_workers():
 
     assert scheduler.state("/Earth nav data/+03+003.dsf") is None
     assert not any(worker.is_alive() for worker in scheduler._workers)
+
+
+def test_flight_gate_parks_without_retries_and_wakes_once():
+    class Gate:
+        def __init__(self):
+            self.allowed = False
+            self.condition = threading.Condition()
+
+        def wait_until_allowed(self, stop_event):
+            with self.condition:
+                while not self.allowed and not stop_event.is_set():
+                    self.condition.wait()
+                return self.allowed
+
+        def notify_state_change(self):
+            with self.condition:
+                self.condition.notify_all()
+
+        def open(self):
+            with self.condition:
+                self.allowed = True
+                self.condition.notify_all()
+
+    gate = Gate()
+    calls = []
+    scheduler = DSFPrefetchScheduler(
+        lambda path: calls.append(path) or 1,
+        lambda: gate.allowed,
+        runtime_gate=gate,
+        grace_period=0,
+        queue_size=8,
+    )
+    path = "/Earth nav data/+04+004.dsf"
+    try:
+        assert scheduler.schedule(path)
+        assert _wait_for(
+            lambda: scheduler.state(path) == scheduler.WAITING_FOR_FLIGHT
+        )
+        time.sleep(0.03)
+        assert calls == []
+        assert scheduler._entries[path]["retries"] == 0
+        assert scheduler._entries[path]["pressure_retries"] == 0
+
+        gate.open()
+        assert _wait_for(lambda: scheduler.state(path) == scheduler.COMPLETE)
+        assert calls == [os.path.normcase(os.path.abspath(path))]
+    finally:
+        scheduler.shutdown()
+
+
+def test_flight_gate_permission_race_does_not_kill_worker():
+    class Gate:
+        def __init__(self):
+            self.condition = threading.Condition()
+            self.allowed = False
+
+        def wait_until_allowed(self, stop_event):
+            with self.condition:
+                self.allowed = True
+                self.condition.notify_all()
+                return True
+
+        def notify_state_change(self):
+            with self.condition:
+                self.condition.notify_all()
+
+    gate = Gate()
+    checks = {"count": 0}
+
+    def allowed():
+        checks["count"] += 1
+        return checks["count"] not in {1, 2}
+
+    scheduler = DSFPrefetchScheduler(
+        lambda _path: 1,
+        allowed,
+        runtime_gate=gate,
+        grace_period=0,
+        poll_interval=0.01,
+    )
+    path = "/Earth nav data/+05+005.dsf"
+    try:
+        assert scheduler.schedule(path)
+        assert _wait_for(
+            lambda: scheduler.state(path) in {
+                scheduler.DEFERRED,
+                scheduler.COMPLETE,
+            }
+        )
+        assert all(worker.is_alive() for worker in scheduler._workers)
+    finally:
+        scheduler.shutdown()

@@ -130,6 +130,8 @@ origins may continue ramping toward `provider_max_in_flight`.
 [autoortho]
 # Adaptive per-origin concurrency (broker-side).
 provider_adaptive_concurrency = True
+# Use two-second throughput/latency/error windows instead of legacy AIMD.
+provider_adaptive_controller_v2 = True
 # 0 => start at provider_max_connections and ramp toward the ceiling.
 provider_origin_initial_concurrency = 0
 provider_origin_min_concurrency = 2
@@ -144,6 +146,7 @@ provider_origin_cooldown_seconds = 5.0
 | Setting | Default | Range | Notes |
 |---------|---------|-------|-------|
 | `provider_adaptive_concurrency` | `True` | bool | Disable to use a fixed per-origin limit equal to the ceiling. |
+| `provider_adaptive_controller_v2` | `True` | bool | Uses windowed proportional probing and severity-based reductions; disable temporarily for legacy per-response AIMD. |
 | `provider_origin_initial_concurrency` | `0` | 0-1024 | `0` starts at the effective connection budget, preventing an initial request flood while still ramping after successful responses. |
 | `provider_origin_min_concurrency` | `2` | 1-256 | Floor the controller will never drop below. Also clamps the initial value upwards. |
 | `provider_origin_max_concurrency` | `0` | 0-1024 | `0` means `provider_max_in_flight`. Always clamped to the global `max_concurrency`. |

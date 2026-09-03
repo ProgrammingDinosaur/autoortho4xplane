@@ -115,6 +115,7 @@ provider_max_connections = 64
 download_dispatch_workers = 4
 provider_queue_timeout = 60
 provider_adaptive_concurrency = True
+provider_adaptive_controller_v2 = True
 live_tile_admission = 16
 tile_image_cache_mb = 96
 cache_write_buffer_mb = 256
@@ -148,16 +149,20 @@ persist_partial_dds_cache = True
 prefetch_pipeline_v2 = True
 prefetch_lookahead = 10
 prefetch_max_chunks = 64
+prefetch_admission_burst = 64
 prefetch_radius_nm = 30
 background_builder_workers = 2
 predictive_dds_memory_mb = 512
 persist_partial_dds_cache = True
 prefetch_quality_mode = responsive
+prefetch_quality_grace_sec = 5
 ```
 
-`prefetch_max_chunks` controls only the admission burst. Queue, candidate, tile,
-JPEG, and predictive-build limits are derived independently from provider and
-memory capacity. A lookahead of `0` permits unlimited route discovery, while
+`prefetch_max_chunks` bounds work published per producer cycle, while
+`prefetch_admission_burst` bounds one candidate's coordinator pass. Queue,
+candidate, tile, JPEG, and predictive-build limits are derived independently
+from provider and memory capacity. A lookahead of `0` permits unlimited route
+discovery, while
 retained candidates and admitted work remain bounded.
 
 Quality modes are `responsive` (lower-resolution fallback after the normal

@@ -18,7 +18,8 @@ import concurrent.futures
 import uuid
 import math
 import tracemalloc
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import Optional, Dict, Tuple, List
 
 from io import BytesIO
@@ -40,6 +41,7 @@ try:
         PrefetchQualityMode,
         PrefetchSource,
         PrefetchSubmitStatus,
+        QualityDeadlinePolicy,
     )
 except ImportError:
     from prefetch import (
@@ -52,6 +54,7 @@ except ImportError:
         PrefetchQualityMode,
         PrefetchSource,
         PrefetchSubmitStatus,
+        QualityDeadlinePolicy,
     )
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
@@ -1060,14 +1063,187 @@ def native_thread_load_peak_and_reset() -> tuple:
         _peak_native_thread_count = _active_native_thread_count
     return snap
 
-# Track live (FUSE-requested) tile reads in progress.
-# When threshold exceeded, prefetching pauses to give network resources
-# to live requests. Background DDS building does NOT pause — instrumentation
-# (native_semaphore_wait_ms_live) confirmed zero contention; gating the
-# builder leaves it idle for the entire flight (the symptom in the bug logs:
-# `BackgroundDDSBuilder: 0 tiles built`).
-_live_reads_in_progress = 0
+class LivePressureController:
+    """Worker-local event source for live demand and bounded imminent sharing."""
+
+    def __init__(
+        self,
+        *,
+        build_threshold=6,
+        clearance_hysteresis=0.35,
+        imminent_share=0.08,
+        token_capacity=8.0,
+        clock=time.monotonic,
+    ):
+        self._condition = threading.Condition()
+        self._clock = clock
+        self._build_threshold = max(1, int(build_threshold))
+        self._clearance_hysteresis = max(
+            0.25, min(0.5, float(clearance_hysteresis))
+        )
+        self._imminent_share = max(0.05, min(0.10, float(imminent_share)))
+        self._token_capacity = max(1.0, float(token_capacity))
+        self._tokens = self._token_capacity
+        self._live_reads = 0
+        self._download_live_pressure = False
+        self._network_pressure = False
+        self._build_pressure = False
+        self._network_clear_since = self._clock()
+        self._build_clear_since = self._clock()
+        self._generation = 0
+        self._listeners = []
+
+    @property
+    def generation(self):
+        with self._condition:
+            return self._generation
+
+    @property
+    def live_reads(self):
+        with self._condition:
+            return self._live_reads
+
+    def add_listener(self, callback):
+        with self._condition:
+            if callback not in self._listeners:
+                self._listeners.append(callback)
+
+    def remove_listener(self, callback):
+        with self._condition:
+            try:
+                self._listeners.remove(callback)
+            except ValueError:
+                pass
+
+    def _update_locked(self):
+        network = self._live_reads > 0 or self._download_live_pressure
+        build = self._live_reads >= self._build_threshold
+        if (network, build) == (
+            self._network_pressure,
+            self._build_pressure,
+        ):
+            return ()
+        now = self._clock()
+        if network != self._network_pressure:
+            self._network_clear_since = None if network else now
+        if build != self._build_pressure:
+            self._build_clear_since = None if build else now
+        self._network_pressure = network
+        self._build_pressure = build
+        self._generation += 1
+        self._condition.notify_all()
+        return tuple(self._listeners)
+
+    @staticmethod
+    def _notify(listeners, generation):
+        for callback in listeners:
+            try:
+                callback(generation)
+            except Exception:
+                log.exception("Live-pressure listener failed")
+
+    def live_read_start(self):
+        with self._condition:
+            self._live_reads += 1
+            listeners = self._update_locked()
+            generation = self._generation
+        self._notify(listeners, generation)
+
+    def live_read_end(self):
+        with self._condition:
+            self._live_reads = max(0, self._live_reads - 1)
+            listeners = self._update_locked()
+            generation = self._generation
+        self._notify(listeners, generation)
+
+    def update_download_pressure(self, active):
+        with self._condition:
+            self._download_live_pressure = bool(active)
+            listeners = self._update_locked()
+            generation = self._generation
+        self._notify(listeners, generation)
+
+    def is_under_pressure(self, kind="network"):
+        with self._condition:
+            if kind == "build":
+                return self._build_pressure
+            return self._network_pressure
+
+    def note_provider_completion(self):
+        with self._condition:
+            previous = int(self._tokens + 1e-9)
+            self._tokens = min(
+                self._token_capacity,
+                self._tokens + self._imminent_share,
+            )
+            if int(self._tokens + 1e-9) <= previous:
+                return
+            self._generation += 1
+            generation = self._generation
+            listeners = tuple(self._listeners)
+            self._condition.notify_all()
+        self._notify(listeners, generation)
+
+    def imminent_tokens(self):
+        with self._condition:
+            return int(self._tokens + 1e-9)
+
+    def allow_imminent(self, *, consume=False):
+        with self._condition:
+            if not self._network_pressure:
+                return True
+            if self._tokens + 1e-9 < 1.0:
+                return False
+            if consume:
+                self._tokens = max(0.0, self._tokens - 1.0)
+            return True
+
+    def refund_imminent(self):
+        with self._condition:
+            self._tokens = min(self._token_capacity, self._tokens + 1.0)
+            self._condition.notify_all()
+
+    def wait_until_clear(self, stop_event, *, kind="build"):
+        with self._condition:
+            while not stop_event.is_set():
+                pressure = (
+                    self._build_pressure
+                    if kind == "build"
+                    else self._network_pressure
+                )
+                if pressure:
+                    self._condition.wait()
+                    continue
+                clear_since = (
+                    self._build_clear_since
+                    if kind == "build"
+                    else self._network_clear_since
+                ) or self._clock()
+                remaining = (
+                    clear_since + self._clearance_hysteresis - self._clock()
+                )
+                if remaining <= 0:
+                    return True
+                self._condition.wait(remaining)
+            return False
+
+    def notify_state_change(self):
+        with self._condition:
+            self._condition.notify_all()
+
+
+try:
+    _pressure_capacity = max(
+        1,
+        int(resolve_provider_setting("provider_max_in_flight") * 0.10),
+    )
+except Exception:
+    _pressure_capacity = 8
+live_pressure_controller = LivePressureController(
+    token_capacity=_pressure_capacity
+)
 _live_reads_lock = threading.Lock()
+_live_reads_in_progress = 0
 try:
     _live_tile_admission_limit = max(
         1,
@@ -1088,13 +1264,26 @@ _partial_mm0_promotions_lock = threading.Lock()
 _read_ahead_executor = None
 _read_ahead_executor_lock = threading.Lock()
 _read_ahead_capacity = threading.BoundedSemaphore(2)
+_exact_row_executor = None
+_exact_row_executor_lock = threading.Lock()
+_exact_row_capacity = threading.BoundedSemaphore(2)
 
 _shutdown_requested = threading.Event()
 
 
 def begin_shutdown(reason="shutdown"):
     """Signal shutdown and unblock queued/waiting chunk work immediately."""
+    global _exact_row_executor
     _shutdown_requested.set()
+    live_pressure_controller.notify_state_change()
+    try:
+        flight_runtime_gate.stop()
+    except NameError:
+        pass
+    with _exact_row_executor_lock:
+        executor, _exact_row_executor = _exact_row_executor, None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
     try:
         chunk_getter.cancel_all_work(reason)
     except Exception:
@@ -1115,13 +1304,15 @@ def _live_read_start():
     global _live_reads_in_progress
     with _live_reads_lock:
         _live_reads_in_progress += 1
+    live_pressure_controller.live_read_start()
 
 
 def _live_read_end():
     """Signal that a live tile read has finished."""
     global _live_reads_in_progress
     with _live_reads_lock:
-        _live_reads_in_progress -= 1
+        _live_reads_in_progress = max(0, _live_reads_in_progress - 1)
+    live_pressure_controller.live_read_end()
 
 
 def acquire_live_tile_slot(timeout: float) -> bool:
@@ -1146,8 +1337,11 @@ def release_live_tile_slot() -> None:
 
 def is_live_building() -> bool:
     """Return True if live read pressure is high enough to pause prefetching."""
-    with _live_reads_lock:
-        return _live_reads_in_progress >= 6
+    return live_pressure_controller.is_under_pressure("build")
+
+
+def has_live_pressure() -> bool:
+    return live_pressure_controller.is_under_pressure("network")
 
 
 _shared_flight_state_lock = threading.Lock()
@@ -1225,16 +1419,112 @@ def _sync_shared_flight_state() -> bool:
         return _shared_flight_state_allowed
 
 
-def is_prefetch_runtime_allowed() -> bool:
-    """Allow speculative work only after X-Plane has entered the flight."""
+class FlightRuntimeGate:
+    """One condition and one watcher for all speculative flight-start waits."""
+
+    def __init__(self, state_reader, poll_interval=0.5):
+        self._state_reader = state_reader
+        self._poll_interval = max(0.1, float(poll_interval))
+        self._condition = threading.Condition()
+        self._allowed = False
+        self._generation = 0
+        self._stop = threading.Event()
+        self._watcher = None
+
+    @property
+    def generation(self):
+        with self._condition:
+            return self._generation
+
+    def _ensure_started(self):
+        allowed = bool(self._state_reader())
+        with self._condition:
+            if allowed != self._allowed:
+                self._allowed = allowed
+                self._generation += 1
+            if self._watcher is not None and self._watcher.is_alive():
+                return
+            self._stop.clear()
+            self._watcher = threading.Thread(
+                target=self._watch,
+                name="FlightRuntimeGate",
+                daemon=True,
+            )
+            self._watcher.start()
+
+    def _watch(self):
+        while not self._stop.is_set() and not is_shutdown_requested():
+            self.notify_state_change()
+            self._stop.wait(self._poll_interval)
+        with self._condition:
+            self._condition.notify_all()
+
+    def is_allowed(self):
+        self._ensure_started()
+        with self._condition:
+            return self._allowed
+
+    def wait_until_allowed(self, stop_event):
+        self._ensure_started()
+        with self._condition:
+            while (
+                not self._allowed
+                and not stop_event.is_set()
+                and not self._stop.is_set()
+                and not is_shutdown_requested()
+            ):
+                self._condition.wait()
+            return bool(self._allowed and not stop_event.is_set())
+
+    def notify_state_change(self):
+        allowed = bool(self._state_reader())
+        with self._condition:
+            if allowed != self._allowed:
+                self._allowed = allowed
+                self._generation += 1
+            self._condition.notify_all()
+
+    def stop(self):
+        self._stop.set()
+        with self._condition:
+            self._condition.notify_all()
+
+
+flight_runtime_gate = FlightRuntimeGate(_sync_shared_flight_state)
+
+
+def is_flight_runtime_allowed() -> bool:
     enabled = getattr(CFG.autoortho, "prefetch_enabled", True)
     if isinstance(enabled, str):
         enabled = enabled.lower().strip() in ("true", "1", "yes", "on")
+    return bool(enabled and flight_runtime_gate.is_allowed())
+
+
+def is_prefetch_runtime_allowed(imminent=False, consume_token=False) -> bool:
+    """Allow speculative work only after X-Plane has entered the flight."""
     return bool(
-        enabled
-        and _sync_shared_flight_state()
-        and not is_live_building()
+        is_flight_runtime_allowed()
+        and (
+            not live_pressure_controller.is_under_pressure("network")
+            or (
+                imminent
+                and live_pressure_controller.allow_imminent(
+                    consume=consume_token
+                )
+            )
+        )
     )
+
+
+def _prefetch_allowed_for(obj, *, consume_token=False):
+    imminent = bool(getattr(obj, "prefetch_imminent", False))
+    try:
+        return is_prefetch_runtime_allowed(
+            imminent=imminent,
+            consume_token=consume_token,
+        )
+    except TypeError:
+        return is_prefetch_runtime_allowed()
 
 
 def _thread_budget_for(active: int) -> int:
@@ -1280,7 +1570,10 @@ class _native_build_context:
 
 
 def _defer_background_build_if_live(tile=None):
-    if is_live_building() and not getattr(tile, '_is_live', False):
+    if (
+        live_pressure_controller.is_under_pressure("build")
+        and not getattr(tile, '_is_live', False)
+    ):
         raise _BackgroundBuildDeferred("live read active")
 
 
@@ -1915,7 +2208,8 @@ class _BrokerDownloadStage(object):
             admitted = self._try_admit_locked(background)
             if admitted:
                 obj._stage_background_admitted = background
-            return admitted
+        self._publish_live_pressure()
+        return admitted
 
     def _try_admit_locked(self, background):
         if self._stopping.is_set():
@@ -1950,8 +2244,24 @@ class _BrokerDownloadStage(object):
                 )
             has_deferred = not self._deferred.empty()
             self._admit_cv.notify()
+        self._publish_live_pressure()
         if has_deferred:
             self._request_drain()
+
+    def _publish_live_pressure(self):
+        with self._lock:
+            live_outstanding = max(
+                0, self._outstanding - self._background_outstanding
+            )
+        live_deferred = any(
+            not self._is_background(pending.obj)
+            for pending in self._deferred.items()
+        )
+        live_queue = getattr(self._getter, "live_queue", None)
+        live_queued = bool(live_queue.qsize()) if live_queue is not None else False
+        live_pressure_controller.update_download_pressure(
+            bool(live_outstanding or live_deferred or live_queued)
+        )
 
     def outstanding(self):
         with self._lock:
@@ -2116,6 +2426,7 @@ class _BrokerDownloadStage(object):
                 # A slot may have been freed between the failed admission and
                 # the push above, so make sure someone looks at the queue.
                 self._request_drain()
+                self._publish_live_pressure()
                 return True
             if expired:
                 self._requeue_deferred(pending)
@@ -2188,6 +2499,7 @@ class _BrokerDownloadStage(object):
                 if pending is None:
                     return
                 self._admit_cv.notify()
+            self._publish_live_pressure()
             if self._stopping.is_set() or getattr(pending.obj, "cancelled", False):
                 self._release(pending.obj)
                 self._retire_deferred(pending)
@@ -2470,6 +2782,7 @@ class _BrokerDownloadStage(object):
             active = list(self._active.keys())
             deferred = self._deferred.drain()
             self._admit_cv.notify_all()
+        self._publish_live_pressure()
         if broker is not None:
             for request_id in active:
                 try:
@@ -2521,6 +2834,7 @@ class _BrokerDownloadStage(object):
                 or self._is_background(pending.obj)
             )
             self._admit_cv.notify_all()
+        self._publish_live_pressure()
         for pending in removed:
             self._retire_deferred(pending)
         return len(removed)
@@ -2536,6 +2850,7 @@ class _BrokerDownloadStage(object):
                 and self._is_background(pending.obj)
             )
             self._admit_cv.notify_all()
+        self._publish_live_pressure()
         for pending in removed:
             self._retire_deferred(pending)
         return len(removed)
@@ -2783,7 +3098,36 @@ class Getter(object):
                     self._inflight_objs.discard(obj)
             # If did_resubmit: in_flight was already cleared before submit(), and
             # _inflight_objs will be managed by whichever worker picks it up next.
+        if not quiet:
+            live_pressure_controller.note_provider_completion()
         return did_resubmit
+
+    @staticmethod
+    def _is_imminent_item(item):
+        return bool(getattr(item[0], "prefetch_imminent", False))
+
+    def _get_prefetch_nowait(self):
+        if is_prefetch_runtime_allowed():
+            return self.prefetch_queue.get_nowait()
+        imminent = self.prefetch_queue.peek(
+            predicate=self._is_imminent_item
+        )
+        if (
+            imminent is not None
+            and _prefetch_allowed_for(imminent[0])
+        ):
+            if _prefetch_allowed_for(
+                imminent[0],
+                consume_token=True,
+            ):
+                try:
+                    return self.prefetch_queue.get_nowait(
+                        predicate=self._is_imminent_item
+                    )
+                except Empty:
+                    live_pressure_controller.refund_imminent()
+                    raise
+        raise Empty
 
     def _get_next_work(self):
         """Always service live work first; never spin on paused prefetch."""
@@ -2792,28 +3136,23 @@ class Getter(object):
         except Empty:
             pass
 
-        if is_prefetch_runtime_allowed():
-            try:
-                return self.prefetch_queue, self.prefetch_queue.get_nowait()
-            except Empty:
-                pass
+        try:
+            return self.prefetch_queue, self._get_prefetch_nowait()
+        except Empty:
+            pass
 
         try:
             return self.live_queue, self.live_queue.get(timeout=0.05)
         except Empty:
-            if is_prefetch_runtime_allowed():
-                try:
-                    return (
-                        self.prefetch_queue,
-                        self.prefetch_queue.get(timeout=0.05),
-                    )
-                except Empty:
-                    pass
+            try:
+                return self.prefetch_queue, self._get_prefetch_nowait()
+            except Empty:
+                pass
         return None, None
 
     def _enqueue(self, obj, args, kwargs) -> bool:
         if getattr(obj, "prefetch", False):
-            if not is_prefetch_runtime_allowed():
+            if not _prefetch_allowed_for(obj):
                 bump("prefetch_skipped_until_flight")
                 return False
             target = self.prefetch_queue
@@ -2840,18 +3179,36 @@ class Getter(object):
     def prefetch_capacity_snapshot(self):
         stage = self._async_stage
         if stage is not None:
-            return stage.prefetch_capacity_snapshot(
+            snapshot = stage.prefetch_capacity_snapshot(
                 queue_available=self.prefetch_queue.available(),
                 live_queued=self.live_queue.qsize(),
             )
-        queue_available = self.prefetch_queue.available()
-        return PrefetchCapacitySnapshot(
-            queue_available=queue_available,
-            stage_available=queue_available,
-            deferred_available=queue_available,
-            live_queued=self.live_queue.qsize(),
-            broker_background_available=queue_available,
+        else:
+            queue_available = self.prefetch_queue.available()
+            snapshot = PrefetchCapacitySnapshot(
+                queue_available=queue_available,
+                stage_available=queue_available,
+                deferred_available=queue_available,
+                live_queued=self.live_queue.qsize(),
+                broker_background_available=queue_available,
+            )
+        live_pressure_controller.update_download_pressure(
+            snapshot.live_pressure
         )
+        if (
+            live_pressure_controller.is_under_pressure("network")
+            and not snapshot.live_pressure
+        ):
+            snapshot = replace(snapshot, live_outstanding=1)
+        return snapshot
+
+    @staticmethod
+    def add_pressure_listener(callback):
+        live_pressure_controller.add_listener(callback)
+
+    @staticmethod
+    def remove_pressure_listener(callback):
+        live_pressure_controller.remove_listener(callback)
 
     def get(obj, *args, **kwargs):
         raise NotImplementedError
@@ -2884,7 +3241,7 @@ class Getter(object):
     def submit_prefetch(self, obj, *args, **kwargs):
         if not self.WORKING.is_set():
             return PrefetchSubmitStatus.STOPPING
-        if not is_prefetch_runtime_allowed():
+        if not _prefetch_allowed_for(obj):
             return PrefetchSubmitStatus.DISABLED
         if getattr(obj, "cancelled", False) or obj.permanent_failure:
             return PrefetchSubmitStatus.CANCELLED
@@ -3137,7 +3494,7 @@ class ChunkGetter(Getter):
         """Typed prefetch admission preserving duplicate coalescing semantics."""
         if not self.WORKING.is_set():
             return PrefetchSubmitStatus.STOPPING
-        if not is_prefetch_runtime_allowed():
+        if not _prefetch_allowed_for(obj):
             return PrefetchSubmitStatus.DISABLED
         if obj.permanent_failure or getattr(obj, "cancelled", False):
             return PrefetchSubmitStatus.CANCELLED
@@ -4894,6 +5251,11 @@ class SpatialPrefetcher:
                         ),
                         "quality_class": 2 if time_sec <= 600 else 3,
                         "source_confidence": 1.0,
+                        "path_start": (lat, lon),
+                        "path_end": (
+                            path_points[-1].lat,
+                            path_points[-1].lon,
+                        ),
                     }
                 )
             signature = tuple(item["key"] for item in evidence)
@@ -4999,6 +5361,8 @@ class SpatialPrefetcher:
                             ),
                             "quality_class": 3,
                             "source_confidence": 0.8,
+                            "path_start": (lat, lon),
+                            "path_end": (fix.lat, fix.lon),
                         }
             ordered = sorted(
                 evidence.values(),
@@ -5106,6 +5470,45 @@ class SpatialPrefetcher:
                 tiles.append((row, col))
         
         return tiles
+
+    def tile_in_projected_corridor(self, row, col, zoom):
+        """Reject broad DSF discoveries outside the current flight corridor."""
+        if not (
+            getattr(datareftracker, "connected", False)
+            and getattr(datareftracker, "data_valid", False)
+        ):
+            return True
+        try:
+            player_lat = float(datareftracker.lat)
+            player_lon = float(datareftracker.lon)
+            heading = math.radians(float(datareftracker.hdg))
+            speed = max(self.MIN_SPEED_MPS, float(datareftracker.spd))
+            tile_lat, tile_lon = _chunk_to_latlon(
+                float(row) + 8.0,
+                float(col) + 8.0,
+                int(zoom),
+            )
+            north = (tile_lat - player_lat) * 111320.0
+            lon_delta = (
+                (tile_lon - player_lon + 180.0) % 360.0
+            ) - 180.0
+            east = (
+                lon_delta
+                * 111320.0
+                * max(0.01, math.cos(math.radians(player_lat)))
+            )
+            along = east * math.sin(heading) + north * math.cos(heading)
+            cross = abs(
+                east * math.cos(heading) - north * math.sin(heading)
+            )
+            radius = self.prefetch_radius_nm * 1852.0
+            max_ahead = speed * self.lookahead_sec + radius
+            return (
+                -min(radius, 10.0 * 1852.0) <= along <= max_ahead
+                and cross <= radius
+            )
+        except Exception:
+            return True
     
     def _prefetch_waypoint_area(self, waypoint_lat: float, waypoint_lon: float,
                                   radius_nm: float, zoom: int) -> int:
@@ -5389,6 +5792,11 @@ class SpatialPrefetcher:
                         "distance_meters": distance,
                         "quality_class": 2 if distance <= 20 * 1852 else 3,
                         "source_confidence": 0.9,
+                        "path_start": (lat, lon),
+                        "path_end": (
+                            sample_points[-1][0],
+                            sample_points[-1][1],
+                        ),
                     }
                 )
             self._velocity_generation += 1
@@ -5646,7 +6054,7 @@ def start_prefetcher(tile_cacher, scenery_id="default"):
                 chunk_getter=chunk_getter,
                 scenery_id=scenery_id,
                 admission_burst=int(
-                    getattr(CFG.autoortho, "prefetch_max_chunks", 64)
+                    getattr(CFG.autoortho, "prefetch_admission_burst", 64)
                 ),
                 max_candidates=256,
                 max_tile_leases=min(96, max(16, provider_capacity)),
@@ -5673,7 +6081,12 @@ def prefetch_dsf(
     cursor: Optional[int] = None,
 ):
     if not is_prefetch_runtime_allowed():
-        return 0
+        return {
+            "submitted": 0,
+            "complete": False,
+            "pressure": True,
+            "cursor": cursor,
+        }
     tiles = get_tiles_for_dsf(dsf_path)
     maptype_override = spatial_prefetcher._get_maptype_filter()
     if maptype_override:
@@ -5690,6 +6103,12 @@ def prefetch_dsf(
         pressure = False
         generation = os.path.normcase(os.path.abspath(dsf_path))
         for row, col, maptype, zoom in tiles[start:end]:
+            if not spatial_prefetcher.tile_in_projected_corridor(
+                row, col, zoom
+            ):
+                bump("dsf_candidates_outside_corridor")
+                next_cursor += 1
+                continue
             target_zoom = spatial_prefetcher._tile_cacher._get_target_zoom_level(
                 zoom, row=row, col=col
             )
@@ -5971,6 +6390,16 @@ class TileCompletionTracker:
 
 
 
+class _DDSBuildState(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    WAITING_FOR_LIVE_CLEAR = "waiting_for_live_clear"
+    WAITING_FOR_MEMORY = "waiting_for_memory"
+    COMPLETE = "complete"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 @dataclass
 class _DDSBuildRequest:
     tile: object
@@ -5979,6 +6408,9 @@ class _DDSBuildRequest:
     exact_target: bool = False
     callbacks: list = field(default_factory=list)
     active: bool = False
+    state: _DDSBuildState = _DDSBuildState.QUEUED
+    waiting_since: float = 0.0
+    resumed_at: float = 0.0
 
 
 class BackgroundDDSBuilder:
@@ -6023,6 +6455,8 @@ class BackgroundDDSBuilder:
         self._queued_bytes = 0
         self._active_bytes = 0
         self._requests = {}
+        self._waiting_live = OrderedDict()
+        self._waiting_memory = OrderedDict()
         
         # Worker pool for parallel builds
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
@@ -6042,6 +6476,7 @@ class BackgroundDDSBuilder:
         """Start the background builder."""
         if self._coordinator_thread is not None and self._coordinator_thread.is_alive():
             return
+        live_pressure_controller.add_listener(self._on_pressure_change)
         
         self._stop_event.clear()
         
@@ -6068,13 +6503,20 @@ class BackgroundDDSBuilder:
 
         pending = self._queue.drain()
         with self._active_lock:
+            pending.extend(self._waiting_live.values())
+            pending.extend(self._waiting_memory.values())
+            self._waiting_live.clear()
+            self._waiting_memory.clear()
             for request in pending:
+                request.state = _DDSBuildState.CANCELLED
                 self._queued_bytes = max(
                     0, self._queued_bytes - request.estimated_bytes
                 )
                 self._requests.pop(request.tile.id, None)
         for request in pending:
             self._notify_build_callbacks(request, False)
+        live_pressure_controller.notify_state_change()
+        live_pressure_controller.remove_listener(self._on_pressure_change)
 
         # Stop coordinator
         if self._coordinator_thread is not None:
@@ -6106,6 +6548,8 @@ class BackgroundDDSBuilder:
 
     @staticmethod
     def _target_is_exact(tile):
+        if BackgroundDDSBuilder._has_complete_persisted_mm0(tile):
+            return True
         grid = tile.chunks.get(tile.max_zoom)
         if grid is None:
             return False
@@ -6122,6 +6566,19 @@ class BackgroundDDSBuilder:
                 chunk.ready.is_set() and bool(chunk.data)
                 for chunk in chunks
             )
+        )
+
+    @staticmethod
+    def _has_complete_persisted_mm0(tile):
+        rows = set(getattr(tile, "_persisted_exact_rows", ()) or ())
+        expected = max(0, int(getattr(tile, "chunks_per_col", 0)))
+        dds = getattr(tile, "dds", None)
+        return bool(
+            expected
+            and len(rows) == expected
+            and dds is not None
+            and dds.mipmap_list
+            and dds.mipmap_list[0].retrieved
         )
 
     def submit(
@@ -6174,13 +6631,15 @@ class BackgroundDDSBuilder:
                             normalized_priority,
                         )
                 return True
-            if (
+            memory_wait = (
                 self._queued_bytes
                 + self._active_bytes
                 + estimated_bytes
                 > self._byte_budget
-            ):
-                bump("background_dds_byte_budget_full")
+                and (self._queued_bytes + self._active_bytes) > 0
+            )
+            if len(self._requests) >= self.MAX_QUEUE_SIZE:
+                bump("background_dds_queue_full")
                 return False
             request = _DDSBuildRequest(
                 tile=tile,
@@ -6194,6 +6653,16 @@ class BackgroundDDSBuilder:
                 ),
             )
             self._requests[tile.id] = request
+            if memory_wait:
+                request.state = _DDSBuildState.WAITING_FOR_MEMORY
+                request.waiting_since = time.monotonic()
+                self._waiting_memory[tile.id] = request
+                bump("background_build_waiting_memory")
+                profile_gauge(
+                    "background_build_waiting_count",
+                    len(self._waiting_live) + len(self._waiting_memory),
+                )
+                return True
             self._queued_bytes += estimated_bytes
         try:
             self._queue.put_nowait(
@@ -6220,9 +6689,97 @@ class BackgroundDDSBuilder:
             if request is None or request.active:
                 return False
             request.priority = self._priority_tuple(priority)
+            if request.state in {
+                _DDSBuildState.WAITING_FOR_LIVE_CLEAR,
+                _DDSBuildState.WAITING_FOR_MEMORY,
+            }:
+                return True
             return self._queue.reprioritize(
                 tile.id, request.priority
             )
+
+    def _on_pressure_change(self, *args, **kwargs):
+        self._work_event.set()
+
+    def _resume_waiting_requests(self):
+        with self._active_lock:
+            has_live_waiters = bool(self._waiting_live)
+        if has_live_waiters:
+            if not live_pressure_controller.wait_until_clear(
+                self._stop_event,
+                kind="build",
+            ):
+                return
+        now = time.monotonic()
+        resumable = []
+        failed = []
+        with self._active_lock:
+            for tile_id, request in tuple(self._waiting_live.items()):
+                if (
+                    getattr(request.tile, "_closed", False)
+                    or self._stop_event.is_set()
+                ):
+                    self._waiting_live.pop(tile_id, None)
+                    self._requests.pop(tile_id, None)
+                    request.state = _DDSBuildState.CANCELLED
+                    failed.append(request)
+                    bump("background_build_stale_while_waiting")
+                    continue
+                if now - request.waiting_since < 0.25:
+                    continue
+                self._waiting_live.pop(tile_id, None)
+                request.state = _DDSBuildState.WAITING_FOR_MEMORY
+                self._waiting_memory[tile_id] = request
+
+            for tile_id, request in tuple(self._waiting_memory.items()):
+                if (
+                    getattr(request.tile, "_closed", False)
+                    or self._stop_event.is_set()
+                ):
+                    self._waiting_memory.pop(tile_id, None)
+                    self._requests.pop(tile_id, None)
+                    request.state = _DDSBuildState.CANCELLED
+                    failed.append(request)
+                    continue
+                if (
+                    self._queued_bytes
+                    + self._active_bytes
+                    + request.estimated_bytes
+                    > self._byte_budget
+                    and (self._queued_bytes + self._active_bytes) > 0
+                ):
+                    continue
+                self._waiting_memory.pop(tile_id, None)
+                self._queued_bytes += request.estimated_bytes
+                request.state = _DDSBuildState.QUEUED
+                request.resumed_at = now
+                resumable.append(request)
+            profile_gauge(
+                "background_build_waiting_count",
+                len(self._waiting_live) + len(self._waiting_memory),
+            )
+        for request in failed:
+            self._notify_build_callbacks(request, False)
+        for request in resumable:
+            try:
+                self._queue.put_nowait(
+                    request,
+                    item_key=request.tile.id,
+                    item_priority=request.priority,
+                )
+                bump("background_build_resumed")
+                if request.waiting_since:
+                    bump(
+                        "background_build_wait_duration_ms",
+                        int((now - request.waiting_since) * 1000),
+                    )
+            except Full:
+                with self._active_lock:
+                    self._queued_bytes = max(
+                        0, self._queued_bytes - request.estimated_bytes
+                    )
+                    request.state = _DDSBuildState.WAITING_FOR_MEMORY
+                    self._waiting_memory[request.tile.id] = request
     
     def _coordinator_loop(self) -> None:
         """
@@ -6242,6 +6799,7 @@ class BackgroundDDSBuilder:
 
             if self._stop_event.is_set() or is_shutdown_requested():
                 break
+            self._resume_waiting_requests()
 
             # Fill all available worker slots
             with self._active_lock:
@@ -6276,6 +6834,7 @@ class BackgroundDDSBuilder:
                 if self._executor is not None:
                     with self._active_lock:
                         request.active = True
+                        request.state = _DDSBuildState.RUNNING
                         self._queued_bytes = max(
                             0,
                             self._queued_bytes - request.estimated_bytes,
@@ -6307,6 +6866,10 @@ class BackgroundDDSBuilder:
                 return
             _defer_background_build_if_live(tile)
             if request.exact_target:
+                if self._has_complete_persisted_mm0(tile):
+                    bump("predictive_dds_exact_rows_complete")
+                    success = True
+                    return
                 tile._get_chunk_grid(tile.max_zoom).ensure_all()
                 if not self._target_is_exact(tile):
                     bump("degraded_dds_builds_rejected")
@@ -6349,38 +6912,28 @@ class BackgroundDDSBuilder:
                 self._active_builds -= 1
                 if not deferred:
                     self._requests.pop(tile.id, None)
+                    request.state = (
+                        _DDSBuildState.COMPLETE
+                        if success
+                        else _DDSBuildState.FAILED
+                    )
             if deferred and not self._stop_event.is_set():
                 with self._active_lock:
-                    if (
-                        self._queued_bytes
-                        + self._active_bytes
-                        + request.estimated_bytes
-                        <= self._byte_budget
-                    ):
-                        self._queued_bytes += request.estimated_bytes
-                        request.active = False
-                        can_requeue = True
-                    else:
-                        self._requests.pop(tile.id, None)
-                        can_requeue = False
-                if can_requeue:
-                    try:
-                        self._queue.put_nowait(
-                            request,
-                            item_key=tile.id,
-                            item_priority=request.priority,
-                        )
-                    except Full:
-                        with self._active_lock:
-                            self._queued_bytes = max(
-                                0,
-                                self._queued_bytes
-                                - request.estimated_bytes,
-                            )
-                            self._requests.pop(tile.id, None)
-                        can_requeue = False
-                if not can_requeue:
-                    deferred = False
+                    request.state = _DDSBuildState.WAITING_FOR_LIVE_CLEAR
+                    request.waiting_since = time.monotonic()
+                    self._waiting_live[tile.id] = request
+                    profile_gauge(
+                        "background_build_waiting_count",
+                        len(self._waiting_live) + len(self._waiting_memory),
+                    )
+                bump("background_build_pressure_transitions")
+            elif deferred:
+                with self._active_lock:
+                    self._requests.pop(tile.id, None)
+                    request.state = _DDSBuildState.CANCELLED
+                deferred = False
+            if success:
+                tile._predictive_complete_at = time.monotonic()
             if not deferred:
                 self._notify_build_callbacks(request, success)
             self._work_event.set()  # Signal coordinator a slot freed up
@@ -7131,7 +7684,12 @@ class BackgroundDDSBuilder:
     @property
     def queue_size(self) -> int:
         """Current number of tiles waiting to be built."""
-        return self._queue.qsize()
+        with self._active_lock:
+            return (
+                self._queue.qsize()
+                + len(self._waiting_live)
+                + len(self._waiting_memory)
+            )
     
     @property
     def stats(self) -> dict:
@@ -7139,14 +7697,18 @@ class BackgroundDDSBuilder:
         with self._active_lock:
             queued_bytes = self._queued_bytes
             active_bytes = self._active_bytes
+            waiting_live = len(self._waiting_live)
+            waiting_memory = len(self._waiting_memory)
         return {
-            'queue_size': self._queue.qsize(),
+            'queue_size': self._queue.qsize() + waiting_live + waiting_memory,
             'builds_completed': self._builds_completed,
             'builds_failed': self._builds_failed,
             'interval_ms': self._build_interval * 1000,
             'queued_bytes': queued_bytes,
             'active_bytes': active_bytes,
             'byte_budget': self._byte_budget,
+            'waiting_live': waiting_live,
+            'waiting_memory': waiting_memory,
         }
 
 
@@ -8102,6 +8664,7 @@ class Chunk(object):
         # freeing the worker slot for other chunks.
         self.cancelled = False
         self.prefetch = False
+        self.prefetch_imminent = False
         self._broker_request_id = None
         self._settled = False
         self._settled_callbacks = []
@@ -8673,6 +9236,26 @@ class Chunk(object):
             except Exception:
                 log.exception("Chunk settlement callback failed")
 
+    def reset_for_retry(self):
+        """Reset a settled, inactive chunk so only its logical hole is retried."""
+        if self.in_queue or self.in_flight:
+            return False
+        self.cancelled = False
+        self.permanent_failure = False
+        self.failure_reason = None
+        self.data = None
+        self.url = None
+        self.attempt = 0
+        self.retry_count = 0
+        self.broker_timeout_count = 0
+        self._broker_request_id = None
+        self.ready.clear()
+        self.download_started.clear()
+        with self._settled_callbacks_lock:
+            self._settled = False
+            self._settled_callbacks.clear()
+        return True
+
     def cancel(self):
         """Cancel this chunk's download.
 
@@ -8996,6 +9579,16 @@ class Tile(object):
         # Bounded repair state for partial DDS cache entries missing mipmap 0.
         self._mm0_promotion_queued = False
         self._mm0_promotion_pin_until = 0.0
+        self._predictive_complete_at = None
+        self._prefetch_eta_at_promotion = None
+        self._prefetch_exact_coverage_at_promotion = 0.0
+        self._effective_target_reported = False
+        self._degraded_provenance_logged = False
+        self._persisted_exact_rows = set()
+        self._exact_row_enqueue_failed = set()
+        self._partial_restore_attempted = False
+        self._exact_row_states = {}
+        self._exact_row_lock = threading.Lock()
 
         #self.tile_condition = threading.Condition()
         if min_zoom:
@@ -9052,6 +9645,10 @@ class Tile(object):
 
         dds_width = self.chunks_per_row * 256
         dds_height = self.chunks_per_col * 256
+        self._mm0_provenance = pydds.MipmapProvenanceGrid(
+            self.chunks_per_row,
+            self.chunks_per_col,
+        )
         log.debug(f"Creating DDS at original size: {dds_width}x{dds_height} (ZL{self.max_zoom})")
             
         self.dds = pydds.DDS(dds_width, dds_height, ispc=use_ispc,
@@ -9086,6 +9683,151 @@ class Tile(object):
 
     def _source_lease(self, sources):
         return SourceLease(self, sources)
+
+    @staticmethod
+    def _provenance_from_name(name):
+        mapping = {
+            "lower_zl_cache": pydds.MipmapProvenance.LOWER_ZL_CACHE,
+            "lower_mipmap_memory": (
+                pydds.MipmapProvenance.LOWER_MIPMAP_MEMORY
+            ),
+            "cascade_network_fallback": (
+                pydds.MipmapProvenance.CASCADE_NETWORK_FALLBACK
+            ),
+        }
+        return mapping.get(name, pydds.MipmapProvenance.UNKNOWN)
+
+    def _set_mm0_provenance(self, indices, source):
+        self._mm0_provenance.set_indices(indices, source)
+
+    def _set_mm0_chunk_provenance(self, chunk, source):
+        grid = self.chunks.get(self.max_zoom)
+        if grid is None:
+            return
+        index = (
+            (int(chunk.row) - int(grid.row)) * int(grid.width)
+            + int(chunk.col)
+            - int(grid.col)
+        )
+        self._mm0_provenance.set_index(index, source)
+
+    def restore_partial_dds_cache(self):
+        if self._partial_restore_attempted or dynamic_dds_cache is None:
+            return bool(self._persisted_exact_rows)
+        self._partial_restore_attempted = True
+        metadata = dynamic_dds_cache.load_metadata(
+            self.id,
+            self.max_zoom,
+            self,
+        )
+        if not metadata:
+            return False
+        self._restore_provenance_from_metadata(metadata)
+        self._load_partial_dds_rows(metadata)
+        return bool(self._persisted_exact_rows)
+
+    def _restore_provenance_from_metadata(self, metadata):
+        missing = set((metadata or {}).get("missing_indices", ()) or ())
+        fallback = set((metadata or {}).get("fallback_indices", ()) or ())
+        total = self.chunks_per_row * self.chunks_per_col
+        if (metadata or {}).get("populated_mipmaps") and 0 in metadata.get(
+            "populated_mipmaps", ()
+        ):
+            self._set_mm0_provenance(
+                range(total), pydds.MipmapProvenance.EXACT_TARGET
+            )
+            self._set_mm0_provenance(
+                fallback, pydds.MipmapProvenance.LOWER_ZL_CACHE
+            )
+            self._set_mm0_provenance(
+                missing, pydds.MipmapProvenance.MISSING_COLOR
+            )
+
+    def schedule_exact_prefetch_row(self, row_index):
+        row_index = int(row_index)
+        if not _get_bool_config(
+            CFG.autoortho,
+            "persist_partial_dds_cache",
+            _persist_partial_dds,
+        ):
+            return False
+        if row_index in self._persisted_exact_rows:
+            return True
+        grid = self._get_chunk_grid(self.max_zoom)
+        chunks = grid.ensure_rows(row_index, row_index)
+        if (
+            len(chunks) != grid.width
+            or not all(chunk.ready.is_set() and chunk.data for chunk in chunks)
+        ):
+            return False
+        with self._exact_row_lock:
+            if self._exact_row_states.get(row_index) in {
+                "build_queued",
+                "building",
+                "persisted",
+            }:
+                return True
+            if not _exact_row_capacity.acquire(blocking=False):
+                return False
+            self._exact_row_states[row_index] = "build_queued"
+        global _exact_row_executor
+        with _exact_row_executor_lock:
+            if _exact_row_executor is None:
+                _exact_row_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="ExactDDSRow",
+                )
+            executor = _exact_row_executor
+        try:
+            future = executor.submit(
+                self._run_exact_prefetch_row,
+                row_index,
+            )
+            future.add_done_callback(
+                lambda completed, row=row_index: (
+                    self._cancel_queued_exact_row(row)
+                    if completed.cancelled()
+                    else None
+                )
+            )
+            return True
+        except Exception:
+            with self._exact_row_lock:
+                self._exact_row_states[row_index] = "unbuilt"
+            _exact_row_capacity.release()
+            return False
+
+    def _cancel_queued_exact_row(self, row_index):
+        with self._exact_row_lock:
+            if self._exact_row_states.get(row_index) != "build_queued":
+                return
+            self._exact_row_states[row_index] = "unbuilt"
+        _exact_row_capacity.release()
+
+    def _run_exact_prefetch_row(self, row_index):
+        try:
+            if self._closed or is_shutdown_requested():
+                return
+            with self._exact_row_lock:
+                self._exact_row_states[row_index] = "building"
+            mm = self.dds.mipmap_list[0]
+            row_bytes = mm.length // self.chunks_per_col
+            success = self._try_native_partial_mipmap_build(
+                0,
+                row_index,
+                row_index,
+                row_bytes,
+                priority=PRIORITY_PREFETCH,
+            )
+            with self._exact_row_lock:
+                if row_index in self._persisted_exact_rows:
+                    self._exact_row_states[row_index] = "persisted"
+                elif success and row_index not in self._exact_row_enqueue_failed:
+                    self._exact_row_states[row_index] = "build_queued"
+                else:
+                    self._exact_row_states[row_index] = "unbuilt"
+        finally:
+            _exact_row_capacity.release()
 
     def _load_partial_dds_rows(self, metadata):
         if (
@@ -9132,6 +9874,34 @@ class Tile(object):
             )
             self._dds_coverage_revision = int(entry.get("revision", 0))
             degraded_rows = set(entry.get("degraded", []))
+            provenance_rows = entry.get("provenance", {})
+            for row in valid_rows:
+                encoded = provenance_rows.get(str(row))
+                if (
+                    isinstance(encoded, list)
+                    and len(encoded) == self.chunks_per_row
+                ):
+                    self._mm0_provenance.set_row(row, encoded)
+                elif row not in degraded_rows:
+                    self._mm0_provenance.set_row(
+                        row,
+                        [
+                            pydds.MipmapProvenance.EXACT_TARGET
+                        ] * self.chunks_per_row,
+                    )
+                else:
+                    self._mm0_provenance.set_row(
+                        row,
+                        [
+                            pydds.MipmapProvenance.UNKNOWN
+                        ] * self.chunks_per_row,
+                    )
+                if all(
+                    value == int(pydds.MipmapProvenance.EXACT_TARGET)
+                    for value in self._mm0_provenance.row(row)
+                ):
+                    self._persisted_exact_rows.add(row)
+                    self._exact_row_states[row] = "persisted"
             if degraded_rows:
                 degraded_indices = {
                     row * self.chunks_per_row + column
@@ -9186,6 +9956,7 @@ class Tile(object):
             if len(row_data) != bytes_per_chunk_row:
                 bump("partial_dds_persistence_dropped")
                 continue
+            provenance = self._mm0_provenance.row(row_index)
             if dynamic_dds_cache.enqueue_partial_row(
                 self.id,
                 self.max_zoom,
@@ -9194,13 +9965,40 @@ class Tile(object):
                 row_data,
                 total_rows,
                 degraded=row_index in degraded_rows,
+                provenance=provenance,
+                completion_callback=self._on_partial_row_persisted,
             ):
+                self._exact_row_enqueue_failed.discard(row_index)
                 bump(
                     "partial_dds_persistence_queue_bytes",
                     len(row_data),
                 )
             else:
+                self._exact_row_enqueue_failed.add(row_index)
+                self._on_partial_row_persisted(False, row_index)
                 bump("partial_dds_persistence_dropped")
+
+    def _on_partial_row_persisted(self, success, row_index):
+        row_index = int(row_index)
+        provenance = self._mm0_provenance.row(row_index)
+        exact_row = bool(provenance) and all(
+            value == int(pydds.MipmapProvenance.EXACT_TARGET)
+            for value in provenance
+        )
+        with self._exact_row_lock:
+            if success and exact_row:
+                self._persisted_exact_rows.add(row_index)
+                self._exact_row_states[row_index] = "persisted"
+                bump("partial_dds_exact_rows_persisted")
+            else:
+                self._persisted_exact_rows.discard(row_index)
+                self._exact_row_enqueue_failed.add(row_index)
+                if self._exact_row_states.get(row_index) in {
+                    "building",
+                    "build_queued",
+                }:
+                    self._exact_row_states[row_index] = "unbuilt"
+                bump("partial_dds_exact_row_persist_failed")
 
     def _maybe_persist_complete_dds(self):
         if (
@@ -9265,6 +10063,19 @@ class Tile(object):
     ):
         missing_indices = list(missing_indices or ())
         fallback_indices = list(fallback_indices or ())
+        total = self.chunks_per_row * self.chunks_per_col
+        if dds_bytes is not None or persisted:
+            self._set_mm0_provenance(
+                range(total), pydds.MipmapProvenance.EXACT_TARGET
+            )
+        self._set_mm0_provenance(
+            fallback_indices,
+            pydds.MipmapProvenance.LOWER_ZL_CACHE,
+        )
+        self._set_mm0_provenance(
+            missing_indices,
+            pydds.MipmapProvenance.MISSING_COLOR,
+        )
         with self._lock:
             self._dds_missing_indices = missing_indices
             self._dds_fallback_indices = fallback_indices
@@ -10401,42 +11212,6 @@ class Tile(object):
             return  # Already live
         
         self._is_live = True
-
-        quality_mode = _prefetch_quality_mode()
-        if time_budget is not None:
-            if quality_mode == PrefetchQualityMode.PREFER_TARGET:
-                try:
-                    grace = max(
-                        0.0,
-                        float(
-                            getattr(
-                                CFG.autoortho,
-                                "prefetch_quality_grace_sec",
-                                5.0,
-                            )
-                        ),
-                    )
-                except (TypeError, ValueError):
-                    grace = 5.0
-                time_budget.max_seconds += grace
-            elif quality_mode == PrefetchQualityMode.STRICT_TARGET:
-                try:
-                    deadline = max(
-                        1.0,
-                        float(
-                            getattr(
-                                CFG.autoortho,
-                                "strict_target_deadline_sec",
-                                120.0,
-                            )
-                        ),
-                    )
-                except (TypeError, ValueError):
-                    deadline = 120.0
-                time_budget.max_seconds = min(
-                    max(time_budget.max_seconds, deadline),
-                    deadline,
-                )
         
         # Store time budget for streaming builder (which runs in separate context)
         if time_budget is not None:
@@ -10857,6 +11632,7 @@ class Tile(object):
             try:
                 meta = dynamic_dds_cache.load_metadata(self.id, self.max_zoom, self)
                 populated = meta.get("populated_mipmaps") if meta else None
+                self._restore_provenance_from_metadata(meta or {})
                 self._load_partial_dds_rows(meta)
                 if populated is not None and 0 not in populated:
                     cache_has_requested_mipmap = False
@@ -11136,12 +11912,11 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════
         # PYTHON FALLBACK PATH
         # ═══════════════════════════════════════════════════════════════════
-        wait_seconds = self.get_maxwait()
-        if time_budget is not None:
-            wait_seconds = min(
-                wait_seconds,
-                max(0.0, time_budget.remaining),
-            )
+        wait_seconds = self._row_wait_seconds(
+            mipmap,
+            time_budget,
+            self.get_maxwait(),
+        )
         coordinator = self._get_mipmap_build_coordinator(mipmap)
         action, revision = coordinator.begin_partial(
             startrow,
@@ -11326,7 +12101,85 @@ class Tile(object):
                 )
         
         self.bytes_read += length
-        return self.dds.read_at(offset, length)
+        data = self.dds.read_at(offset, length)
+        self._record_mipmap_provenance(offset, len(data))
+        return data
+
+    def _record_mipmap_provenance(self, offset, length):
+        if self.dds is None or not self.dds.mipmap_list or length <= 0:
+            return
+        requested_mipmap = self.find_mipmap_pos(offset)
+        counters = {f"requested_mipmap:{requested_mipmap}": 1}
+        if not self._effective_target_reported:
+            self._effective_target_reported = True
+            counters[f"effective_target_zoom:{self.max_zoom}"] = 1
+            if self.max_zoom != self.tilename_zoom:
+                counters["effective_target_capped"] = 1
+        mm0 = self.dds.mipmap_list[0]
+        overlap_start = max(int(offset), mm0.startpos)
+        overlap_end = min(int(offset) + int(length), mm0.endpos)
+        if overlap_start < overlap_end:
+            relative_offset = overlap_start - mm0.startpos
+            overlap_length = overlap_end - overlap_start
+            row_bytes = max(1, mm0.length // self.chunks_per_col)
+            sources = self._mm0_provenance.summarize_bytes(
+                relative_offset,
+                overlap_length,
+                row_bytes,
+            )
+            exact = sources.get(
+                pydds.MipmapProvenance.EXACT_TARGET, 0
+            )
+            lower = sum(
+                sources.get(source, 0)
+                for source in (
+                    pydds.MipmapProvenance.LOWER_ZL_CACHE,
+                    pydds.MipmapProvenance.LOWER_MIPMAP_MEMORY,
+                    pydds.MipmapProvenance.CASCADE_NETWORK_FALLBACK,
+                )
+            )
+            missing = sources.get(
+                pydds.MipmapProvenance.MISSING_COLOR, 0
+            )
+            unknown = max(0, overlap_length - exact - lower - missing)
+            counters.update(
+                {
+                    "mm0_served_exact_bytes": exact,
+                    "mm0_served_lower_zl_bytes": lower,
+                    "mm0_served_missing_bytes": missing,
+                    "mm0_served_unknown_bytes": unknown,
+                }
+            )
+            if (
+                _prefetch_quality_mode()
+                == PrefetchQualityMode.STRICT_TARGET
+                and exact < overlap_length
+            ):
+                counters["strict_quality_failure"] = 1
+            rows = (
+                (relative_offset + overlap_length - 1) // row_bytes
+                - relative_offset // row_bytes
+                + 1
+            )
+            if self._predictive_complete_at is None:
+                counters["mm0_reads_before_predictive_complete"] = 1
+                counters["mm0_rows_served_before_predictive_complete"] = rows
+            else:
+                counters["mm0_rows_served_after_predictive_complete"] = rows
+            if (
+                not self._degraded_provenance_logged
+                and exact < overlap_length
+            ):
+                self._degraded_provenance_logged = True
+                log.info(
+                    "MM0_DEGRADED: %s exact=%d lower=%d missing=%d unknown=%d",
+                    self.id,
+                    exact,
+                    lower,
+                    missing,
+                    unknown,
+                )
+        bump_many(counters)
 
     def _get_or_create_tile_time_budget(self):
         use_time_budget = getattr(CFG.autoortho, "use_time_budget", True)
@@ -11355,6 +12208,29 @@ class Tile(object):
                     and not getattr(datareftracker, "has_ever_connected", False)
                 ):
                     budget_seconds = min(budget_seconds * 10.0, 1800.0)
+                quality_mode = _prefetch_quality_mode()
+                if quality_mode == PrefetchQualityMode.PREFER_TARGET:
+                    budget_seconds += max(
+                        0.0,
+                        float(
+                            getattr(
+                                CFG.autoortho,
+                                "prefetch_quality_grace_sec",
+                                5.0,
+                            )
+                        ),
+                    )
+                elif quality_mode == PrefetchQualityMode.STRICT_TARGET:
+                    budget_seconds = max(
+                        1.0,
+                        float(
+                            getattr(
+                                CFG.autoortho,
+                                "strict_target_deadline_sec",
+                                120.0,
+                            )
+                        ),
+                    )
                 self._tile_time_budget = TimeBudget(budget_seconds)
             return self._tile_time_budget
 
@@ -11369,6 +12245,28 @@ class Tile(object):
                 )
                 self._fallback_time_budget = TimeBudget(timeout)
             return self._fallback_time_budget
+
+    def _row_deadline(self, mipmap, time_budget, maxwait=None):
+        maxwait = self.get_maxwait() if maxwait is None else maxwait
+        return QualityDeadlinePolicy.row_deadline(
+            _prefetch_quality_mode(),
+            time_budget,
+            maxwait,
+            getattr(CFG.autoortho, "prefetch_quality_grace_sec", 5.0),
+            getattr(CFG.autoortho, "strict_target_deadline_sec", 120.0),
+            mipmap == 0,
+        )
+
+    def _row_wait_seconds(self, mipmap, time_budget, maxwait=None):
+        maxwait = self.get_maxwait() if maxwait is None else maxwait
+        return QualityDeadlinePolicy.wait_seconds(
+            _prefetch_quality_mode(),
+            time_budget,
+            maxwait,
+            getattr(CFG.autoortho, "prefetch_quality_grace_sec", 5.0),
+            getattr(CFG.autoortho, "strict_target_deadline_sec", 120.0),
+            mipmap == 0,
+        )
 
     def write(self):
         outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{self.tilename_zoom}.dds")
@@ -11673,6 +12571,19 @@ class Tile(object):
         else:
             log.debug(f"GET_IMG: Using prefilled base from mipmap {prefill_source_mm}")
 
+        if mipmap == 0:
+            provenance_end = (
+                endchunk if endchunk is not None else grid.logical_length
+            )
+            self._set_mm0_provenance(
+                range(startchunk, provenance_end),
+                (
+                    pydds.MipmapProvenance.LOWER_MIPMAP_MEMORY
+                    if prefill_source_mm is not None
+                    else pydds.MipmapProvenance.MISSING_COLOR
+                ),
+            )
+
         log.debug(f"GET_IMG: Will use image {new_im}")
 
         # Check if we have any chunks to process
@@ -11729,6 +12640,11 @@ class Tile(object):
                     if chunk_img:
                         _safe_paste(new_im, chunk_img, start_x, start_y)
                         chunks_with_images.add(id(chunk))
+                        if mipmap == 0:
+                            self._set_mm0_chunk_provenance(
+                                chunk,
+                                pydds.MipmapProvenance.EXACT_TARGET,
+                            )
                         time_budget.record_chunk_processed()
                     else:
                         deferred_chunks.append((chunk, start_x, start_y))
@@ -11754,7 +12670,11 @@ class Tile(object):
 
             # Per-chunk deadline tracking: each chunk gets maxwait seconds from now
             pass2_start = time.monotonic()
-            pass2_deadline = pass2_start + maxwait  # Cap entire pass at maxwait
+            pass2_deadline = self._row_deadline(
+                mipmap,
+                time_budget,
+                maxwait,
+            )
             chunk_first_seen = {}  # chunk id -> monotonic time first polled
 
             while still_waiting and not time_budget.exhausted:
@@ -11797,6 +12717,11 @@ class Tile(object):
                             if chunk_img:
                                 _safe_paste(new_im, chunk_img, sx, sy)
                                 chunks_with_images.add(id(chunk))
+                                if mipmap == 0:
+                                    self._set_mm0_chunk_provenance(
+                                        chunk,
+                                        pydds.MipmapProvenance.EXACT_TARGET,
+                                    )
                                 time_budget.record_chunk_processed()
                         except Exception as e:
                             log.error(f"GET_IMG: Pass 2 decode exception for {chunk}: {e}")
@@ -11840,6 +12765,7 @@ class Tile(object):
                     continue
 
                 chunk_img = None
+                chunk_source = None
                 is_permanent_failure = chunk.permanent_failure
 
                 # Budget exhaustion: attempt local fallbacks only (fast, sub-ms)
@@ -11848,7 +12774,13 @@ class Tile(object):
                     bump('chunk_budget_exhausted_local_fallback')
 
                 # Fallback 1: disk cache (fast, ~1ms)
-                chunk_img = self.get_best_chunk(chunk.col, chunk.row, mipmap, zoom)
+                chunk_img, chunk_source = self.get_best_chunk(
+                    chunk.col,
+                    chunk.row,
+                    mipmap,
+                    zoom,
+                    with_source=True,
+                )
 
                 # Track lazy build need
                 if not chunk_img and mipmap == 0:
@@ -11859,7 +12791,15 @@ class Tile(object):
 
                 # Fallback 2: mipmap scaling (fast, in-memory)
                 if not chunk_img:
-                    chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
+                    chunk_img, chunk_source = (
+                        self.get_downscaled_from_higher_mipmap(
+                            mipmap,
+                            chunk.col,
+                            chunk.row,
+                            zoom,
+                            with_source=True,
+                        )
+                    )
 
                 # Fallback 3: network (only if budget allows and fallback_level >= 2)
                 if not chunk_img and (not is_permanent_failure or True) and fallback_level >= 2:
@@ -11874,17 +12814,19 @@ class Tile(object):
                                     f"fallback budget {fallback_timeout:.1f}s"
                                 )
                         if fallback_budget is not None and not fallback_budget.exhausted:
-                            chunk_img = self.get_or_build_lower_mipmap_chunk(
+                            chunk_img, chunk_source = self.get_or_build_lower_mipmap_chunk(
                                 mipmap, chunk.col, chunk.row, zoom,
                                 main_budget=None,
-                                fallback_budget=fallback_budget
+                                fallback_budget=fallback_budget,
+                                with_source=True,
                             )
                     elif not budget_exhausted_at_entry:
-                        chunk_img = self.get_or_build_lower_mipmap_chunk(
+                        chunk_img, chunk_source = self.get_or_build_lower_mipmap_chunk(
                             mipmap, chunk.col, chunk.row, zoom,
                             main_budget=time_budget,
                             fallback_budget=fallback_budget,
-                            fallback_timeout=fallback_timeout if fallback_extends_budget else None
+                            fallback_timeout=fallback_timeout if fallback_extends_budget else None,
+                            with_source=True,
                         )
 
                 # Final retry: check if chunk completed during fallback attempts
@@ -11894,12 +12836,22 @@ class Tile(object):
                         try:
                             with _decode_sem:
                                 chunk_img = AoImage.load_from_memory(chunk_data)
+                            if chunk_img:
+                                chunk_source = (
+                                    pydds.MipmapProvenance.EXACT_TARGET
+                                )
                         except Exception:
                             chunk_img = None
 
                 if chunk_img:
                     _safe_paste(new_im, chunk_img, sx, sy)
                     chunks_with_images.add(id(chunk))
+                    if mipmap == 0:
+                        self._set_mm0_chunk_provenance(
+                            chunk,
+                            chunk_source
+                            or pydds.MipmapProvenance.UNKNOWN,
+                        )
                     time_budget.record_chunk_processed()
                 else:
                     # All fallbacks exhausted — cancel chunk to free worker slot
@@ -11938,7 +12890,15 @@ class Tile(object):
                 for chunk in missing_after_lazy:
                     # get_downscaled_from_higher_mipmap is pure in-memory
                     # scaling -- always worth attempting regardless of budget.
-                    chunk_img = self.get_downscaled_from_higher_mipmap(mipmap, chunk.col, chunk.row, zoom)
+                    chunk_img, chunk_source = (
+                        self.get_downscaled_from_higher_mipmap(
+                            mipmap,
+                            chunk.col,
+                            chunk.row,
+                            zoom,
+                            with_source=True,
+                        )
+                    )
                     if chunk_img:
                         start_x = int(chunk.width * (chunk.col - col))
                         start_y = (
@@ -11947,6 +12907,12 @@ class Tile(object):
                         )
                         _safe_paste(new_im, chunk_img, start_x, start_y)
                         chunks_with_images.add(id(chunk))
+                        if mipmap == 0:
+                            self._set_mm0_chunk_provenance(
+                                chunk,
+                                chunk_source
+                                or pydds.MipmapProvenance.UNKNOWN,
+                            )
                         log.debug(f"GET_IMG: Recovered chunk via deferred lazy build fallback")
 
         # Determine if we need to cache this image for fallback/upscaling
@@ -12120,7 +13086,8 @@ class Tile(object):
 
     def get_or_build_lower_mipmap_chunk(self, target_mipmap, col, row, zoom, 
                                          main_budget=None, fallback_budget=None,
-                                         fallback_timeout=None):
+                                         fallback_timeout=None,
+                                         with_source=False):
         """
         Cascading fallback: Try to get/build progressively lower-detail mipmaps.
         Only downloads chunks on-demand when needed (lazy evaluation).
@@ -12146,6 +13113,9 @@ class Tile(object):
         # Track the fallback budget - may be created lazily when main exhausts
         _fallback_budget = fallback_budget
         _using_fallback_budget = False
+
+        def result(image, source=None):
+            return (image, source) if with_source else image
         
         def get_active_budget():
             """Return the currently active budget, switching from main to fallback when needed."""
@@ -12171,7 +13141,7 @@ class Tile(object):
             pass  # No budget constraints
         elif active_budget is None:
             log.debug(f"Cascading fallback: skipping - all budgets exhausted")
-            return None
+            return result(None)
         
         # Try each progressively lower-detail mipmap
         for fallback_mipmap in range(target_mipmap + 1, self.max_mipmap + 1):
@@ -12265,16 +13235,26 @@ class Tile(object):
                 
                 # Don't close fallback_chunk - shared pool manages lifecycle
                 # Other threads may still be using this chunk
-                return upscaled
+                return result(
+                    upscaled,
+                    pydds.MipmapProvenance.CASCADE_NETWORK_FALLBACK,
+                )
                 
             except Exception as e:
                 log.warning(f"Cascading fallback: failed to upscale from mipmap {fallback_mipmap}: {e}")
                 continue
         
         log.debug(f"Cascading fallback: all mipmaps failed for {col}x{row} at mipmap {target_mipmap}")
-        return None
+        return result(None)
 
-    def get_downscaled_from_higher_mipmap(self, target_mipmap, col, row, zoom):
+    def get_downscaled_from_higher_mipmap(
+        self,
+        target_mipmap,
+        col,
+        row,
+        zoom,
+        with_source=False,
+    ):
         """
         Try to scale from already-built mipmaps to fill missing chunk.
         Checks both downscaling (from higher-detail) and upscaling (from lower-detail).
@@ -12334,7 +13314,14 @@ class Tile(object):
                 
                 log.debug(f"Downscaled mipmap {higher_mipmap} to fill missing mipmap {target_mipmap} chunk at {col}x{row}")
                 bump('downscaled_chunk_count')
-                return downscaled
+                return (
+                    (
+                        downscaled,
+                        pydds.MipmapProvenance.LOWER_MIPMAP_MEMORY,
+                    )
+                    if with_source
+                    else downscaled
+                )
             except Exception as e:
                 log.debug(f"Failed to downscale from mipmap {higher_mipmap}: {e}")
                 continue
@@ -12411,14 +13398,21 @@ class Tile(object):
                 )
                 log.debug(f"Upscaled mipmap {lower_mipmap} (zoom {base_zoom}) to fill mipmap {target_mipmap} chunk at {col}x{row}")
                 bump('upscaled_chunk_count')
-                return upscaled
+                return (
+                    (
+                        upscaled,
+                        pydds.MipmapProvenance.LOWER_MIPMAP_MEMORY,
+                    )
+                    if with_source
+                    else upscaled
+                )
             except Exception as e:
                 log.debug(f"Failed to upscale from mipmap {lower_mipmap}: {e}")
                 continue
         
-        return None
+        return (None, None) if with_source else None
 
-    def get_best_chunk(self, col, row, mm, zoom):
+    def get_best_chunk(self, col, row, mm, zoom, with_source=False):
         """
         Search disk cache for lower-zoom JPEG chunks and upscale to fill missing chunk.
         
@@ -12541,10 +13535,17 @@ class Tile(object):
             
             # Track upscaling from cached JPEGs
             bump('upscaled_from_jpeg_count')
-            return chunk_img
+            return (
+                (
+                    chunk_img,
+                    pydds.MipmapProvenance.LOWER_ZL_CACHE,
+                )
+                if with_source
+                else chunk_img
+            )
 
         log.debug(f"No best chunk found for {col}x{row}x{zoom}!")
-        return None
+        return (None, None) if with_source else None
 
     def get_maxwait(self):
         effective_maxwait = self.maxchunk_wait
@@ -12922,6 +13923,11 @@ class Tile(object):
             if not result.data or len(result.data) < 16:
                 log.debug(f"_try_native_mipmap_build: Build produced too few bytes for mipmap {mipmap}")
                 return False
+            if mipmap == 0:
+                self._set_mm0_provenance(
+                    range(self.chunks_per_row * self.chunks_per_col),
+                    pydds.MipmapProvenance.EXACT_TARGET,
+                )
             
             # Guard against DDS being cleared during build
             if self.dds is None:
@@ -13097,13 +14103,11 @@ class Tile(object):
                     chunk_getter.submit(chunk)
 
         if deadline is None:
-            maxwait_cap = self.get_maxwait()
-            max_wait = (
-                min(time_budget.remaining, maxwait_cap)
-                if time_budget
-                else min(2.0, maxwait_cap)
+            deadline = self._row_deadline(
+                0,
+                time_budget,
+                min(2.0, self.get_maxwait()),
             )
-            deadline = time.monotonic() + max(0.0, max_wait)
         if not grid.wait_for(row_chunks, deadline):
             bump("row_batch_deadline_expired")
 
@@ -13125,6 +14129,7 @@ class Tile(object):
         sources = list(jpeg_datas)
         fallback_indices = []
         missing_indices = []
+        provenance = {}
         fallback_level = self.get_fallback_level()
         grid = self._get_chunk_grid(zoom)
         row_chunks = grid.ensure_range(
@@ -13168,15 +14173,18 @@ class Tile(object):
             global_index = startrow * chunks_width + local_index
             chunk = row_chunks[local_index]
             rgba = None
+            source_name = None
             if resolver is not None and not budget.exhausted:
                 try:
-                    rgba = resolver.resolve(
+                    resolved = resolver.resolve_with_source(
                         chunk.col,
                         chunk.row,
                         zoom,
                         target_mipmap=0,
                         time_budget=budget,
                     )
+                    if resolved is not None:
+                        rgba, source_name = resolved
                 except Exception:
                     rgba = None
             if rgba:
@@ -13187,11 +14195,14 @@ class Tile(object):
                     "height": 256,
                 }
                 fallback_indices.append(global_index)
+                provenance[global_index] = self._provenance_from_name(
+                    source_name
+                )
                 bump("partial_lower_zl_fallback_chunks")
             else:
                 missing_indices.append(global_index)
                 bump("partial_missing_color_chunks")
-        return sources, fallback_indices, missing_indices
+        return sources, fallback_indices, missing_indices, provenance
 
     @profiled_stage("dds.native_partial_build")
     def _try_native_partial_mipmap_build(
@@ -13246,10 +14257,11 @@ class Tile(object):
         # Calculate zoom for this mipmap
         zoom = self.max_zoom - mipmap
         
-        max_wait = self.get_maxwait()
-        if time_budget is not None:
-            max_wait = min(max_wait, max(0.0, time_budget.remaining))
-        deadline = time.monotonic() + max_wait
+        deadline = self._row_deadline(
+            mipmap,
+            time_budget,
+            self.get_maxwait(),
+        )
         coordinator = self._get_mipmap_build_coordinator(mipmap)
         action, revision = coordinator.begin_partial(
             startrow,
@@ -13297,12 +14309,14 @@ class Tile(object):
             partial_sources = jpeg_datas
             fallback_indices = []
             missing_indices = []
+            fallback_provenance = {}
             if valid_count < chunk_count:
                 bump("native_partial_incomplete_build")
                 (
                     partial_sources,
                     fallback_indices,
                     missing_indices,
+                    fallback_provenance,
                 ) = self._resolve_partial_sources(
                     jpeg_datas,
                     startrow,
@@ -13373,6 +14387,22 @@ class Tile(object):
             if not result.data or len(result.data) < 16:
                 log.debug(f"_try_native_partial_mipmap_build: Too few bytes")
                 return False
+
+            exact_indices = [
+                startrow * chunks_width + index
+                for index, data in enumerate(jpeg_datas)
+                if data is not None
+            ]
+            self._set_mm0_provenance(
+                exact_indices,
+                pydds.MipmapProvenance.EXACT_TARGET,
+            )
+            for index, source in fallback_provenance.items():
+                self._mm0_provenance.set_index(index, source)
+            self._set_mm0_provenance(
+                missing_indices,
+                pydds.MipmapProvenance.MISSING_COLOR,
+            )
             
             # Guard against DDS being cleared during build
             if self.dds is None or len(self.dds.mipmap_list) == 0:

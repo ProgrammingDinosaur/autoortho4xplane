@@ -1,6 +1,7 @@
 import os
 import sys
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -261,6 +262,27 @@ def test_predictive_builder_rejects_degraded_target_data():
     assert builder.queue_size == 0
 
 
+def test_predictive_builder_accepts_complete_exact_target_data():
+    chunks = [FakeChunk(f"ready-{index}") for index in range(2)]
+    for chunk in chunks:
+        chunk.data = b"exact"
+        chunk.ready.set()
+
+    class FakeTile:
+        id = "exact"
+        max_zoom = 17
+
+        def __init__(self, exact_chunks):
+            self.chunks = {17: exact_chunks}
+
+    builder = getortho.BackgroundDDSBuilder(None)
+    try:
+        assert builder.submit(FakeTile(chunks)) is True
+        assert builder.queue_size == 1
+    finally:
+        builder.stop()
+
+
 def test_coordinator_exact_build_is_admitted_before_full_grid_materialization():
     class SparseGrid:
         logical_length = 4
@@ -279,6 +301,117 @@ def test_coordinator_exact_build_is_admitted_before_full_grid_materialization():
     assert builder.submit(FakeTile(), exact_target=True) is True
     assert builder.queue_size == 1
     builder.stop()
+
+
+def test_predictive_builder_parks_memory_without_executor_work():
+    class Grid:
+        logical_length = 128
+
+    class Tile:
+        max_zoom = 17
+
+        def __init__(self, tile_id):
+            self.id = tile_id
+            self.chunks = {17: Grid()}
+
+    builder = getortho.BackgroundDDSBuilder(None)
+    builder._byte_budget = 64 * 1024 * 1024
+    try:
+        assert builder.submit(Tile("one"), exact_target=True)
+        assert builder.submit(Tile("two"), exact_target=True)
+        assert builder.submit(Tile("three"), exact_target=True)
+        assert builder._requests["three"].state == (
+            getortho._DDSBuildState.WAITING_FOR_MEMORY
+        )
+        assert builder._active_builds == 0
+        assert builder.queue_size == 3
+    finally:
+        builder.stop()
+
+
+def test_predictive_builder_parks_once_during_live_pressure():
+    class Grid:
+        logical_length = 1
+
+        @staticmethod
+        def ensure_all():
+            return []
+
+    class Tile:
+        id = "pressure"
+        max_zoom = 17
+        chunks = {17: Grid()}
+        _closed = False
+        _is_live = False
+        _predictive_complete_at = None
+
+        @staticmethod
+        def _clear_mm0_promotion_pin():
+            return None
+
+    builder = getortho.BackgroundDDSBuilder(None, build_interval_sec=0.01)
+    for _ in range(6):
+        getortho.live_pressure_controller.live_read_start()
+    try:
+        builder.start()
+        assert builder.submit(Tile(), exact_target=True)
+        deadline = time.monotonic() + 1.0
+        while not builder._waiting_live and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert list(builder._waiting_live) == ["pressure"]
+        assert builder._active_builds == 0
+        assert builder._queue.qsize() == 0
+    finally:
+        builder.stop()
+        for _ in range(6):
+            getortho.live_pressure_controller.live_read_end()
+
+
+def test_imminent_background_share_is_bounded_and_refilled():
+    controller = getortho.LivePressureController(
+        imminent_share=0.10,
+        token_capacity=2,
+    )
+    controller.live_read_start()
+    try:
+        assert controller.allow_imminent(consume=True)
+        assert controller.allow_imminent(consume=True)
+        assert not controller.allow_imminent(consume=True)
+        for _ in range(10):
+            controller.note_provider_completion()
+        assert controller.imminent_tokens() == 1
+        assert controller.allow_imminent(consume=True)
+        assert not controller.allow_imminent(consume=True)
+    finally:
+        controller.live_read_end()
+
+
+def test_build_pressure_hysteresis_clears_while_network_remains_live():
+    controller = getortho.LivePressureController(
+        build_threshold=2,
+        clearance_hysteresis=0.25,
+    )
+    stop = threading.Event()
+    completed = threading.Event()
+    controller.live_read_start()
+    controller.live_read_start()
+    waiter = threading.Thread(
+        target=lambda: (
+            controller.wait_until_clear(stop, kind="build"),
+            completed.set(),
+        )
+    )
+    waiter.start()
+    controller.live_read_end()
+    try:
+        assert completed.wait(0.6)
+        assert controller.is_under_pressure("network")
+        assert not controller.is_under_pressure("build")
+    finally:
+        stop.set()
+        controller.notify_state_change()
+        controller.live_read_end()
+        waiter.join(1.0)
 
 
 def test_dsf_prefetch_reports_pressure_without_advancing_cursor(monkeypatch):
@@ -328,6 +461,19 @@ def test_dsf_prefetch_reports_pressure_without_advancing_cursor(monkeypatch):
         "complete": False,
         "pressure": True,
         "cursor": 0,
+    }
+
+
+def test_dsf_prefetch_reports_runtime_pressure_as_deferred(monkeypatch):
+    monkeypatch.setattr(
+        getortho, "is_prefetch_runtime_allowed", lambda: False
+    )
+
+    assert getortho.prefetch_dsf("/tmp/+00+000.dsf", cursor=7) == {
+        "submitted": 0,
+        "complete": False,
+        "pressure": True,
+        "cursor": 7,
     }
 
 

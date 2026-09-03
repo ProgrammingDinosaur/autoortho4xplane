@@ -217,6 +217,8 @@ prefetch_lookahead = 10
 prefetch_interval = 1.0
 # Maximum chunks admitted in one coordinator cycle. This does not size queues.
 prefetch_max_chunks = 64
+# Maximum chunks materialized by one candidate admission pass.
+prefetch_admission_burst = 64
 # Prefetch radius in nautical miles (10-150)
 # Tiles within this radius of the flight path are prefetched
 # Used by both velocity-based and SimBrief prefetching
@@ -388,6 +390,9 @@ provider_queue_timeout = 60.0
 # reports overload (429, 5xx, timeouts). 403/410 are provider policy answers
 # and never shrink the limit.
 provider_adaptive_concurrency = True
+# Windowed v2 observes two-second throughput/latency/error windows. Disable
+# temporarily to restore the legacy per-response AIMD controller.
+provider_adaptive_controller_v2 = True
 # Starting per-origin limit. 0 starts at provider_max_connections and ramps
 # toward provider_origin_max_concurrency after successful responses.
 provider_origin_initial_concurrency = 0
@@ -781,6 +786,11 @@ PROVIDER_SETTINGS = {
     },
     # Adaptive per-origin concurrency (enforced by the broker server).
     "provider_adaptive_concurrency": {
+        "type": bool,
+        "default": True,
+        "legacy": None,
+    },
+    "provider_adaptive_controller_v2": {
         "type": bool,
         "default": True,
         "legacy": None,

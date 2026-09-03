@@ -305,6 +305,7 @@ class DSFPrefetchScheduler:
     PENDING = "pending"
     RUNNING = "running"
     DEFERRED = "deferred"
+    WAITING_FOR_FLIGHT = "waiting_for_flight"
     COMPLETE = "complete"
 
     def __init__(
@@ -312,6 +313,7 @@ class DSFPrefetchScheduler:
         submit,
         runtime_allowed,
         live_demand=None,
+        runtime_gate=None,
         before_submit=None,
         worker_count=1,
         queue_size=16,
@@ -325,6 +327,7 @@ class DSFPrefetchScheduler:
         self._submit = submit
         self._runtime_allowed = runtime_allowed
         self._live_demand = live_demand or (lambda: False)
+        self._runtime_gate = runtime_gate
         self._before_submit = before_submit
         self._worker_count = max(1, min(2, int(worker_count)))
         self._queue_size = max(1, int(queue_size))
@@ -430,6 +433,11 @@ class DSFPrefetchScheduler:
     def shutdown(self, timeout=1.0):
         """Cancel queued/deferred work and wait briefly for active workers."""
         self._stop.set()
+        if self._runtime_gate is not None:
+            try:
+                self._runtime_gate.notify_state_change()
+            except Exception:
+                pass
         with self._lock:
             self._entries.clear()
             self._deferred_heap.clear()
@@ -543,7 +551,10 @@ class DSFPrefetchScheduler:
             self._completed.pop(path, None)
 
     def _can_run(self):
-        if not self._runtime_allowed() or self._live_demand():
+        if (
+            not self._runtime_allowed()
+            or self._live_demand()
+        ):
             self._allowed_since = None
             return False, self._poll_interval
         now = self._clock()
@@ -650,6 +661,33 @@ class DSFPrefetchScheduler:
                     continue
                 entry["state"] = self.RUNNING
                 cursor = entry["cursor"]
+            if (
+                self._runtime_gate is not None
+                and not self._runtime_allowed()
+            ):
+                with self._lock:
+                    current = self._entries.get(path)
+                    if current is not None:
+                        current["state"] = self.WAITING_FOR_FLIGHT
+                self._bump("dsf_prefetch_waiting_for_flight")
+                if not self._runtime_gate.wait_until_allowed(self._stop):
+                    return
+                if not self._runtime_allowed():
+                    with self._lock:
+                        current = self._entries.get(path)
+                        if current is not None:
+                            self._defer(
+                                current,
+                                self._poll_interval,
+                                path=path,
+                            )
+                    continue
+                with self._lock:
+                    current = self._entries.get(path)
+                    if current is None:
+                        continue
+                    current["state"] = self.RUNNING
+                    cursor = current["cursor"]
             allowed, delay = self._can_run()
             if not allowed:
                 with self._lock:
@@ -760,9 +798,10 @@ class AutoOrtho(Operations):
         ) or DSFPrefetchScheduler(
             getattr(getortho, "prefetch_dsf", lambda _path: 0),
             runtime_allowed=getattr(
-                getortho, "is_prefetch_runtime_allowed", lambda: False
+                getortho, "is_flight_runtime_allowed", lambda: False
             ),
-            live_demand=getattr(getortho, "is_live_building", lambda: False),
+            runtime_gate=getattr(getortho, "flight_runtime_gate", None),
+            live_demand=getattr(getortho, "has_live_pressure", lambda: False),
             before_submit=self._ensure_runtime_services,
             worker_count=kwargs.get("dsf_prefetch_workers", 1),
             queue_size=kwargs.get("dsf_prefetch_queue_size", 16),

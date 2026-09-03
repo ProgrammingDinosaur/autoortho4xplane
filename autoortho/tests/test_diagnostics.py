@@ -60,12 +60,27 @@ def test_session_report_combines_process_timing_and_memory(tmp_path):
             "config": {
                 "cache": {"cache_mem_limit": 4},
                 "diagnostics": {"performance_profiling": True},
+                "autoortho": {
+                    "prefetch_lookahead": 0,
+                    "prefetch_max_chunks": 256,
+                    "prefetch_radius_nm": 50,
+                },
             }
         },
     ).start()
     parent.record("fuse.dds_read", 1_700.0, tile_id="1_2_BI_16")
     report_path = parent.stop(
-        stats_snapshot={"chunk_hit": 20, "chunk_miss": 4},
+        stats_snapshot={
+            "chunk_hit": 20,
+            "chunk_miss": 4,
+            "effective_target_zoom:17": 2,
+            "mm0_served_exact_bytes": 900,
+            "mm0_served_lower_zl_bytes": 100,
+            "prefetch_live_exact_coverage_pct:90": 3,
+            "prefetch_promotion_eta_seconds:60": 3,
+            "mm0_rows_served_before_predictive_complete": 4,
+            "mm0_rows_served_after_predictive_complete": 8,
+        },
         finalize_session=True,
     )
 
@@ -75,11 +90,17 @@ def test_session_report_combines_process_timing_and_memory(tmp_path):
     assert "mount-worker:test" in markdown
     assert "network.http_request" in markdown
     assert "HTTP request p95 exceeds 1 second" in markdown
+    assert "Mipmap-zero delivery" in markdown
+    assert "| Exact target | 900 | 90.0% |" in markdown
+    assert "Legacy prefetch settings combine unlimited lookahead" in markdown
 
     report = json.loads((session_dir / "report.json").read_text(encoding="utf-8"))
     assert report["process_count"] == 2
     assert report["stats_snapshot"]["chunk_hit"] == 20
     assert report["peak_total_rss_bytes"] > 0
+    assert report["delivery"]["effective_target_zoom"] == [
+        {"value": "17", "count": 2}
+    ]
     assert any(
         row["stage"] == "fuse.dds_read"
         for row in report["stages"]

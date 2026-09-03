@@ -141,6 +141,23 @@ class FallbackResolver:
     def resolve(self, chunk_col: int, chunk_row: int, chunk_zoom: int,
                 target_mipmap: int = 0,
                 time_budget: Optional[TimeBudget] = None) -> Optional[bytes]:
+        result = self.resolve_with_source(
+            chunk_col,
+            chunk_row,
+            chunk_zoom,
+            target_mipmap=target_mipmap,
+            time_budget=time_budget,
+        )
+        return result[0] if result is not None else None
+
+    def resolve_with_source(
+        self,
+        chunk_col: int,
+        chunk_row: int,
+        chunk_zoom: int,
+        target_mipmap: int = 0,
+        time_budget: Optional[TimeBudget] = None,
+    ) -> Optional[tuple[bytes, str]]:
         """
         Attempt to resolve a missing chunk using the fallback chain.
         
@@ -169,7 +186,7 @@ class FallbackResolver:
             if result:
                 self.stats['disk_cache_hits'] += 1
                 self.stats['total_resolved'] += 1
-                return result
+                return result, "lower_zl_cache"
             self.stats['disk_cache_misses'] += 1
         
         # Check time budget
@@ -183,7 +200,7 @@ class FallbackResolver:
             if result:
                 self.stats['mipmap_scale_hits'] += 1
                 self.stats['total_resolved'] += 1
-                return result
+                return result, "lower_mipmap_memory"
             self.stats['mipmap_scale_misses'] += 1
         
         # Check time budget
@@ -198,7 +215,7 @@ class FallbackResolver:
             if result:
                 self.stats['network_hits'] += 1
                 self.stats['total_resolved'] += 1
-                return result
+                return result, "cascade_network_fallback"
             self.stats['network_misses'] += 1
         
         self.stats['total_failed'] += 1

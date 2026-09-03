@@ -1256,6 +1256,244 @@ def test_controller_rejects_invalid_decrease_factor():
         hb._AdaptiveConcurrencyController(decrease_factor=0.0)
 
 
+def test_windowed_controller_holds_on_isolated_timeout():
+    clock = _FakeClock()
+    ctl = hb._WindowedAdaptiveConcurrencyController(
+        clock=clock,
+        initial=10,
+        minimum=2,
+        maximum=100,
+        window_seconds=1.0,
+    )
+    origin = "https://tiles.test"
+
+    ctl.on_outcome(origin, error=hb.BrokerTimeoutError("isolated"))
+    clock.advance(1.0)
+    ctl.on_outcome(origin, status_code=200, response_bytes=1024)
+
+    assert ctl.limit_for(origin) == 10
+
+
+def test_windowed_controller_does_not_probe_on_slow_successes():
+    clock = _FakeClock()
+    ctl = hb._WindowedAdaptiveConcurrencyController(
+        clock=clock,
+        initial=4,
+        minimum=2,
+        maximum=16,
+        window_seconds=1.0,
+    )
+    origin = "https://tiles.test"
+    ctl._state(origin).active = 4
+    for _ in range(3):
+        assert ctl.on_outcome(
+            origin,
+            status_code=200,
+            latency_seconds=5.0,
+            slow_threshold_seconds=4.0,
+            response_bytes=1000,
+            queue_depth=1,
+        ) == "slow"
+    clock.advance(1.0)
+    assert ctl.on_outcome(
+        origin,
+        status_code=200,
+        latency_seconds=5.0,
+        slow_threshold_seconds=4.0,
+        response_bytes=1000,
+        queue_depth=1,
+    ) == "slow"
+    assert ctl.limit_for(origin) == 4
+
+
+def test_windowed_controller_reduces_sustained_overload():
+    clock = _FakeClock()
+    ctl = hb._WindowedAdaptiveConcurrencyController(
+        clock=clock,
+        initial=20,
+        minimum=2,
+        maximum=100,
+        window_seconds=1.0,
+    )
+    origin = "https://tiles.test"
+    for _ in range(3):
+        ctl.on_outcome(origin, status_code=503)
+    clock.advance(1.0)
+    ctl.on_outcome(origin, status_code=503)
+
+    assert ctl.limit_for(origin) == 10
+
+
+def test_windowed_controller_applies_decrease_cooldown():
+    clock = _FakeClock()
+    ctl = hb._WindowedAdaptiveConcurrencyController(
+        clock=clock,
+        initial=20,
+        minimum=2,
+        maximum=100,
+        window_seconds=1.0,
+        cooldown=5.0,
+    )
+    origin = "https://tiles.test"
+    for _ in range(3):
+        ctl.on_outcome(origin, status_code=503)
+    clock.advance(1.0)
+    ctl.on_outcome(origin, status_code=503)
+    assert ctl.limit_for(origin) == 10
+
+    for _ in range(3):
+        ctl.on_outcome(origin, status_code=503)
+    clock.advance(1.0)
+    ctl.on_outcome(origin, status_code=503)
+    assert ctl.limit_for(origin) == 10
+
+
+def test_windowed_controller_probes_by_five_percent_and_rolls_back():
+    clock = _FakeClock()
+    ctl = hb._WindowedAdaptiveConcurrencyController(
+        clock=clock,
+        initial=20,
+        minimum=2,
+        maximum=100,
+        window_seconds=1.0,
+    )
+    origin = "https://tiles.test"
+    ctl._state(origin).active = 20
+    for _ in range(4):
+        ctl.on_outcome(
+            origin,
+            status_code=200,
+            response_bytes=1000,
+            ttfb_seconds=0.05,
+            queue_depth=1,
+        )
+    clock.advance(1.0)
+    ctl.on_outcome(
+        origin,
+        status_code=200,
+        response_bytes=1000,
+        ttfb_seconds=0.05,
+        queue_depth=1,
+    )
+    assert ctl.limit_for(origin) == 21
+
+    ctl._state(origin).active = 21
+    for _ in range(3):
+        ctl.on_outcome(
+            origin,
+            status_code=200,
+            response_bytes=10,
+            ttfb_seconds=0.05,
+            queue_depth=1,
+        )
+    clock.advance(1.0)
+    ctl.on_outcome(
+        origin,
+        status_code=200,
+        response_bytes=10,
+        ttfb_seconds=0.05,
+        queue_depth=1,
+    )
+    assert ctl.limit_for(origin) == 20
+
+
+def test_windowed_controller_rebaselines_and_recovers_after_overload():
+    clock = _FakeClock()
+    ctl = hb._WindowedAdaptiveConcurrencyController(
+        clock=clock,
+        initial=20,
+        minimum=2,
+        maximum=100,
+        window_seconds=1.0,
+    )
+    origin = "https://tiles.test"
+    for _ in range(3):
+        ctl.on_outcome(origin, status_code=503)
+    clock.advance(1.0)
+    ctl.on_outcome(origin, status_code=503)
+    assert ctl.limit_for(origin) == 10
+
+    clock.advance(5.0)
+    ctl._state(origin).active = 10
+    for _ in range(3):
+        ctl.on_outcome(
+            origin,
+            status_code=200,
+            response_bytes=1000,
+            ttfb_seconds=0.05,
+            queue_depth=1,
+        )
+    clock.advance(1.0)
+    ctl.on_outcome(
+        origin,
+        status_code=200,
+        response_bytes=1000,
+        ttfb_seconds=0.05,
+        queue_depth=1,
+    )
+    assert ctl.limit_for(origin) > 10
+
+
+def test_windowed_controller_ignores_neutral_failures():
+    clock = _FakeClock()
+    ctl = hb._WindowedAdaptiveConcurrencyController(
+        clock=clock,
+        initial=20,
+        minimum=2,
+        maximum=100,
+        window_seconds=1.0,
+    )
+    origin = "https://tiles.test"
+    for _ in range(3):
+        assert ctl.on_outcome(
+            origin,
+            error=hb.ResponseTooLargeError("policy"),
+        ) == "neutral"
+    clock.advance(1.0)
+    ctl.on_outcome(
+        origin,
+        error=hb.ResponseTooLargeError("policy"),
+    )
+    assert ctl.limit_for(origin) == 20
+
+
+def test_windowed_controller_does_not_rollback_after_idle_sample():
+    clock = _FakeClock()
+    ctl = hb._WindowedAdaptiveConcurrencyController(
+        clock=clock,
+        initial=20,
+        minimum=2,
+        maximum=100,
+        window_seconds=1.0,
+    )
+    origin = "https://tiles.test"
+    ctl._state(origin).active = 20
+    for _ in range(3):
+        ctl.on_outcome(
+            origin,
+            status_code=200,
+            response_bytes=1000,
+            queue_depth=1,
+        )
+    clock.advance(1.0)
+    ctl.on_outcome(
+        origin,
+        status_code=200,
+        response_bytes=1000,
+        queue_depth=1,
+    )
+    assert ctl.limit_for(origin) == 21
+
+    clock.advance(30.0)
+    ctl.on_outcome(
+        origin,
+        status_code=200,
+        response_bytes=10,
+        queue_depth=1,
+    )
+    assert ctl.limit_for(origin) == 21
+
+
 def test_origin_key_normalizes_scheme_and_host():
     assert hb._origin_key("https://Tiles.Test:443/a/b?c=1") == "https://tiles.test:443"
     assert hb._origin_key("http://a.test/x") == "http://a.test"

@@ -140,6 +140,37 @@ def test_sparse_buffer_preserves_bc3_alignment_across_gap():
     )
 
 
+def test_mipmap_provenance_reports_mixed_row_bytes_exactly():
+    grid = pydds.MipmapProvenanceGrid(4, 1)
+    grid.set_row(
+        0,
+        [
+            pydds.MipmapProvenance.EXACT_TARGET,
+            pydds.MipmapProvenance.EXACT_TARGET,
+            pydds.MipmapProvenance.LOWER_ZL_CACHE,
+            pydds.MipmapProvenance.MISSING_COLOR,
+        ],
+    )
+
+    summary = grid.summarize_bytes(0, 16, 16)
+
+    assert summary == {
+        pydds.MipmapProvenance.EXACT_TARGET: 8,
+        pydds.MipmapProvenance.LOWER_ZL_CACHE: 4,
+        pydds.MipmapProvenance.MISSING_COLOR: 4,
+    }
+
+
+def test_mipmap_provenance_partial_read_preserves_requested_length():
+    grid = pydds.MipmapProvenanceGrid(3, 1)
+    grid.set_indices(range(3), pydds.MipmapProvenance.EXACT_TARGET)
+
+    summary = grid.summarize_bytes(2, 5, 10)
+
+    assert sum(summary.values()) == 5
+    assert summary[pydds.MipmapProvenance.EXACT_TARGET] == 5
+
+
 def test_dds_read_at_is_stateless_and_exact():
     dds = pydds.DDS(512, 512, dxt_format="BC1")
     mm = dds.mipmap_list[0]
@@ -197,6 +228,41 @@ def test_partial_row_calculation_does_not_expand_read(monkeypatch, tmp_path):
 
     assert captured == [(0, 7, 7, bytes_per_chunk_row)]
     assert tile.chunks == {}
+
+
+def test_tile_serving_batches_mipmap_zero_provenance(monkeypatch, tmp_path):
+    tile = getortho.Tile(
+        0,
+        0,
+        "BI",
+        16,
+        cache_dir=str(tmp_path),
+        max_zoom=17,
+    )
+    mm = tile.dds.mipmap_list[0]
+    row_size = mm.length // tile.chunks_per_col
+    tile._mm0_provenance.set_row(
+        0,
+        [
+            pydds.MipmapProvenance.EXACT_TARGET
+        ] * (tile.chunks_per_row // 2)
+        + [
+            pydds.MipmapProvenance.LOWER_ZL_CACHE
+        ] * (tile.chunks_per_row // 2),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        getortho,
+        "bump_many",
+        lambda counters: captured.update(counters),
+    )
+
+    tile._record_mipmap_provenance(mm.startpos, row_size)
+
+    assert captured["mm0_served_exact_bytes"] == row_size // 2
+    assert captured["mm0_served_lower_zl_bytes"] == row_size // 2
+    assert captured["mm0_served_missing_bytes"] == 0
+    assert captured["mm0_reads_before_predictive_complete"] == 1
 
 
 def test_partial_row_ranges_cover_first_and_last_rows(tmp_path):
@@ -336,6 +402,10 @@ def test_partial_cache_load_populates_only_persisted_rows(
     )
     assert not mm.retrieved
     assert tile.chunks == {}
+    assert tile._persisted_exact_rows == {5}
+    assert set(tile._mm0_provenance.row(5)) == {
+        int(pydds.MipmapProvenance.EXACT_TARGET)
+    }
 
 
 def test_partial_v2_accepts_prepared_target_pixels(monkeypatch):

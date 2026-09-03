@@ -31,11 +31,22 @@ class PrefetchSource(str, Enum):
     LIVE = "live"
 
 
+class WorkClass(str, Enum):
+    LIVE = "live"
+    IMMINENT_PREFETCH = "imminent_prefetch"
+    REGULAR_PREFETCH = "regular_prefetch"
+    DISTANT_PREFETCH = "distant_prefetch"
+    HEALING = "healing"
+
+
 class CandidateState(str, Enum):
     DISCOVERED = "discovered"
     WAITING_FOR_CAPACITY = "waiting_for_capacity"
+    WAITING_FOR_LIVE_CLEAR = "waiting_for_live_clear"
     ADMITTING = "admitting"
     DOWNLOADING = "downloading"
+    PARTIAL_EXACT = "partial_exact"
+    RETRYING_HOLES = "retrying_holes"
     TARGET_READY = "target_ready"
     BUILD_QUEUED = "build_queued"
     COMPLETE = "complete"
@@ -80,6 +91,143 @@ class PrefetchQualityMode(str, Enum):
     RESPONSIVE = "responsive"
     PREFER_TARGET = "prefer_target"
     STRICT_TARGET = "strict_target"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceEvidence:
+    generation: Hashable
+    eta: float = math.inf
+    distance: float = math.inf
+    confidence: float = 0.0
+    quality_class: int = 5
+    path_start: Optional[tuple[float, float]] = None
+    path_end: Optional[tuple[float, float]] = None
+
+
+@dataclass(slots=True)
+class RetryState:
+    attempts: int = 0
+    last_error_class: str = ""
+    next_attempt_at: float = 0.0
+    last_attempt_at: float = 0.0
+    terminal: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkOrder:
+    """Immutable logical chunk order for one candidate revision."""
+
+    revision: int
+    indices: tuple[int, ...]
+
+    @classmethod
+    def row_major(cls, width: int, height: int, revision: int = 0):
+        return cls(revision, tuple(range(max(0, int(width) * int(height)))))
+
+    @classmethod
+    def center_out(cls, width: int, height: int, revision: int = 0):
+        width = max(0, int(width))
+        height = max(0, int(height))
+        center_x = width / 2.0
+        center_y = height / 2.0
+        indices = tuple(
+            sorted(
+                range(width * height),
+                key=lambda index: (
+                    (index % width + 0.5 - center_x) ** 2
+                    + (index // width + 0.5 - center_y) ** 2,
+                    index,
+                ),
+            )
+        )
+        return cls(revision, indices)
+
+    @classmethod
+    def for_corridor(
+        cls,
+        width: int,
+        height: int,
+        start: tuple[float, float],
+        end: tuple[float, float],
+        revision: int = 0,
+    ):
+        width = max(0, int(width))
+        height = max(0, int(height))
+        start_x, start_y = map(float, start)
+        end_x, end_y = map(float, end)
+        delta_x = end_x - start_x
+        delta_y = end_y - start_y
+        length_sq = delta_x * delta_x + delta_y * delta_y
+        if length_sq <= 1e-9:
+            return cls.center_out(width, height, revision)
+
+        def rank(index: int):
+            x = index % width + 0.5
+            y = index // width + 0.5
+            projection = (
+                (x - start_x) * delta_x + (y - start_y) * delta_y
+            ) / length_sq
+            nearest_x = start_x + min(1.0, max(0.0, projection)) * delta_x
+            nearest_y = start_y + min(1.0, max(0.0, projection)) * delta_y
+            distance_sq = (x - nearest_x) ** 2 + (y - nearest_y) ** 2
+            return (
+                distance_sq,
+                1 if projection < 0.0 else 0,
+                abs(projection),
+                index,
+            )
+
+        return cls(revision, tuple(sorted(range(width * height), key=rank)))
+
+
+class QualityDeadlinePolicy:
+    """Central row-wait policy shared by native and Python composition paths."""
+
+    @staticmethod
+    def wait_seconds(
+        mode: PrefetchQualityMode | str,
+        tile_budget: Any,
+        maxwait: float,
+        quality_grace: float,
+        strict_deadline: float,
+        is_mipmap_zero: bool,
+    ) -> float:
+        try:
+            mode = PrefetchQualityMode(mode)
+        except (TypeError, ValueError):
+            mode = PrefetchQualityMode.RESPONSIVE
+        remaining = (
+            max(0.0, float(tile_budget.remaining))
+            if tile_budget is not None
+            else math.inf
+        )
+        maxwait = max(0.0, float(maxwait))
+        if is_mipmap_zero and mode == PrefetchQualityMode.STRICT_TARGET:
+            return min(remaining, max(0.0, float(strict_deadline)))
+        if is_mipmap_zero and mode == PrefetchQualityMode.PREFER_TARGET:
+            return min(remaining, maxwait + max(0.0, float(quality_grace)))
+        return min(remaining, maxwait)
+
+    @classmethod
+    def row_deadline(
+        cls,
+        mode: PrefetchQualityMode | str,
+        tile_budget: Any,
+        maxwait: float,
+        quality_grace: float,
+        strict_deadline: float,
+        is_mipmap_zero: bool,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> float:
+        return clock() + cls.wait_seconds(
+            mode,
+            tile_budget,
+            maxwait,
+            quality_grace,
+            strict_deadline,
+            is_mipmap_zero,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,13 +299,19 @@ class PrefetchCandidate:
     key: PrefetchKey
     sources: set[PrefetchSource] = field(default_factory=set)
     generations: dict[PrefetchSource, Hashable] = field(default_factory=dict)
+    evidence: dict[PrefetchSource, SourceEvidence] = field(default_factory=dict)
     eta_seconds: float = math.inf
     distance_meters: float = math.inf
     quality_class: int = 5
     source_confidence: float = 0.0
+    source_rank: int = 5
     priority_revision: int = 0
     cursor: PrefetchCursor = field(default_factory=PrefetchCursor)
-    coverage: set[int] = field(default_factory=set)
+    chunk_order: Optional[ChunkOrder] = None
+    exact_coverage: set[int] = field(default_factory=set)
+    persisted_exact_rows: set[int] = field(default_factory=set)
+    missing_indices: dict[int, RetryState] = field(default_factory=dict)
+    active_indices: set[int] = field(default_factory=set)
     active_chunks: set[str] = field(default_factory=set)
     state: CandidateState = CandidateState.DISCOVERED
     created_at: float = field(default_factory=time.monotonic)
@@ -178,10 +332,69 @@ class PrefetchCandidate:
             CandidateState.CANCELLED,
         }
 
+    @property
+    def coverage(self) -> set[int]:
+        return self.exact_coverage
+
+    @property
+    def work_class(self) -> WorkClass:
+        if PrefetchSource.LIVE in self.sources:
+            return WorkClass.LIVE
+        if self.eta_seconds <= 120.0 or self.distance_meters <= 10 * 1852:
+            return WorkClass.IMMINENT_PREFETCH
+        if self.eta_seconds <= 600.0 or self.distance_meters <= 30 * 1852:
+            return WorkClass.REGULAR_PREFETCH
+        return WorkClass.DISTANT_PREFETCH
+
+    @property
+    def imminent(self) -> bool:
+        return self.work_class in {
+            WorkClass.LIVE,
+            WorkClass.IMMINENT_PREFETCH,
+        }
+
+    def recompute_priority(self) -> None:
+        source_order = {
+            PrefetchSource.LIVE: 0,
+            PrefetchSource.VELOCITY: 1,
+            PrefetchSource.SIMBRIEF: 1,
+            PrefetchSource.DSF: 3,
+        }
+        if not self.evidence:
+            self.sources.clear()
+            self.generations.clear()
+            self.eta_seconds = math.inf
+            self.distance_meters = math.inf
+            self.quality_class = 5
+            self.source_confidence = 0.0
+            self.source_rank = 5
+            return
+        self.sources = set(self.evidence)
+        self.generations = {
+            source: evidence.generation
+            for source, evidence in self.evidence.items()
+        }
+        best_source, best = min(
+            self.evidence.items(),
+            key=lambda item: (
+                source_order.get(item[0], 5),
+                item[1].quality_class,
+                item[1].eta,
+                item[1].distance,
+                -item[1].confidence,
+            ),
+        )
+        self.source_rank = source_order.get(best_source, 5)
+        self.eta_seconds = max(0.0, float(best.eta))
+        self.distance_meters = max(0.0, float(best.distance))
+        self.quality_class = max(0, int(best.quality_class))
+        self.source_confidence = float(best.confidence)
+
     def priority(self, now: Optional[float] = None) -> tuple:
         now = time.monotonic() if now is None else now
         bounded_age = min(300.0, max(0.0, now - self.created_at))
         return (
+            int(self.source_rank),
             int(self.quality_class),
             float(self.eta_seconds),
             float(self.distance_meters),
@@ -666,11 +879,27 @@ class PrefetchCoordinator:
         self._thread: Optional[threading.Thread] = None
         self._builder: Any = None
         self._pressure = _PressureGate()
+        self._pressure_waiting: dict[PrefetchKey, PrefetchCandidate] = {}
+        self._rediscovery: OrderedDict[
+            PrefetchKey, tuple[PrefetchSource, Hashable, float, float]
+        ] = OrderedDict()
+        self._rediscovery_limit = max(64, self.max_candidates * 4)
+        self._rediscovery_ttl = 120.0
         self._materialized_chunks = 0
         self._resident_jpeg_bytes = 0
         self._peak_candidates = 0
+        add_pressure_listener = getattr(
+            self.chunk_getter, "add_pressure_listener", None
+        )
+        if add_pressure_listener is not None:
+            add_pressure_listener(self._on_pressure_change)
 
     def start(self) -> None:
+        add_pressure_listener = getattr(
+            self.chunk_getter, "add_pressure_listener", None
+        )
+        if add_pressure_listener is not None:
+            add_pressure_listener(self._on_pressure_change)
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
@@ -726,6 +955,8 @@ class PrefetchCoordinator:
         distance_meters: float = math.inf,
         quality_class: int = 5,
         source_confidence: float = 0.0,
+        path_start: Optional[tuple[float, float]] = None,
+        path_end: Optional[tuple[float, float]] = None,
     ) -> bool:
         source = PrefetchSource(source)
         now = time.monotonic()
@@ -738,6 +969,21 @@ class PrefetchCoordinator:
             if key in self._completed:
                 self._metric("prefetch_candidates_coalesced")
                 return False
+            rediscovery = self._rediscovery.get(key)
+            if rediscovery is not None and source != PrefetchSource.LIVE:
+                old_source, old_generation, old_eta, expires = rediscovery
+                if expires <= now:
+                    self._rediscovery.pop(key, None)
+                elif (
+                    source == old_source
+                    and generation == old_generation
+                    and float(eta_seconds) >= old_eta * 0.75
+                ):
+                    self._rediscovery.move_to_end(key)
+                    self._metric("prefetch_rediscovery_suppressed")
+                    return False
+                else:
+                    self._rediscovery.pop(key, None)
             candidate = self._candidates.get(key)
             if candidate is not None and candidate.terminal:
                 # The retired object may still own active network/build work.
@@ -769,20 +1015,28 @@ class PrefetchCoordinator:
                 self._metric("prefetch_candidates_coalesced")
 
             old_priority = candidate.priority(now)
-            candidate.sources.add(source)
-            candidate.generations[source] = generation
-            candidate.eta_seconds = min(
-                candidate.eta_seconds, max(0.0, float(eta_seconds))
+            previous_evidence = candidate.evidence.get(source)
+            candidate.evidence[source] = SourceEvidence(
+                generation=generation,
+                eta=max(0.0, float(eta_seconds)),
+                distance=max(0.0, float(distance_meters)),
+                confidence=float(source_confidence),
+                quality_class=max(0, int(quality_class)),
+                path_start=path_start,
+                path_end=path_end,
             )
-            candidate.distance_meters = min(
-                candidate.distance_meters, max(0.0, float(distance_meters))
-            )
-            candidate.quality_class = min(
-                candidate.quality_class, max(0, int(quality_class))
-            )
-            candidate.source_confidence = max(
-                candidate.source_confidence, float(source_confidence)
-            )
+            candidate.recompute_priority()
+            if (
+                previous_evidence is None
+                or previous_evidence.path_start != path_start
+                or previous_evidence.path_end != path_end
+            ):
+                candidate.cursor = PrefetchCursor(
+                    ordering_revision=candidate.cursor.ordering_revision + 1,
+                    next_position=0,
+                    target_zoom=candidate.cursor.target_zoom,
+                )
+                candidate.chunk_order = None
             candidate.last_updated_at = now
             candidate.priority_revision += 1
             self._generation_keys.setdefault(
@@ -839,9 +1093,17 @@ class PrefetchCoordinator:
                         and candidate.generations.get(source) == token[1]
                     ):
                         candidate.generations.pop(source, None)
-                        candidate.sources.discard(source)
-                        if not candidate.sources:
+                        candidate.evidence.pop(source, None)
+                        candidate.recompute_priority()
+                        if not candidate.evidence:
                             self._stale_locked(candidate)
+                        else:
+                            candidate.priority_revision += 1
+                            self._queue.put(
+                                candidate,
+                                item_key=key,
+                                item_priority=candidate.priority(),
+                            )
             self._report_locked()
 
         published = 0
@@ -893,11 +1155,18 @@ class PrefetchCoordinator:
             candidate = self._candidates.get(key) if key is not None else None
             if candidate is None or candidate.terminal:
                 return False
-            candidate.sources.add(PrefetchSource.LIVE)
-            candidate.generations[PrefetchSource.LIVE] = "live"
-            candidate.quality_class = 0
-            candidate.eta_seconds = 0.0
-            candidate.distance_meters = 0.0
+            eta_at_promotion = candidate.eta_seconds
+            grid = tile.chunks.get(tile.max_zoom)
+            logical_length = getattr(grid, "logical_length", 0)
+            exact_count = len(candidate.exact_coverage)
+            candidate.evidence[PrefetchSource.LIVE] = SourceEvidence(
+                generation="live",
+                eta=0.0,
+                distance=0.0,
+                confidence=1.0,
+                quality_class=0,
+            )
+            candidate.recompute_priority()
             candidate.priority_revision += 1
             candidate.last_updated_at = time.monotonic()
             candidate.state = CandidateState.CANCELLED
@@ -906,9 +1175,49 @@ class PrefetchCoordinator:
             self._live_tile_keys[tile.id] = key
             lease = candidate.lease
             chunks = tuple(lease.chunks.values()) if lease is not None else ()
+            retry_chunks = (
+                tuple(
+                    lease.chunks[index]
+                    for index in candidate.missing_indices
+                    if index in lease.chunks
+                )
+                if lease is not None
+                else ()
+            )
+            if lease is None and candidate.missing_indices:
+                grid = tile.chunks.get(tile.max_zoom)
+                materialized_items = getattr(
+                    grid, "materialized_items", None
+                )
+                if materialized_items is not None:
+                    by_index = dict(materialized_items())
+                else:
+                    by_index = dict(getattr(grid, "slots", {}))
+                retry_chunks = tuple(
+                    by_index[index]
+                    for index in candidate.missing_indices
+                    if index in by_index
+                )
+            for retry in candidate.missing_indices.values():
+                retry.next_attempt_at = 0.0
+                retry.terminal = False
+            tile._prefetch_eta_at_promotion = eta_at_promotion
+            tile._prefetch_exact_coverage_at_promotion = (
+                exact_count / logical_length if logical_length else 0.0
+            )
         for chunk in chunks:
             chunk.priority = 0
             chunk.prefetch = False
+        for chunk in retry_chunks:
+            if self._reset_chunk_for_retry(chunk):
+                chunk.priority = 0
+                chunk.prefetch = False
+                self.chunk_getter.submit(
+                    chunk,
+                    timeout=(5, 10),
+                    max_attempts=8,
+                )
+                self._metric("prefetch_live_holes_retried")
         self.chunk_getter.reprioritize_queue()
         builder = self._builder
         if builder is not None and hasattr(builder, "reprioritize"):
@@ -917,6 +1226,30 @@ class PrefetchCoordinator:
         # queued/active chunks remain strongly held by the live tile and Getter.
         self._release_candidate(candidate)
         self._metric("prefetched_tiles_promoted_live")
+        eta_bucket = (
+            "unknown"
+            if not math.isfinite(eta_at_promotion)
+            else str(max(0, min(600, int(eta_at_promotion // 30) * 30)))
+        )
+        coverage_bucket = min(
+            100,
+            max(
+                0,
+                int(
+                    round(
+                        getattr(
+                            tile,
+                            "_prefetch_exact_coverage_at_promotion",
+                            0.0,
+                        )
+                        * 10
+                    )
+                    * 10
+                ),
+            ),
+        )
+        self._metric(f"prefetch_promotion_eta_seconds:{eta_bucket}")
+        self._metric(f"prefetch_live_exact_coverage_pct:{coverage_bucket}")
         self._wake.set()
         return True
 
@@ -946,6 +1279,7 @@ class PrefetchCoordinator:
                 "materialized_chunks": self._materialized_chunks,
                 "resident_jpeg_bytes": self._resident_jpeg_bytes,
                 "pressure": self._pressure.active,
+                "pressure_waiting": len(self._pressure_waiting),
             }
 
     def is_known(self, key: PrefetchKey) -> bool:
@@ -969,6 +1303,7 @@ class PrefetchCoordinator:
                 if not candidate.terminal:
                     candidate.state = CandidateState.CANCELLED
             self._queue.drain()
+            self._pressure_waiting.clear()
             thread, self._thread = self._thread, None
         self._wake.set()
         self.chunk_getter.cancel_prefetch_work("coordinator shutdown")
@@ -996,13 +1331,20 @@ class PrefetchCoordinator:
             self._generation_keys.clear()
             self._live_owned.clear()
             self._live_tile_keys.clear()
+            self._rediscovery.clear()
             self._report_locked()
+        remove_pressure_listener = getattr(
+            self.chunk_getter, "remove_pressure_listener", None
+        )
+        if remove_pressure_listener is not None:
+            remove_pressure_listener(self._on_pressure_change)
         self._gauge("prefetch_coordinator_threads", 0)
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            self._wake.wait(0.5)
+            self._wake.wait(self._next_wake_delay())
             self._wake.clear()
+            self._resume_pressure_waiters()
             while not self._stop.is_set():
                 candidate = None
                 try:
@@ -1019,6 +1361,15 @@ class PrefetchCoordinator:
                     elif (
                         result.reason == PrefetchBatchReason.PROGRESSED
                         and not candidate.terminal
+                    ):
+                        self._requeue(candidate)
+                    elif (
+                        result.reason == PrefetchBatchReason.NO_USEFUL_WORK
+                        and not candidate.terminal
+                        and any(
+                            not retry.terminal
+                            for retry in candidate.missing_indices.values()
+                        )
                     ):
                         self._requeue(candidate)
                     elif (
@@ -1041,6 +1392,75 @@ class PrefetchCoordinator:
                                 "Could not retire failed prefetch candidate"
                             )
 
+    def _next_wake_delay(self) -> Optional[float]:
+        with self._lock:
+            deadlines = [
+                candidate.next_attempt_at
+                for candidate in self._queue.items()
+                if (
+                    not candidate.terminal
+                    and candidate.next_attempt_at > 0.0
+                    and candidate.key not in self._pressure_waiting
+                )
+            ]
+            if (
+                self._pressure_waiting
+                and self._pressure.clear_since is not None
+            ):
+                deadlines.append(
+                    self._pressure.clear_since
+                    + self._pressure.minimum_pause
+                )
+        if not deadlines:
+            return None
+        return max(0.0, min(deadlines) - time.monotonic())
+
+    def _on_pressure_change(self, *args, **kwargs) -> None:
+        self._wake.set()
+
+    def _resume_pressure_waiters(self) -> None:
+        with self._lock:
+            if not self._pressure_waiting:
+                return
+        try:
+            snapshot = self.chunk_getter.prefetch_capacity_snapshot()
+            queue_capacity = (
+                snapshot.queue_available
+                + self.chunk_getter.queue_depths()["prefetch"]
+            )
+        except Exception:
+            return
+        pressure, changed = self._pressure.update(snapshot, queue_capacity)
+        if pressure:
+            return
+        now = time.monotonic()
+        with self._lock:
+            waiting = list(self._pressure_waiting.values())
+            self._pressure_waiting.clear()
+            for candidate in waiting:
+                if (
+                    self._candidates.get(candidate.key) is not candidate
+                    or candidate.terminal
+                ):
+                    self._metric("prefetch_stale_while_waiting")
+                    continue
+                candidate.state = (
+                    CandidateState.PARTIAL_EXACT
+                    if candidate.exact_coverage
+                    else CandidateState.WAITING_FOR_CAPACITY
+                )
+                candidate.next_attempt_at = max(
+                    candidate.next_attempt_at, now + 0.25
+                )
+                self._queue.put(
+                    candidate,
+                    item_key=candidate.key,
+                    item_priority=candidate.priority(now),
+                )
+                self._metric("prefetch_pressure_resumed")
+        if waiting:
+            self._wake.set()
+
     def _next_ready_candidate(self) -> Optional[PrefetchCandidate]:
         now = time.monotonic()
         deferred: list[PrefetchCandidate] = []
@@ -1049,7 +1469,7 @@ class PrefetchCoordinator:
                 candidate = self._queue.get_nowait()
             except queue.Empty:
                 for item in deferred:
-                    self._requeue(item)
+                    self._requeue(item, wake=False)
                 return None
             self._queue.task_done()
             if candidate.terminal or candidate.key not in self._candidates:
@@ -1058,7 +1478,7 @@ class PrefetchCoordinator:
                 deferred.append(candidate)
                 continue
             for item in deferred:
-                self._requeue(item)
+                self._requeue(item, wake=False)
             return candidate
 
     def _admit(self, candidate: PrefetchCandidate) -> PrefetchBatchResult:
@@ -1095,6 +1515,153 @@ class PrefetchCoordinator:
                 self._candidates.get(candidate.key) is candidate
                 and not candidate.terminal
             )
+
+    @staticmethod
+    def _retry_delay(attempts: int, terminal: bool = False) -> float:
+        schedule = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0)
+        delay = schedule[min(max(0, int(attempts) - 1), len(schedule) - 1)]
+        return max(30.0, delay) if terminal else delay
+
+    def _record_failure_locked(
+        self,
+        candidate: PrefetchCandidate,
+        index: int,
+        chunk: Any,
+    ) -> None:
+        now = time.monotonic()
+        previous = candidate.missing_indices.get(index)
+        attempts = 1 if previous is None else previous.attempts + 1
+        permanent = bool(getattr(chunk, "permanent_failure", False))
+        terminal = permanent and attempts >= 3
+        retry = RetryState(
+            attempts=attempts,
+            last_error_class=str(
+                getattr(chunk, "failure_reason", None)
+                or ("cancelled" if getattr(chunk, "cancelled", False) else "failed")
+            ),
+            next_attempt_at=now + self._retry_delay(attempts, terminal),
+            last_attempt_at=now,
+            terminal=terminal,
+        )
+        candidate.missing_indices[index] = retry
+        candidate.active_indices.discard(index)
+        candidate.state = CandidateState.PARTIAL_EXACT
+        retry_deadlines = [
+            state.next_attempt_at
+            for state in candidate.missing_indices.values()
+            if not state.terminal
+        ]
+        candidate.next_attempt_at = min(retry_deadlines) if retry_deadlines else 0.0
+        self._metric("prefetch_exact_target_chunk_holes")
+        if terminal:
+            self._metric("prefetch_terminal_holes")
+
+    @staticmethod
+    def _reset_chunk_for_retry(chunk: Any) -> bool:
+        reset = getattr(chunk, "reset_for_retry", None)
+        if reset is not None:
+            return bool(reset())
+        if getattr(chunk, "in_queue", False) or getattr(chunk, "in_flight", False):
+            return False
+        chunk.cancelled = False
+        chunk.permanent_failure = False
+        chunk.data = None
+        chunk.ready.clear()
+        return True
+
+    @staticmethod
+    def _latlon_to_grid(
+        latlon: tuple[float, float],
+        grid: Any,
+    ) -> tuple[float, float]:
+        lat, lon = map(float, latlon)
+        lat = max(-85.0511, min(85.0511, lat))
+        scale = 2 ** int(grid.zoom)
+        x = (lon + 180.0) / 360.0 * scale
+        lat_rad = math.radians(lat)
+        y = (
+            1.0
+            - math.asinh(math.tan(lat_rad)) / math.pi
+        ) / 2.0 * scale
+        return x - float(grid.col), y - float(grid.row)
+
+    def _ensure_candidate_order(
+        self,
+        candidate: PrefetchCandidate,
+        grid: Any,
+    ) -> ChunkOrder:
+        current = candidate.chunk_order
+        if (
+            current is not None
+            and current.revision == candidate.cursor.ordering_revision
+            and len(current.indices) == grid.logical_length
+        ):
+            return current
+        best = min(
+            candidate.evidence.items(),
+            key=lambda item: (
+                0 if item[0] == PrefetchSource.LIVE else
+                1 if item[0] in {PrefetchSource.VELOCITY, PrefetchSource.SIMBRIEF}
+                else 3,
+                item[1].eta,
+            ),
+            default=(None, None),
+        )[1]
+        width = max(1, int(getattr(grid, "width", grid.logical_length)))
+        height = max(
+            1,
+            int(
+                getattr(
+                    grid,
+                    "height",
+                    math.ceil(grid.logical_length / width),
+                )
+            ),
+        )
+        try:
+            if best is not None and best.path_start and best.path_end:
+                order = ChunkOrder.for_corridor(
+                    width,
+                    height,
+                    self._latlon_to_grid(best.path_start, grid),
+                    self._latlon_to_grid(best.path_end, grid),
+                    candidate.cursor.ordering_revision,
+                )
+            else:
+                order = ChunkOrder.row_major(
+                    width,
+                    height,
+                    candidate.cursor.ordering_revision,
+                )
+        except Exception:
+            order = ChunkOrder.row_major(
+                width,
+                height,
+                candidate.cursor.ordering_revision,
+            )
+        candidate.chunk_order = order
+        return order
+
+    @staticmethod
+    def _materialize_indices(grid: Any, indices: list[int]) -> dict[int, Any]:
+        if not indices:
+            return {}
+        result = {}
+        ordered = sorted(set(indices))
+        run_start = ordered[0]
+        previous = ordered[0]
+        runs = []
+        for index in ordered[1:]:
+            if index == previous + 1:
+                previous = index
+                continue
+            runs.append((run_start, previous + 1))
+            run_start = previous = index
+        runs.append((run_start, previous + 1))
+        for start, end in runs:
+            for index, chunk in zip(range(start, end), grid.ensure_range(start, end)):
+                result[index] = chunk
+        return result
 
     def _admit_candidate(
         self, candidate: PrefetchCandidate
@@ -1133,7 +1700,7 @@ class PrefetchCoordinator:
                 if pressure
                 else "prefetch_pressure_exit"
             )
-        if pressure and snapshot.live_pressure and candidate.quality_class > 1:
+        if pressure and snapshot.live_pressure and not candidate.imminent:
             self._metric("prefetch_batches_deferred_live_pressure")
             return PrefetchBatchResult(
                 0, 0, 0, False, cursor, PrefetchBatchReason.LIVE_PRESSURE
@@ -1141,7 +1708,10 @@ class PrefetchCoordinator:
         scan_budget = min(
             self.admission_burst,
             snapshot.admission_available,
-            max(0, self.max_materialized_chunks - self._materialized_chunks),
+            max(
+                0,
+                self.max_materialized_chunks - self._materialized_chunks,
+            ),
             max(
                 0,
                 (self.max_jpeg_bytes - self._resident_jpeg_bytes)
@@ -1186,12 +1756,53 @@ class PrefetchCoordinator:
                 cursor,
                 PrefetchBatchReason.STALE,
             )
-        start = min(cursor.next_position, grid.logical_length)
-        end = min(grid.logical_length, start + scan_budget)
-        if start >= end:
-            return self._settle_scanned_candidate(candidate, grid.logical_length)
+        order = self._ensure_candidate_order(candidate, grid)
+        now = time.monotonic()
+        due_retries = [
+            index
+            for index in order.indices
+            if (
+                index in candidate.missing_indices
+                and index not in candidate.exact_coverage
+                and index not in candidate.active_indices
+                and not candidate.missing_indices[index].terminal
+                and candidate.missing_indices[index].next_attempt_at <= now
+            )
+        ]
+        retrying = bool(due_retries)
+        next_position = min(cursor.next_position, len(order.indices))
+        selected_positions = {}
+        if retrying:
+            selected_indices = due_retries[:scan_budget]
+            candidate.state = CandidateState.RETRYING_HOLES
+        else:
+            selected_indices = []
+            while (
+                next_position < len(order.indices)
+                and len(selected_indices) < scan_budget
+            ):
+                index = order.indices[next_position]
+                order_position = next_position
+                next_position += 1
+                if (
+                    index in candidate.exact_coverage
+                    or index in candidate.active_indices
+                    or index in candidate.missing_indices
+                ):
+                    continue
+                selected_indices.append(index)
+                selected_positions[index] = order_position
+            if not selected_indices and next_position >= len(order.indices):
+                candidate.cursor = PrefetchCursor(
+                    cursor.ordering_revision,
+                    next_position,
+                    cursor.target_zoom,
+                )
+                return self._settle_scanned_candidate(
+                    candidate, grid.logical_length
+                )
 
-        chunks = grid.ensure_range(start, end)
+        chunks_by_index = self._materialize_indices(grid, selected_indices)
         if not self._candidate_is_current(candidate):
             return PrefetchBatchResult(
                 0, 0, 0, False, cursor, PrefetchBatchReason.STALE
@@ -1199,8 +1810,10 @@ class PrefetchCoordinator:
         submitted = 0
         cache_hits = 0
         scanned = 0
-        next_position = start
-        for offset, chunk in enumerate(chunks):
+        capacity_blocked = False
+        committed_position = cursor.next_position
+        for index in selected_indices:
+            chunk = chunks_by_index[index]
             if not self._candidate_is_current(candidate):
                 return PrefetchBatchResult(
                     submitted,
@@ -1210,30 +1823,26 @@ class PrefetchCoordinator:
                     candidate.cursor,
                     PrefetchBatchReason.STALE,
                 )
-            index = start + offset
             scanned += 1
             if lease.retain(index, chunk):
                 with self._lock:
                     self._materialized_chunks += 1
             if chunk.ready.is_set():
-                next_position = index + 1
                 if chunk.data:
                     cache_hits += 1
                     self._record_ready(candidate, index, chunk)
+                    if not retrying:
+                        committed_position = selected_positions[index] + 1
                     continue
-                self._finish_candidate(candidate, CandidateState.FAILED)
-                return PrefetchBatchResult(
-                    submitted,
-                    cache_hits,
-                    scanned,
-                    False,
-                    PrefetchCursor(
-                        cursor.ordering_revision,
-                        next_position,
-                        cursor.target_zoom,
-                    ),
-                    PrefetchBatchReason.FAILED,
-                )
+                if retrying and not self._reset_chunk_for_retry(chunk):
+                    with self._lock:
+                        self._record_failure_locked(candidate, index, chunk)
+                    continue
+                if not retrying:
+                    with self._lock:
+                        self._record_failure_locked(candidate, index, chunk)
+                    committed_position = selected_positions[index] + 1
+                    continue
 
             if candidate.quality_class == 0:
                 chunk.priority = 0
@@ -1241,28 +1850,27 @@ class PrefetchCoordinator:
             else:
                 chunk.priority = max(100, 100 + candidate.quality_class)
                 chunk.prefetch = True
+                chunk.prefetch_imminent = candidate.imminent
             status = self.chunk_getter.submit_prefetch(
                 chunk,
                 timeout=(5, 10),
                 max_attempts=8,
             )
             if status == PrefetchSubmitStatus.NO_CAPACITY:
+                capacity_blocked = True
                 break
             if status == PrefetchSubmitStatus.ALREADY_READY:
-                next_position = index + 1
                 if chunk.data:
                     cache_hits += 1
                     self._record_ready(candidate, index, chunk)
+                    if not retrying:
+                        committed_position = selected_positions[index] + 1
                     continue
-                self._finish_candidate(candidate, CandidateState.FAILED)
-                return PrefetchBatchResult(
-                    submitted,
-                    cache_hits,
-                    scanned,
-                    False,
-                    candidate.cursor,
-                    PrefetchBatchReason.FAILED,
-                )
+                with self._lock:
+                    self._record_failure_locked(candidate, index, chunk)
+                if not retrying:
+                    committed_position = selected_positions[index] + 1
+                continue
             if status in {
                 PrefetchSubmitStatus.DISABLED,
                 PrefetchSubmitStatus.STOPPING,
@@ -1279,27 +1887,25 @@ class PrefetchCoordinator:
                     False,
                     PrefetchCursor(
                         cursor.ordering_revision,
-                        next_position,
+                        cursor.next_position if retrying else committed_position,
                         cursor.target_zoom,
                     ),
                     reason,
                 )
             if status == PrefetchSubmitStatus.CANCELLED:
-                self._finish_candidate(candidate, CandidateState.FAILED)
-                return PrefetchBatchResult(
-                    submitted,
-                    cache_hits,
-                    scanned,
-                    False,
-                    cursor,
-                    PrefetchBatchReason.FAILED,
-                )
-            next_position = index + 1
+                with self._lock:
+                    self._record_failure_locked(candidate, index, chunk)
+                if not retrying:
+                    committed_position = selected_positions[index] + 1
+                continue
             if status.owns_work:
                 candidate.active_chunks.add(chunk.chunk_id)
+                candidate.active_indices.add(index)
                 self._subscribe_chunk(candidate, index, chunk)
                 if status == PrefetchSubmitStatus.ACCEPTED:
                     submitted += 1
+                if not retrying:
+                    committed_position = selected_positions[index] + 1
 
         with self._lock:
             if not self._candidate_is_current(candidate):
@@ -1311,21 +1917,26 @@ class PrefetchCoordinator:
                     candidate.cursor,
                     PrefetchBatchReason.STALE,
                 )
-            candidate.cursor = PrefetchCursor(
-                cursor.ordering_revision,
-                next_position,
-                cursor.target_zoom,
-            )
+            if not retrying:
+                candidate.cursor = PrefetchCursor(
+                    cursor.ordering_revision,
+                    committed_position if capacity_blocked else next_position,
+                    cursor.target_zoom,
+                )
             candidate.state = (
                 CandidateState.DOWNLOADING
                 if candidate.active_chunks
-                else CandidateState.WAITING_FOR_CAPACITY
+                else (
+                    CandidateState.PARTIAL_EXACT
+                    if candidate.missing_indices
+                    else CandidateState.WAITING_FOR_CAPACITY
+                )
             )
         self._metric("prefetch_chunks_scanned", scanned)
         self._metric("prefetch_chunks_cache_hits", cache_hits)
         self._metric("prefetch_chunks_admitted", submitted)
         self._report()
-        if next_position < end:
+        if capacity_blocked:
             return PrefetchBatchResult(
                 submitted,
                 cache_hits,
@@ -1334,7 +1945,13 @@ class PrefetchCoordinator:
                 candidate.cursor,
                 PrefetchBatchReason.NO_CAPACITY,
             )
-        if next_position >= grid.logical_length:
+        if (
+            not retrying
+            and candidate.cursor.next_position >= len(order.indices)
+        ) or (
+            retrying
+            and not candidate.active_chunks
+        ):
             return self._settle_scanned_candidate(candidate, grid.logical_length)
         return PrefetchBatchResult(
             submitted,
@@ -1370,6 +1987,16 @@ class PrefetchCoordinator:
         if tile is None:
             self._finish_candidate(candidate, CandidateState.FAILED)
             return None
+        restore_partial = getattr(tile, "restore_partial_dds_cache", None)
+        if restore_partial is not None:
+            try:
+                restore_partial()
+            except Exception:
+                log.debug(
+                    "Could not restore partial DDS rows for %s",
+                    candidate.key,
+                    exc_info=True,
+                )
 
         def release() -> None:
             close_prefetch = getattr(
@@ -1394,6 +2021,16 @@ class PrefetchCoordinator:
                 return None
             candidate.lease = lease
             self._tile_keys[tile.id] = (key, candidate.sequence)
+            persisted_rows = set(
+                getattr(tile, "_persisted_exact_rows", ()) or ()
+            )
+            candidate.persisted_exact_rows.update(persisted_rows)
+            grid = tile._get_chunk_grid(tile.max_zoom)
+            for row_index in persisted_rows:
+                row_start = row_index * grid.width
+                candidate.exact_coverage.update(
+                    range(row_start, min(row_start + grid.width, grid.logical_length))
+                )
             self._report_locked()
         return lease
 
@@ -1430,24 +2067,51 @@ class PrefetchCoordinator:
     ) -> None:
         release_terminal = False
         should_settle = False
+        should_requeue = False
         failed = False
         logical_length = 0
+        row_to_schedule = None
+        tile = None
         with self._lock:
             candidate.active_chunks.discard(chunk.chunk_id)
+            candidate.active_indices.discard(index)
             if candidate.terminal:
                 release_terminal = not candidate.active_chunks
             elif chunk.data:
                 self._record_ready_locked(candidate, index, chunk)
             elif not getattr(chunk, "cancelled", False):
                 failed = True
+                self._record_failure_locked(candidate, index, chunk)
+            else:
+                failed = True
+                self._record_failure_locked(candidate, index, chunk)
             if not candidate.terminal and not failed:
                 lease = candidate.lease
                 tile = lease.tile if lease is not None else None
                 if tile is not None:
                     grid = tile.chunks.get(tile.max_zoom)
                     logical_length = getattr(grid, "logical_length", 0)
+                    if grid is not None:
+                        grid_width = max(
+                            1,
+                            int(getattr(grid, "width", logical_length)),
+                        )
+                        row_index = index // grid_width
+                        row_start = row_index * grid_width
+                        if all(
+                            position in candidate.exact_coverage
+                            for position in range(
+                                row_start,
+                                min(row_start + grid_width, logical_length),
+                            )
+                        ):
+                            row_to_schedule = row_index
                     should_settle = (
                         candidate.cursor.next_position >= logical_length
+                        and not candidate.active_chunks
+                    )
+                    should_requeue = (
+                        candidate.cursor.next_position < logical_length
                         and not candidate.active_chunks
                     )
         if release_terminal:
@@ -1456,10 +2120,42 @@ class PrefetchCoordinator:
         if candidate.terminal:
             return
         if failed:
-            self._finish_candidate(candidate, CandidateState.FAILED)
+            if not candidate.active_chunks:
+                if any(
+                    not retry.terminal
+                    for retry in candidate.missing_indices.values()
+                ):
+                    self._drop_lease(candidate)
+                    self._requeue(candidate)
+                else:
+                    self._drop_lease(candidate)
+                    self._finish_candidate(
+                        candidate,
+                        CandidateState.FAILED,
+                    )
+            self._report()
             return
+        if row_to_schedule is not None and tile is not None:
+            schedule_row = getattr(tile, "schedule_exact_prefetch_row", None)
+            if schedule_row is not None:
+                schedule_row(row_to_schedule)
+        if should_requeue and not candidate.terminal:
+            self._requeue(candidate)
         if should_settle:
-            self._settle_scanned_candidate(candidate, logical_length)
+            result = self._settle_scanned_candidate(
+                candidate, logical_length
+            )
+            if (
+                result.reason == PrefetchBatchReason.PROGRESSED
+                or (
+                    result.reason == PrefetchBatchReason.NO_USEFUL_WORK
+                    and any(
+                        not retry.terminal
+                        for retry in candidate.missing_indices.values()
+                    )
+                )
+            ) and not candidate.terminal:
+                self._requeue(candidate)
         self._wake.set()
 
     def _record_ready(
@@ -1468,8 +2164,36 @@ class PrefetchCoordinator:
         index: int,
         chunk: Any,
     ) -> None:
+        tile = None
+        row_index = None
         with self._lock:
             self._record_ready_locked(candidate, index, chunk)
+            lease = candidate.lease
+            tile = lease.tile if lease is not None else None
+            grid = (
+                tile.chunks.get(tile.max_zoom)
+                if tile is not None
+                else None
+            )
+            if grid is not None:
+                width = max(
+                    1,
+                    int(getattr(grid, "width", grid.logical_length)),
+                )
+                row_index = index // width
+                row_start = row_index * width
+                if not all(
+                    position in candidate.exact_coverage
+                    for position in range(
+                        row_start,
+                        min(row_start + width, grid.logical_length),
+                    )
+                ):
+                    row_index = None
+        if tile is not None and row_index is not None:
+            schedule_row = getattr(tile, "schedule_exact_prefetch_row", None)
+            if schedule_row is not None:
+                schedule_row(row_index)
 
     def _record_ready_locked(
         self,
@@ -1478,9 +2202,12 @@ class PrefetchCoordinator:
         chunk: Any,
     ) -> None:
         if index in candidate.coverage:
+            candidate.missing_indices.pop(index, None)
             return
         data_size = len(chunk.data or b"")
         candidate.coverage.add(index)
+        candidate.missing_indices.pop(index, None)
+        candidate.active_indices.discard(index)
         lease = candidate.lease
         if lease is not None:
             lease.resident_jpeg_bytes += data_size
@@ -1519,14 +2246,38 @@ class PrefetchCoordinator:
             )
             if target_complete:
                 candidate.state = CandidateState.TARGET_READY
+                candidate.missing_indices.clear()
+                candidate.next_attempt_at = 0.0
             else:
+                candidate.state = (
+                    CandidateState.PARTIAL_EXACT
+                    if candidate.coverage
+                    else CandidateState.RETRYING_HOLES
+                )
+                retry_deadlines = [
+                    state.next_attempt_at
+                    for state in candidate.missing_indices.values()
+                    if not state.terminal
+                ]
+                candidate.next_attempt_at = (
+                    min(retry_deadlines) if retry_deadlines else 0.0
+                )
                 reason = (
-                    PrefetchBatchReason.FAILED
-                    if cursor_complete
-                    else PrefetchBatchReason.NO_USEFUL_WORK
+                    PrefetchBatchReason.NO_USEFUL_WORK
+                    if candidate.missing_indices or cursor_complete
+                    else PrefetchBatchReason.PROGRESSED
                 )
         if not target_complete:
-            self._finish_candidate(candidate, CandidateState.FAILED)
+            if not candidate.active_chunks:
+                self._drop_lease(candidate)
+            if (
+                candidate.missing_indices
+                and not any(
+                    not retry.terminal
+                    for retry in candidate.missing_indices.values()
+                )
+            ):
+                self._finish_candidate(candidate, CandidateState.FAILED)
             return PrefetchBatchResult(
                 0, 0, 0, False, candidate.cursor, reason
             )
@@ -1631,13 +2382,20 @@ class PrefetchCoordinator:
             ):
                 return
             candidate.state = CandidateState.WAITING_FOR_CAPACITY
-            candidate.retry_count += 1
-            base = min(
-                5.0, 0.05 * (2 ** min(candidate.retry_count, 7))
-            )
-            candidate.next_attempt_at = (
-                time.monotonic() + base * random.uniform(0.8, 1.2)
-            )
+            if reason == PrefetchBatchReason.LIVE_PRESSURE:
+                candidate.state = CandidateState.WAITING_FOR_LIVE_CLEAR
+                if candidate.key not in self._pressure_waiting:
+                    self._pressure_waiting[candidate.key] = candidate
+                    self._metric("prefetch_pressure_deferred")
+                candidate.next_attempt_at = 0.0
+            else:
+                candidate.retry_count += 1
+                base = min(
+                    5.0, 0.05 * (2 ** min(candidate.retry_count, 7))
+                )
+                candidate.next_attempt_at = (
+                    time.monotonic() + base * random.uniform(0.8, 1.2)
+                )
             lease = candidate.lease
             tile = lease.tile if lease is not None else None
             grid = (
@@ -1659,9 +2417,15 @@ class PrefetchCoordinator:
         self._metric(f"prefetch_admission_{reason.value}")
         if should_drop:
             self._drop_lease(candidate)
-        self._requeue(candidate)
+        if reason != PrefetchBatchReason.LIVE_PRESSURE:
+            self._requeue(candidate)
 
-    def _requeue(self, candidate: PrefetchCandidate) -> None:
+    def _requeue(
+        self,
+        candidate: PrefetchCandidate,
+        *,
+        wake: bool = True,
+    ) -> None:
         with self._lock:
             if candidate.terminal or candidate.key not in self._candidates:
                 return
@@ -1670,8 +2434,7 @@ class PrefetchCoordinator:
                 item_key=candidate.key,
                 item_priority=candidate.priority(),
             )
-        delay = max(0.0, candidate.next_attempt_at - time.monotonic())
-        if delay <= 0:
+        if wake:
             self._wake.set()
 
     def _stale_locked(self, candidate: PrefetchCandidate) -> None:
@@ -1679,6 +2442,7 @@ class PrefetchCoordinator:
             return
         candidate.state = CandidateState.STALE
         self._queue.remove(candidate.key)
+        self._pressure_waiting.pop(candidate.key, None)
         if self._candidates.get(candidate.key) is candidate:
             self._candidates.pop(candidate.key, None)
         self._metric("prefetch_candidates_stale")
@@ -1713,6 +2477,7 @@ class PrefetchCoordinator:
                 return
             candidate.state = state
             self._queue.remove(candidate.key)
+            self._pressure_waiting.pop(candidate.key, None)
             if state == CandidateState.COMPLETE:
                 self._completed.add(candidate.key)
                 self._metric("prefetch_candidates_complete")
@@ -1767,6 +2532,31 @@ class PrefetchCoordinator:
             self._resident_jpeg_bytes = max(
                 0, self._resident_jpeg_bytes - lease.resident_jpeg_bytes
             )
+            if not candidate.terminal:
+                grid = getattr(lease.tile, "chunks", {}).get(
+                    getattr(lease.tile, "max_zoom", None)
+                )
+                width = max(
+                    1,
+                    int(
+                        getattr(
+                            grid,
+                            "width",
+                            getattr(grid, "logical_length", 1),
+                        )
+                    ),
+                )
+                durable = {
+                    row * width + column
+                    for row in candidate.persisted_exact_rows
+                    for column in range(width)
+                }
+                candidate.exact_coverage.intersection_update(durable)
+                candidate.cursor = PrefetchCursor(
+                    candidate.cursor.ordering_revision,
+                    0,
+                    candidate.cursor.target_zoom,
+                )
             self._report_locked()
         lease.close()
         return lease
@@ -1802,6 +2592,27 @@ class PrefetchCoordinator:
             victim.state = CandidateState.STALE
             self._queue.remove(victim.key)
             self._metric("prefetch_candidates_evicted")
+            if not victim.coverage and not victim.persisted_exact_rows:
+                source, evidence = min(
+                    victim.evidence.items(),
+                    key=lambda item: (
+                        victim.source_rank
+                        if item[0] in victim.sources
+                        else 5,
+                        item[1].eta,
+                    ),
+                    default=(None, None),
+                )
+                if source is not None and evidence is not None:
+                    self._rediscovery[victim.key] = (
+                        source,
+                        evidence.generation,
+                        evidence.eta,
+                        time.monotonic() + self._rediscovery_ttl,
+                    )
+                    self._rediscovery.move_to_end(victim.key)
+                    while len(self._rediscovery) > self._rediscovery_limit:
+                        self._rediscovery.popitem(last=False)
             self._release_candidate(victim)
 
     def _metric(self, name: str, value: int = 1) -> None:
@@ -1845,3 +2656,16 @@ class PrefetchCoordinator:
             "prefetch_resident_jpeg_bytes", self._resident_jpeg_bytes
         )
         self._gauge("prefetch_queue_tombstones", self._queue.tombstones)
+        self._gauge(
+            "prefetch_pressure_waiting_count", len(self._pressure_waiting)
+        )
+        self._gauge(
+            "prefetch_retry_holes",
+            sum(
+                len(candidate.missing_indices)
+                for candidate in (
+                    tuple(self._candidates.values())
+                    + tuple(self._retired.values())
+                )
+            ),
+        )

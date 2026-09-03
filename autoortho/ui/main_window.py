@@ -252,9 +252,11 @@ class ConfigUI(QMainWindow):
         "persist_partial_dds_cache_check",
         "prefetch_enabled_check",
         "prefetch_quality_mode_combo",
+        "prefetch_quality_grace_spinbox",
         "prefetch_lookahead_slider",
         "prefetch_interval_slider",
         "prefetch_max_chunks_slider",
+        "prefetch_admission_burst_spinbox",
         "prefetch_radius_slider",
         "predictive_dds_enabled_check",
         "predictive_interval_slider",
@@ -325,9 +327,11 @@ class ConfigUI(QMainWindow):
         "persist_partial_dds_cache_check",
         "prefetch_enabled_check",
         "prefetch_quality_mode_combo",
+        "prefetch_quality_grace_spinbox",
         "prefetch_lookahead_slider",
         "prefetch_interval_slider",
         "prefetch_max_chunks_slider",
+        "prefetch_admission_burst_spinbox",
         "prefetch_radius_slider",
         "predictive_dds_enabled_check",
         "predictive_interval_slider",
@@ -1172,9 +1176,9 @@ class ConfigUI(QMainWindow):
                 "maxwait_slider": 20,
                 "fallback_timeout_slider": 30,
                 "prefetch_lookahead_slider": 10,
-                "prefetch_max_chunks_slider": 48,
-                "prefetch_radius_slider": 40,
-                "background_workers_slider": 4,
+                "prefetch_max_chunks_slider": 64,
+                "prefetch_radius_slider": 30,
+                "background_workers_slider": 2,
                 "live_concurrency_slider": 8,
                 "provider_inflight_spinbox": 128,
                 "provider_connections_spinbox": 64,
@@ -1293,8 +1297,8 @@ class ConfigUI(QMainWindow):
             "Prefetching": {
                 "prefetch_enabled_check": True,
                 "prefetch_lookahead_slider": 10,
-                "prefetch_max_chunks_slider": 48,
-                "prefetch_radius_slider": 40,
+                "prefetch_max_chunks_slider": 64,
+                "prefetch_radius_slider": 30,
             },
             "Performance": {
                 "use_time_budget_check": True,
@@ -3722,6 +3726,32 @@ class ConfigUI(QMainWindow):
         quality_mode_layout.addWidget(quality_mode_label)
         quality_mode_layout.addWidget(self.prefetch_quality_mode_combo)
         autoortho_layout.addLayout(quality_mode_layout)
+
+        quality_grace_layout = QHBoxLayout()
+        self.prefetch_quality_grace_label = QLabel("Target quality grace:")
+        self.prefetch_quality_grace_spinbox = QDoubleSpinBox()
+        self.prefetch_quality_grace_spinbox.setRange(0.0, 60.0)
+        self.prefetch_quality_grace_spinbox.setSingleStep(0.5)
+        self.prefetch_quality_grace_spinbox.setSuffix(" sec")
+        self.prefetch_quality_grace_spinbox.setValue(
+            float(
+                getattr(
+                    self.cfg.autoortho,
+                    "prefetch_quality_grace_sec",
+                    5.0,
+                )
+            )
+        )
+        self.prefetch_quality_grace_spinbox.setObjectName(
+            "prefetch_quality_grace_sec"
+        )
+        self.prefetch_quality_grace_spinbox.setToolTip(
+            "Additional mipmap-zero row wait used only by Prefer target mode."
+        )
+        quality_grace_layout.addWidget(self.prefetch_quality_grace_label)
+        quality_grace_layout.addWidget(self.prefetch_quality_grace_spinbox)
+        quality_grace_layout.addStretch()
+        autoortho_layout.addLayout(quality_grace_layout)
         
         # Prefetch lookahead slider (in minutes, 0 = Unlimited)
         lookahead_layout = QHBoxLayout()
@@ -3814,6 +3844,30 @@ class ConfigUI(QMainWindow):
         max_chunks_layout.addWidget(self.prefetch_max_chunks_slider)
         max_chunks_layout.addWidget(self.prefetch_max_chunks_value)
         autoortho_layout.addLayout(max_chunks_layout)
+
+        admission_layout = QHBoxLayout()
+        self.prefetch_admission_burst_label = QLabel("Admission burst:")
+        self.prefetch_admission_burst_spinbox = QSpinBox()
+        self.prefetch_admission_burst_spinbox.setRange(1, 512)
+        self.prefetch_admission_burst_spinbox.setValue(
+            int(
+                getattr(
+                    self.cfg.autoortho,
+                    "prefetch_admission_burst",
+                    64,
+                )
+            )
+        )
+        self.prefetch_admission_burst_spinbox.setObjectName(
+            "prefetch_admission_burst"
+        )
+        self.prefetch_admission_burst_spinbox.setToolTip(
+            "Maximum chunks one candidate may materialize in a coordinator pass."
+        )
+        admission_layout.addWidget(self.prefetch_admission_burst_label)
+        admission_layout.addWidget(self.prefetch_admission_burst_spinbox)
+        admission_layout.addStretch()
+        autoortho_layout.addLayout(admission_layout)
         
         # Prefetch radius slider (unified for both velocity and SimBrief methods)
         radius_layout = QHBoxLayout()
@@ -3846,6 +3900,29 @@ class ConfigUI(QMainWindow):
         radius_layout.addWidget(self.prefetch_radius_slider)
         radius_layout.addWidget(self.prefetch_radius_value)
         autoortho_layout.addLayout(radius_layout)
+
+        self.prefetch_defaults_warning = QLabel()
+        self.prefetch_defaults_warning.setWordWrap(True)
+        self.prefetch_defaults_warning.setStyleSheet(
+            "color: #ffb74d; font-weight: 600;"
+        )
+        self.prefetch_defaults_warning.setVisible(False)
+        autoortho_layout.addWidget(self.prefetch_defaults_warning)
+        self.apply_prefetch_defaults_button = QPushButton(
+            "Apply current recommended prefetch defaults"
+        )
+        self.apply_prefetch_defaults_button.clicked.connect(
+            self._apply_recommended_prefetch_defaults
+        )
+        self.apply_prefetch_defaults_button.setVisible(False)
+        autoortho_layout.addWidget(self.apply_prefetch_defaults_button)
+        for control in (
+            self.prefetch_lookahead_slider,
+            self.prefetch_max_chunks_slider,
+            self.prefetch_radius_slider,
+        ):
+            control.valueChanged.connect(self._update_prefetch_diagnostics)
+        self._update_prefetch_diagnostics()
         
         # ═══════════════════════════════════════════════════════════════════
         # PREDICTIVE DDS SECTION (NEW)
@@ -6019,6 +6096,8 @@ class ConfigUI(QMainWindow):
         """Update enabled state of prefetch controls based on enable checkbox."""
         enabled = self.prefetch_enabled_check.isChecked()
         self.prefetch_quality_mode_combo.setEnabled(enabled)
+        self.prefetch_quality_grace_spinbox.setEnabled(enabled)
+        self.prefetch_quality_grace_label.setEnabled(enabled)
         
         # Existing controls
         self.prefetch_lookahead_slider.setEnabled(enabled)
@@ -6033,6 +6112,8 @@ class ConfigUI(QMainWindow):
         self.prefetch_max_chunks_slider.setEnabled(enabled)
         self.prefetch_max_chunks_label.setEnabled(enabled)
         self.prefetch_max_chunks_value.setEnabled(enabled)
+        self.prefetch_admission_burst_spinbox.setEnabled(enabled)
+        self.prefetch_admission_burst_label.setEnabled(enabled)
         
         # Prefetch radius (unified setting for both methods)
         self.prefetch_radius_slider.setEnabled(enabled)
@@ -6044,6 +6125,39 @@ class ConfigUI(QMainWindow):
             self.predictive_dds_enabled_check.setChecked(False)
         self.predictive_dds_enabled_check.setEnabled(enabled)
         self._update_predictive_dds_controls()
+
+    def _update_prefetch_diagnostics(self, *_args):
+        unsafe = (
+            self.prefetch_lookahead_slider.value() == 61
+            and self.prefetch_max_chunks_slider.value() >= 256
+            and self.prefetch_radius_slider.value() >= 50
+        )
+        self.prefetch_defaults_warning.setText(
+            "This legacy combination uses unlimited lookahead, at least 256 "
+            "chunks per cycle, and a radius of 50 nm or more. It can cause "
+            "candidate churn and sustained memory/network pressure."
+            if unsafe
+            else ""
+        )
+        self.prefetch_defaults_warning.setVisible(unsafe)
+        self.apply_prefetch_defaults_button.setVisible(unsafe)
+
+    def _apply_recommended_prefetch_defaults(self):
+        self.prefetch_lookahead_slider.setValue(10)
+        self.prefetch_max_chunks_slider.setValue(64)
+        self.prefetch_admission_burst_spinbox.setValue(64)
+        self.prefetch_radius_slider.setValue(30)
+        self.background_workers_slider.setValue(2)
+        self.live_concurrency_slider.setValue(8)
+        self.prefetch_quality_mode_combo.setCurrentIndex(
+            max(
+                0,
+                self.prefetch_quality_mode_combo.findData("responsive"),
+            )
+        )
+        self.prefetch_quality_grace_spinbox.setValue(5.0)
+        self.persist_partial_dds_cache_check.setChecked(True)
+        self._update_prefetch_diagnostics()
     
     def _update_predictive_dds_controls(self):
         """Update enabled state of predictive DDS controls."""
@@ -8108,6 +8222,9 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.prefetch_quality_mode = (
                 self.prefetch_quality_mode_combo.currentData()
             )
+            self.cfg.autoortho.prefetch_quality_grace_sec = str(
+                self.prefetch_quality_grace_spinbox.value()
+            )
             # Slider value 61 = Unlimited, save as 0 to config
             lookahead_val = self.prefetch_lookahead_slider.value()
             self.cfg.autoortho.prefetch_lookahead = str(
@@ -8118,6 +8235,9 @@ class ConfigUI(QMainWindow):
             )
             self.cfg.autoortho.prefetch_max_chunks = str(
                 self.prefetch_max_chunks_slider.value()
+            )
+            self.cfg.autoortho.prefetch_admission_burst = str(
+                self.prefetch_admission_burst_spinbox.value()
             )
             self.cfg.autoortho.prefetch_radius_nm = str(
                 self.prefetch_radius_slider.value()

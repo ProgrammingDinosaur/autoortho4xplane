@@ -11,12 +11,15 @@ sys.path.insert(
 
 from prefetch import (
     CandidateState,
+    ChunkOrder,
     IndexedPriorityQueue,
     PrefetchBatchReason,
     PrefetchCapacitySnapshot,
     PrefetchCoordinator,
     PrefetchSource,
     PrefetchSubmitStatus,
+    QualityDeadlinePolicy,
+    RetryState,
 )
 
 
@@ -62,6 +65,8 @@ class FakeChunk:
 class FakeGrid:
     def __init__(self, count, cached=()):
         self.logical_length = count
+        self.width = count
+        self.height = 1
         self.cached = set(cached)
         self.slots = {}
         self.ranges = []
@@ -154,6 +159,11 @@ class FakeGetter:
             self.submitted.append(chunk)
         return status
 
+    def submit(self, chunk, **kwargs):
+        chunk.in_queue = True
+        self.submitted.append(chunk)
+        return True
+
     def reprioritize_queue(self):
         self.reprioritized += 1
 
@@ -226,7 +236,8 @@ def test_candidates_coalesce_sources_and_reprioritize():
         PrefetchSource.VELOCITY,
         PrefetchSource.DSF,
     }
-    assert candidate.distance_meters == 50
+    assert candidate.distance_meters == 1000
+    assert candidate.source_rank == 1
 
 
 def test_candidate_count_is_hard_bounded():
@@ -323,7 +334,7 @@ def test_first_authoritative_no_capacity_preserves_cursor_and_drops_idle_lease()
 
     candidate.active_chunks.clear()
     coordinator._defer_candidate(candidate, result.reason)
-    assert candidate.cursor.next_position == 1
+    assert candidate.cursor.next_position == 0
     assert candidate.lease is None
     assert cacher.closes == 1
 
@@ -381,7 +392,12 @@ def test_coordinator_parks_fully_scanned_downloads_without_busy_spin():
 
 def test_live_pressure_defers_distant_candidate_without_opening_tile():
     coordinator, cacher, getter = make_coordinator()
-    key = publish(coordinator, quality_class=5)
+    key = publish(
+        coordinator,
+        quality_class=5,
+        eta_seconds=300,
+        distance_meters=100_000,
+    )
     getter.prefetch_capacity_snapshot = lambda: PrefetchCapacitySnapshot(
         queue_available=8,
         stage_available=8,
@@ -392,6 +408,44 @@ def test_live_pressure_defers_distant_candidate_without_opening_tile():
     result = coordinator._admit(coordinator._candidates[key])
     assert result.reason == PrefetchBatchReason.LIVE_PRESSURE
     assert cacher.opens == 0
+
+
+def test_pressure_waiter_resumes_once_after_hysteresis():
+    coordinator, _, getter = make_coordinator()
+    key = publish(
+        coordinator,
+        eta_seconds=300,
+        distance_meters=100_000,
+        quality_class=5,
+    )
+    getter.prefetch_capacity_snapshot = lambda: PrefetchCapacitySnapshot(
+        queue_available=8,
+        stage_available=8,
+        deferred_available=8,
+        live_queued=1,
+        broker_background_available=8,
+    )
+    candidate = coordinator._candidates[key]
+    coordinator._queue.remove(key)
+    result = coordinator._admit(candidate)
+    coordinator._defer_candidate(candidate, result.reason)
+    assert candidate.state == CandidateState.WAITING_FOR_LIVE_CLEAR
+    assert coordinator._queue.qsize() == 0
+
+    getter.prefetch_capacity_snapshot = lambda: PrefetchCapacitySnapshot(
+        queue_available=8,
+        stage_available=8,
+        deferred_available=8,
+        broker_background_available=8,
+    )
+    coordinator._resume_pressure_waiters()
+    assert coordinator._queue.qsize() == 0
+    coordinator._pressure.clear_since -= coordinator._pressure.minimum_pause
+    coordinator._pressure.entered_at -= coordinator._pressure.minimum_pause
+    coordinator._resume_pressure_waiters()
+
+    assert coordinator._queue.qsize() == 1
+    assert candidate.state == CandidateState.WAITING_FOR_CAPACITY
 
 
 def test_live_promotion_transfers_tile_ownership_and_rekeys_chunks():
@@ -421,6 +475,27 @@ def test_live_promotion_transfers_tile_ownership_and_rekeys_chunks():
         source=PrefetchSource.DSF,
         generation="after-close",
     )
+
+
+def test_live_promotion_resets_hole_backoff_and_retries_immediately():
+    coordinator, cacher, getter = make_coordinator(count=1, burst=1)
+    key = publish(coordinator)
+    candidate = coordinator._candidates[key]
+    coordinator._admit(candidate)
+    chunk = getter.submitted[0]
+    chunk.in_queue = False
+    chunk.data = b""
+    chunk.ready.set()
+    retry = candidate.missing_indices[0]
+    assert retry.next_attempt_at > time.monotonic()
+
+    tile = cacher.tiles[(1, 2, "BI", 17)]
+    assert coordinator.promote_tile(tile)
+
+    assert retry.next_attempt_at == 0.0
+    assert getter.submitted[-1] is chunk
+    assert chunk.prefetch is False
+    assert chunk.priority == 0
 
 
 def test_runtime_disabled_result_is_retryable_and_releases_idle_lease():
@@ -468,23 +543,187 @@ def test_stale_generation_cancels_queued_chunks_and_releases_after_settlement():
     assert cacher.closes == 1
 
 
-def test_failed_candidate_keeps_lease_until_other_active_chunks_settle():
+def test_failed_candidate_retains_exact_progress_and_retries_only_hole():
     coordinator, cacher, getter = make_coordinator(count=2, burst=2)
+    coordinator.set_builder(False)
     key = publish(coordinator)
     candidate = coordinator._candidates[key]
     coordinator._admit(candidate)
     first, second = getter.submitted
 
     first.data = b""
+    first.in_queue = False
     first.ready.set()
-    assert candidate.state == CandidateState.FAILED
+    assert candidate.state == CandidateState.PARTIAL_EXACT
     assert candidate.lease is not None
     assert cacher.closes == 0
 
     second.data = b"exact"
+    second.in_queue = False
     second.ready.set()
-    assert key not in coordinator._candidates
+    assert candidate.coverage == set()
+    assert set(candidate.missing_indices) == {0}
+    assert candidate.lease is None
     assert cacher.closes == 1
+    candidate.missing_indices[0].next_attempt_at = 0.0
+    candidate.next_attempt_at = 0.0
+
+    coordinator._admit(candidate)
+
+    assert [chunk.chunk_id for chunk in getter.submitted] == [
+        "chunk-0",
+        "chunk-1",
+        "chunk-0",
+    ]
+    first.data = b"exact-retry"
+    first.in_queue = False
+    first.ready.set()
+    coordinator._queue.remove(key)
+    result = coordinator._admit(candidate)
+    assert result.reason == PrefetchBatchReason.TARGET_COMPLETE
+    assert key not in coordinator._candidates
+    assert cacher.closes == 2
+
+
+def test_chunk_order_prefers_projected_corridor_without_duplicates():
+    order = ChunkOrder.for_corridor(
+        4,
+        4,
+        start=(-1.0, 1.5),
+        end=(5.0, 1.5),
+        revision=2,
+    )
+    assert order.revision == 2
+    assert len(order.indices) == len(set(order.indices)) == 16
+    assert all(index // 4 in {1, 2} for index in order.indices[:4])
+
+
+def test_quality_deadline_policy_distinguishes_modes():
+    class Budget:
+        remaining = 20.0
+
+    assert QualityDeadlinePolicy.wait_seconds(
+        "responsive", Budget(), 2.0, 5.0, 60.0, True
+    ) == 2.0
+    assert QualityDeadlinePolicy.wait_seconds(
+        "prefer_target", Budget(), 2.0, 5.0, 60.0, True
+    ) == 7.0
+    assert QualityDeadlinePolicy.wait_seconds(
+        "strict_target", Budget(), 2.0, 5.0, 60.0, True
+    ) == 20.0
+
+
+def test_permanent_hole_parks_after_bounded_attempts():
+    coordinator, _, _ = make_coordinator(count=2, burst=2)
+    key = publish(coordinator)
+    candidate = coordinator._candidates[key]
+    candidate.cursor = candidate.cursor.__class__(
+        candidate.cursor.ordering_revision,
+        2,
+        candidate.cursor.target_zoom,
+    )
+    candidate.exact_coverage.add(1)
+    chunk = FakeChunk(0)
+    chunk.permanent_failure = True
+    chunk.failure_reason = "404"
+    with coordinator._lock:
+        for _ in range(3):
+            coordinator._record_failure_locked(candidate, 0, chunk)
+
+    result = coordinator._settle_scanned_candidate(candidate, 2)
+
+    assert result.reason == PrefetchBatchReason.NO_USEFUL_WORK
+    assert candidate.missing_indices[0].terminal is True
+    assert candidate.next_attempt_at == 0.0
+    assert candidate.state == CandidateState.FAILED
+    assert key not in coordinator._candidates
+
+
+def test_permanent_retry_attempts_survive_active_admission():
+    coordinator, _, getter = make_coordinator(count=1, burst=1)
+    key = publish(coordinator)
+    candidate = coordinator._candidates[key]
+    coordinator._admit(candidate)
+    chunk = getter.submitted[-1]
+
+    for attempt in range(1, 4):
+        chunk.in_queue = False
+        chunk.permanent_failure = True
+        chunk.failure_reason = "404"
+        chunk.data = b""
+        chunk.ready.set()
+        if attempt == 3:
+            break
+        assert candidate.missing_indices[0].attempts == attempt
+        candidate.missing_indices[0].next_attempt_at = 0.0
+        candidate.next_attempt_at = 0.0
+        coordinator._admit(candidate)
+        chunk = getter.submitted[-1]
+
+    assert candidate.state == CandidateState.FAILED
+    assert key not in coordinator._candidates
+
+
+def test_reordering_resets_cursor_but_preserves_exact_coverage():
+    coordinator, _, _ = make_coordinator(count=4, burst=2)
+    key = publish(coordinator)
+    candidate = coordinator._candidates[key]
+    candidate.cursor = candidate.cursor.__class__(1, 3, 17)
+    candidate.exact_coverage = {0, 1}
+
+    coordinator.publish(
+        key,
+        source=PrefetchSource.VELOCITY,
+        generation=2,
+        eta_seconds=5,
+        distance_meters=10,
+        quality_class=1,
+        path_start=(0.0, 0.0),
+        path_end=(1.0, 1.0),
+    )
+
+    assert candidate.cursor.next_position == 0
+    assert candidate.exact_coverage == {0, 1}
+
+
+def test_reordering_never_resubmits_terminal_hole():
+    coordinator, _, getter = make_coordinator(count=2, burst=2)
+    key = publish(coordinator)
+    candidate = coordinator._candidates[key]
+    candidate.missing_indices[0] = RetryState(
+        attempts=3,
+        last_error_class="404",
+        terminal=True,
+    )
+    candidate.cursor = candidate.cursor.__class__(1, 2, 17)
+
+    coordinator.publish(
+        key,
+        source=PrefetchSource.VELOCITY,
+        generation=2,
+        eta_seconds=5,
+        path_start=(0.0, 0.0),
+        path_end=(1.0, 1.0),
+    )
+    coordinator._admit(candidate)
+
+    assert all(chunk.chunk_id != "chunk-0" for chunk in getter.submitted)
+
+
+def test_persisted_exact_row_skips_network_admission():
+    coordinator, cacher, getter = make_coordinator(count=4, burst=4)
+    coordinator.set_builder(False)
+    key = publish(coordinator)
+    tile = FakeTile(1, 2, "BI", 17, 17, count=4)
+    tile._persisted_exact_rows = {0}
+    tile.restore_partial_dds_cache = lambda: True
+    cacher.tiles[(1, 2, "BI", 17)] = tile
+
+    result = coordinator._admit(coordinator._candidates[key])
+
+    assert result.reason == PrefetchBatchReason.TARGET_COMPLETE
+    assert getter.submitted == []
+    assert key not in coordinator._candidates
 
 
 def test_generation_change_cannot_revive_candidate_during_admission():

@@ -1348,6 +1348,10 @@ class _AdaptiveConcurrencyController:
         error: Optional[BaseException] = None,
         latency_seconds: Optional[float] = None,
         slow_threshold_seconds: Optional[float] = None,
+        ttfb_seconds: Optional[float] = None,
+        response_bytes: int = 0,
+        is_live: bool = False,
+        queue_depth: int = 0,
     ) -> str:
         verdict = _classify_origin_outcome(status_code, error)
         if (
@@ -1461,6 +1465,255 @@ class _AdaptiveConcurrencyController:
         }
 
 
+@dataclass
+class _WindowObservation:
+    started_at: float
+    completed: int = 0
+    response_bytes: int = 0
+    throttles: int = 0
+    errors: int = 0
+    slow: int = 0
+    live: int = 0
+    background: int = 0
+    peak_active: int = 0
+    ttfb: collections.deque = field(
+        default_factory=lambda: collections.deque(maxlen=2048)
+    )
+    stable_limit: int = 0
+    stable_throughput: float = 0.0
+    stable_p95: float = 0.0
+    probe_from: int = 0
+
+
+class _WindowedAdaptiveConcurrencyController(_AdaptiveConcurrencyController):
+    """Two-second, throughput-aware controller with bounded proportional steps."""
+
+    def __init__(self, *args, window_seconds=2.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._window_seconds = max(0.25, float(window_seconds))
+        self._windows: Dict[str, _WindowObservation] = {}
+
+    def _window(self, origin: str) -> _WindowObservation:
+        window = self._windows.get(origin)
+        if window is None:
+            state = self._state(origin)
+            window = _WindowObservation(
+                started_at=self._clock(),
+                stable_limit=state.limit,
+            )
+            self._windows[origin] = window
+        return window
+
+    @staticmethod
+    def _percentile(values, percentile):
+        ordered = sorted(values)
+        if not ordered:
+            return 0.0
+        index = min(
+            len(ordered) - 1,
+            max(0, int(math.ceil(len(ordered) * percentile)) - 1),
+        )
+        return float(ordered[index])
+
+    def on_outcome(
+        self,
+        origin: str,
+        *,
+        status_code: Optional[int] = None,
+        error: Optional[BaseException] = None,
+        latency_seconds: Optional[float] = None,
+        slow_threshold_seconds: Optional[float] = None,
+        ttfb_seconds: Optional[float] = None,
+        response_bytes: int = 0,
+        is_live: bool = False,
+        queue_depth: int = 0,
+    ) -> str:
+        verdict = _classify_origin_outcome(status_code, error)
+        if verdict == "neutral":
+            return verdict
+        slow = bool(
+            verdict == "success"
+            and latency_seconds is not None
+            and slow_threshold_seconds is not None
+            and latency_seconds >= slow_threshold_seconds
+        )
+        window = self._window(origin)
+        now = self._clock()
+        if (
+            now - window.started_at > self._window_seconds * 2.0
+        ):
+            window = _WindowObservation(
+                started_at=now,
+                stable_limit=window.stable_limit,
+                stable_throughput=window.stable_throughput,
+                stable_p95=window.stable_p95,
+                probe_from=window.probe_from,
+            )
+            self._windows[origin] = window
+        window.completed += 1
+        window.response_bytes += max(0, int(response_bytes))
+        window.peak_active = max(
+            window.peak_active,
+            self._state(origin).active,
+        )
+        if is_live:
+            window.live += 1
+        else:
+            window.background += 1
+        if ttfb_seconds is not None:
+            window.ttfb.append(max(0.0, float(ttfb_seconds)))
+        elif latency_seconds is not None:
+            window.ttfb.append(max(0.0, float(latency_seconds)))
+        if verdict == "throttle":
+            window.throttles += 1
+            self._state(origin).throttles += 1
+        elif slow:
+            window.slow += 1
+        if self._clock() - window.started_at >= self._window_seconds:
+            self._evaluate_window(origin, queue_depth)
+        return "slow" if slow else verdict
+
+    def _evaluate_window(self, origin: str, queue_depth: int) -> None:
+        state = self._state(origin)
+        window = self._window(origin)
+        elapsed = max(self._window_seconds, self._clock() - window.started_at)
+        completed = max(1, window.completed)
+        throughput = window.response_bytes / elapsed
+        p95 = self._percentile(window.ttfb, 0.95)
+        throttle_ratio = window.throttles / completed
+        error_ratio = (window.throttles + window.errors) / completed
+        utilized = (
+            window.peak_active >= max(1, math.ceil(state.limit * 0.75))
+            or queue_depth > 0
+        )
+        action = "hold"
+        can_decrease = (
+            self._clock() - state.last_decrease >= self._cooldown
+        )
+
+        if error_ratio >= 0.50 and completed >= 4 and can_decrease:
+            state.limit = max(self._minimum, int(state.limit * 0.50))
+            state.decreases += 1
+            state.last_decrease = self._clock()
+            action = "severe_decrease"
+        elif throttle_ratio >= 0.20 and completed >= 4 and can_decrease:
+            state.limit = max(self._minimum, int(state.limit * 0.65))
+            state.decreases += 1
+            state.last_decrease = self._clock()
+            action = "overload_decrease"
+        elif (
+            error_ratio >= 0.05
+            or (
+                window.stable_p95 > 0
+                and p95 > window.stable_p95 * 1.50
+            )
+        ) and completed >= 4 and can_decrease:
+            state.limit = max(
+                self._minimum,
+                min(state.limit - 1, int(state.limit * 0.85)),
+            )
+            state.decreases += 1
+            state.last_decrease = self._clock()
+            action = "moderate_decrease"
+        elif (
+            window.probe_from
+            and window.stable_throughput > 0
+            and throughput < window.stable_throughput * 0.90
+            and completed >= 4
+            and can_decrease
+        ):
+            state.limit = max(
+                self._minimum,
+                min(state.ceiling, window.probe_from),
+            )
+            state.decreases += 1
+            state.last_decrease = self._clock()
+            action = "probe_rollback"
+        elif (
+            utilized
+            and can_decrease
+            and error_ratio < 0.02
+            and window.slow == 0
+            and (
+                window.stable_throughput <= 0
+                or throughput >= window.stable_throughput * 0.98
+            )
+            and (
+                window.stable_p95 <= 0
+                or p95 <= max(0.001, window.stable_p95) * 1.25
+            )
+            and state.limit < state.ceiling
+        ):
+            previous = state.limit
+            state.limit = min(
+                state.ceiling,
+                state.limit + max(1, int(math.ceil(state.limit * 0.05))),
+            )
+            state.increases += 1
+            action = "window_increase"
+            window.probe_from = previous
+
+        clean = error_ratio < 0.02 and window.slow == 0 and action not in {
+            "probe_rollback",
+            "severe_decrease",
+            "overload_decrease",
+            "moderate_decrease",
+        }
+        if action in {
+            "severe_decrease",
+            "overload_decrease",
+            "moderate_decrease",
+        }:
+            window.stable_limit = state.limit
+            window.stable_throughput = 0.0
+            window.stable_p95 = 0.0
+            window.probe_from = 0
+        if clean and throughput >= window.stable_throughput:
+            window.stable_limit = state.limit
+            window.stable_throughput = throughput
+            if p95 > 0:
+                window.stable_p95 = p95
+        if action != "hold":
+            self._report(origin, state, action)
+
+        self._windows[origin] = _WindowObservation(
+            started_at=self._clock(),
+            stable_limit=window.stable_limit or state.limit,
+            stable_throughput=window.stable_throughput,
+            stable_p95=window.stable_p95,
+            probe_from=(
+                window.probe_from
+                if action == "window_increase"
+                else 0
+            ),
+        )
+
+    def snapshot(self) -> Dict[str, Dict[str, Any]]:
+        snapshot = super().snapshot()
+        for origin, row in snapshot.items():
+            window = self._windows.get(origin)
+            if window is not None:
+                row.update(
+                    {
+                        "controller": "windowed_v2",
+                        "stable_limit": window.stable_limit,
+                        "stable_throughput": window.stable_throughput,
+                        "window_completed": window.completed,
+                    }
+                )
+        return snapshot
+
+    def settings(self) -> Dict[str, Any]:
+        settings = super().settings()
+        settings.update(
+            {
+                "controller": "windowed_v2",
+                "window_seconds": self._window_seconds,
+            }
+        )
+        return settings
+
+
 class _BrokerCore:
     """Owns the httpx client, priority queue and coalescing/cancellation state."""
 
@@ -1505,7 +1758,13 @@ class _BrokerCore:
         adaptive_kwargs["maximum"] = min(
             self._max_concurrency, max(1, int(adaptive_kwargs["maximum"]))
         )
-        self._limiter = _AdaptiveConcurrencyController(**adaptive_kwargs)
+        windowed = bool(adaptive_kwargs.pop("windowed", False))
+        controller = (
+            _WindowedAdaptiveConcurrencyController
+            if windowed
+            else _AdaptiveConcurrencyController
+        )
+        self._limiter = controller(**adaptive_kwargs)
         # Entries waiting for a permit on their origin. They are parked here
         # rather than blocking a worker, so a saturated (or throttled)
         # provider can never starve the other origins.
@@ -1944,6 +2203,13 @@ class _BrokerCore:
                             1.0,
                             entry.timeout.read,
                         ),
+                        ttfb_seconds=headers_received - request_started,
+                        response_bytes=total,
+                        is_live=(
+                            entry.priority
+                            < DEFAULT_LIVE_PRIORITY_THRESHOLD
+                        ),
+                        queue_depth=self._queue.qsize(),
                     )
                     # The body travels in its own zmq frame; only the (small)
                     # metadata is msgpack-encoded.
@@ -1968,7 +2234,14 @@ class _BrokerCore:
             error = BrokerTimeoutError(
                 "provider request exceeded its absolute timeout"
             )
-            self._limiter.on_outcome(entry.origin, error=error)
+            self._limiter.on_outcome(
+                entry.origin,
+                error=error,
+                is_live=(
+                    entry.priority < DEFAULT_LIVE_PRIORITY_THRESHOLD
+                ),
+                queue_depth=self._queue.qsize(),
+            )
             message = {
                 "type": "ERROR",
                 "error": {
@@ -1978,7 +2251,14 @@ class _BrokerCore:
             }
         except Exception as exc:
             outcome = "failed"
-            self._limiter.on_outcome(entry.origin, error=exc)
+            self._limiter.on_outcome(
+                entry.origin,
+                error=exc,
+                is_live=(
+                    entry.priority < DEFAULT_LIVE_PRIORITY_THRESHOLD
+                ),
+                queue_depth=self._queue.qsize(),
+            )
             message = {"type": "ERROR", "error": {"type": type(exc).__name__, "message": str(exc)}}
         finally:
             self._entries.pop(entry.key, None)
@@ -2171,6 +2451,7 @@ def _adaptive_config(
     success_threshold: int = DEFAULT_ORIGIN_SUCCESS_THRESHOLD,
     decrease_factor: float = DEFAULT_ORIGIN_DECREASE_FACTOR,
     cooldown: float = DEFAULT_ORIGIN_COOLDOWN_SECONDS,
+    windowed: bool = False,
 ) -> Dict[str, Any]:
     """Normalize the adaptive-concurrency knobs into a picklable dict."""
     config: Dict[str, Any] = {
@@ -2181,6 +2462,7 @@ def _adaptive_config(
         "success_threshold": int(success_threshold),
         "decrease_factor": float(decrease_factor),
         "cooldown": float(cooldown),
+        "windowed": bool(windowed),
     }
     if maximum is not None:
         config["maximum"] = int(maximum)
@@ -2499,6 +2781,7 @@ class HTTP2Broker:
         server_factory=None,
         profile_environment: Optional[Dict[str, str]] = None,
         adaptive_concurrency: bool = DEFAULT_ADAPTIVE_CONCURRENCY,
+        adaptive_controller_v2: bool = False,
         origin_initial_concurrency: int = DEFAULT_ORIGIN_INITIAL_CONCURRENCY,
         origin_min_concurrency: int = DEFAULT_ORIGIN_MIN_CONCURRENCY,
         origin_max_concurrency: Optional[int] = None,
@@ -2546,6 +2829,7 @@ class HTTP2Broker:
             success_threshold=origin_success_threshold,
             decrease_factor=origin_decrease_factor,
             cooldown=origin_cooldown_seconds,
+            windowed=adaptive_controller_v2,
         )
 
         self._token = secrets.token_urlsafe(32)

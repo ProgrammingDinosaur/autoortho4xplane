@@ -15,6 +15,7 @@ except ImportError:
     from aoimage import AoImage as Image
 
 import threading
+from enum import IntEnum
 
 #from functools import lru_cache, cache
 
@@ -100,6 +101,111 @@ def _get_fallback_slice(offset: int, length: int, blocksize: int = 8) -> bytes:
         return b""
     prefix = offset % blocksize
     return get_fallback_bytes(prefix + length, blocksize)[prefix:]
+
+
+class MipmapProvenance(IntEnum):
+    UNKNOWN = 0
+    EXACT_TARGET = 1
+    LOWER_ZL_CACHE = 2
+    LOWER_MIPMAP_MEMORY = 3
+    CASCADE_NETWORK_FALLBACK = 4
+    MISSING_COLOR = 5
+    PROVIDER_TARGET_UNKNOWN_QUALITY = 6
+
+
+class MipmapProvenanceGrid:
+    """One-byte-per-imagery-chunk provenance with row-level byte summaries."""
+
+    def __init__(self, width: int, height: int):
+        self.width = max(0, int(width))
+        self.height = max(0, int(height))
+        self._values = bytearray(self.width * self.height)
+        self._lock = threading.Lock()
+
+    def set_index(self, index: int, source: MipmapProvenance | int) -> None:
+        index = int(index)
+        if not 0 <= index < len(self._values):
+            return
+        with self._lock:
+            self._values[index] = int(source)
+
+    def set_indices(self, indices, source: MipmapProvenance | int) -> None:
+        value = int(source)
+        with self._lock:
+            for index in indices:
+                index = int(index)
+                if 0 <= index < len(self._values):
+                    self._values[index] = value
+
+    def set_row(self, row: int, sources) -> None:
+        row = int(row)
+        if not 0 <= row < self.height:
+            return
+        values = bytes(int(source) for source in sources)
+        if len(values) != self.width:
+            raise ValueError(
+                f"provenance row width mismatch: {len(values)} != {self.width}"
+            )
+        start = row * self.width
+        with self._lock:
+            self._values[start:start + self.width] = values
+
+    def row(self, row: int) -> bytes:
+        row = int(row)
+        if not 0 <= row < self.height:
+            return b""
+        start = row * self.width
+        with self._lock:
+            return bytes(self._values[start:start + self.width])
+
+    def snapshot(self) -> bytes:
+        with self._lock:
+            return bytes(self._values)
+
+    def exact_indices(self) -> set[int]:
+        exact = int(MipmapProvenance.EXACT_TARGET)
+        with self._lock:
+            return {
+                index
+                for index, value in enumerate(self._values)
+                if value == exact
+            }
+
+    def summarize_bytes(
+        self,
+        offset: int,
+        length: int,
+        compressed_row_bytes: int,
+    ) -> dict[MipmapProvenance, int]:
+        """Attribute a compressed byte range proportionally across chunk rows."""
+        offset = max(0, int(offset))
+        length = max(0, int(length))
+        row_bytes = max(1, int(compressed_row_bytes))
+        if not length or not self.width or not self.height:
+            return {}
+        values = self.snapshot()
+        end = offset + length
+        summary: dict[MipmapProvenance, int] = {}
+        first_row = min(self.height - 1, offset // row_bytes)
+        last_row = min(self.height - 1, max(offset, end - 1) // row_bytes)
+        for row in range(first_row, last_row + 1):
+            overlap_start = max(offset, row * row_bytes)
+            overlap_end = min(end, (row + 1) * row_bytes)
+            overlap = max(0, overlap_end - overlap_start)
+            if not overlap:
+                continue
+            base, remainder = divmod(overlap, self.width)
+            row_start = row * self.width
+            for column in range(self.width):
+                attributed = base + (1 if column < remainder else 0)
+                if not attributed:
+                    continue
+                try:
+                    source = MipmapProvenance(values[row_start + column])
+                except ValueError:
+                    source = MipmapProvenance.UNKNOWN
+                summary[source] = summary.get(source, 0) + attributed
+        return summary
 
 
 class MipmapBuffer:
