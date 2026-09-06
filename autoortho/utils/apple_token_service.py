@@ -1,8 +1,11 @@
 """Thread-safe retrieval and renewal of Apple Maps access tokens."""
 
+import logging
 import threading
 
 import requests
+
+log = logging.getLogger(__name__)
 
 
 class AppleTokenService:
@@ -19,7 +22,22 @@ class AppleTokenService:
         self.apple_token = None
         self.version = 0
         self.generation = 0
-        self._refresh_lock = threading.Lock()
+        self._condition = threading.Condition()
+        self._refreshing_generation = None
+        self._refresh_error = None
+        self._invalid_responses = 0
+
+    def snapshot(self, *, wait=True):
+        """Return one atomic token generation, optionally waiting for rotation."""
+        with self._condition:
+            while wait and self._refreshing_generation is not None:
+                self._condition.wait()
+            return (
+                self.apple_token,
+                self.version,
+                self.generation,
+                self._refreshing_generation is None,
+            )
 
     def get_url_metadata_from_response(
         self, response: dict
@@ -39,15 +57,43 @@ class AppleTokenService:
             ) from exc
         raise RuntimeError("Apple Maps response contained no satellite source")
 
-    def reset_apple_maps_token(self, expected_generation=None) -> str:
+    def reset_apple_maps_token(
+        self,
+        expected_generation=None,
+        *,
+        status_code=None,
+    ) -> str:
         """Refresh once when concurrent requests reject the same generation."""
-        with self._refresh_lock:
+        with self._condition:
             if (
                 expected_generation is not None
                 and self.apple_token is not None
                 and self.generation != expected_generation
             ):
                 return self.apple_token
+            self._invalid_responses += 1
+            if self._refreshing_generation is not None:
+                waiting_generation = self._refreshing_generation
+                while self._refreshing_generation is not None:
+                    self._condition.wait()
+                if (
+                    self.generation == waiting_generation
+                    and self._refresh_error is not None
+                ):
+                    raise RuntimeError(
+                        "Apple Maps token refresh failed"
+                    ) from self._refresh_error
+                return self.apple_token
+            invalid_generation = self.generation
+            self._refreshing_generation = invalid_generation
+            self._refresh_error = None
+
+        log.warning(
+            "APPLE token generation %d rejected%s; rotating once",
+            invalid_generation,
+            f" with HTTP {status_code}" if status_code is not None else "",
+        )
+        try:
             try:
                 token_response = requests.get(
                     self.duckduckgo_token_url,
@@ -72,10 +118,29 @@ class AppleTokenService:
                     f"Failed to retrieve Apple Maps token: {exc}"
                 ) from exc
 
-            self.apple_token = metadata["access_key"]
-            self.version = metadata["version"]
-            self.generation += 1
+            with self._condition:
+                rejected = self._invalid_responses
+                self.apple_token = metadata["access_key"]
+                self.version = metadata["version"]
+                self.generation += 1
+                self._invalid_responses = 0
+                self._refreshing_generation = None
+                self._refresh_error = None
+                self._condition.notify_all()
+            log.warning(
+                "APPLE token rotated generation %d -> %d after %d "
+                "correlated rejection(s)",
+                invalid_generation,
+                self.generation,
+                rejected,
+            )
             return self.apple_token
+        except Exception as exc:
+            with self._condition:
+                self._refresh_error = exc
+                self._refreshing_generation = None
+                self._condition.notify_all()
+            raise
 
 
 apple_token_service = AppleTokenService()

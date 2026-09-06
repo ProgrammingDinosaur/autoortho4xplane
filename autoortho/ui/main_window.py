@@ -253,6 +253,7 @@ class ConfigUI(QMainWindow):
         "prefetch_enabled_check",
         "prefetch_quality_mode_combo",
         "prefetch_quality_grace_spinbox",
+        "strict_target_deadline_spinbox",
         "prefetch_lookahead_slider",
         "prefetch_interval_slider",
         "prefetch_max_chunks_slider",
@@ -270,6 +271,7 @@ class ConfigUI(QMainWindow):
         "download_dispatch_workers_spinbox",
         "provider_queue_timeout_spinbox",
         "provider_adaptive_check",
+        "provider_controller_v2_check",
         "provider_initial_concurrency_spinbox",
         "provider_decrease_factor_spinbox",
         "provider_cooldown_spinbox",
@@ -328,6 +330,7 @@ class ConfigUI(QMainWindow):
         "prefetch_enabled_check",
         "prefetch_quality_mode_combo",
         "prefetch_quality_grace_spinbox",
+        "strict_target_deadline_spinbox",
         "prefetch_lookahead_slider",
         "prefetch_interval_slider",
         "prefetch_max_chunks_slider",
@@ -345,6 +348,7 @@ class ConfigUI(QMainWindow):
         "download_dispatch_workers_spinbox",
         "provider_queue_timeout_spinbox",
         "provider_adaptive_check",
+        "provider_controller_v2_check",
         "provider_initial_concurrency_spinbox",
         "provider_decrease_factor_spinbox",
         "provider_cooldown_spinbox",
@@ -3723,6 +3727,9 @@ class ConfigUI(QMainWindow):
             "Strict target never substitutes lower-resolution mipmap-zero imagery and may\n"
             "show missing areas or stall until the hard tile deadline."
         )
+        self.prefetch_quality_mode_combo.currentIndexChanged.connect(
+            self._update_quality_controls
+        )
         quality_mode_layout.addWidget(quality_mode_label)
         quality_mode_layout.addWidget(self.prefetch_quality_mode_combo)
         autoortho_layout.addLayout(quality_mode_layout)
@@ -3752,6 +3759,38 @@ class ConfigUI(QMainWindow):
         quality_grace_layout.addWidget(self.prefetch_quality_grace_spinbox)
         quality_grace_layout.addStretch()
         autoortho_layout.addLayout(quality_grace_layout)
+
+        strict_deadline_layout = QHBoxLayout()
+        self.strict_target_deadline_label = QLabel(
+            "Strict target deadline:"
+        )
+        self.strict_target_deadline_spinbox = QDoubleSpinBox()
+        self.strict_target_deadline_spinbox.setRange(5.0, 600.0)
+        self.strict_target_deadline_spinbox.setSingleStep(5.0)
+        self.strict_target_deadline_spinbox.setSuffix(" sec")
+        self.strict_target_deadline_spinbox.setValue(
+            float(
+                getattr(
+                    self.cfg.autoortho,
+                    "strict_target_deadline_sec",
+                    120.0,
+                )
+            )
+        )
+        self.strict_target_deadline_spinbox.setObjectName(
+            "strict_target_deadline_sec"
+        )
+        self.strict_target_deadline_spinbox.setToolTip(
+            "Hard end-to-end row deadline used only by Strict target mode."
+        )
+        strict_deadline_layout.addWidget(
+            self.strict_target_deadline_label
+        )
+        strict_deadline_layout.addWidget(
+            self.strict_target_deadline_spinbox
+        )
+        strict_deadline_layout.addStretch()
+        autoortho_layout.addLayout(strict_deadline_layout)
         
         # Prefetch lookahead slider (in minutes, 0 = Unlimited)
         lookahead_layout = QHBoxLayout()
@@ -4221,7 +4260,7 @@ class ConfigUI(QMainWindow):
         self.provider_inflight_spinbox = ModernSpinBox()
         self.provider_inflight_spinbox.setRange(8, 1024)
         self.provider_inflight_spinbox.setValue(
-            int(getattr(self.cfg.autoortho, "provider_max_in_flight", 128))
+            int(getattr(self.cfg.autoortho, "provider_max_in_flight", 320))
         )
         self.provider_inflight_spinbox.setObjectName("provider_max_in_flight")
         inflight_layout.addWidget(self.provider_inflight_spinbox)
@@ -4232,13 +4271,13 @@ class ConfigUI(QMainWindow):
         connections_label = QLabel("Provider connections:")
         connections_label.setToolTip(
             "Maximum reusable physical connections. HTTP/2 can carry many streams\n"
-            "per connection; 64 also preserves throughput for HTTP/1.1 providers."
+            "per connection; the recommended ZL17 profile uses 160."
         )
         connections_layout.addWidget(connections_label)
         self.provider_connections_spinbox = ModernSpinBox()
         self.provider_connections_spinbox.setRange(1, 256)
         self.provider_connections_spinbox.setValue(
-            int(getattr(self.cfg.autoortho, "provider_max_connections", 64))
+            int(getattr(self.cfg.autoortho, "provider_max_connections", 160))
         )
         self.provider_connections_spinbox.setObjectName(
             "provider_max_connections"
@@ -4309,6 +4348,33 @@ class ConfigUI(QMainWindow):
         )
         autoortho_layout.addWidget(self.provider_adaptive_check)
 
+        self.provider_controller_v2_check = QCheckBox(
+            "Use saturation-aware adaptive controller v2"
+        )
+        self.provider_controller_v2_check.setChecked(
+            bool(
+                getattr(
+                    self.cfg.autoortho,
+                    "provider_adaptive_controller_v2",
+                    False,
+                )
+            )
+        )
+        self.provider_controller_v2_check.setObjectName(
+            "provider_adaptive_controller_v2"
+        )
+        self.provider_controller_v2_check.setToolTip(
+            "Windowed controller that changes limits only after utilized, "
+            "backlogged provider windows. Leave disabled while comparing "
+            "the conservative fixed/legacy profile."
+        )
+        autoortho_layout.addWidget(self.provider_controller_v2_check)
+
+        self.provider_status_label = QLabel()
+        self.provider_status_label.setWordWrap(True)
+        self.provider_status_label.setProperty("textRole", "caption")
+        autoortho_layout.addWidget(self.provider_status_label)
+
         self.advanced_adaptive_toggle = QPushButton(
             "Advanced adaptive tuning ▸"
         )
@@ -4355,7 +4421,7 @@ class ConfigUI(QMainWindow):
                 getattr(
                     self.cfg.autoortho,
                     "provider_origin_initial_concurrency",
-                    0,
+                    128,
                 )
             )
         )
@@ -4458,6 +4524,7 @@ class ConfigUI(QMainWindow):
 
         def _adaptive_enabled_changed(enabled):
             self.advanced_adaptive_toggle.setEnabled(enabled)
+            self.provider_controller_v2_check.setEnabled(enabled)
             if not enabled:
                 self.advanced_adaptive_toggle.setChecked(False)
 
@@ -4467,9 +4534,26 @@ class ConfigUI(QMainWindow):
         self.provider_adaptive_check.toggled.connect(
             _adaptive_enabled_changed
         )
+        for control in (
+            self.provider_adaptive_check,
+            self.provider_controller_v2_check,
+            self.provider_inflight_spinbox,
+            self.provider_connections_spinbox,
+            self.provider_initial_concurrency_spinbox,
+        ):
+            signal = (
+                control.toggled
+                if isinstance(control, QCheckBox)
+                else control.valueChanged
+            )
+            signal.connect(self._update_provider_status)
         self.advanced_adaptive_toggle.setEnabled(
             self.provider_adaptive_check.isChecked()
         )
+        self.provider_controller_v2_check.setEnabled(
+            self.provider_adaptive_check.isChecked()
+        )
+        self._update_provider_status()
 
         memory_layout = QHBoxLayout()
         memory_label = QLabel("Concurrent live tiles:")
@@ -6096,8 +6180,7 @@ class ConfigUI(QMainWindow):
         """Update enabled state of prefetch controls based on enable checkbox."""
         enabled = self.prefetch_enabled_check.isChecked()
         self.prefetch_quality_mode_combo.setEnabled(enabled)
-        self.prefetch_quality_grace_spinbox.setEnabled(enabled)
-        self.prefetch_quality_grace_label.setEnabled(enabled)
+        self._update_quality_controls()
         
         # Existing controls
         self.prefetch_lookahead_slider.setEnabled(enabled)
@@ -6126,6 +6209,56 @@ class ConfigUI(QMainWindow):
         self.predictive_dds_enabled_check.setEnabled(enabled)
         self._update_predictive_dds_controls()
 
+    def _update_quality_controls(self, *_args):
+        enabled = self.prefetch_enabled_check.isChecked()
+        mode = self.prefetch_quality_mode_combo.currentData()
+        prefer = enabled and mode == "prefer_target"
+        strict = enabled and mode == "strict_target"
+        self.prefetch_quality_grace_spinbox.setEnabled(prefer)
+        self.prefetch_quality_grace_label.setEnabled(prefer)
+        self.strict_target_deadline_spinbox.setEnabled(strict)
+        self.strict_target_deadline_label.setEnabled(strict)
+
+    def _update_provider_status(self, *_args):
+        adaptive = self.provider_adaptive_check.isChecked()
+        controller = (
+            "windowed v2"
+            if self.provider_controller_v2_check.isChecked()
+            else "legacy/conservative"
+        )
+        configured = self.provider_inflight_spinbox.value()
+        connections = self.provider_connections_spinbox.value()
+        initial = self.provider_initial_concurrency_spinbox.value()
+        effective = min(
+            configured,
+            connections,
+            initial if initial > 0 else connections,
+        )
+        warnings = []
+        if adaptive and effective < max(1, connections // 2):
+            warnings.append(
+                "Warning: effective provider limit is below half the "
+                "configured connection pool."
+            )
+        if int(
+            getattr(
+                self.cfg.autoortho,
+                "partial_cache_promote_startup_max_tiles",
+                0,
+            )
+        ) > 0:
+            warnings.append(
+                "Warning: startup MM0 promotion is enabled before flight gating."
+            )
+        status = (
+            f"Adaptive status: {'enabled' if adaptive else 'disabled'} "
+            f"({controller}); effective startup limit: {effective} / "
+            f"{configured} requests."
+        )
+        if warnings:
+            status += "\n" + "\n".join(warnings)
+        self.provider_status_label.setText(status)
+
     def _update_prefetch_diagnostics(self, *_args):
         unsafe = (
             self.prefetch_lookahead_slider.value() == 61
@@ -6143,6 +6276,7 @@ class ConfigUI(QMainWindow):
         self.apply_prefetch_defaults_button.setVisible(unsafe)
 
     def _apply_recommended_prefetch_defaults(self):
+        self.maxwait_slider.setValue(50)
         self.prefetch_lookahead_slider.setValue(10)
         self.prefetch_max_chunks_slider.setValue(64)
         self.prefetch_admission_burst_spinbox.setValue(64)
@@ -6152,11 +6286,16 @@ class ConfigUI(QMainWindow):
         self.prefetch_quality_mode_combo.setCurrentIndex(
             max(
                 0,
-                self.prefetch_quality_mode_combo.findData("responsive"),
+                self.prefetch_quality_mode_combo.findData("prefer_target"),
             )
         )
         self.prefetch_quality_grace_spinbox.setValue(5.0)
+        self.strict_target_deadline_spinbox.setValue(120.0)
         self.persist_partial_dds_cache_check.setChecked(True)
+        self.provider_connections_spinbox.setValue(160)
+        self.provider_inflight_spinbox.setValue(320)
+        self.provider_initial_concurrency_spinbox.setValue(128)
+        self.provider_controller_v2_check.setChecked(False)
         self._update_prefetch_diagnostics()
     
     def _update_predictive_dds_controls(self):
@@ -8225,6 +8364,9 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.prefetch_quality_grace_sec = str(
                 self.prefetch_quality_grace_spinbox.value()
             )
+            self.cfg.autoortho.strict_target_deadline_sec = str(
+                self.strict_target_deadline_spinbox.value()
+            )
             # Slider value 61 = Unlimited, save as 0 to config
             lookahead_val = self.prefetch_lookahead_slider.value()
             self.cfg.autoortho.prefetch_lookahead = str(
@@ -8280,6 +8422,9 @@ class ConfigUI(QMainWindow):
             )
             self.cfg.autoortho.provider_adaptive_concurrency = (
                 self.provider_adaptive_check.isChecked()
+            )
+            self.cfg.autoortho.provider_adaptive_controller_v2 = (
+                self.provider_controller_v2_check.isChecked()
             )
             self.cfg.autoortho.provider_origin_initial_concurrency = str(
                 self.provider_initial_concurrency_spinbox.value()

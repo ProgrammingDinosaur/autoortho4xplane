@@ -240,6 +240,156 @@ def test_indexed_broker_queue_rejects_same_key_tombstone():
     assert asyncio.run(work.get())[3] is middle
 
 
+def _broker_queue_item(name, priority=0, sequence=0, revision=0):
+    entry = hb._CoalescedEntry(
+        key=("GET", name, ()),
+        method="GET",
+        url=f"http://example.test/{name}",
+        headers={},
+        priority=priority,
+        timeout=hb.RequestTimeout(),
+        seq=sequence,
+        priority_revision=revision,
+    )
+    return priority, sequence, revision, entry
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 512])
+def test_indexed_broker_queue_only_wakes_consumers_for_available_work(batch_size):
+    async def scenario():
+        work = hb._AsyncIndexedPriorityQueue()
+        consumers = [asyncio.create_task(work.get()) for _ in range(512)]
+        try:
+            await asyncio.sleep(0)
+            suspended = [task.get_coro().cr_await for task in consumers]
+            assert all(wait is not None for wait in suspended)
+
+            for index in range(batch_size):
+                work.put_nowait(_broker_queue_item(str(index), sequence=index))
+            await asyncio.sleep(0)
+
+            completed = [task for task in consumers if task.done()]
+            assert len(completed) == batch_size
+            assert len({task.result()[3].key for task in completed}) == batch_size
+            assert work.qsize() == 0
+            for task, original_wait in zip(consumers, suspended):
+                if not task.done():
+                    # Idle consumers must stay asleep, not wake and re-wait.
+                    assert task.get_coro().cr_await is original_wait
+        finally:
+            for task in consumers:
+                task.cancel()
+            await asyncio.gather(*consumers, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_after_put", [False, True])
+def test_indexed_broker_queue_cancelled_consumer_does_not_strand_work(
+    cancel_after_put,
+):
+    async def scenario():
+        work = hb._AsyncIndexedPriorityQueue()
+        consumers = [asyncio.create_task(work.get()) for _ in range(2)]
+        item = _broker_queue_item("tile")
+        try:
+            await asyncio.sleep(0)
+            if cancel_after_put:
+                work.put_nowait(item)
+            consumers[0].cancel()
+            if not cancel_after_put:
+                work.put_nowait(item)
+
+            with pytest.raises(asyncio.CancelledError):
+                await consumers[0]
+            assert await asyncio.wait_for(consumers[1], timeout=1.0) == item
+            assert work.qsize() == 0
+        finally:
+            for task in consumers:
+                task.cancel()
+            await asyncio.gather(*consumers, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_indexed_broker_queue_reprioritization_does_not_wake_extra_consumers():
+    async def scenario():
+        work = hb._AsyncIndexedPriorityQueue()
+        consumers = [asyncio.create_task(work.get()) for _ in range(3)]
+        old = _broker_queue_item("promoted", priority=100, sequence=1)
+        promoted = (0, 1, 1, old[3])
+        other = _broker_queue_item("other", priority=50, sequence=2)
+        try:
+            await asyncio.sleep(0)
+            suspended = [task.get_coro().cr_await for task in consumers]
+            work.put_nowait(old)
+            work.put_nowait(promoted)
+            work.put_nowait(other)
+            await asyncio.sleep(0)
+
+            assert consumers[0].result() == promoted
+            assert consumers[1].result() == other
+            assert not consumers[2].done()
+            assert consumers[2].get_coro().cr_await is suspended[2]
+            assert work.qsize() == 0
+        finally:
+            for task in consumers:
+                task.cancel()
+            await asyncio.gather(*consumers, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_indexed_broker_queue_removed_item_does_not_strand_next_put():
+    async def scenario():
+        work = hb._AsyncIndexedPriorityQueue()
+        consumers = [asyncio.create_task(work.get()) for _ in range(2)]
+        removed = _broker_queue_item("removed")
+        replacement = _broker_queue_item("replacement", sequence=1)
+        try:
+            await asyncio.sleep(0)
+            work.put_nowait(removed)
+            work.remove(removed[3].key)
+            await asyncio.sleep(0)
+            assert not any(task.done() for task in consumers)
+
+            work.put_nowait(replacement)
+            done, pending = await asyncio.wait(
+                consumers, timeout=1.0, return_when=asyncio.FIRST_COMPLETED
+            )
+            assert len(done) == 1
+            assert len(pending) == 1
+            assert next(iter(done)).result() == replacement
+            assert work.qsize() == 0
+        finally:
+            for task in consumers:
+                task.cancel()
+            await asyncio.gather(*consumers, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_indexed_broker_queue_cancel_all_waiters_leaves_queue_reusable():
+    async def scenario():
+        work = hb._AsyncIndexedPriorityQueue()
+        consumers = [asyncio.create_task(work.get()) for _ in range(512)]
+        await asyncio.sleep(0)
+        for task in consumers:
+            task.cancel()
+        outcomes = await asyncio.gather(*consumers, return_exceptions=True)
+
+        assert all(isinstance(outcome, asyncio.CancelledError) for outcome in outcomes)
+        assert not work._getters
+        assert work.qsize() == 0
+
+        item = _broker_queue_item("after-cancellation")
+        work.put_nowait(item)
+        assert await asyncio.wait_for(work.get(), timeout=1.0) == item
+        assert work.qsize() == 0
+
+    asyncio.run(scenario())
+
+
 # ---------------------------------------------------------------------------
 # Deduplication / coalescing
 # ---------------------------------------------------------------------------
@@ -1394,7 +1544,99 @@ def test_windowed_controller_probes_by_five_percent_and_rolls_back():
         ttfb_seconds=0.05,
         queue_depth=1,
     )
+    assert ctl.limit_for(origin) == 21
+
+    ctl._state(origin).active = 21
+    for _ in range(3):
+        ctl.on_outcome(
+            origin,
+            status_code=200,
+            response_bytes=10,
+            ttfb_seconds=0.05,
+            queue_depth=1,
+        )
+    clock.advance(1.0)
+    ctl.on_outcome(
+        origin,
+        status_code=200,
+        response_bytes=10,
+        ttfb_seconds=0.05,
+        queue_depth=1,
+    )
     assert ctl.limit_for(origin) == 20
+
+
+def test_windowed_controller_holds_low_demand_latency_regression():
+    clock = _FakeClock()
+    ctl = hb._WindowedAdaptiveConcurrencyController(
+        clock=clock,
+        initial=20,
+        minimum=2,
+        maximum=100,
+        window_seconds=1.0,
+    )
+    origin = "https://tiles.test"
+    window = ctl._window(origin)
+    window.stable_p95 = 0.05
+    window.stable_limit = 20
+
+    for _ in range(3):
+        ctl.on_outcome(
+            origin,
+            status_code=200,
+            ttfb_seconds=1.0,
+            queue_depth=0,
+        )
+    clock.advance(1.0)
+    ctl.on_outcome(
+        origin,
+        status_code=200,
+        ttfb_seconds=1.0,
+        queue_depth=0,
+    )
+
+    assert ctl.limit_for(origin) == 20
+
+
+def test_transport_lifecycle_metrics_are_disabled_by_default():
+    metrics = hb._TransportLifecycleMetrics()
+
+    asyncio.run(metrics.trace_callback()("connection.connect_tcp.complete", {}))
+
+    assert metrics.snapshot() == {
+        "keepalive_reuses": 0,
+        "requests_per_connection": 0.0,
+        "duration_seconds": {},
+        "cdn_endpoints": {},
+        "observed_open_connections": 0,
+        "max_observed_connection_age_seconds": 0.0,
+        "enabled": False,
+    }
+
+
+def test_transport_lifecycle_metrics_aggregate_supported_events():
+    clock = _FakeClock()
+    metrics = hb._TransportLifecycleMetrics(True, clock=clock)
+    trace = metrics.trace_callback()
+
+    asyncio.run(trace("connection.connect_tcp.started", {}))
+    clock.advance(0.1)
+    asyncio.run(trace("connection.connect_tcp.complete", {}))
+    asyncio.run(trace("connection.start_tls.started", {}))
+    clock.advance(0.2)
+    asyncio.run(trace("connection.start_tls.complete", {}))
+    asyncio.run(trace("http2.send_request_headers.started", {}))
+    asyncio.run(trace("http2.send_request_headers.complete", {}))
+    asyncio.run(trace("http2.send_request_headers.started", {}))
+    asyncio.run(trace("http2.send_request_headers.complete", {}))
+
+    snapshot = metrics.snapshot()
+
+    assert snapshot["tcp_connections_opened"] == 1
+    assert snapshot["tls_handshakes"] == 1
+    assert snapshot["requests_started"] == 2
+    assert snapshot["keepalive_reuses"] == 1
+    assert snapshot["requests_per_connection"] == 2.0
 
 
 def test_windowed_controller_rebaselines_and_recovers_after_overload():

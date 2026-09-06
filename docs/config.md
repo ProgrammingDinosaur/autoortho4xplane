@@ -110,18 +110,22 @@ The shared provider transport uses asynchronous HTTP/2 requests. Network and
 tile-build concurrency are bounded independently:
 
 ```ini
-provider_max_in_flight = 128
-provider_max_connections = 64
+provider_max_in_flight = 320
+provider_max_connections = 160
 download_dispatch_workers = 4
 provider_queue_timeout = 60
 provider_adaptive_concurrency = True
-provider_adaptive_controller_v2 = True
+provider_adaptive_controller_v2 = False
+provider_origin_initial_concurrency = 128
+provider_origin_min_concurrency = 64
+provider_transport_trace = False
 live_tile_admission = 16
 tile_image_cache_mb = 96
 cache_write_buffer_mb = 256
 long_term_cache_write_buffer_mb = 128
 native_partial_allow_incomplete = False
 persist_partial_dds_cache = True
+partial_cache_promote_startup_max_tiles = 0
 ```
 
 - `provider_max_in_flight` is the strict global pending-request limit. A
@@ -131,7 +135,8 @@ persist_partial_dds_cache = True
 - `download_dispatch_workers` applies completed responses; it does not limit
   network concurrency.
 - Adaptive concurrency raises a provider's limit after sustained successes and
-  reduces it after overload responses or timeouts.
+  reduces it after overload responses or timeouts. Windowed v2 additionally
+  requires utilized, backlogged windows before latency-based adjustments.
 - `live_tile_admission` bounds expensive concurrent tile construction while
   allowing JPEG retrieval to continue independently.
 - `tile_image_cache_mb` is a per-tile byte budget for temporary fallback RGBA
@@ -140,8 +145,9 @@ persist_partial_dds_cache = True
   number of downloaded JPEGs.
 - `native_partial_allow_incomplete` trades strict row quality for shorter
   deadline stalls by using child-cropped lower-ZL imagery and `missing_color`.
-- `persist_partial_dds_cache` stores completed compressed rows asynchronously
-  for faster repeat loads. It uses additional space inside the DDS disk budget.
+- `persist_partial_dds_cache` stores only exact, checksummed compressed rows
+  asynchronously for faster repeat loads. DDM v5 binds each row's immutable
+  source manifest to the bytes that were compressed.
 
 ### Bounded prefetch pipeline
 
@@ -154,8 +160,10 @@ prefetch_radius_nm = 30
 background_builder_workers = 2
 predictive_dds_memory_mb = 512
 persist_partial_dds_cache = True
-prefetch_quality_mode = responsive
+prefetch_quality_mode = prefer_target
 prefetch_quality_grace_sec = 5
+strict_target_deadline_sec = 120
+partial_cache_promote_startup_max_tiles = 0
 ```
 
 `prefetch_max_chunks` bounds work published per producer cycle, while
@@ -168,6 +176,8 @@ retained candidates and admitted work remain bounded.
 Quality modes are `responsive` (lower-resolution fallback after the normal
 wait), `prefer_target` (a short exact-quality grace period), and
 `strict_target` (no lower-ZL substitution in mipmap zero, with a hard deadline).
+Rows are sealed on their first X-Plane read. Late target-ZL arrivals can improve
+only a future cache generation, never the bytes or provenance already served.
 
 ### Performance Diagnostics
 

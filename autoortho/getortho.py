@@ -63,6 +63,27 @@ try:
 except ImportError:
     import pydds
 
+try:
+    from autoortho.dds_manifest import (
+        ComposedImageResult,
+        CompressedRowResult,
+        MipmapSource,
+        RowBuildManifest,
+        RowState,
+        RowStateCoordinator,
+        manifests_from_dict,
+    )
+except ImportError:
+    from dds_manifest import (
+        ComposedImageResult,
+        CompressedRowResult,
+        MipmapSource,
+        RowBuildManifest,
+        RowState,
+        RowStateCoordinator,
+        manifests_from_dict,
+    )
+
 import requests
 import psutil
 
@@ -752,8 +773,12 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
         jpeg_datas = []
         valid_count = 0
         for chunk in chunks:
-            # Capture local reference (atomic due to GIL)
-            data = chunk.data
+            # Callers may pass an immutable JPEG snapshot or a Chunk.
+            data = (
+                chunk
+                if isinstance(chunk, (bytes, bytearray))
+                else chunk.data
+            )
             if data and len(data) > 0:
                 jpeg_datas.append(data)
                 valid_count += 1
@@ -1258,9 +1283,6 @@ _live_tile_admission = threading.BoundedSemaphore(
     _live_tile_admission_limit
 )
 
-# Bounded repair queue for partial DDS entries that are missing mipmap 0.
-_partial_mm0_promotions = OrderedDict()
-_partial_mm0_promotions_lock = threading.Lock()
 _read_ahead_executor = None
 _read_ahead_executor_lock = threading.Lock()
 _read_ahead_capacity = threading.BoundedSemaphore(2)
@@ -2572,6 +2594,33 @@ class _BrokerDownloadStage(object):
             return
 
         request = state.request
+        if getattr(state.obj, "maptype", "").upper() == "APPLE":
+            _token, _version, generation, ready = (
+                apple_token_service.snapshot(wait=False)
+            )
+            if not ready:
+                self._schedule(
+                    self._CAPACITY_RETRY_DELAY,
+                    self._send,
+                    state,
+                )
+                return
+            if request.apple_token_generation != generation:
+                url, headers, server, generation = (
+                    state.obj._build_tile_url(request.idx)
+                )
+                request = _NetworkRequest(
+                    url=url,
+                    headers=headers,
+                    timeout=request.timeout,
+                    delay=0.0,
+                    server=server,
+                    idx=request.idx,
+                    apple_token_generation=generation,
+                    apple_retried=request.apple_retried,
+                )
+                state.request = request
+                bump("apple_queued_request_generation_rebuilt")
         request_id = uuid.uuid4().hex
         state.request_id = request_id
         state.obj._broker_request_id = request_id
@@ -6899,11 +6948,6 @@ class BackgroundDDSBuilder:
                 getattr(tile, "id", tile),
             )
         finally:
-            if not deferred and not success:
-                try:
-                    tile._clear_mm0_promotion_pin()
-                except Exception:
-                    pass
             with self._active_lock:
                 request.active = False
                 self._active_bytes = max(
@@ -6946,6 +6990,25 @@ class BackgroundDDSBuilder:
                 callback(bool(success))
             except Exception:
                 log.exception("Background DDS completion callback failed")
+
+    @staticmethod
+    def _manifest_rows_for_dds(tile, dds_bytes, sources):
+        generation = tile._mm0_rows.next_generation()
+        results = tile._make_mm0_results_from_dds(
+            dds_bytes,
+            sources,
+            generation=generation,
+        )
+        return {
+            result.manifest.row_index: result.manifest
+            for result in results
+        }
+
+    @classmethod
+    def _manifest_rows_for_file(cls, tile, path, sources):
+        with open(path, "rb") as dds_file:
+            dds_bytes = dds_file.read()
+        return cls._manifest_rows_for_dds(tile, dds_bytes, sources)
     
     def _try_streaming_prefetch_build(self, tile, tile_id: str, build_start: float) -> bool:
         """
@@ -6987,7 +7050,6 @@ class BackgroundDDSBuilder:
             dxt_format = "BC3"
         
         missing_color = tuple(CFG.autoortho.missing_color[:3]) if hasattr(CFG.autoortho, 'missing_color') else (66, 77, 55)
-        
         # Get fallback level - prefetch uses same settings as live
         use_fallbacks = getattr(CFG.autoortho, 'predictive_dds_use_fallbacks', True)
         if use_fallbacks:
@@ -7056,9 +7118,15 @@ class BackgroundDDSBuilder:
             pending_indices = []
             prefetch_mm0_missing = []
             prefetch_mm0_fallback = []
+            prefetch_sources = bytearray(
+                [int(MipmapSource.MISSING_COLOR)] * len(chunks)
+            )
             for i, chunk in enumerate(chunks):
                 if chunk.ready.is_set() and chunk.data:
                     ready_chunks.append((i, chunk.data))
+                    prefetch_sources[i] = int(
+                        MipmapSource.TARGET_PROVIDER
+                    )
                 else:
                     pending_indices.append(i)
             
@@ -7107,32 +7175,50 @@ class BackgroundDDSBuilder:
                         chunk_col = tile.col + (i % tile.chunks_per_row)
                         chunk_row = tile.row + (i // tile.chunks_per_row)
                         
-                        fallback_rgba = resolver.resolve(
+                        resolved = resolver.resolve_with_source(
                             chunk_col, chunk_row, tile.max_zoom,
                             target_mipmap=0,
                             time_budget=fb_budget
                         )
+                        if resolved is None:
+                            fallback_rgba, source_name = None, None
+                        else:
+                            fallback_rgba, source_name = resolved
                         
                         if fallback_rgba:
                             builder.add_fallback_image(i, fallback_rgba)
                             prefetch_mm0_fallback.append(i)
+                            prefetch_sources[i] = int(
+                                tile._provenance_from_name(source_name)
+                            )
                         else:
                             builder.mark_missing(i)
                             prefetch_mm0_missing.append(i)
+                    else:
+                        prefetch_sources[i] = int(
+                            MipmapSource.TARGET_PROVIDER
+                        )
                 else:
                     # Chunk failed to download - apply full fallback chain
                     chunk_col = tile.col + (i % tile.chunks_per_row)
                     chunk_row = tile.row + (i // tile.chunks_per_row)
                     
-                    fallback_rgba = resolver.resolve(
+                    resolved = resolver.resolve_with_source(
                         chunk_col, chunk_row, tile.max_zoom,
                         target_mipmap=0,
                         time_budget=fb_budget
                     )
+                    if resolved is None:
+                        fallback_rgba, source_name = None, None
+                    else:
+                        fallback_rgba, source_name = resolved
                     
                     if fallback_rgba:
                         builder.add_fallback_image(i, fallback_rgba)
                         prefetch_mm0_fallback.append(i)
+                        prefetch_sources[i] = int(
+                            tile._provenance_from_name(source_name)
+                        )
                     else:
                         builder.mark_missing(i)
                         prefetch_mm0_missing.append(i)
@@ -7149,10 +7235,14 @@ class BackgroundDDSBuilder:
                     )
                 
                 if success and bytes_written >= 128:
+                    manifests = self._manifest_rows_for_file(
+                        tile,
+                        staging_path,
+                        prefetch_sources,
+                    )
                     self._dds_cache.store_from_file(
                         tile_id, tile.max_zoom, staging_path, tile,
-                        mm0_missing_indices=prefetch_mm0_missing or None,
-                        mm0_fallback_indices=prefetch_mm0_fallback or None)
+                        mm0_manifest=manifests)
                     
                     build_time = (time.monotonic() - build_start) * 1000
                     status = builder.get_status()
@@ -7254,11 +7344,26 @@ class BackgroundDDSBuilder:
                 # HYBRID MODE: Python reads files, C does decode+compress
                 # Best for macOS/Linux due to efficient Python I/O caching
                 # ───────────────────────────────────────────────────────────────────
-                if pipeline_mode == PIPELINE_MODE_HYBRID:
+                if pipeline_mode in (
+                    PIPELINE_MODE_HYBRID,
+                    PIPELINE_MODE_NATIVE,
+                ):
                     chunks_for_hybrid = tile.chunks.get(tile.max_zoom, [])
+                    hybrid_jpeg_snapshot = tuple(
+                        chunk.data if chunk.data else None
+                        for chunk in chunks_for_hybrid
+                    )
+                    hybrid_sources = bytes(
+                        int(
+                            MipmapSource.TARGET_PROVIDER
+                            if data is not None
+                            else MipmapSource.MISSING_COLOR
+                        )
+                        for data in hybrid_jpeg_snapshot
+                    )
                     hybrid_mm0_missing = [
-                        i for i, c in enumerate(chunks_for_hybrid)
-                        if not getattr(c, 'data', None)
+                        i for i, data in enumerate(hybrid_jpeg_snapshot)
+                        if data is None
                     ]
                     if chunks_for_hybrid:
                         # ═══════════════════════════════════════════════════════════════
@@ -7276,15 +7381,10 @@ class BackgroundDDSBuilder:
                             hasattr(native_dds, 'build_from_jpegs_to_file')):
                             try:
                                 # Extract JPEG data from chunks
-                                jpeg_datas = []
-                                valid_count = 0
-                                for chunk in chunks_for_hybrid:
-                                    data = chunk.data
-                                    if data and len(data) > 0:
-                                        jpeg_datas.append(data)
-                                        valid_count += 1
-                                    else:
-                                        jpeg_datas.append(None)
+                                jpeg_datas = list(hybrid_jpeg_snapshot)
+                                valid_count = sum(
+                                    data is not None for data in jpeg_datas
+                                )
 
                                 if valid_count > 0:
                                     _defer_background_build_if_live(tile)
@@ -7303,9 +7403,14 @@ class BackgroundDDSBuilder:
                                         )
 
                                     if result.success and result.bytes_written >= 128:
+                                        manifests = self._manifest_rows_for_file(
+                                            tile,
+                                            staging_path,
+                                            hybrid_sources,
+                                        )
                                         self._dds_cache.store_from_file(
                                             tile_id, tile.max_zoom, staging_path, tile,
-                                            mm0_missing_indices=hybrid_mm0_missing or None)
+                                            mm0_manifest=manifests)
                                         build_time = (time.monotonic() - build_start) * 1000
                                         self._builds_completed += 1
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk built {tile_id} "
@@ -7328,7 +7433,7 @@ class BackgroundDDSBuilder:
                         # ═══════════════════════════════════════════════════════════════
                         try:
                             dds_bytes = _build_dds_hybrid(
-                                chunks=chunks_for_hybrid,
+                                chunks=hybrid_jpeg_snapshot,
                                 dxt_format=dxt_format,
                                 missing_color=missing_color,
                                 buffer_priority=PRIORITY_PREFETCH,
@@ -7338,9 +7443,14 @@ class BackgroundDDSBuilder:
                                 # Hybrid build succeeded - store in DDS cache
                                 if self._dds_cache is not None:
                                     try:
+                                        manifests = self._manifest_rows_for_dds(
+                                            tile,
+                                            dds_bytes,
+                                            hybrid_sources,
+                                        )
                                         self._dds_cache.store(
                                             tile_id, tile.max_zoom, dds_bytes, tile,
-                                            mm0_missing_indices=hybrid_mm0_missing or None)
+                                            mm0_manifest=manifests)
                                     except Exception:
                                         pass
                                 build_time = (time.monotonic() - build_start) * 1000
@@ -7392,17 +7502,21 @@ class BackgroundDDSBuilder:
                             )
 
                         if result.success and result.bytes_written >= 128:
-                            # Check which chunks were missing from cache (filled with missing_color by native build)
-                            native_mm0_missing = None
-                            if hasattr(tile, 'chunks') and tile.max_zoom in tile.chunks:
-                                mm0_chunks = tile.chunks[tile.max_zoom]
-                                missing = [i for i, c in enumerate(mm0_chunks)
-                                           if not (c.ready.is_set() and c.data)]
-                                if missing:
-                                    native_mm0_missing = missing
+                            unknown_sources = bytes(
+                                [int(MipmapSource.UNKNOWN)]
+                                * (
+                                    tile.chunks_per_row
+                                    * tile.chunks_per_col
+                                )
+                            )
+                            manifests = self._manifest_rows_for_file(
+                                tile,
+                                staging_path,
+                                unknown_sources,
+                            )
                             self._dds_cache.store_from_file(
                                 tile_id, tile.max_zoom, staging_path, tile,
-                                mm0_missing_indices=native_mm0_missing)
+                                mm0_manifest=manifests)
                             build_time = (time.monotonic() - build_start) * 1000
                             self._builds_completed += 1
                             log.debug(f"BackgroundDDSBuilder: Native direct-to-disk built {tile_id} "
@@ -7466,16 +7580,21 @@ class BackgroundDDSBuilder:
                         dds_bytes = result.to_bytes()
                         if self._dds_cache is not None:
                             try:
-                                native_mm0_missing = None
-                                if hasattr(tile, 'chunks') and tile.max_zoom in tile.chunks:
-                                    mm0_chunks = tile.chunks[tile.max_zoom]
-                                    missing = [i for i, c in enumerate(mm0_chunks)
-                                               if not (c.ready.is_set() and c.data)]
-                                    if missing:
-                                        native_mm0_missing = missing
+                                unknown_sources = bytes(
+                                    [int(MipmapSource.UNKNOWN)]
+                                    * (
+                                        tile.chunks_per_row
+                                        * tile.chunks_per_col
+                                    )
+                                )
+                                manifests = self._manifest_rows_for_dds(
+                                    tile,
+                                    dds_bytes,
+                                    unknown_sources,
+                                )
                                 self._dds_cache.store(
                                     tile_id, tile.max_zoom, dds_bytes, tile,
-                                    mm0_missing_indices=native_mm0_missing)
+                                    mm0_manifest=manifests)
                             except Exception:
                                 pass
                         build_time = (time.monotonic() - build_start) * 1000
@@ -7581,8 +7700,23 @@ class BackgroundDDSBuilder:
             
             # Step 2: Get mipmap 0 image to determine DDS dimensions
             _defer_background_build_if_live(tile)
-            img0 = tile.get_img(0, startrow=0, endrow=None, maxwait=30,
-                               fallback_level_override=fallback_override)
+            composed0 = tile.get_img(
+                0,
+                startrow=0,
+                endrow=None,
+                maxwait=30,
+                fallback_level_override=fallback_override,
+                with_source_manifest=True,
+            )
+            if isinstance(composed0, ComposedImageResult):
+                img0 = composed0.image
+                mm0_sources = composed0.source_manifest
+            else:
+                img0 = composed0
+                mm0_sources = bytes(
+                    [int(MipmapSource.UNKNOWN)]
+                    * (tile.chunks_per_row * tile.chunks_per_col)
+                )
             
             if img0 is None:
                 log.debug(f"BackgroundDDSBuilder: {tile_id} - mipmap 0 get_img returned None")
@@ -7639,16 +7773,18 @@ class BackgroundDDSBuilder:
             # Step 6: Store in DDS cache
             if self._dds_cache is not None:
                 try:
-                    mm0_grid = tile.chunks.get(tile.max_zoom)
-                    mm0_chunks = (
-                        mm0_grid.ensure_all()
-                        if mm0_grid is not None
-                        else []
+                    manifests = self._manifest_rows_for_dds(
+                        tile,
+                        dds_bytes,
+                        mm0_sources,
                     )
-                    python_mm0_missing = [i for i, c in enumerate(mm0_chunks)
-                                          if not (c.ready.is_set() and c.data)]
-                    self._dds_cache.store(tile_id, tile.max_zoom, dds_bytes, tile,
-                                         mm0_missing_indices=python_mm0_missing or None)
+                    self._dds_cache.store(
+                        tile_id,
+                        tile.max_zoom,
+                        dds_bytes,
+                        tile,
+                        mm0_manifest=manifests,
+                    )
                 except Exception:
                     pass
             
@@ -8002,8 +8138,6 @@ def _on_tile_complete_callback(tile_id: str, tile,
     elif getattr(tile, '_dds_needs_healing', False) and dynamic_dds_cache is not None:
         _dispatch_healing(tile)
     elif background_dds_builder is not None:
-        if getattr(tile, '_mm0_promotion_queued', False):
-            tile._pin_mm0_promotion()
         background_dds_builder.submit(tile)
 
 
@@ -8856,7 +8990,17 @@ class Chunk(object):
 
         MAPID = "s2cloudless-2024_3857"
         MATRIXSET = "g"
-        apple_token_generation = apple_token_service.generation
+        if self.maptype.upper() == "APPLE":
+            (
+                apple_token,
+                apple_version,
+                apple_token_generation,
+                _ready,
+            ) = apple_token_service.snapshot()
+        else:
+            apple_token = apple_token_service.apple_token
+            apple_version = apple_token_service.version
+            apple_token_generation = apple_token_service.generation
         MAPTYPES = {
             "EOX": f"https://s2maps-tiles.eu/wmts?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
             "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
@@ -8866,7 +9010,7 @@ class Chunk(object):
             "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
-            "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_token_service.version}&accessKey={apple_token_service.apple_token}"
+            "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_version}&accessKey={apple_token}"
         }
 
         url = MAPTYPES[self.maptype.upper()]
@@ -8974,9 +9118,9 @@ class Chunk(object):
 
         if self.maptype.upper() == "APPLE" and status_code in (403, 410):
             if not request.apple_retried:
-                log.warning("APPLE tile got %s; rotating token and retrying", status_code)
                 apple_token_service.reset_apple_maps_token(
                     expected_generation=request.apple_token_generation,
+                    status_code=status_code,
                 )
                 url, header, server, generation = self._build_tile_url(request.idx)
                 self.url = url
@@ -9576,9 +9720,6 @@ class Tile(object):
         self._read_ahead_state = {}
         self._read_ahead_lock = threading.Lock()
 
-        # Bounded repair state for partial DDS cache entries missing mipmap 0.
-        self._mm0_promotion_queued = False
-        self._mm0_promotion_pin_until = 0.0
         self._predictive_complete_at = None
         self._prefetch_eta_at_promotion = None
         self._prefetch_exact_coverage_at_promotion = 0.0
@@ -9589,6 +9730,7 @@ class Tile(object):
         self._partial_restore_attempted = False
         self._exact_row_states = {}
         self._exact_row_lock = threading.Lock()
+        self._future_healing_rows = set()
 
         #self.tile_condition = threading.Condition()
         if min_zoom:
@@ -9649,6 +9791,8 @@ class Tile(object):
             self.chunks_per_row,
             self.chunks_per_col,
         )
+        self._mm0_rows = RowStateCoordinator(self.chunks_per_col)
+        self._loaded_mm0_manifests = {}
         log.debug(f"Creating DDS at original size: {dds_width}x{dds_height} (ZL{self.max_zoom})")
             
         self.dds = pydds.DDS(dds_width, dds_height, ispc=use_ispc,
@@ -9711,6 +9855,95 @@ class Tile(object):
         )
         self._mm0_provenance.set_index(index, source)
 
+    def _make_mm0_row_results(
+        self,
+        compressed_data,
+        source_manifest,
+        *,
+        start_row=0,
+        generation=None,
+    ):
+        data = bytes(compressed_data)
+        sources = bytes(source_manifest)
+        if len(sources) % self.chunks_per_row:
+            raise ValueError("mipmap-zero source manifest is not row aligned")
+        row_count = len(sources) // self.chunks_per_row
+        if row_count <= 0:
+            raise ValueError("mipmap-zero source manifest is empty")
+        if len(data) % row_count:
+            raise ValueError("compressed mipmap-zero data is not row aligned")
+        row_bytes = len(data) // row_count
+        if generation is None:
+            generation = self._mm0_rows.next_generation()
+        results = []
+        for relative_row in range(row_count):
+            row_index = int(start_row) + relative_row
+            data_start = relative_row * row_bytes
+            source_start = relative_row * self.chunks_per_row
+            row_data = data[data_start:data_start + row_bytes]
+            manifest = RowBuildManifest.create(
+                tile_id=self.id,
+                target_zoom=self.max_zoom,
+                mipmap=0,
+                row_index=row_index,
+                build_generation=generation,
+                sources=sources[
+                    source_start:source_start + self.chunks_per_row
+                ],
+                compressed_data=row_data,
+            )
+            results.append(CompressedRowResult(row_data, manifest))
+        return tuple(results)
+
+    def _make_mm0_results_from_dds(
+        self,
+        dds_bytes,
+        source_manifest,
+        *,
+        generation=None,
+    ):
+        mm0 = self.dds.mipmap_list[0]
+        compressed = bytes(dds_bytes)[mm0.startpos:mm0.endpos]
+        if len(compressed) != mm0.length:
+            raise ValueError("DDS does not contain a complete mipmap zero")
+        return self._make_mm0_row_results(
+            compressed,
+            source_manifest,
+            generation=generation,
+        )
+
+    def _commit_mm0_rows(self, results, installer):
+        results = tuple(results)
+
+        def install_with_lock(committed):
+            with self._dds_write_lock:
+                installer(committed)
+
+        if not self._mm0_rows.commit(results, install_with_lock):
+            return False
+        for result in results:
+            self._mm0_provenance.set_row(
+                result.manifest.row_index,
+                result.manifest.sources,
+            )
+        self._sync_mm0_manifest_state()
+        return True
+
+    def _sync_mm0_manifest_state(self):
+        missing = []
+        fallback = []
+        for row_index, manifest in self._mm0_rows.manifests().items():
+            base = row_index * self.chunks_per_row
+            missing.extend(base + index for index in manifest.missing_indices)
+            fallback.extend(base + index for index in manifest.fallback_indices)
+        with self._lock:
+            self._dds_missing_indices = sorted(set(missing))
+            self._dds_fallback_indices = sorted(set(fallback))
+            self._dds_needs_healing = bool(missing or fallback)
+
+    def _mm0_manifest_rows(self):
+        return self._mm0_rows.manifests()
+
     def restore_partial_dds_cache(self):
         if self._partial_restore_attempted or dynamic_dds_cache is None:
             return bool(self._persisted_exact_rows)
@@ -9727,21 +9960,13 @@ class Tile(object):
         return bool(self._persisted_exact_rows)
 
     def _restore_provenance_from_metadata(self, metadata):
-        missing = set((metadata or {}).get("missing_indices", ()) or ())
-        fallback = set((metadata or {}).get("fallback_indices", ()) or ())
-        total = self.chunks_per_row * self.chunks_per_col
-        if (metadata or {}).get("populated_mipmaps") and 0 in metadata.get(
-            "populated_mipmaps", ()
-        ):
-            self._set_mm0_provenance(
-                range(total), pydds.MipmapProvenance.EXACT_TARGET
+        try:
+            self._loaded_mm0_manifests = manifests_from_dict(
+                (metadata or {})["mm0_manifest"],
+                tile_id=self.id,
             )
-            self._set_mm0_provenance(
-                fallback, pydds.MipmapProvenance.LOWER_ZL_CACHE
-            )
-            self._set_mm0_provenance(
-                missing, pydds.MipmapProvenance.MISSING_COLOR
-            )
+        except (KeyError, TypeError, ValueError):
+            self._loaded_mm0_manifests = {}
 
     def schedule_exact_prefetch_row(self, row_index):
         row_index = int(row_index)
@@ -9810,15 +10035,22 @@ class Tile(object):
                 return
             with self._exact_row_lock:
                 self._exact_row_states[row_index] = "building"
-            mm = self.dds.mipmap_list[0]
-            row_bytes = mm.length // self.chunks_per_col
-            success = self._try_native_partial_mipmap_build(
-                0,
-                row_index,
-                row_index,
-                row_bytes,
-                priority=PRIORITY_PREFETCH,
-            )
+            if self._mm0_rows.state(row_index) in {
+                RowState.SERVED_EXACT,
+                RowState.SERVED_DEGRADED,
+                RowState.SERVED_MISSING,
+            }:
+                success = self._build_future_exact_row(row_index)
+            else:
+                mm = self.dds.mipmap_list[0]
+                row_bytes = mm.length // self.chunks_per_col
+                success = self._try_native_partial_mipmap_build(
+                    0,
+                    row_index,
+                    row_index,
+                    row_bytes,
+                    priority=PRIORITY_PREFETCH,
+                )
             with self._exact_row_lock:
                 if row_index in self._persisted_exact_rows:
                     self._exact_row_states[row_index] = "persisted"
@@ -9828,6 +10060,110 @@ class Tile(object):
                     self._exact_row_states[row_index] = "unbuilt"
         finally:
             _exact_row_capacity.release()
+
+    def _build_future_exact_row(self, row_index):
+        if dynamic_dds_cache is None or self.dds is None:
+            return False
+        native_dds = _get_native_dds()
+        if native_dds is None or not hasattr(
+            native_dds,
+            "build_partial_mipmap",
+        ):
+            return False
+        grid = self._get_chunk_grid(self.max_zoom)
+        chunks = grid.ensure_rows(row_index, row_index)
+        jpeg_datas = tuple(
+            chunk.data if chunk.ready.is_set() and chunk.data else None
+            for chunk in chunks
+        )
+        if len(jpeg_datas) != self.chunks_per_row or any(
+            data is None for data in jpeg_datas
+        ):
+            return False
+        generation = self._mm0_rows.next_generation()
+        with self._source_lease(jpeg_datas):
+            result = native_dds.build_partial_mipmap(
+                jpeg_datas=list(jpeg_datas),
+                chunks_width=self.chunks_per_row,
+                chunks_height=1,
+                format=CFG.pydds.format.upper(),
+                missing_color=tuple(CFG.autoortho.missing_color[:3]),
+            )
+        row_bytes = self.dds.mipmap_list[0].length // self.chunks_per_col
+        if (
+            not result.success
+            or not result.data
+            or len(result.data) != row_bytes
+        ):
+            return False
+        row_result = self._make_mm0_row_results(
+            result.data,
+            bytes(
+                [int(MipmapSource.TARGET_PROVIDER)]
+                * self.chunks_per_row
+            ),
+            start_row=row_index,
+            generation=generation,
+        )[0]
+        self._queue_partial_rows((row_result,))
+        bump("future_cache_exact_rows_built")
+        return True
+
+    def _schedule_future_cache_healing(self, manifest):
+        row_index = manifest.row_index
+        if manifest.is_exact or self._closed:
+            return
+        with self._exact_row_lock:
+            if row_index in self._future_healing_rows:
+                return
+            self._future_healing_rows.add(row_index)
+        try:
+            capacity = chunk_getter.prefetch_capacity_snapshot()
+            available = max(0, int(capacity.admission_available))
+        except Exception:
+            available = 0
+        if available <= 0:
+            with self._exact_row_lock:
+                self._future_healing_rows.discard(row_index)
+            bump("future_cache_healing_deferred_capacity")
+            return
+
+        grid = self._get_chunk_grid(self.max_zoom)
+        chunks = grid.ensure_rows(row_index, row_index)
+
+        def row_progressed(_chunk):
+            if all(chunk.ready.is_set() and chunk.data for chunk in chunks):
+                with self._exact_row_lock:
+                    self._future_healing_rows.discard(row_index)
+                self.schedule_exact_prefetch_row(row_index)
+
+        submitted = 0
+        for column, chunk in enumerate(chunks):
+            if manifest.sources[column] == int(MipmapSource.TARGET_PROVIDER):
+                continue
+            if chunk.ready.is_set() and chunk.data:
+                continue
+            if chunk.ready.is_set() and not chunk.reset_for_retry():
+                continue
+            if submitted >= available:
+                break
+            chunk.priority = PRIORITY_CACHE_REPAIR
+            chunk.prefetch = True
+            chunk.add_settled_callback(row_progressed)
+            status = chunk_getter.submit_prefetch(chunk)
+            if (
+                status is True
+                or getattr(status, "owns_work", False)
+            ):
+                submitted += 1
+            else:
+                break
+        if all(chunk.ready.is_set() and chunk.data for chunk in chunks):
+            row_progressed(None)
+        elif submitted == 0:
+            with self._exact_row_lock:
+                self._future_healing_rows.discard(row_index)
+        bump("future_cache_healing_chunks_submitted", submitted)
 
     def _load_partial_dds_rows(self, metadata):
         if (
@@ -9858,86 +10194,55 @@ class Tile(object):
             for row, data in rows.items()
             if 0 <= int(row) < total_rows
             and len(data) == bytes_per_chunk_row
+            and int(row) in self._loaded_mm0_manifests
+            and self._loaded_mm0_manifests[int(row)].is_exact
+            and self._loaded_mm0_manifests[int(row)].validate_data(data)
         }
         if not valid_rows:
             return False
-        with self._dds_write_lock:
-            sparse = self.dds.ensure_sparse_mipmap(
-                0,
-                bytes_per_chunk_row,
-                total_rows,
+        restored_rows = set()
+        for row, data in valid_rows.items():
+            result = CompressedRowResult(
+                data,
+                self._loaded_mm0_manifests[row],
             )
-            for row, data in valid_rows.items():
-                sparse.write_at(row * bytes_per_chunk_row, data)
-            self._get_mipmap_build_coordinator(0).restore_coverage(
-                valid_rows
-            )
-            self._dds_coverage_revision = int(entry.get("revision", 0))
-            degraded_rows = set(entry.get("degraded", []))
-            provenance_rows = entry.get("provenance", {})
-            for row in valid_rows:
-                encoded = provenance_rows.get(str(row))
-                if (
-                    isinstance(encoded, list)
-                    and len(encoded) == self.chunks_per_row
-                ):
-                    self._mm0_provenance.set_row(row, encoded)
-                elif row not in degraded_rows:
-                    self._mm0_provenance.set_row(
-                        row,
-                        [
-                            pydds.MipmapProvenance.EXACT_TARGET
-                        ] * self.chunks_per_row,
-                    )
-                else:
-                    self._mm0_provenance.set_row(
-                        row,
-                        [
-                            pydds.MipmapProvenance.UNKNOWN
-                        ] * self.chunks_per_row,
-                    )
-                if all(
-                    value == int(pydds.MipmapProvenance.EXACT_TARGET)
-                    for value in self._mm0_provenance.row(row)
-                ):
-                    self._persisted_exact_rows.add(row)
-                    self._exact_row_states[row] = "persisted"
-            if degraded_rows:
-                degraded_indices = {
-                    row * self.chunks_per_row + column
-                    for row in degraded_rows
-                    for column in range(self.chunks_per_row)
-                }
-                self._dds_fallback_indices = sorted(
-                    set(self._dds_fallback_indices).union(
-                        degraded_indices
-                    )
+
+            def install_row(committed, row_index=row):
+                sparse_buffer = self.dds.ensure_sparse_mipmap(
+                    0,
+                    bytes_per_chunk_row,
+                    total_rows,
                 )
-                self._dds_needs_healing = True
-            if sparse.is_complete() and not self._dds_needs_healing:
+                sparse_buffer.write_at(
+                    row_index * bytes_per_chunk_row,
+                    committed[0].data,
+                )
+
+            if self._commit_mm0_rows((result,), install_row):
+                restored_rows.add(row)
+                self._persisted_exact_rows.add(row)
+                self._exact_row_states[row] = "persisted"
+        if not restored_rows:
+            return False
+        self._get_mipmap_build_coordinator(0).restore_coverage(restored_rows)
+        self._dds_coverage_revision = int(entry.get("revision", 0))
+        sparse = self.dds.mipmap_list[0].buffer
+        if sparse.is_complete() and not self._dds_needs_healing:
+            with self._dds_write_lock:
                 dense = sparse.read_at(0, mm.length)
                 self.dds.replace_mipmap_dense(0, dense, complete=True)
                 sparse = self.dds.mipmap_list[0].buffer
                 bump("sparse_to_dense_promotions")
-        bump("partial_dds_cache_rows_loaded", len(valid_rows))
+        bump("partial_dds_cache_rows_loaded", len(restored_rows))
         profile_gauge(
             "dds.sparse_allocated_bytes",
             sparse.allocated_bytes(),
         )
         return True
 
-    def _queue_partial_rows(
-        self,
-        mipmap,
-        startrow,
-        endrow,
-        bytes_per_chunk_row,
-        data,
-        degraded_rows=None,
-    ):
+    def _queue_partial_rows(self, row_results):
         if (
-            mipmap != 0
-            or dynamic_dds_cache is None
+            dynamic_dds_cache is None
             or not hasattr(dynamic_dds_cache, "enqueue_partial_row")
             or not _get_bool_config(
                 CFG.autoortho,
@@ -9946,45 +10251,46 @@ class Tile(object):
             )
         ):
             return
-        degraded_rows = set(degraded_rows or ())
         total_rows = self._get_mipmap_build_coordinator(0).total_rows
-        for relative_row, row_index in enumerate(
-            range(startrow, endrow + 1)
-        ):
-            row_start = relative_row * bytes_per_chunk_row
-            row_data = data[row_start:row_start + bytes_per_chunk_row]
-            if len(row_data) != bytes_per_chunk_row:
-                bump("partial_dds_persistence_dropped")
+        for result in row_results:
+            manifest = result.manifest
+            if not manifest.is_exact:
+                bump("partial_dds_degraded_row_not_cached")
                 continue
-            provenance = self._mm0_provenance.row(row_index)
             if dynamic_dds_cache.enqueue_partial_row(
                 self.id,
                 self.max_zoom,
                 self,
-                row_index,
-                row_data,
+                manifest.row_index,
+                result.data,
                 total_rows,
-                degraded=row_index in degraded_rows,
-                provenance=provenance,
-                completion_callback=self._on_partial_row_persisted,
+                manifest=manifest,
+                completion_callback=(
+                    lambda success, row_index, row_manifest=manifest:
+                    self._on_partial_row_persisted(
+                        success,
+                        row_index,
+                        row_manifest,
+                    )
+                ),
             ):
-                self._exact_row_enqueue_failed.discard(row_index)
+                self._exact_row_enqueue_failed.discard(manifest.row_index)
                 bump(
                     "partial_dds_persistence_queue_bytes",
-                    len(row_data),
+                    len(result.data),
                 )
             else:
-                self._exact_row_enqueue_failed.add(row_index)
-                self._on_partial_row_persisted(False, row_index)
+                self._exact_row_enqueue_failed.add(manifest.row_index)
+                self._on_partial_row_persisted(
+                    False,
+                    manifest.row_index,
+                    manifest,
+                )
                 bump("partial_dds_persistence_dropped")
 
-    def _on_partial_row_persisted(self, success, row_index):
+    def _on_partial_row_persisted(self, success, row_index, manifest):
         row_index = int(row_index)
-        provenance = self._mm0_provenance.row(row_index)
-        exact_row = bool(provenance) and all(
-            value == int(pydds.MipmapProvenance.EXACT_TARGET)
-            for value in provenance
-        )
+        exact_row = bool(manifest and manifest.is_exact)
         with self._exact_row_lock:
             if success and exact_row:
                 self._persisted_exact_rows.add(row_index)
@@ -10014,8 +10320,12 @@ class Tile(object):
         dds_bytes = self.dds.read_at(0, self.dds.total_size)
         if len(dds_bytes) != self.dds.total_size:
             return False
+        manifests = self._mm0_manifest_rows()
+        if set(manifests) != set(range(self.chunks_per_col)):
+            return False
         self._dds_persistence_accepted = self._enqueue_dds_persistence(
             dds_bytes,
+            manifests,
         )
         if self._dds_persistence_accepted:
             self._release_completed_sources()
@@ -10024,10 +10334,11 @@ class Tile(object):
     def _enqueue_dds_persistence(
         self,
         dds_bytes,
-        missing_indices=None,
-        fallback_indices=None,
+        mipmap_zero_manifest,
     ):
         if dynamic_dds_cache is None:
+            return False
+        if not mipmap_zero_manifest:
             return False
         try:
             if hasattr(dynamic_dds_cache, "enqueue_store"):
@@ -10036,8 +10347,7 @@ class Tile(object):
                     self.max_zoom,
                     dds_bytes,
                     self,
-                    missing_indices,
-                    fallback_indices,
+                    mm0_manifest=mipmap_zero_manifest,
                 )
             else:
                 accepted = dynamic_dds_cache.store(
@@ -10045,8 +10355,7 @@ class Tile(object):
                     self.max_zoom,
                     dds_bytes,
                     self,
-                    mm0_missing_indices=missing_indices,
-                    mm0_fallback_indices=fallback_indices,
+                    mm0_manifest=mipmap_zero_manifest,
                 )
         except Exception:
             accepted = False
@@ -10057,42 +10366,47 @@ class Tile(object):
         self,
         *,
         dds_bytes=None,
-        missing_indices=None,
-        fallback_indices=None,
+        mipmap_zero_manifest=None,
         persisted=False,
     ):
-        missing_indices = list(missing_indices or ())
-        fallback_indices = list(fallback_indices or ())
-        total = self.chunks_per_row * self.chunks_per_col
-        if dds_bytes is not None or persisted:
-            self._set_mm0_provenance(
-                range(total), pydds.MipmapProvenance.EXACT_TARGET
-            )
-        self._set_mm0_provenance(
-            fallback_indices,
-            pydds.MipmapProvenance.LOWER_ZL_CACHE,
-        )
-        self._set_mm0_provenance(
-            missing_indices,
-            pydds.MipmapProvenance.MISSING_COLOR,
-        )
+        manifests = dict(mipmap_zero_manifest or {})
+        if set(manifests) != set(range(self.chunks_per_col)):
+            return False
+        if any(
+            manifest.tile_id != self.id
+            or manifest.target_zoom != self.max_zoom
+            or manifest.mipmap != 0
+            or manifest.row_index != row
+            or len(manifest.sources) != self.chunks_per_row
+            for row, manifest in manifests.items()
+        ):
+            return False
+        if dds_bytes is not None:
+            mm0 = self.dds.mipmap_list[0]
+            row_bytes = mm0.length // self.chunks_per_col
+            for row, manifest in manifests.items():
+                start = mm0.startpos + row * row_bytes
+                if not manifest.validate_data(
+                    dds_bytes[start:start + row_bytes]
+                ):
+                    return False
+        self._sync_mm0_manifest_state()
         with self._lock:
-            self._dds_missing_indices = missing_indices
-            self._dds_fallback_indices = fallback_indices
-            self._dds_needs_healing = bool(
-                missing_indices or fallback_indices
-            )
             if persisted:
                 self._dds_persisted = True
                 self._dds_persistence_accepted = True
-        if dds_bytes is not None and not persisted:
+        if (
+            dds_bytes is not None
+            and not persisted
+            and all(manifest.is_exact for manifest in manifests.values())
+        ):
             self._enqueue_dds_persistence(
                 dds_bytes,
-                missing_indices or None,
-                fallback_indices or None,
+                manifests,
             )
         if not self._dds_needs_healing:
             self._release_completed_sources()
+        return True
 
     def _maybe_schedule_read_ahead(
         self,
@@ -10503,11 +10817,11 @@ class Tile(object):
         
         # Determine download wait time, capped by the user's per-chunk wait.
         maxwait_cap = self.get_maxwait()
-        if time_budget and not time_budget.exhausted:
-            wait_time = min(time_budget.remaining, maxwait_cap)
-        else:
-            # No budget - use a reasonable default
-            wait_time = min(5.0, maxwait_cap)
+        wait_time = self._row_wait_seconds(
+            0,
+            time_budget,
+            maxwait_cap,
+        )
         
         if wait_time <= 0:
             log.debug(f"_collect_chunk_jpegs: No time for Phase 2 downloads")
@@ -10742,6 +11056,16 @@ class Tile(object):
             # ═══════════════════════════════════════════════════════════════
             # STEP 4: Build DDS with native aopipeline
             # ═══════════════════════════════════════════════════════════════
+            generation = self._mm0_rows.next_generation()
+            self._mm0_rows.mark_building(range(self.chunks_per_col))
+            source_manifest = bytes(
+                int(
+                    MipmapSource.TARGET_PROVIDER
+                    if data is not None
+                    else MipmapSource.MISSING_COLOR
+                )
+                for data in jpeg_datas
+            )
             native_start = time.monotonic()
             with self._source_lease(jpeg_datas):
                 with _native_build_context() as threads:
@@ -10774,10 +11098,19 @@ class Tile(object):
             # ═══════════════════════════════════════════════════════════════
             # Use to_bytes() to extract from buffer
             dds_bytes = result.to_bytes()
+            row_results = self._make_mm0_results_from_dds(
+                dds_bytes,
+                source_manifest,
+                generation=generation,
+            )
+            manifests = {
+                row_result.manifest.row_index: row_result.manifest
+                for row_result in row_results
+            }
             
             # Reuse existing _populate_dds_from_prebuilt (proven, tested)
             # This populates all mipmap buffers and marks them as retrieved
-            if not self._populate_dds_from_prebuilt(dds_bytes):
+            if not self._populate_dds_from_prebuilt(dds_bytes, manifests):
                 log.debug(f"_try_aopipeline_build: Failed to populate DDS for {self.id}")
                 bump('live_aopipeline_populate_failed')
                 return False
@@ -10788,10 +11121,9 @@ class Tile(object):
                       f"{result.bytes_written} bytes in {build_time:.0f}ms")
             build_success = True
             
-            mm0_missing = [i for i, d in enumerate(jpeg_datas) if d is None]
             self._finalize_build(
                 dds_bytes=dds_bytes,
-                missing_indices=mm0_missing,
+                mipmap_zero_manifest=manifests,
             )
             
         except Exception as e:
@@ -10912,10 +11244,11 @@ class Tile(object):
             # Streaming builder now uses time_budget for download waits (not deprecated max_download_wait)
             # Default to 5s if no budget provided
             maxwait_cap = self.get_maxwait()
-            if time_budget and not time_budget.exhausted:
-                max_wait = min(time_budget.remaining, maxwait_cap)
-            else:
-                max_wait = min(5.0, maxwait_cap)
+            max_wait = self._row_wait_seconds(
+                0,
+                time_budget,
+                maxwait_cap,
+            )
             
             if use_precollected:
                 # Use pre-collected data from batch attempt
@@ -10964,6 +11297,10 @@ class Tile(object):
             # Phase 3: Process all pending chunks - batch add successful, collect failures
             streaming_mm0_missing = []
             streaming_mm0_fallback = []
+            streaming_sources = bytearray(
+                [int(MipmapSource.MISSING_COLOR)]
+                * (self.chunks_per_row * self.chunks_per_col)
+            )
             newly_ready = []
             failed_indices = []
             for i in pending_indices:
@@ -10975,6 +11312,10 @@ class Tile(object):
             
             if newly_ready:
                 final_ready_chunks.extend(newly_ready)
+            for index, _data in final_ready_chunks:
+                streaming_sources[index] = int(
+                    MipmapSource.TARGET_PROVIDER
+                )
             
             # Phase 4: Resolve fallbacks for failed chunks.
             # Always attempt fallback resolution even if the main time budget is
@@ -11007,17 +11348,21 @@ class Tile(object):
                                 "zoom": self.max_zoom,
                             },
                         ) as fallback_span:
-                            rgba = resolver.resolve(
+                            resolved = resolver.resolve_with_source(
                                 chunk_col, chunk_row, self.max_zoom,
                                 target_mipmap=0,
                                 time_budget=shared_fb_budget
                             )
+                            if resolved is None:
+                                rgba, source_name = None, None
+                            else:
+                                rgba, source_name = resolved
                             if rgba is None:
                                 fallback_span.outcome = "miss"
-                        fallback_results.append((idx, rgba))
+                        fallback_results.append((idx, rgba, source_name))
                     except Exception as e:
                         log.debug(f"_try_streaming_aopipeline_build: Fallback failed for {self.id} chunk {idx}: {e}")
-                        fallback_results.append((idx, None))
+                        fallback_results.append((idx, None, None))
 
             config = {
                 'chunks_per_side': self.chunks_per_row,
@@ -11062,11 +11407,14 @@ class Tile(object):
             if failed_indices:
                 # Apply fallback results to builder
                 resolved_indices = set()
-                for idx, rgba in fallback_results:
+                for idx, rgba, source_name in fallback_results:
                     resolved_indices.add(idx)
                     if rgba:
                         builder.add_fallback_image(idx, rgba)
                         streaming_mm0_fallback.append(idx)
+                        streaming_sources[idx] = int(
+                            self._provenance_from_name(source_name)
+                        )
                     else:
                         builder.mark_missing(idx)
                         streaming_mm0_missing.append(idx)
@@ -11130,7 +11478,24 @@ class Tile(object):
                 )
                 if result.success and result.bytes_written >= 128:
                     dds_bytes = bytes(buffer[:result.bytes_written])
-                    if self._populate_dds_from_prebuilt(dds_bytes):
+                    generation = self._mm0_rows.next_generation()
+                    self._mm0_rows.mark_building(
+                        range(self.chunks_per_col)
+                    )
+                    row_results = self._make_mm0_results_from_dds(
+                        dds_bytes,
+                        streaming_sources,
+                        generation=generation,
+                    )
+                    manifests = {
+                        row_result.manifest.row_index:
+                        row_result.manifest
+                        for row_result in row_results
+                    }
+                    if self._populate_dds_from_prebuilt(
+                        dds_bytes,
+                        manifests,
+                    ):
                         build_time = (time.monotonic() - build_start) * 1000
                         status = builder.get_status()
                         log.debug(f"_try_streaming_aopipeline_build: SUCCESS for {self.id} - "
@@ -11141,8 +11506,7 @@ class Tile(object):
                         
                         self._finalize_build(
                             dds_bytes=dds_bytes,
-                            missing_indices=streaming_mm0_missing,
-                            fallback_indices=streaming_mm0_fallback,
+                            mipmap_zero_manifest=manifests,
                         )
                         
                         return True
@@ -11321,7 +11685,13 @@ class Tile(object):
 
         return True
     
-    def _populate_dds_from_prebuilt(self, prebuilt_bytes: bytes) -> bool:
+    def _populate_dds_from_prebuilt(
+        self,
+        prebuilt_bytes: bytes,
+        mipmap_zero_manifest=None,
+        *,
+        persisted=False,
+    ) -> bool:
         """
         Populate DDS mipmap buffers from prebuilt byte buffer.
         
@@ -11347,66 +11717,101 @@ class Tile(object):
             return False
         
         try:
-            # The prebuilt bytes include the 128-byte DDS header followed by mipmap data
-            # We need to populate each mipmap's databuffer
-            last_valid_mm_data = None
-            last_valid_mm_idx = -1
-
             populated = getattr(self, '_dds_populated_mipmaps', None)
+            includes_mm0 = populated is None or 0 in populated
+            manifests = dict(
+                mipmap_zero_manifest
+                if mipmap_zero_manifest is not None
+                else self._loaded_mm0_manifests
+            )
+            row_results = ()
+            if includes_mm0:
+                if set(manifests) != set(range(self.chunks_per_col)):
+                    log.debug(
+                        "Prebuilt DDS rejected without complete row manifests: %s",
+                        self.id,
+                    )
+                    return False
+                mm0 = self.dds.mipmap_list[0]
+                row_bytes = mm0.length // self.chunks_per_col
+                row_results = tuple(
+                    CompressedRowResult(
+                        prebuilt_bytes[
+                            mm0.startpos + row * row_bytes:
+                            mm0.startpos + (row + 1) * row_bytes
+                        ],
+                        manifests[row],
+                    )
+                    for row in range(self.chunks_per_col)
+                )
 
-            for mm in self.dds.mipmap_list:
-                if mm.startpos >= len(prebuilt_bytes):
-                    # Prebuilt data doesn't include this mipmap
-                    # Propagate last valid mipmap data to this and all remaining mipmaps
-                    # This matches pydds.gen_mipmaps() behavior for trailing mipmaps
-                    if last_valid_mm_data is not None:
-                        for trailing_mm in self.dds.mipmap_list[mm.idx:]:
-                            if populated is not None and trailing_mm.idx not in populated:
-                                continue
-                            self.dds.replace_mipmap_dense(
-                                trailing_mm.idx,
-                                last_valid_mm_data,
-                            )
-                    break
+            def install_prebuilt(_committed=None):
+                # The prebuilt bytes include the 128-byte DDS header followed by mipmap data.
+                self.ready.clear()
+                try:
+                    self._install_prebuilt_mipmaps(prebuilt_bytes, populated)
+                finally:
+                    self.ready.set()
 
-                # Skip unpopulated mipmaps (partial DDS from incremental save)
-                if populated is not None and mm.idx not in populated:
-                    continue
+            if includes_mm0:
+                if not self._commit_mm0_rows(row_results, install_prebuilt):
+                    return False
+            else:
+                with self._dds_write_lock:
+                    install_prebuilt()
 
-                # Extract this mipmap's data from the prebuilt buffer
-                mm_end = min(mm.endpos, len(prebuilt_bytes))
-                if mm_end <= mm.startpos:
-                    # No data for this mipmap - propagate last valid
-                    if last_valid_mm_data is not None:
-                        for trailing_mm in self.dds.mipmap_list[mm.idx:]:
-                            if populated is not None and trailing_mm.idx not in populated:
-                                continue
-                            self.dds.replace_mipmap_dense(
-                                trailing_mm.idx,
-                                last_valid_mm_data,
-                            )
-                    break
-                    
-                mm_data = prebuilt_bytes[mm.startpos:mm_end]
-                
-                # Store in the mipmap's databuffer
-                self.dds.replace_mipmap_dense(mm.idx, mm_data)
-                
-                # Track last valid mipmap data for propagation to trailing mipmaps
-                last_valid_mm_data = mm_data
-                last_valid_mm_idx = mm.idx
-            
             log.debug(f"Populated DDS from prebuilt cache for {self} "
-                      f"(last_mm={last_valid_mm_idx}, "
-                      f"populated={sorted(populated) if populated else 'all'})")
-            # Mark as prepopulated so bytes_read warning doesn't trigger
+                      f"(populated={sorted(populated) if populated else 'all'})")
             self._prepopulated = True
-            self._finalize_build(persisted=True)
+            if persisted:
+                return self._finalize_build(
+                    dds_bytes=prebuilt_bytes,
+                    mipmap_zero_manifest=manifests,
+                    persisted=True,
+                )
             return True
-            
         except Exception as e:
             log.warning(f"Failed to populate DDS from prebuilt: {e}")
             return False
+
+    def _install_prebuilt_mipmaps(self, prebuilt_bytes, populated):
+        """Install prevalidated prebuilt mipmaps while the DDS write lock is held."""
+        # We need to populate each mipmap's databuffer.
+        last_valid_mm_data = None
+        last_valid_mm_idx = -1
+
+        for mm in self.dds.mipmap_list:
+            if mm.startpos >= len(prebuilt_bytes):
+                if last_valid_mm_data is not None:
+                    for trailing_mm in self.dds.mipmap_list[mm.idx:]:
+                        if populated is not None and trailing_mm.idx not in populated:
+                            continue
+                        self.dds.replace_mipmap_dense(
+                            trailing_mm.idx,
+                            last_valid_mm_data,
+                        )
+                break
+
+            if populated is not None and mm.idx not in populated:
+                continue
+
+            mm_end = min(mm.endpos, len(prebuilt_bytes))
+            if mm_end <= mm.startpos:
+                if last_valid_mm_data is not None:
+                    for trailing_mm in self.dds.mipmap_list[mm.idx:]:
+                        if populated is not None and trailing_mm.idx not in populated:
+                            continue
+                        self.dds.replace_mipmap_dense(
+                            trailing_mm.idx,
+                            last_valid_mm_data,
+                        )
+                break
+
+            mm_data = prebuilt_bytes[mm.startpos:mm_end]
+            self.dds.replace_mipmap_dense(mm.idx, mm_data)
+            last_valid_mm_data = mm_data
+            last_valid_mm_idx = mm.idx
+        return last_valid_mm_idx
    
     def find_mipmap_pos(self, offset):
         for m in self.dds.mipmap_list:
@@ -11425,173 +11830,18 @@ class Tile(object):
         endrow = min(total_rows - 1, end_byte // bytes_per_chunk_row)
         return startrow, max(startrow, endrow), bytes_per_chunk_row, total_rows
 
-    def _pin_mm0_promotion(self) -> None:
-        try:
-            ttl_sec = float(getattr(CFG.autoortho, 'partial_cache_promote_pin_sec', 180.0))
-        except Exception:
-            ttl_sec = 180.0
-        ttl_sec = max(30.0, min(600.0, ttl_sec))
-        self._mm0_promotion_pin_until = time.monotonic() + ttl_sec
-
-    def _clear_mm0_promotion_pin(self) -> None:
-        self._mm0_promotion_pin_until = 0.0
-
-    def _mm0_promotion_is_pinned(self, now: Optional[float] = None) -> bool:
-        if now is None:
-            now = time.monotonic()
-        return self._mm0_promotion_pin_until > now
-
-    def _release_mm0_promotion_claim(self) -> None:
-        self._mm0_promotion_queued = False
-        self._clear_mm0_promotion_pin()
-        with _partial_mm0_promotions_lock:
-            _partial_mm0_promotions.pop(self.id, None)
-
     def _maybe_promote_partial_cache_to_mm0(self, requested_mipmap: int) -> bool:
-        """Queue bounded full-detail repair for a partial DDS cache entry."""
-        if self._mm0_promotion_queued:
-            bump('partial_mm0_promote_duplicate')
+        """Promote cache-backed work without eagerly materializing mipmap zero."""
+        if requested_mipmap != 0:
+            # Lower mipmap reads retain only lightweight cache metadata. If
+            # X-Plane later requests mipmap zero, its exact row range is built
+            # through the normal live coordinator.
+            bump("partial_mm0_promotion_metadata_only")
             return False
-        if requested_mipmap <= 0:
-            return False
-        if background_dds_builder is None or tile_completion_tracker is None:
-            bump('partial_mm0_promote_no_builder')
-            return False
-        if not _get_bool_config(CFG.autoortho, 'partial_cache_promote_mm0', True):
-            bump('partial_mm0_promote_disabled')
-            return False
-        if self.dds is None or self.dds.mipmap_list[0].retrieved:
-            return False
-
-        have_position = bool(datareftracker.data_valid and datareftracker.connected)
-
-        try:
-            radius_nm = float(getattr(CFG.autoortho, 'partial_cache_promote_radius_nm', 12.0))
-        except Exception:
-            radius_nm = 12.0
-        radius_nm = max(1.0, min(80.0, radius_nm))
-
-        try:
-            max_promotions = int(getattr(CFG.autoortho, 'partial_cache_promote_max_tiles', 500))
-        except Exception:
-            max_promotions = 500
-        max_promotions = max(0, min(1000, max_promotions))
-        if max_promotions <= 0:
-            bump('partial_mm0_promote_cap_zero')
-            return False
-
-        try:
-            promotion_window_sec = float(getattr(CFG.autoortho, 'partial_cache_promote_window_sec', 90.0))
-        except Exception:
-            promotion_window_sec = 90.0
-        promotion_window_sec = max(15.0, min(600.0, promotion_window_sec))
-
-        distance_nm = None
-        if have_position:
-            try:
-                with datareftracker._lock:
-                    player_lat = datareftracker.lat
-                    player_lon = datareftracker.lon
-
-                center_row = self.row + (self.height / 2.0) - 0.5
-                center_col = self.col + (self.width / 2.0) - 0.5
-                tile_lat, tile_lon = _chunk_to_latlon(center_row, center_col, self.tilename_zoom)
-                distance_nm = _haversine_distance(player_lat, player_lon, tile_lat, tile_lon) / 1852.0
-            except Exception as e:
-                log.debug(f"Partial mm0 promotion distance check failed for {self.id}: {e}")
-                bump('partial_mm0_promote_distance_error')
-                return False
-
-            if distance_nm > radius_nm:
-                bump('partial_mm0_promote_too_far')
-                return False
-        else:
-            try:
-                startup_cap = int(getattr(CFG.autoortho, 'partial_cache_promote_startup_max_tiles', 500))
-            except Exception:
-                startup_cap = 96
-            startup_cap = max(0, min(max_promotions, startup_cap))
-            if startup_cap <= 0:
-                bump('partial_mm0_promote_no_position')
-                return False
-            max_promotions = startup_cap
-
-        with _partial_mm0_promotions_lock:
-            cutoff = time.monotonic() - promotion_window_sec
-            while _partial_mm0_promotions:
-                _old_id, old_ts = next(iter(_partial_mm0_promotions.items()))
-                if old_ts >= cutoff:
-                    break
-                _partial_mm0_promotions.popitem(last=False)
-
-            if self.id in _partial_mm0_promotions:
-                self._mm0_promotion_queued = True
-                bump('partial_mm0_promote_duplicate')
-                return False
-            if len(_partial_mm0_promotions) >= max_promotions:
-                bump('partial_mm0_promote_cap_hit')
-                return False
-            _partial_mm0_promotions[self.id] = time.monotonic()
-
-        try:
-            chunks = self._create_chunks(self.max_zoom).ensure_all()
-            if not chunks:
-                bump('partial_mm0_promote_no_chunks')
-                self._release_mm0_promotion_claim()
-                return False
-
-            not_ready = [c for c in chunks if not c.ready.is_set()]
-            self._mm0_promotion_queued = True
-
-            if not not_ready:
-                self._pin_mm0_promotion()
-                if background_dds_builder.submit(self, priority=PRIORITY_CACHE_REPAIR):
-                    bump('partial_mm0_promote_builder_ready')
-                    log.info(
-                        f"PARTIAL_MM0_PROMOTE: {self.id} queued DDS build "
-                        f"(distance={distance_nm:.1f}nm, chunks=cached)"
-                        if distance_nm is not None else
-                        f"PARTIAL_MM0_PROMOTE: {self.id} queued DDS build "
-                        f"(distance=unknown, chunks=cached)"
-                    )
-                    return True
-                bump('partial_mm0_promote_builder_rejected')
-                self._release_mm0_promotion_claim()
-                return False
-
-            self._pin_mm0_promotion()
-            tile_completion_tracker.start_tracking(self, self.max_zoom)
-
-            submitted = 0
-            for chunk in not_ready:
-                if chunk.ready.is_set():
-                    continue
-                if not getattr(chunk, 'in_queue', False) and not getattr(chunk, 'in_flight', False):
-                    chunk.priority = (
-                        PRIORITY_CACHE_REPAIR +
-                        _calculate_spatial_priority(chunk.row, chunk.col, chunk.zoom, 0)
-                    )
-                    chunk.prefetch = True
-                    chunk_getter.submit(chunk)
-                    submitted += 1
-
-            bump('partial_mm0_promote_queued')
-            if submitted:
-                bump('partial_mm0_promote_chunks_submitted', submitted)
-            log.info(
-                f"PARTIAL_MM0_PROMOTE: {self.id} queued mm0 repair "
-                f"(distance={distance_nm:.1f}nm, submitted={submitted}, "
-                f"pending={len(not_ready)})"
-                if distance_nm is not None else
-                f"PARTIAL_MM0_PROMOTE: {self.id} queued mm0 repair "
-                f"(distance=unknown, submitted={submitted}, pending={len(not_ready)})"
-            )
-            return True
-        except Exception as e:
-            self._release_mm0_promotion_claim()
-            log.debug(f"Partial mm0 promotion failed for {self.id}: {e}")
-            bump('partial_mm0_promote_error')
-            return False
+        if prefetch_coordinator is not None:
+            prefetch_coordinator.promote_tile(self)
+        bump("partial_mm0_promotion_deferred_to_live_rows")
+        return False
 
     def get_bytes(self, offset, length, time_budget=None):
         """
@@ -11657,7 +11907,11 @@ class Tile(object):
                 if cache_has_requested_mipmap else None
             )
             if cached_bytes is not None:
-                if self._populate_dds_from_prebuilt(cached_bytes):
+                if self._populate_dds_from_prebuilt(
+                    cached_bytes,
+                    self._loaded_mm0_manifests,
+                    persisted=True,
+                ):
                     # FIX: Only return early if mm0 was actually populated.
                     # Partial DDS entries (from store_incremental) contain mm4-12 but
                     # NOT mm0. Returning True here would serve empty mm0 data to X-Plane
@@ -11704,7 +11958,11 @@ class Tile(object):
                     if dynamic_dds_cache is not None:
                         cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
                         if cached_bytes is not None:
-                            if self._populate_dds_from_prebuilt(cached_bytes):
+                            if self._populate_dds_from_prebuilt(
+                                cached_bytes,
+                                self._loaded_mm0_manifests,
+                                persisted=True,
+                            ):
                                 # Only return if mm0 was populated (same guard as primary cache path)
                                 if self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
                                     log.debug(f"GET_BYTES: DDS cache HIT after transition for {self.id}")
@@ -11932,16 +12190,27 @@ class Tile(object):
         build_succeeded = False
         start_time = time.monotonic()
         try:
-            new_im = self.get_img(
+            composed = self.get_img(
                 mipmap,
                 startrow,
                 endrow,
                 maxwait=self.get_maxwait(),
                 time_budget=time_budget,
+                with_source_manifest=mipmap == 0,
             )
+            source_manifest = None
+            if isinstance(composed, ComposedImageResult):
+                new_im = composed.image
+                source_manifest = composed.source_manifest
+            else:
+                new_im = composed
             if not new_im or self.dds is None:
                 return False
 
+            generation = None
+            if mipmap == 0:
+                generation = self._mm0_rows.next_generation()
+                self._mm0_rows.mark_building(range(startrow, endrow + 1))
             img_data = new_im.data_ptr()
             pixel_width, pixel_height = new_im.size
             dxtdata = self.dds.compress(
@@ -11968,7 +12237,7 @@ class Tile(object):
             if not coordinator.can_commit_partial(revision):
                 return True
 
-            with self._dds_write_lock:
+            def install_partial(_committed=None):
                 self.ready.clear()
                 try:
                     mm = self.dds.mipmap_list[mipmap]
@@ -11990,21 +12259,23 @@ class Tile(object):
                 finally:
                     self.ready.set()
 
-            degraded_rows = set()
-            grid = self.chunks.get(self.max_zoom - mipmap)
-            if grid is not None:
-                for row_index in range(startrow, endrow + 1):
-                    row_chunks = grid.ensure_rows(row_index, row_index)
-                    if any(not chunk.data for chunk in row_chunks):
-                        degraded_rows.add(row_index)
-            self._queue_partial_rows(
-                mipmap,
-                startrow,
-                endrow,
-                bytes_per_chunk_row,
-                dxtdata,
-                degraded_rows,
-            )
+            if mipmap == 0:
+                row_results = self._make_mm0_row_results(
+                    dxtdata,
+                    source_manifest,
+                    start_row=startrow,
+                    generation=generation,
+                )
+                if not self._commit_mm0_rows(
+                    row_results,
+                    install_partial,
+                ):
+                    return True
+                self._queue_partial_rows(row_results)
+            else:
+                with self._dds_write_lock:
+                    install_partial()
+
             build_succeeded = True
             self._dds_coverage_revision += 1
             return True
@@ -12101,8 +12372,58 @@ class Tile(object):
                 )
         
         self.bytes_read += length
-        data = self.dds.read_at(offset, length)
+        data = self._read_with_mm0_sealing(offset, length)
         self._record_mipmap_provenance(offset, len(data))
+        return data
+
+    def _read_with_mm0_sealing(self, offset, length):
+        mm0 = self.dds.mipmap_list[0]
+        overlap_start = max(int(offset), mm0.startpos)
+        overlap_end = min(int(offset) + int(length), mm0.endpos)
+        if overlap_start >= overlap_end:
+            return self.dds.read_at(offset, length)
+
+        start_row, end_row, row_bytes, _total_rows = self._partial_row_range(
+            0,
+            overlap_start,
+            overlap_end - overlap_start,
+        )
+        missing_generation = self._mm0_rows.next_generation()
+
+        def missing_result(row):
+            row_data = mm0.read_at(
+                row * row_bytes,
+                row_bytes,
+                self.dds.blocksize,
+            )
+            manifest = RowBuildManifest.create(
+                tile_id=self.id,
+                target_zoom=self.max_zoom,
+                mipmap=0,
+                row_index=row,
+                build_generation=missing_generation,
+                sources=bytes(
+                    [int(MipmapSource.MISSING_COLOR)]
+                    * self.chunks_per_row
+                ),
+                compressed_data=row_data,
+            )
+            return CompressedRowResult(row_data, manifest)
+
+        data, manifests = self._mm0_rows.seal_and_read(
+            range(start_row, end_row + 1),
+            lambda: self.dds.read_at(offset, length),
+            missing_result,
+        )
+        for manifest in manifests:
+            self._mm0_provenance.set_row(
+                manifest.row_index,
+                manifest.sources,
+            )
+        self._sync_mm0_manifest_state()
+        for manifest in manifests:
+            if not manifest.is_exact:
+                self._schedule_future_cache_healing(manifest)
         return data
 
     def _record_mipmap_provenance(self, offset, length):
@@ -12285,7 +12606,7 @@ class Tile(object):
 
     @profiled_stage("image.compose")
     def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None,
-                fallback_level_override=None):
+                fallback_level_override=None, with_source_manifest=False):
         #
         # Get an image for a particular mipmap
         #
@@ -12376,10 +12697,20 @@ class Tile(object):
             if isinstance(cached_img_data, tuple):
                 img = cached_img_data[0]  # Extract just the image
                 log.debug(f"GET_IMG: Found saved image: {img}")
+                if with_source_manifest and mipmap == 0:
+                    return ComposedImageResult(
+                        img,
+                        self._mm0_provenance.snapshot(),
+                    )
                 return img
             else:
                 # Old format: just the image without metadata
                 log.debug(f"GET_IMG: Found saved image (old format): {cached_img_data}")
+                if with_source_manifest and mipmap == 0:
+                    return ComposedImageResult(
+                        cached_img_data,
+                        self._mm0_provenance.snapshot(),
+                    )
                 return cached_img_data
 
         log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
@@ -12403,6 +12734,26 @@ class Tile(object):
             startchunk = startrow * chunks_per_row
         if endrow is not None:
             endchunk = (endrow * chunks_per_row) + chunks_per_row
+
+        source_end = endchunk if endchunk is not None else width * height
+        source_start = startchunk
+        composed_sources = (
+            bytearray(source_end - source_start)
+            if mipmap == 0
+            else None
+        )
+
+        def set_composed_source(chunk, source):
+            if composed_sources is None:
+                return
+            global_index = (
+                (int(chunk.row) - int(row)) * int(width)
+                + int(chunk.col)
+                - int(col)
+            )
+            local_index = global_index - source_start
+            if 0 <= local_index < len(composed_sources):
+                composed_sources[local_index] = int(source)
             
         log.debug(f"GET_IMG: Chunk indices - start: {startchunk}, end: {endchunk}, chunks_per_row: {chunks_per_row}")
 
@@ -12572,16 +12923,13 @@ class Tile(object):
             log.debug(f"GET_IMG: Using prefilled base from mipmap {prefill_source_mm}")
 
         if mipmap == 0:
-            provenance_end = (
-                endchunk if endchunk is not None else grid.logical_length
+            initial_source = (
+                MipmapSource.LOWER_MIPMAP_MEMORY
+                if prefill_source_mm is not None
+                else MipmapSource.MISSING_COLOR
             )
-            self._set_mm0_provenance(
-                range(startchunk, provenance_end),
-                (
-                    pydds.MipmapProvenance.LOWER_MIPMAP_MEMORY
-                    if prefill_source_mm is not None
-                    else pydds.MipmapProvenance.MISSING_COLOR
-                ),
+            composed_sources[:] = bytes([int(initial_source)]) * len(
+                composed_sources
             )
 
         log.debug(f"GET_IMG: Will use image {new_im}")
@@ -12591,6 +12939,8 @@ class Tile(object):
             log.warning(f"GET_IMG: No chunks created for zoom {zoom}, mipmap {mipmap}")
             # Return the missing_color filled image we already created
             # This ensures consistency - X-Plane sees missing_color, not arbitrary gray
+            if with_source_manifest and mipmap == 0:
+                return ComposedImageResult(new_im, bytes(composed_sources))
             return new_im
         
         # Track if any pass needs a lazy build
@@ -12641,9 +12991,9 @@ class Tile(object):
                         _safe_paste(new_im, chunk_img, start_x, start_y)
                         chunks_with_images.add(id(chunk))
                         if mipmap == 0:
-                            self._set_mm0_chunk_provenance(
+                            set_composed_source(
                                 chunk,
-                                pydds.MipmapProvenance.EXACT_TARGET,
+                                MipmapSource.TARGET_PROVIDER,
                             )
                         time_budget.record_chunk_processed()
                     else:
@@ -12675,8 +13025,6 @@ class Tile(object):
                 time_budget,
                 maxwait,
             )
-            chunk_first_seen = {}  # chunk id -> monotonic time first polled
-
             while still_waiting and not time_budget.exhausted:
                 now = time.monotonic()
                 if now >= pass2_deadline:
@@ -12688,22 +13036,12 @@ class Tile(object):
                     break
 
                 newly_ready = []
-                timed_out = []
                 remaining = []
 
                 for item in still_waiting:
                     chunk, sx, sy = item
-                    chunk_id = id(chunk)
-
-                    # Track first-seen time for per-chunk timeout
-                    if chunk_id not in chunk_first_seen:
-                        chunk_first_seen[chunk_id] = now
-
                     if chunk.ready.is_set():
                         newly_ready.append(item)
-                    elif now - chunk_first_seen[chunk_id] >= maxwait:
-                        # This chunk has exceeded its per-chunk maxwait — give up
-                        timed_out.append(item)
                     else:
                         remaining.append(item)
 
@@ -12718,20 +13056,13 @@ class Tile(object):
                                 _safe_paste(new_im, chunk_img, sx, sy)
                                 chunks_with_images.add(id(chunk))
                                 if mipmap == 0:
-                                    self._set_mm0_chunk_provenance(
+                                    set_composed_source(
                                         chunk,
-                                        pydds.MipmapProvenance.EXACT_TARGET,
+                                        MipmapSource.TARGET_PROVIDER,
                                     )
                                 time_budget.record_chunk_processed()
                         except Exception as e:
                             log.error(f"GET_IMG: Pass 2 decode exception for {chunk}: {e}")
-
-                if timed_out:
-                    log.debug(f"GET_IMG: Pass 2: {len(timed_out)} chunks timed out after maxwait={maxwait:.1f}s")
-                    bump('chunk_pass2_timeout', len(timed_out))
-                    # Cancel timed-out chunks to free their worker slots
-                    for chunk, _, _ in timed_out:
-                        chunk.cancel()
 
                 still_waiting = remaining
                 if not still_waiting:
@@ -12847,10 +13178,10 @@ class Tile(object):
                     _safe_paste(new_im, chunk_img, sx, sy)
                     chunks_with_images.add(id(chunk))
                     if mipmap == 0:
-                        self._set_mm0_chunk_provenance(
+                        set_composed_source(
                             chunk,
                             chunk_source
-                            or pydds.MipmapProvenance.UNKNOWN,
+                            or MipmapSource.UNKNOWN,
                         )
                     time_budget.record_chunk_processed()
                 else:
@@ -12908,10 +13239,10 @@ class Tile(object):
                         _safe_paste(new_im, chunk_img, start_x, start_y)
                         chunks_with_images.add(id(chunk))
                         if mipmap == 0:
-                            self._set_mm0_chunk_provenance(
+                            set_composed_source(
                                 chunk,
                                 chunk_source
-                                or pydds.MipmapProvenance.UNKNOWN,
+                                or MipmapSource.UNKNOWN,
                             )
                         log.debug(f"GET_IMG: Recovered chunk via deferred lazy build fallback")
 
@@ -12949,6 +13280,8 @@ class Tile(object):
                     new_im = new_im.desaturate(saturation)
         
         # Return image along with mipmap and zoom level this was created at
+        if with_source_manifest and mipmap == 0:
+            return ComposedImageResult(new_im, bytes(composed_sources))
         return new_im
 
     def _try_lazy_build_fallback_mipmap(self, time_budget=None):
@@ -13171,15 +13504,20 @@ class Tile(object):
                 
                 # Wait for download with budget awareness
                 # Uses active_budget which may switch from main to fallback mid-wait
-                per_chunk_timeout = self.get_maxwait()
                 active_budget = get_active_budget()
                 if active_budget:
                     fallback_chunk_ready = active_budget.wait_with_budget(
-                        fallback_chunk.ready, max_single_wait=per_chunk_timeout
+                        fallback_chunk.ready,
+                        max_single_wait=active_budget.remaining,
                     )
                 else:
-                    # No budget constraints - use simple timeout
-                    fallback_chunk_ready = fallback_chunk.ready.wait(timeout=per_chunk_timeout)
+                    fallback_chunk_ready = fallback_chunk.ready.wait(
+                        timeout=self._row_wait_seconds(
+                            target_mipmap,
+                            None,
+                            self.get_maxwait(),
+                        )
+                    )
                 
                 if not fallback_chunk_ready:
                     # Check if we can switch to fallback budget and continue
@@ -13789,8 +14127,11 @@ class Tile(object):
                     # caused the native path to spin for minutes when a single
                     # chunk was unreachable, then fall through to get_img() for
                     # another 180s — total 360s stall.
-                    maxwait_cap = self.get_maxwait()
-                    wait_time = min(time_budget.remaining, maxwait_cap)
+                    wait_time = self._row_wait_seconds(
+                        mipmap,
+                        time_budget,
+                        self.get_maxwait(),
+                    )
                     if wait_time > 0:
                         wait_deadline = time.monotonic() + wait_time
                         
@@ -13908,6 +14249,10 @@ class Tile(object):
                 for data in zoom_datas
                 if data
             ] if "jpeg_datas_per_zoom" in locals() else jpeg_datas
+            mm0_generation = None
+            if mipmap == 0:
+                mm0_generation = self._mm0_rows.next_generation()
+                self._mm0_rows.mark_building(range(self.chunks_per_col))
             with self._source_lease(lease_sources):
                 with _native_build_context() as threads:
                     result = build_fn(
@@ -13923,50 +14268,62 @@ class Tile(object):
             if not result.data or len(result.data) < 16:
                 log.debug(f"_try_native_mipmap_build: Build produced too few bytes for mipmap {mipmap}")
                 return False
-            if mipmap == 0:
-                self._set_mm0_provenance(
-                    range(self.chunks_per_row * self.chunks_per_col),
-                    pydds.MipmapProvenance.EXACT_TARGET,
-                )
-            
             # Guard against DDS being cleared during build
             if self.dds is None:
                 log.debug(f"_try_native_mipmap_build: DDS cleared during build for {self.id}")
                 return False
             
-            # Write mipmap data to DDS buffers — short critical section
-            with self._dds_write_lock:
+            def install_native(_committed=None):
                 self.ready.clear()
-                if hasattr(result, 'mipmap_count') and result.mipmap_count > 0:
-                    # MipmapChainResult: write each mipmap to its DDS buffer
-                    for i in range(result.mipmap_count):
-                        target_mipmap = mipmap + i
-                        if target_mipmap < len(self.dds.mipmap_list):
-                            mip_data = result.get_mipmap_data(i)
-                            if mip_data:
-                                self.dds.replace_mipmap_dense(
-                                    target_mipmap,
-                                    mip_data,
-                                )
+                try:
+                    if hasattr(result, 'mipmap_count') and result.mipmap_count > 0:
+                        for i in range(result.mipmap_count):
+                            target_mipmap = mipmap + i
+                            if target_mipmap < len(self.dds.mipmap_list):
+                                mip_data = result.get_mipmap_data(i)
+                                if mip_data:
+                                    self.dds.replace_mipmap_dense(
+                                        target_mipmap,
+                                        mip_data,
+                                    )
 
-                    # For mipmaps beyond smallest_mm, copy the 4×4 block
-                    # (This matches Python gen_mipmaps behavior)
-                    smallest_mm = self.dds.smallest_mm
-                    if mipmap + result.mipmap_count - 1 >= smallest_mm:
-                        smallest_data = result.get_mipmap_data(result.mipmap_count - 1)
-                        if smallest_data:
-                            for mm in self.dds.mipmap_list[smallest_mm + 1:]:
-                                self.dds.replace_mipmap_dense(
-                                    mm.idx,
-                                    smallest_data,
-                                )
+                        smallest_mm = self.dds.smallest_mm
+                        if mipmap + result.mipmap_count - 1 >= smallest_mm:
+                            smallest_data = result.get_mipmap_data(result.mipmap_count - 1)
+                            if smallest_data:
+                                for mm in self.dds.mipmap_list[smallest_mm + 1:]:
+                                    self.dds.replace_mipmap_dense(
+                                        mm.idx,
+                                        smallest_data,
+                                    )
 
-                    log.debug(f"_try_native_mipmap_build: Built {result.mipmap_count} mipmaps "
-                             f"({mipmap} to {mipmap + result.mipmap_count - 1})")
-                else:
-                    # SingleMipmapResult: only write the one mipmap
-                    self.dds.replace_mipmap_dense(mipmap, result.data)
-                self.ready.set()
+                        log.debug(f"_try_native_mipmap_build: Built {result.mipmap_count} mipmaps "
+                                 f"({mipmap} to {mipmap + result.mipmap_count - 1})")
+                    else:
+                        self.dds.replace_mipmap_dense(mipmap, result.data)
+                finally:
+                    self.ready.set()
+
+            if mipmap == 0:
+                mm0_data = (
+                    result.get_mipmap_data(0)
+                    if hasattr(result, "mipmap_count")
+                    and result.mipmap_count > 0
+                    else result.data
+                )
+                row_results = self._make_mm0_row_results(
+                    mm0_data,
+                    bytes(
+                        [int(MipmapSource.TARGET_PROVIDER)]
+                        * (self.chunks_per_row * self.chunks_per_col)
+                    ),
+                    generation=mm0_generation,
+                )
+                if not self._commit_mm0_rows(row_results, install_native):
+                    return False
+            else:
+                with self._dds_write_lock:
+                    install_native()
             
             # Record timing stats
             total_time = time.monotonic() - build_start
@@ -14324,19 +14681,6 @@ class Tile(object):
                     zoom,
                     deadline,
                 )
-                with self._lock:
-                    self._dds_missing_indices = sorted(
-                        set(self._dds_missing_indices).union(missing_indices)
-                    )
-                    self._dds_fallback_indices = sorted(
-                        set(self._dds_fallback_indices).union(
-                            fallback_indices
-                        )
-                    )
-                    self._dds_needs_healing = bool(
-                        self._dds_missing_indices
-                        or self._dds_fallback_indices
-                    )
             else:
                 bump("native_partial_strict_build")
         
@@ -14348,6 +14692,23 @@ class Tile(object):
             )
 
             build_start = time.monotonic()
+            generation = self._mm0_rows.next_generation()
+            self._mm0_rows.mark_building(
+                range(startrow, endrow + 1),
+                prefetch=priority != PRIORITY_LIVE,
+            )
+            source_manifest = bytearray(
+                [int(MipmapSource.MISSING_COLOR)] * chunk_count
+            )
+            for index, jpeg_data in enumerate(jpeg_datas):
+                if jpeg_data is not None:
+                    source_manifest[index] = int(
+                        MipmapSource.TARGET_PROVIDER
+                    )
+            for global_index, source in fallback_provenance.items():
+                source_manifest[
+                    global_index - startrow * chunks_width
+                ] = int(source)
             
             # Build partial mipmap using native code
             with self._source_lease(
@@ -14384,26 +14745,25 @@ class Tile(object):
                 log.debug(f"_try_native_partial_mipmap_build: Build failed: {result.error}")
                 return False
             
-            if not result.data or len(result.data) < 16:
-                log.debug(f"_try_native_partial_mipmap_build: Too few bytes")
+            expected_length = (
+                (endrow - startrow + 1) * bytes_per_chunk_row
+            )
+            if not result.data or len(result.data) != expected_length:
+                log.debug(
+                    "_try_native_partial_mipmap_build: length mismatch "
+                    "%d != %d",
+                    len(result.data) if result.data else 0,
+                    expected_length,
+                )
                 return False
 
-            exact_indices = [
-                startrow * chunks_width + index
-                for index, data in enumerate(jpeg_datas)
-                if data is not None
-            ]
-            self._set_mm0_provenance(
-                exact_indices,
-                pydds.MipmapProvenance.EXACT_TARGET,
+            row_results = self._make_mm0_row_results(
+                result.data,
+                source_manifest,
+                start_row=startrow,
+                generation=generation,
             )
-            for index, source in fallback_provenance.items():
-                self._mm0_provenance.set_index(index, source)
-            self._set_mm0_provenance(
-                missing_indices,
-                pydds.MipmapProvenance.MISSING_COLOR,
-            )
-            
+
             # Guard against DDS being cleared during build
             if self.dds is None or len(self.dds.mipmap_list) == 0:
                 log.debug(f"_try_native_partial_mipmap_build: DDS cleared during build")
@@ -14412,37 +14772,35 @@ class Tile(object):
             if not coordinator.can_commit_partial(revision):
                 return True
 
-            with self._dds_write_lock:
+            def install_rows(committed):
                 self.ready.clear()
-                mm = self.dds.mipmap_list[mipmap]
-                row_offset = startrow * bytes_per_chunk_row
-                sparse = self.dds.ensure_sparse_mipmap(
-                    mipmap,
-                    bytes_per_chunk_row,
-                    coordinator.total_rows,
-                )
-                self.dds.write_mipmap_at(mipmap, row_offset, result.data)
-                allocated = sparse.allocated_bytes()
-                bump("sparse_dds_allocated_bytes", len(result.data))
-                bump(
-                    "sparse_dds_avoided_dense_bytes",
-                    max(0, mm.length - allocated),
-                )
-                profile_gauge("dds.sparse_allocated_bytes", allocated)
-                self.ready.set()
+                try:
+                    mm = self.dds.mipmap_list[mipmap]
+                    sparse = self.dds.ensure_sparse_mipmap(
+                        mipmap,
+                        bytes_per_chunk_row,
+                        coordinator.total_rows,
+                    )
+                    for row_result in committed:
+                        self.dds.write_mipmap_at(
+                            mipmap,
+                            row_result.manifest.row_index
+                            * bytes_per_chunk_row,
+                            row_result.data,
+                        )
+                    allocated = sparse.allocated_bytes()
+                    bump("sparse_dds_allocated_bytes", len(result.data))
+                    bump(
+                        "sparse_dds_avoided_dense_bytes",
+                        max(0, mm.length - allocated),
+                    )
+                    profile_gauge("dds.sparse_allocated_bytes", allocated)
+                finally:
+                    self.ready.set()
 
-            degraded_rows = {
-                index // chunks_width
-                for index in fallback_indices + missing_indices
-            }
-            self._queue_partial_rows(
-                mipmap,
-                startrow,
-                endrow,
-                bytes_per_chunk_row,
-                result.data,
-                degraded_rows,
-            )
+            if not self._commit_mm0_rows(row_results, install_rows):
+                return True
+            self._queue_partial_rows(row_results)
 
             build_succeeded = True
             build_time = time.monotonic() - build_start
@@ -14562,22 +14920,58 @@ class Tile(object):
 
         # Python path: get_img runs WITHOUT tile lock held
         log.debug(f"GET_MIPMAP: Next call is get_img which may block!.............")
-        new_im = self.get_img(mipmap, maxwait=self.get_maxwait(), time_budget=time_budget)
+        composed = self.get_img(
+            mipmap,
+            maxwait=self.get_maxwait(),
+            time_budget=time_budget,
+            with_source_manifest=mipmap == 0,
+        )
+        source_manifest = None
+        if isinstance(composed, ComposedImageResult):
+            new_im = composed.image
+            source_manifest = composed.source_manifest
+        else:
+            new_im = composed
         if not new_im:
             log.debug("GET_MIPMAP: No updates, so no image generated")
             return True
 
-        # DDS WRITE — short critical section (~10-50ms)
         compress_start_time = time.monotonic()
-        with self._dds_write_lock:
-            self.ready.clear()
-            try:
-                if mipmap == 0:
-                    self.dds.gen_mipmaps(new_im, mipmap, 0)
-                else:
+        if mipmap == 0:
+            generation = self._mm0_rows.next_generation()
+            self._mm0_rows.mark_building(range(self.chunks_per_col))
+            dxtdata = bytes(
+                self.dds.compress(
+                    new_im.size[0],
+                    new_im.size[1],
+                    new_im.data_ptr(),
+                )
+            )
+            row_results = self._make_mm0_row_results(
+                dxtdata,
+                source_manifest,
+                generation=generation,
+            )
+
+            def install_python_mm0(_committed):
+                self.ready.clear()
+                try:
+                    self.dds.replace_mipmap_dense(0, dxtdata)
+                finally:
+                    self.ready.set()
+
+            if not self._commit_mm0_rows(
+                row_results,
+                install_python_mm0,
+            ):
+                return False
+        else:
+            with self._dds_write_lock:
+                self.ready.clear()
+                try:
                     self.dds.gen_mipmaps(new_im, mipmap)
-            finally:
-                self.ready.set()
+                finally:
+                    self.ready.set()
 
         compress_end_time = time.monotonic()
 
@@ -14611,7 +15005,6 @@ class Tile(object):
         # Log tile completion when mipmap 0 is done (full tile delivered to X-Plane)
         if mipmap == 0 and not self._completion_reported:
             self._completion_reported = True
-            mm0_missing = None
             if self.first_request_time is not None:
                 tile_completion_time = time.monotonic() - self.first_request_time
             else:
@@ -14625,29 +15018,16 @@ class Tile(object):
                 try:
                     dds_bytes = self.dds.read_at(0, self.dds.total_size)
                     if dds_bytes and len(dds_bytes) >= 128:
-                        mm0_missing = None
-                        with self._lock:
-                            mm0_grid = self.chunks.get(self.max_zoom)
-                            mm0_chunks = (
-                                mm0_grid.ensure_all()
-                                if mm0_grid is not None
-                                else []
-                            )
-                        if mm0_chunks:
-                            missing = [i for i, c in enumerate(mm0_chunks)
-                                       if not (c.ready.is_set() and c.data)]
-                            if missing:
-                                mm0_missing = missing
-                                log.debug(f"GET_MIPMAP: Progressive store for {self.id} "
-                                          f"recording {len(missing)} missing chunks for healing")
                         self._finalize_build(
                             dds_bytes=dds_bytes,
-                            missing_indices=mm0_missing,
+                            mipmap_zero_manifest=self._mm0_manifest_rows(),
                         )
                 except Exception:
                     pass
             else:
-                self._finalize_build(missing_indices=mm0_missing)
+                self._finalize_build(
+                    mipmap_zero_manifest=self._mm0_manifest_rows(),
+                )
 
         log.debug(f"GET_MIPMAP: Tile {self} mipmap {mipmap} created in {total_creation_time:.2f}s "
                  f"(download+compose: {total_creation_time - compress_time:.2f}s, compress: {compress_time:.2f}s)")
@@ -14735,6 +15115,7 @@ class Tile(object):
             self._mipmap_builds.clear()
         for coordinator in coordinators:
             coordinator.close()
+        self._mm0_rows.close()
 
         # 3) Close all chunks
         try:
@@ -15327,12 +15708,6 @@ class TileCacher(object):
                     if not t:
                         continue
                     if t.refs > 0:
-                        continue
-                    if (
-                        hasattr(t, '_mm0_promotion_is_pinned') and
-                        t._mm0_promotion_is_pinned(now)
-                    ):
-                        bump('partial_mm0_promote_pin_evict_skip')
                         continue
                     # Pop from dict immediately - tile is now "orphaned"
                     try:

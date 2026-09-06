@@ -3,12 +3,21 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 from autoortho.diagnostics import (
     PerformanceProfiler,
     StageAggregate,
     _append_bounded_sample,
     _aggregate_memory_timeline,
+    export_imagery_comparison,
     finalize_session_report,
+)
+from autoortho import pydds
+from autoortho.dds_manifest import (
+    MipmapSource,
+    RowBuildManifest,
+    manifests_to_dict,
 )
 
 
@@ -91,7 +100,7 @@ def test_session_report_combines_process_timing_and_memory(tmp_path):
     assert "network.http_request" in markdown
     assert "HTTP request p95 exceeds 1 second" in markdown
     assert "Mipmap-zero delivery" in markdown
-    assert "| Exact target | 900 | 90.0% |" in markdown
+    assert "| Target-ZL provider response | 900 | 90.0% |" in markdown
     assert "Legacy prefetch settings combine unlimited lookahead" in markdown
 
     report = json.loads((session_dir / "report.json").read_text(encoding="utf-8"))
@@ -301,3 +310,73 @@ def test_report_prefers_checkpoint_over_observed_profile(tmp_path):
     assert report["process_count"] == 1
     assert report["processes"][0]["profile_status"] == "checkpoint"
     assert [row["stage"] for row in report["stages"]] == ["fuse.dds_read"]
+
+
+def test_export_imagery_comparison_writes_local_bundle(
+    tmp_path,
+    monkeypatch,
+):
+    dds = pydds.DDS(256, 256, dxt_format="BC1")
+    dds_bytes = dds.read_at(0, dds.total_size)
+    mm0 = dds.mipmap_list[0]
+    row_data = dds_bytes[mm0.startpos:mm0.endpos]
+    manifest = RowBuildManifest.create(
+        tile_id="0_0_BI_16",
+        target_zoom=16,
+        mipmap=0,
+        row_index=0,
+        build_generation=1,
+        sources=[MipmapSource.TARGET_PROVIDER],
+        compressed_data=row_data,
+    )
+    cache_dir = tmp_path / "cache"
+    metadata_dir = cache_dir / "dds_cache" / "tiles"
+    metadata_dir.mkdir(parents=True)
+    ddm_path = metadata_dir / "tile.ddm"
+    ddm_path.with_suffix(".dds").write_bytes(dds_bytes)
+    ddm_path.write_text(
+        json.dumps(
+            {
+                "v": 5,
+                "tile_row": 0,
+                "tile_col": 0,
+                "zl": 16,
+                "max_zl": 16,
+                "map": "BI",
+                "w": 256,
+                "h": 256,
+                "built": 1.0,
+                "disk_compression": "none",
+                "mm0_manifest": manifests_to_dict(
+                    {0: manifest},
+                    target_zoom=16,
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def tiny_mosaic(_cache_root, output_path, **_kwargs):
+        output_path.write_bytes(b"jpeg")
+        return {"present": 0, "expected": 1}
+
+    monkeypatch.setattr(
+        "autoortho.diagnostics._write_jpeg_mosaic",
+        tiny_mosaic,
+    )
+
+    output = export_imagery_comparison(ddm_path, tmp_path / "exports")
+
+    assert (output / "target-zl-mosaic.jpg").is_file()
+    assert (output / "lower-zl-parent-mosaic.jpg").is_file()
+    assert (output / "generated-dds-mipmap-zero.ppm").is_file()
+    assert (output / "row-manifests.json").is_file()
+    assert (output / "ddm-metadata.json").is_file()
+    assert (output / "timing-summary.json").is_file()
+    assert (output / "checksums.json").is_file()
+
+    unsafe = json.loads(ddm_path.read_text(encoding="utf-8"))
+    unsafe["map"] = "../../escape"
+    ddm_path.write_text(json.dumps(unsafe), encoding="utf-8")
+    with pytest.raises(ValueError, match="unsafe"):
+        export_imagery_comparison(ddm_path, tmp_path / "safe-root")

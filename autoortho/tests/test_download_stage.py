@@ -161,7 +161,19 @@ def test_apple_403_rotates_token_once_then_retries(tmp_path, monkeypatch):
         version = "v1"
         apple_token = "token-a"
 
-        def reset_apple_maps_token(self, expected_generation=None):
+        def snapshot(self, wait=True):
+            return (
+                self.apple_token,
+                self.version,
+                self.generation,
+                True,
+            )
+
+        def reset_apple_maps_token(
+            self,
+            expected_generation=None,
+            status_code=None,
+        ):
             resets.append(expected_generation)
             FakeAppleTokenService.generation += 1
             FakeAppleTokenService.apple_token = "token-b"
@@ -758,8 +770,8 @@ def test_provider_settings_defaults():
     from types import SimpleNamespace
 
     cfg = SimpleNamespace(autoortho=SimpleNamespace())
-    assert aoconfig.resolve_provider_setting("provider_max_in_flight", cfg) == 128
-    assert aoconfig.resolve_provider_setting("provider_max_connections", cfg) == 64
+    assert aoconfig.resolve_provider_setting("provider_max_in_flight", cfg) == 320
+    assert aoconfig.resolve_provider_setting("provider_max_connections", cfg) == 160
     assert aoconfig.resolve_provider_setting("download_dispatch_workers", cfg) == 4
     assert aoconfig.resolve_provider_setting("provider_queue_timeout", cfg) == 60.0
 
@@ -789,7 +801,7 @@ def test_legacy_aliases_apply_only_when_new_setting_is_default():
     )
     assert (
         aoconfig.resolve_provider_setting("provider_max_in_flight", untouched)
-        == 128
+        == 320
     )
 
     extreme_legacy = SimpleNamespace(
@@ -811,14 +823,14 @@ def test_provider_settings_are_clamped_and_fault_tolerant():
     assert aoconfig.resolve_provider_setting("provider_max_in_flight", huge) == 1024
 
     junk = SimpleNamespace(autoortho=SimpleNamespace(provider_max_in_flight="nope"))
-    assert aoconfig.resolve_provider_setting("provider_max_in_flight", junk) == 128
+    assert aoconfig.resolve_provider_setting("provider_max_in_flight", junk) == 320
 
 
 def test_explicit_modern_provider_setting_wins_over_legacy(tmp_path):
     path = tmp_path / ".autoortho"
     path.write_text(
         "[autoortho]\n"
-        "provider_max_in_flight = 128\n"
+        "provider_max_in_flight = 320\n"
         "max_concurrent_downloads = 2000\n",
         encoding="utf-8",
     )
@@ -828,7 +840,7 @@ def test_explicit_modern_provider_setting_wins_over_legacy(tmp_path):
     assert aoconfig.resolve_provider_setting(
         "provider_max_in_flight",
         cfg,
-    ) == 128
+    ) == 320
     assert cfg.autoortho.max_concurrent_downloads == 256
 
 
@@ -857,7 +869,7 @@ def test_legacy_provider_setting_is_migrated_once(tmp_path):
 def test_saved_modern_default_remains_authoritative(tmp_path):
     path = tmp_path / ".autoortho"
     original = aoconfig.AOConfig(str(path))
-    assert original.autoortho.provider_max_in_flight == 128
+    assert original.autoortho.provider_max_in_flight == 320
 
     text = path.read_text(encoding="utf-8")
     text = text.replace(
@@ -868,12 +880,12 @@ def test_saved_modern_default_remains_authoritative(tmp_path):
 
     reloaded = aoconfig.AOConfig(str(path))
 
-    assert reloaded.autoortho.provider_max_in_flight == 128
+    assert reloaded.autoortho.provider_max_in_flight == 320
     assert reloaded.autoortho.max_concurrent_downloads == 256
     assert aoconfig.resolve_provider_setting(
         "provider_max_in_flight",
         reloaded,
-    ) == 128
+    ) == 320
 
 
 def test_worker_reload_uses_fresh_legacy_value(tmp_path, monkeypatch):

@@ -28,6 +28,7 @@ class PrefetchSource(str, Enum):
     DSF = "dsf"
     VELOCITY = "velocity"
     SIMBRIEF = "simbrief"
+    PARTIAL_CACHE_PROMOTION = "partial_cache_promotion"
     LIVE = "live"
 
 
@@ -358,6 +359,7 @@ class PrefetchCandidate:
             PrefetchSource.LIVE: 0,
             PrefetchSource.VELOCITY: 1,
             PrefetchSource.SIMBRIEF: 1,
+            PrefetchSource.PARTIAL_CACHE_PROMOTION: 2,
             PrefetchSource.DSF: 3,
         }
         if not self.evidence:
@@ -393,11 +395,38 @@ class PrefetchCandidate:
     def priority(self, now: Optional[float] = None) -> tuple:
         now = time.monotonic() if now is None else now
         bounded_age = min(300.0, max(0.0, now - self.created_at))
+        work_order = {
+            WorkClass.LIVE: 0,
+            WorkClass.IMMINENT_PREFETCH: 1,
+            WorkClass.REGULAR_PREFETCH: 2,
+            WorkClass.HEALING: 3,
+            WorkClass.DISTANT_PREFETCH: 4,
+        }
+        grid = None
+        if self.lease is not None:
+            tile = self.lease.tile
+            grid = tile.chunks.get(tile.max_zoom)
+        width = max(1, int(getattr(grid, "width", 1)))
+        logical_length = max(
+            len(self.exact_coverage),
+            int(getattr(grid, "logical_length", 0)),
+        )
+        row_remaining = {}
+        for index in range(logical_length):
+            if index not in self.exact_coverage:
+                row = index // width
+                row_remaining[row] = row_remaining.get(row, 0) + 1
+        next_row_remaining = min(row_remaining.values(), default=0)
+        total_remaining = max(0, logical_length - len(self.exact_coverage))
         return (
+            work_order.get(self.work_class, 4),
             int(self.source_rank),
             int(self.quality_class),
             float(self.eta_seconds),
             float(self.distance_meters),
+            next_row_remaining,
+            total_remaining,
+            1 if not self.exact_coverage else 0,
             -float(self.source_confidence),
             -bounded_age,
             int(self.sequence),
@@ -1093,10 +1122,59 @@ class PrefetchCoordinator:
                         and candidate.generations.get(source) == token[1]
                     ):
                         candidate.generations.pop(source, None)
-                        candidate.evidence.pop(source, None)
+                        removed_evidence = candidate.evidence.pop(
+                            source,
+                            None,
+                        )
                         candidate.recompute_priority()
                         if not candidate.evidence:
-                            self._stale_locked(candidate)
+                            if (
+                                candidate.exact_coverage
+                                or candidate.persisted_exact_rows
+                            ):
+                                candidate.evidence[
+                                    PrefetchSource.PARTIAL_CACHE_PROMOTION
+                                ] = SourceEvidence(
+                                    generation=(
+                                        "retained",
+                                        candidate.sequence,
+                                    ),
+                                    eta=(
+                                        removed_evidence.eta
+                                        if removed_evidence is not None
+                                        else 600.0
+                                    ),
+                                    distance=(
+                                        removed_evidence.distance
+                                        if removed_evidence is not None
+                                        else 30 * 1852
+                                    ),
+                                    confidence=0.5,
+                                    quality_class=2,
+                                    path_start=(
+                                        removed_evidence.path_start
+                                        if removed_evidence is not None
+                                        else None
+                                    ),
+                                    path_end=(
+                                        removed_evidence.path_end
+                                        if removed_evidence is not None
+                                        else None
+                                    ),
+                                )
+                                candidate.recompute_priority()
+                                candidate.state = CandidateState.PARTIAL_EXACT
+                                candidate.priority_revision += 1
+                                self._queue.put(
+                                    candidate,
+                                    item_key=key,
+                                    item_priority=candidate.priority(),
+                                )
+                                self._metric(
+                                    "prefetch_candidates_retained_exact_progress"
+                                )
+                            else:
+                                self._stale_locked(candidate)
                         else:
                             candidate.priority_revision += 1
                             self._queue.put(
@@ -1639,6 +1717,34 @@ class PrefetchCoordinator:
                 height,
                 candidate.cursor.ordering_revision,
             )
+        row_remaining = {}
+        for index in range(width * height):
+            if index not in candidate.exact_coverage:
+                row = index // width
+                row_remaining[row] = row_remaining.get(row, 0) + 1
+        path_position = {
+            index: position for position, index in enumerate(order.indices)
+        }
+
+        def completion_rank(index):
+            row = index // width
+            neighbors = sum(
+                neighbor in candidate.exact_coverage
+                for neighbor in (index - 1, index + 1)
+                if 0 <= neighbor < width * height
+                and neighbor // width == row
+            )
+            return (
+                path_position[index] // width,
+                row_remaining.get(row, 0),
+                -neighbors,
+                path_position[index],
+            )
+
+        order = ChunkOrder(
+            order.revision,
+            tuple(sorted(order.indices, key=completion_rank)),
+        )
         candidate.chunk_order = order
         return order
 
@@ -2581,6 +2687,9 @@ class PrefetchCoordinator:
         victim = max(
             candidates,
             key=lambda item: (
+                0 if not (
+                    item.coverage or item.persisted_exact_rows
+                ) else -1,
                 item.distance_meters,
                 item.eta_seconds,
                 -len(item.coverage),
@@ -2592,27 +2701,26 @@ class PrefetchCoordinator:
             victim.state = CandidateState.STALE
             self._queue.remove(victim.key)
             self._metric("prefetch_candidates_evicted")
-            if not victim.coverage and not victim.persisted_exact_rows:
-                source, evidence = min(
-                    victim.evidence.items(),
-                    key=lambda item: (
-                        victim.source_rank
-                        if item[0] in victim.sources
-                        else 5,
-                        item[1].eta,
-                    ),
-                    default=(None, None),
+            source, evidence = min(
+                victim.evidence.items(),
+                key=lambda item: (
+                    victim.source_rank
+                    if item[0] in victim.sources
+                    else 5,
+                    item[1].eta,
+                ),
+                default=(None, None),
+            )
+            if source is not None and evidence is not None:
+                self._rediscovery[victim.key] = (
+                    source,
+                    evidence.generation,
+                    evidence.eta,
+                    time.monotonic() + self._rediscovery_ttl,
                 )
-                if source is not None and evidence is not None:
-                    self._rediscovery[victim.key] = (
-                        source,
-                        evidence.generation,
-                        evidence.eta,
-                        time.monotonic() + self._rediscovery_ttl,
-                    )
-                    self._rediscovery.move_to_end(victim.key)
-                    while len(self._rediscovery) > self._rediscovery_limit:
-                        self._rediscovery.popitem(last=False)
+                self._rediscovery.move_to_end(victim.key)
+                while len(self._rediscovery) > self._rediscovery_limit:
+                    self._rediscovery.popitem(last=False)
             self._release_candidate(victim)
 
     def _metric(self, name: str, value: int = 1) -> None:

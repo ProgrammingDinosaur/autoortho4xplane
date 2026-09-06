@@ -1077,18 +1077,19 @@ ReplyCallback = Callable[..., "asyncio.Future"]
 
 
 class _AsyncIndexedPriorityQueue:
-    """Event-loop-local revisioned queue with bounded tombstones."""
+    """Revisioned priority queue with targeted, cancellation-safe wakeups."""
 
     def __init__(self):
         self._heap = []
         self._entries = {}
-        self._event = asyncio.Event()
+        self._getters: collections.deque[asyncio.Future[None]] = collections.deque()
         self._tombstones = 0
 
     def put_nowait(self, item):
         priority, sequence, revision, entry = item
         key = entry.key
-        if key in self._entries:
+        is_new = key not in self._entries
+        if not is_new:
             self._tombstones += 1
         self._entries[key] = item
         heapq.heappush(
@@ -1097,7 +1098,15 @@ class _AsyncIndexedPriorityQueue:
         )
         if self._tombstones > max(32, len(self._entries)):
             self._compact()
-        self._event.set()
+        if is_new:
+            self._wake_next_getter()
+
+    def _wake_next_getter(self):
+        while self._getters:
+            getter = self._getters.popleft()
+            if not getter.done():
+                getter.set_result(None)
+                break
 
     async def get(self):
         while True:
@@ -1115,10 +1124,20 @@ class _AsyncIndexedPriorityQueue:
                     continue
                 self._entries.pop(key, None)
                 return priority, sequence, revision, item[3]
-            self._event.clear()
-            if self._heap:
-                continue
-            await self._event.wait()
+            getter = asyncio.get_running_loop().create_future()
+            self._getters.append(getter)
+            try:
+                await getter
+            except asyncio.CancelledError:
+                getter.cancel()
+                try:
+                    self._getters.remove(getter)
+                except ValueError:
+                    pass  # Already removed by the producer that woke us.
+                if self._entries and not getter.cancelled():
+                    # Cancellation after wakeup must pass the work to a sleeper.
+                    self._wake_next_getter()
+                raise
 
     def remove(self, key):
         if self._entries.pop(key, None) is not None:
@@ -1466,6 +1485,16 @@ class _AdaptiveConcurrencyController:
 
 
 @dataclass
+class _StablePoint:
+    concurrency: int
+    requests_per_second: float
+    bytes_per_second: float
+    p50_ttfb: float
+    p95_ttfb: float
+    error_rate: float
+
+
+@dataclass
 class _WindowObservation:
     started_at: float
     completed: int = 0
@@ -1483,6 +1512,10 @@ class _WindowObservation:
     stable_throughput: float = 0.0
     stable_p95: float = 0.0
     probe_from: int = 0
+    backlog_samples: int = 0
+    bad_utilized_windows: int = 0
+    probe_utilized_windows: int = 0
+    stable_point: Optional[_StablePoint] = None
 
 
 class _WindowedAdaptiveConcurrencyController(_AdaptiveConcurrencyController):
@@ -1548,6 +1581,9 @@ class _WindowedAdaptiveConcurrencyController(_AdaptiveConcurrencyController):
                 stable_throughput=window.stable_throughput,
                 stable_p95=window.stable_p95,
                 probe_from=window.probe_from,
+                bad_utilized_windows=window.bad_utilized_windows,
+                probe_utilized_windows=window.probe_utilized_windows,
+                stable_point=window.stable_point,
             )
             self._windows[origin] = window
         window.completed += 1
@@ -1556,6 +1592,8 @@ class _WindowedAdaptiveConcurrencyController(_AdaptiveConcurrencyController):
             window.peak_active,
             self._state(origin).active,
         )
+        if queue_depth > 0:
+            window.backlog_samples += 1
         if is_live:
             window.live += 1
         else:
@@ -1578,59 +1616,93 @@ class _WindowedAdaptiveConcurrencyController(_AdaptiveConcurrencyController):
         window = self._window(origin)
         elapsed = max(self._window_seconds, self._clock() - window.started_at)
         completed = max(1, window.completed)
+        requests_per_second = window.completed / elapsed
         throughput = window.response_bytes / elapsed
+        p50 = self._percentile(window.ttfb, 0.50)
         p95 = self._percentile(window.ttfb, 0.95)
         throttle_ratio = window.throttles / completed
         error_ratio = (window.throttles + window.errors) / completed
-        utilized = (
-            window.peak_active >= max(1, math.ceil(state.limit * 0.75))
-            or queue_depth > 0
+        utilization = window.peak_active / max(1, state.limit)
+        backlog_ratio = window.backlog_samples / completed
+        eligible = (
+            window.completed >= 4
+            and utilization >= 0.75
+            and backlog_ratio >= 0.25
         )
         action = "hold"
         can_decrease = (
             self._clock() - state.last_decrease >= self._cooldown
         )
+        stable_point = window.stable_point
+        stable_p95 = (
+            stable_point.p95_ttfb
+            if stable_point is not None
+            else window.stable_p95
+        )
+        latency_regressed = (
+            stable_p95 > 0
+            and p95 > stable_p95 * 1.50
+        )
+        moderate_error = 0.05 <= error_ratio < 0.20
+        bad_utilized_window = eligible and (
+            latency_regressed or moderate_error
+        )
+        bad_windows = (
+            window.bad_utilized_windows + 1
+            if bad_utilized_window
+            else 0
+        )
 
-        if error_ratio >= 0.50 and completed >= 4 and can_decrease:
+        # Genuine overload responses are actionable immediately and may cross
+        # the stable safety floor.
+        if error_ratio >= 0.50 and window.completed >= 4 and can_decrease:
             state.limit = max(self._minimum, int(state.limit * 0.50))
             state.decreases += 1
             state.last_decrease = self._clock()
             action = "severe_decrease"
-        elif throttle_ratio >= 0.20 and completed >= 4 and can_decrease:
+        elif throttle_ratio >= 0.20 and window.completed >= 4 and can_decrease:
             state.limit = max(self._minimum, int(state.limit * 0.65))
             state.decreases += 1
             state.last_decrease = self._clock()
             action = "overload_decrease"
-        elif (
-            error_ratio >= 0.05
-            or (
-                window.stable_p95 > 0
-                and p95 > window.stable_p95 * 1.50
+        elif bad_windows >= 2 and can_decrease:
+            stable_limit = (
+                stable_point.concurrency
+                if stable_point is not None
+                else window.stable_limit or state.limit
             )
-        ) and completed >= 4 and can_decrease:
-            state.limit = max(
+            safety_floor = max(
                 self._minimum,
+                int(math.ceil(stable_limit * 0.50)),
+            )
+            state.limit = max(
+                safety_floor,
                 min(state.limit - 1, int(state.limit * 0.85)),
             )
             state.decreases += 1
             state.last_decrease = self._clock()
             action = "moderate_decrease"
+            bad_windows = 0
         elif (
             window.probe_from
             and window.stable_throughput > 0
             and throughput < window.stable_throughput * 0.90
-            and completed >= 4
+            and eligible
             and can_decrease
         ):
-            state.limit = max(
-                self._minimum,
-                min(state.ceiling, window.probe_from),
-            )
-            state.decreases += 1
-            state.last_decrease = self._clock()
-            action = "probe_rollback"
+            window.probe_utilized_windows += 1
+            if window.probe_utilized_windows >= 2:
+                state.limit = max(
+                    self._minimum,
+                    min(state.ceiling, window.probe_from),
+                )
+                state.decreases += 1
+                state.last_decrease = self._clock()
+                action = "probe_rollback"
+            else:
+                action = "probe_observing"
         elif (
-            utilized
+            eligible
             and can_decrease
             and error_ratio < 0.02
             and window.slow == 0
@@ -1652,8 +1724,9 @@ class _WindowedAdaptiveConcurrencyController(_AdaptiveConcurrencyController):
             state.increases += 1
             action = "window_increase"
             window.probe_from = previous
+            window.probe_utilized_windows = 0
 
-        clean = error_ratio < 0.02 and window.slow == 0 and action not in {
+        clean = eligible and error_ratio < 0.02 and window.slow == 0 and action not in {
             "probe_rollback",
             "severe_decrease",
             "overload_decrease",
@@ -1668,13 +1741,43 @@ class _WindowedAdaptiveConcurrencyController(_AdaptiveConcurrencyController):
             window.stable_throughput = 0.0
             window.stable_p95 = 0.0
             window.probe_from = 0
+            window.stable_point = None
         if clean and throughput >= window.stable_throughput:
             window.stable_limit = state.limit
             window.stable_throughput = throughput
             if p95 > 0:
                 window.stable_p95 = p95
+            window.stable_point = _StablePoint(
+                concurrency=state.limit,
+                requests_per_second=requests_per_second,
+                bytes_per_second=throughput,
+                p50_ttfb=p50,
+                p95_ttfb=p95,
+                error_rate=error_ratio,
+            )
         if action != "hold":
             self._report(origin, state, action)
+        record_stage(
+            "broker.origin_window",
+            elapsed * 1000.0,
+            outcome=action,
+            details={
+                "origin": origin,
+                "limit": state.limit,
+                "active_peak": window.peak_active,
+                "utilization": utilization,
+                "backlog_ratio": backlog_ratio,
+                "completed": window.completed,
+                "live_completed": window.live,
+                "background_completed": window.background,
+                "requests_per_second": requests_per_second,
+                "bytes_per_second": throughput,
+                "p50_ttfb": p50,
+                "p95_ttfb": p95,
+                "error_rate": error_ratio,
+                "eligible": eligible,
+            },
+        )
 
         self._windows[origin] = _WindowObservation(
             started_at=self._clock(),
@@ -1683,9 +1786,16 @@ class _WindowedAdaptiveConcurrencyController(_AdaptiveConcurrencyController):
             stable_p95=window.stable_p95,
             probe_from=(
                 window.probe_from
-                if action == "window_increase"
+                if action in {"window_increase", "probe_observing"}
                 else 0
             ),
+            bad_utilized_windows=bad_windows,
+            probe_utilized_windows=(
+                window.probe_utilized_windows
+                if action in {"window_increase", "probe_observing"}
+                else 0
+            ),
+            stable_point=window.stable_point,
         )
 
     def snapshot(self) -> Dict[str, Dict[str, Any]]:
@@ -1714,6 +1824,106 @@ class _WindowedAdaptiveConcurrencyController(_AdaptiveConcurrencyController):
         return settings
 
 
+class _TransportLifecycleMetrics:
+    """Aggregate supported httpcore trace events without retaining requests."""
+
+    def __init__(self, enabled=False, *, clock=time.monotonic):
+        self.enabled = bool(enabled)
+        self._clock = clock
+        self._counts = collections.Counter()
+        self._duration_total = collections.Counter()
+        self._connection_started = collections.OrderedDict()
+        self._endpoints = collections.Counter()
+
+    def trace_callback(self):
+        started = {}
+
+        async def trace(name, info):
+            if not self.enabled:
+                return
+            now = self._clock()
+            event = str(name)
+            base, _, phase = event.rpartition(".")
+            if phase == "started":
+                started[base] = now
+                self._counts[f"{base}.started"] += 1
+            elif phase in {"complete", "failed"}:
+                self._counts[f"{base}.{phase}"] += 1
+                began = started.pop(base, None)
+                if began is not None:
+                    self._duration_total[base] += max(0.0, now - began)
+
+            if event.endswith("connect_tcp.complete"):
+                self._counts["tcp_connections_opened"] += 1
+                stream = info.get("return_value") or info.get("network_stream")
+                if stream is not None:
+                    self._connection_started[id(stream)] = now
+                    self._connection_started.move_to_end(id(stream))
+                    while len(self._connection_started) > 4096:
+                        self._connection_started.popitem(last=False)
+                    try:
+                        endpoint = stream.get_extra_info("server_addr")
+                    except (AttributeError, OSError):
+                        endpoint = None
+                    if endpoint:
+                        self._endpoints[str(endpoint)] += 1
+                        if len(self._endpoints) > 256:
+                            for stale, _count in self._endpoints.most_common()[
+                                128:
+                            ]:
+                                del self._endpoints[stale]
+            elif event.endswith("start_tls.complete"):
+                self._counts["tls_handshakes"] += 1
+            elif event.endswith("send_request_headers.started"):
+                self._counts["requests_started"] += 1
+            elif event.endswith("close.complete"):
+                stream = info.get("network_stream")
+                opened = (
+                    self._connection_started.pop(id(stream), None)
+                    if stream is not None
+                    else None
+                )
+                if opened is not None:
+                    self._counts["connections_closed"] += 1
+                    self._duration_total["connection_lifetime"] += max(
+                        0.0,
+                        now - opened,
+                    )
+            if "resolve" in event and phase == "complete":
+                self._counts["dns_resolutions"] += 1
+            if (
+                phase == "failed"
+                and ("connect" in base or "tls" in base)
+            ):
+                self._counts["connection_establishment_failures"] += 1
+
+        return trace
+
+    def snapshot(self):
+        now = self._clock()
+        while self._connection_started:
+            _key, opened = next(iter(self._connection_started.items()))
+            if now - opened <= 3600.0:
+                break
+            self._connection_started.popitem(last=False)
+        requests = self._counts.get("requests_started", 0)
+        opened = self._counts.get("tcp_connections_opened", 0)
+        result = dict(self._counts)
+        result["keepalive_reuses"] = max(0, requests - opened)
+        result["requests_per_connection"] = (
+            requests / opened if opened else 0.0
+        )
+        result["duration_seconds"] = dict(self._duration_total)
+        result["cdn_endpoints"] = dict(self._endpoints.most_common(16))
+        result["observed_open_connections"] = len(self._connection_started)
+        result["max_observed_connection_age_seconds"] = max(
+            (now - opened for opened in self._connection_started.values()),
+            default=0.0,
+        )
+        result["enabled"] = self.enabled
+        return result
+
+
 class _BrokerCore:
     """Owns the httpx client, priority queue and coalescing/cancellation state."""
 
@@ -1726,6 +1936,7 @@ class _BrokerCore:
         reply_cb: ReplyCallback,
         transport: Any = None,
         adaptive: Optional[Dict[str, Any]] = None,
+        transport_trace: bool = False,
     ):
         _require_dependencies(require_http2=transport is None)
         limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections)
@@ -1751,6 +1962,9 @@ class _BrokerCore:
         self._workers: list = []
         self._stopping = False
         self._active_requests = 0
+        self._transport_metrics = _TransportLifecycleMetrics(
+            transport_trace
+        )
 
         adaptive_kwargs = dict(adaptive or {})
         adaptive_kwargs.setdefault("maximum", self._max_concurrency)
@@ -2073,6 +2287,7 @@ class _BrokerCore:
             "max_concurrency": self._max_concurrency,
             "adaptive": self._limiter.settings(),
             "origins": self._limiter.snapshot(),
+            "transport": self._transport_metrics.snapshot(),
         }
 
     async def _worker_loop(self) -> None:
@@ -2141,7 +2356,18 @@ class _BrokerCore:
             # A server that continuously trickles bytes can otherwise keep a
             # coalesced request alive indefinitely as new waiters join it.
             async with asyncio.timeout(entry.timeout.total_seconds()):
-                async with self._client.stream(entry.method, entry.url, headers=entry.headers, timeout=timeout) as resp:
+                extensions = None
+                if self._transport_metrics.enabled:
+                    extensions = {
+                        "trace": self._transport_metrics.trace_callback()
+                    }
+                async with self._client.stream(
+                    entry.method,
+                    entry.url,
+                    headers=entry.headers,
+                    timeout=timeout,
+                    extensions=extensions,
+                ) as resp:
                     headers_received = time.monotonic()
                     observed_versions = [
                         history.http_version
@@ -2308,6 +2534,7 @@ class _RouterServer:
             reply_cb=self._send,
             transport=transport,
             adaptive=config.get("adaptive"),
+            transport_trace=bool(config.get("transport_trace", False)),
         )
 
     async def _send(
@@ -2477,6 +2704,7 @@ def _server_config(
     max_response_bytes,
     profile_environment=None,
     adaptive=None,
+    transport_trace=False,
 ) -> Dict[str, Any]:
     return {
         "max_concurrency": max_concurrency,
@@ -2485,6 +2713,7 @@ def _server_config(
         "max_response_bytes": max_response_bytes,
         "profile_environment": dict(profile_environment or {}),
         "adaptive": dict(adaptive or {}),
+        "transport_trace": bool(transport_trace),
     }
 
 
@@ -2790,6 +3019,7 @@ class HTTP2Broker:
         origin_decrease_factor: float = DEFAULT_ORIGIN_DECREASE_FACTOR,
         origin_cooldown_seconds: float = DEFAULT_ORIGIN_COOLDOWN_SECONDS,
         queue_timeout: float = 60.0,
+        transport_trace: bool = False,
     ):
         if transport is not None and not in_process:
             raise ValueError("transport injection is only supported with in_process=True")
@@ -2813,6 +3043,7 @@ class HTTP2Broker:
         )
         self._live_priority_threshold = int(live_priority_threshold)
         self._profile_environment = dict(profile_environment or {})
+        self._transport_trace = bool(transport_trace)
         self._adaptive = _adaptive_config(
             enabled=adaptive_concurrency,
             initial=min(
@@ -2871,6 +3102,7 @@ class HTTP2Broker:
             max_response_bytes=self._max_response_bytes,
             profile_environment=self._profile_environment,
             adaptive=self._adaptive,
+            transport_trace=self._transport_trace,
         )
 
         if self._in_process:

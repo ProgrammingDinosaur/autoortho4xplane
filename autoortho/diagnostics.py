@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import heapq
 import json
 import logging
@@ -46,6 +47,274 @@ _MAX_OBSERVED_MEMORY_SAMPLES = 7_200
 
 _active_profiler: Optional["PerformanceProfiler"] = None
 _active_profiler_lock = threading.RLock()
+
+
+def export_imagery_comparison(
+    ddm_path: str | Path,
+    output_root: str | Path,
+) -> Path:
+    """Export a local, token-free comparison bundle for one compiled tile."""
+    metadata_path = Path(ddm_path).expanduser().resolve()
+    if metadata_path.suffix.lower() != ".ddm" or not metadata_path.is_file():
+        raise ValueError("select an existing .ddm tile metadata file")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    required = (
+        "tile_row",
+        "tile_col",
+        "zl",
+        "max_zl",
+        "map",
+        "mm0_manifest",
+    )
+    if any(key not in metadata for key in required):
+        raise ValueError("DDM does not contain v5 tile manifest metadata")
+    if int(metadata.get("v", 0)) != 5:
+        raise ValueError("only DDM v5 entries can be exported")
+
+    dds_path = metadata_path.with_suffix(".dds")
+    if not dds_path.is_file():
+        raise ValueError("the DDM has no compiled DDS file")
+    cache_root = next(
+        (
+            parent.parent
+            for parent in metadata_path.parents
+            if parent.name == "dds_cache"
+        ),
+        None,
+    )
+    if cache_root is None:
+        raise ValueError("the DDM is not inside an AutoOrtho DDS cache")
+
+    try:
+        tile_row = int(metadata["tile_row"])
+        tile_col = int(metadata["tile_col"])
+        tile_zoom = int(metadata["zl"])
+        target_zoom = int(metadata["max_zl"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("DDM tile coordinates and zooms must be integers") from exc
+    maptype = str(metadata["map"])
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", maptype):
+        raise ValueError("DDM map type contains unsafe characters")
+    tile_id = f"{tile_row}_{tile_col}_{maptype}_{tile_zoom}"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output_root = Path(output_root).expanduser().resolve()
+    output_dir = (
+        output_root
+        / f"imagery-comparison-{tile_id}-z{target_zoom}-{timestamp}"
+    )
+    output_dir.mkdir(parents=True, exist_ok=False)
+
+    missing_color = (66, 77, 55)
+    target_stats = _write_jpeg_mosaic(
+        cache_root,
+        output_dir / "target-zl-mosaic.jpg",
+        row=tile_row,
+        col=tile_col,
+        tile_zoom=tile_zoom,
+        source_zoom=target_zoom,
+        maptype=maptype,
+        missing_color=missing_color,
+    )
+    lower_stats = _write_jpeg_mosaic(
+        cache_root,
+        output_dir / "lower-zl-parent-mosaic.jpg",
+        row=tile_row,
+        col=tile_col,
+        tile_zoom=tile_zoom,
+        source_zoom=max(0, target_zoom - 1),
+        maptype=maptype,
+        missing_color=missing_color,
+    )
+
+    dds_bytes = dds_path.read_bytes()
+    if metadata.get("disk_compression") == "zstd":
+        try:
+            import zstandard
+        except ImportError as exc:
+            raise RuntimeError(
+                "zstandard is required to decode this cached DDS"
+            ) from exc
+        dds_bytes = zstandard.ZstdDecompressor().decompress(dds_bytes)
+    _write_dds_mipmap_zero_ppm(
+        dds_bytes,
+        output_dir / "generated-dds-mipmap-zero.ppm",
+        width=int(metadata.get("w", 0)),
+        height=int(metadata.get("h", 0)),
+        dds_format=str(metadata.get("fmt", "BC1")),
+    )
+
+    (output_dir / "row-manifests.json").write_text(
+        json.dumps(metadata["mm0_manifest"], indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    (output_dir / "ddm-metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    timing = {
+        "tile": tile_id,
+        "target_zoom": target_zoom,
+        "compiled_at_epoch": metadata.get("built"),
+        "exported_at": _utc_now_iso(),
+        "target_jpegs": target_stats,
+        "lower_zl_jpegs": lower_stats,
+    }
+    (output_dir / "timing-summary.json").write_text(
+        json.dumps(timing, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    checksums = {}
+    for path in sorted(output_dir.iterdir()):
+        if path.is_file():
+            checksums[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (output_dir / "checksums.json").write_text(
+        json.dumps(checksums, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return output_dir
+
+
+def _write_jpeg_mosaic(
+    cache_root: Path,
+    output_path: Path,
+    *,
+    row: int,
+    col: int,
+    tile_zoom: int,
+    source_zoom: int,
+    maptype: str,
+    missing_color: tuple[int, int, int],
+) -> dict:
+    try:
+        from autoortho.aoimage import AoImage as Image
+    except ImportError:
+        from aoimage import AoImage as Image
+
+    zoom_diff = tile_zoom - source_zoom
+    if zoom_diff >= 0:
+        origin_col = col >> zoom_diff
+        origin_row = row >> zoom_diff
+        width = height = max(1, 16 >> zoom_diff)
+    else:
+        shift = -zoom_diff
+        origin_col = col << shift
+        origin_row = row << shift
+        width = height = 16 << shift
+    mosaic = Image.new(
+        "RGBA",
+        (width * 256, height * 256),
+        missing_color,
+    )
+    if mosaic is None:
+        raise RuntimeError("could not allocate the diagnostic mosaic")
+    present = 0
+    try:
+        for y in range(height):
+            for x in range(width):
+                jpeg_path = cache_root / (
+                    f"{origin_col + x}_{origin_row + y}_"
+                    f"{source_zoom}_{maptype}.jpg"
+                )
+                if not jpeg_path.is_file():
+                    continue
+                try:
+                    source = Image.load_from_memory(jpeg_path.read_bytes())
+                    if source is None:
+                        continue
+                    try:
+                        mosaic.paste(source, (x * 256, y * 256))
+                    finally:
+                        source.close()
+                    present += 1
+                except (OSError, ValueError):
+                    continue
+        mosaic.write_jpg(str(output_path), quality=95)
+    finally:
+        mosaic.close()
+    return {
+        "zoom": source_zoom,
+        "present": present,
+        "expected": width * height,
+    }
+
+
+def _rgb565(value: int) -> tuple[int, int, int]:
+    return (
+        ((value >> 11) & 0x1F) * 255 // 31,
+        ((value >> 5) & 0x3F) * 255 // 63,
+        (value & 0x1F) * 255 // 31,
+    )
+
+
+def _bc1_palette(block: bytes, *, force_four_colors: bool):
+    color0 = int.from_bytes(block[0:2], "little")
+    color1 = int.from_bytes(block[2:4], "little")
+    first = _rgb565(color0)
+    second = _rgb565(color1)
+    if force_four_colors or color0 > color1:
+        third = tuple((2 * a + b) // 3 for a, b in zip(first, second))
+        fourth = tuple((a + 2 * b) // 3 for a, b in zip(first, second))
+    else:
+        third = tuple((a + b) // 2 for a, b in zip(first, second))
+        fourth = (0, 0, 0)
+    return first, second, third, fourth
+
+
+def _write_dds_mipmap_zero_ppm(
+    dds_bytes: bytes,
+    output_path: Path,
+    *,
+    width: int,
+    height: int,
+    dds_format: str,
+) -> None:
+    """Decode BC1/BC3 mipmap zero to a bounded-memory PPM artifact."""
+    if width <= 0 or height <= 0 or width % 4 or height % 4:
+        raise ValueError("DDS dimensions must be positive multiples of four")
+    normalized = dds_format.upper()
+    if normalized in {"DXT1", "BC1"}:
+        block_size = 8
+        color_offset = 0
+        force_four_colors = False
+    elif normalized in {"DXT5", "BC3"}:
+        block_size = 16
+        color_offset = 8
+        force_four_colors = True
+    else:
+        raise ValueError(f"unsupported DDS format: {dds_format}")
+    blocks_x = width // 4
+    blocks_y = height // 4
+    mm0_length = blocks_x * blocks_y * block_size
+    compressed = memoryview(dds_bytes)[128:128 + mm0_length]
+    if len(compressed) != mm0_length:
+        raise ValueError("DDS mipmap zero is truncated")
+
+    with open(output_path, "wb") as output:
+        output.write(f"P6\n{width} {height}\n255\n".encode("ascii"))
+        for block_y in range(blocks_y):
+            scanlines = [bytearray(width * 3) for _ in range(4)]
+            for block_x in range(blocks_x):
+                start = (block_y * blocks_x + block_x) * block_size
+                color_block = bytes(
+                    compressed[
+                        start + color_offset:
+                        start + color_offset + 8
+                    ]
+                )
+                palette = _bc1_palette(
+                    color_block,
+                    force_four_colors=force_four_colors,
+                )
+                indices = int.from_bytes(color_block[4:8], "little")
+                for pixel in range(16):
+                    x = block_x * 4 + pixel % 4
+                    y = pixel // 4
+                    color = palette[(indices >> (pixel * 2)) & 0x03]
+                    offset = x * 3
+                    scanlines[y][offset:offset + 3] = bytes(color)
+            for scanline in scanlines:
+                output.write(scanline)
 
 
 def _utc_now_iso() -> str:
@@ -1257,7 +1526,10 @@ def _build_delivery_summary(stats_snapshot: dict) -> dict:
                 "bytes": int(stats_snapshot.get(counter, 0) or 0),
             }
             for source, counter in (
-                ("Exact target", "mm0_served_exact_bytes"),
+                (
+                    "Target-ZL provider response",
+                    "mm0_served_exact_bytes",
+                ),
                 ("Lower ZL / derived", "mm0_served_lower_zl_bytes"),
                 ("Missing color", "mm0_served_missing_bytes"),
                 ("Unknown", "mm0_served_unknown_bytes"),

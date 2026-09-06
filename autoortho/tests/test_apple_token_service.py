@@ -3,6 +3,8 @@ import sys
 import threading
 import time
 
+import requests
+
 sys.path.insert(
     0,
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -65,3 +67,41 @@ def test_concurrent_refresh_is_single_flight(monkeypatch):
     assert service.apple_token == "new-key"
     assert service.generation == 1
     assert len(calls) == 2
+
+
+def test_concurrent_refresh_failure_reaches_waiters(monkeypatch):
+    service = AppleTokenService()
+    started = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def failing_get(_url, **_kwargs):
+        started.set()
+        release.wait(1)
+        raise requests.exceptions.Timeout("offline")
+
+    monkeypatch.setattr(
+        "utils.apple_token_service.requests.get",
+        failing_get,
+    )
+
+    def refresh():
+        try:
+            service.reset_apple_maps_token(expected_generation=0)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    leader = threading.Thread(target=refresh)
+    leader.start()
+    assert started.wait(1)
+    waiters = [threading.Thread(target=refresh) for _ in range(5)]
+    for waiter in waiters:
+        waiter.start()
+    time.sleep(0.02)
+    release.set()
+    leader.join(1)
+    for waiter in waiters:
+        waiter.join(1)
+
+    assert len(errors) == 6
+    assert service.generation == 0

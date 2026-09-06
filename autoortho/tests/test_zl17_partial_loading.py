@@ -2,6 +2,7 @@ import threading
 import time
 
 from autoortho import getortho, pydds
+from autoortho.dds_manifest import RowBuildManifest, manifests_to_dict
 
 
 def _grid(monkeypatch, tmp_path, width=32, height=32):
@@ -382,7 +383,23 @@ def test_partial_cache_load_populates_only_persisted_rows(
         True,
     )
 
-    assert tile._load_partial_dds_rows({
+    row_manifest = RowBuildManifest.create(
+        tile_id=tile.id,
+        target_zoom=tile.max_zoom,
+        mipmap=0,
+        row_index=5,
+        build_generation=3,
+        sources=bytes(
+            [pydds.MipmapProvenance.EXACT_TARGET]
+            * tile.chunks_per_row
+        ),
+        compressed_data=b"P" * row_size,
+    )
+    metadata = {
+        "mm0_manifest": manifests_to_dict(
+            {5: row_manifest},
+            target_zoom=tile.max_zoom,
+        ),
         "partial_mipmaps": {
             "0": {
                 "unit": "chunk_row",
@@ -392,7 +409,10 @@ def test_partial_cache_load_populates_only_persisted_rows(
                 "revision": 3,
             }
         }
-    })
+    }
+    tile._restore_provenance_from_metadata(metadata)
+
+    assert tile._load_partial_dds_rows(metadata)
 
     mm = tile.dds.mipmap_list[0]
     assert isinstance(mm.buffer, pydds.SparseMipmapBuffer)

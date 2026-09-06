@@ -281,6 +281,7 @@ persistent_dds_cache_mb = 0
 # Persist compressed mipmap-0 chunk rows asynchronously for repeat ZL17 loads.
 # Exact compressed rows are safe to reuse across sessions.
 persist_partial_dds_cache = True
+partial_cache_promote_startup_max_tiles = 0
 # Delete source JPEG chunks only after a complete DDS is durably stored. Keeping
 # sources improves rebuild resilience when compiled DDS entries are evicted.
 cleanup_source_jpegs_after_dds = False
@@ -373,10 +374,10 @@ http2_enabled = True
 # Maximum broker requests that may be in flight (pending a reply) at once.
 # This is the real download-concurrency knob: it is not bounded by the number
 # of downloader threads because broker requests are dispatched asynchronously.
-provider_max_in_flight = 128
+provider_max_in_flight = 320
 # Maximum reusable HTTP connections owned by the broker. HTTP/2 multiplexes
 # many requests per connection, so this stays well below provider_max_in_flight.
-provider_max_connections = 64
+provider_max_connections = 160
 # Threads used to apply broker responses (cache write, decode hand-off).
 # This is a coordination pool, not a download pool; keep it small.
 download_dispatch_workers = 4
@@ -392,12 +393,15 @@ provider_queue_timeout = 60.0
 provider_adaptive_concurrency = True
 # Windowed v2 observes two-second throughput/latency/error windows. Disable
 # temporarily to restore the legacy per-response AIMD controller.
-provider_adaptive_controller_v2 = True
+provider_adaptive_controller_v2 = False
+# Aggregate supported httpcore connection lifecycle events. Detailed request
+# tracing remains disabled and no request URLs or tokens are retained.
+provider_transport_trace = False
 # Starting per-origin limit. 0 starts at provider_max_connections and ramps
 # toward provider_origin_max_concurrency after successful responses.
-provider_origin_initial_concurrency = 0
+provider_origin_initial_concurrency = 128
 # Floor for a throttled origin, so a bad patch cannot starve it completely.
-provider_origin_min_concurrency = 2
+provider_origin_min_concurrency = 64
 # Ceiling for one origin. 0 means "use provider_max_in_flight".
 provider_origin_max_concurrency = 0
 provider_origin_increase_step = 1
@@ -764,12 +768,12 @@ route_prefetch_radius_nm = 40
 # value is never silently overridden by a stale legacy one.
 PROVIDER_SETTINGS = {
     "provider_max_in_flight": {
-        "default": 128,
+        "default": 320,
         "range": (8, 1024),
         "legacy": ("max_concurrent_downloads", 256),
     },
     "provider_max_connections": {
-        "default": 64,
+        "default": 160,
         "range": (1, 256),
         "legacy": ("http2_max_connections", 64),
     },
@@ -792,16 +796,21 @@ PROVIDER_SETTINGS = {
     },
     "provider_adaptive_controller_v2": {
         "type": bool,
-        "default": True,
+        "default": False,
+        "legacy": None,
+    },
+    "provider_transport_trace": {
+        "type": bool,
+        "default": False,
         "legacy": None,
     },
     "provider_origin_initial_concurrency": {
-        "default": 0,  # 0 => start at the ceiling and only react to overload
+        "default": 128,
         "range": (0, 1024),
         "legacy": None,
     },
     "provider_origin_min_concurrency": {
-        "default": 2,
+        "default": 64,
         "range": (1, 256),
         "legacy": None,
     },

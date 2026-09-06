@@ -861,6 +861,9 @@ class AOMount:
                 "adaptive_controller_v2": aoconfig.resolve_provider_setting(
                     "provider_adaptive_controller_v2", self.cfg
                 ),
+                "transport_trace": aoconfig.resolve_provider_setting(
+                    "provider_transport_trace", self.cfg
+                ),
                 "origin_initial_concurrency": aoconfig.resolve_provider_setting(
                     "provider_origin_initial_concurrency", self.cfg
                 ),

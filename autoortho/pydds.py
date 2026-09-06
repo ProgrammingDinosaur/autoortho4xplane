@@ -15,7 +15,11 @@ except ImportError:
     from aoimage import AoImage as Image
 
 import threading
-from enum import IntEnum
+
+try:
+    from autoortho.dds_manifest import MipmapSource as MipmapProvenance
+except ImportError:
+    from dds_manifest import MipmapSource as MipmapProvenance
 
 #from functools import lru_cache, cache
 
@@ -101,16 +105,6 @@ def _get_fallback_slice(offset: int, length: int, blocksize: int = 8) -> bytes:
         return b""
     prefix = offset % blocksize
     return get_fallback_bytes(prefix + length, blocksize)[prefix:]
-
-
-class MipmapProvenance(IntEnum):
-    UNKNOWN = 0
-    EXACT_TARGET = 1
-    LOWER_ZL_CACHE = 2
-    LOWER_MIPMAP_MEMORY = 3
-    CASCADE_NETWORK_FALLBACK = 4
-    MISSING_COLOR = 5
-    PROVIDER_TARGET_UNKNOWN_QUALITY = 6
 
 
 class MipmapProvenanceGrid:

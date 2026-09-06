@@ -40,9 +40,10 @@ deadline with correctly cropped cache/lower-ZL imagery where available and
 those degraded areas for the current flight. Leave it disabled for strict
 quality.
 
-**Persist partial DDS rows** writes completed compressed rows through a bounded
-background queue. First-load behavior is unchanged; repeat visits can serve
-covered rows immediately and fetch only missing rows. Partial metadata never
+**Persist partial DDS rows** writes only exact, checksummed compressed rows
+through a bounded background queue. First-load behavior is unchanged; repeat
+visits can serve covered rows immediately and fetch only missing rows. DDM v5
+stores an immutable source manifest for every row. Partial metadata never
 advertises mipmap zero as complete, corrupt records are ignored, and complete
 textures are promoted to the normal DDS cache. The row cache consumes additional
 space within the DDS disk budget. The Balanced, Quality, and Low Bandwidth
@@ -56,12 +57,16 @@ thread owns the broker client socket and keeps many requests in flight at once.
 Downloader threads no longer block one-per-request, so real concurrency is set
 by the broker budget rather than by the size of the worker pool.
 
+The broker queue wakes one idle coroutine per new request instead of waking all
+idle workers. Reprioritizing an existing item does not wake additional workers;
+cancellation hands off an unused wakeup so queued work is not stranded.
+
 ```ini
 [autoortho]
 # Maximum imagery requests in flight against the broker at any moment.
-provider_max_in_flight = 128
+provider_max_in_flight = 320
 # Upstream HTTP/2 connections the broker keeps open per provider host.
-provider_max_connections = 64
+provider_max_connections = 160
 # Threads used to settle completed downloads (coordination only).
 download_dispatch_workers = 4
 # Queue watchdog; HTTP timeouts begin only after the broker sends STARTED.
@@ -70,14 +75,14 @@ provider_queue_timeout = 60
 
 | Setting | Default | Range | Notes |
 |---------|---------|-------|-------|
-| `provider_max_in_flight` | `128` | 8-1024 | Strict cap. A reserved slice (25%) is held for live, X-Plane-visible tiles so prefetch and healing can never starve them. |
-| `provider_max_connections` | `64` | 1-256 | Effective value is `min(provider_max_in_flight, provider_max_connections)`. This preserves throughput when a provider negotiates HTTP/1.1 rather than multiplexed HTTP/2. |
+| `provider_max_in_flight` | `320` | 8-1024 | Strict cap. A reserved slice (25%) is held for live, X-Plane-visible tiles so prefetch and healing can never starve them. |
+| `provider_max_connections` | `160` | 1-256 | Effective value is `min(provider_max_in_flight, provider_max_connections)`. This preserves throughput when a provider negotiates HTTP/1.1 rather than multiplexed HTTP/2. |
 | `download_dispatch_workers` | `4` | 1-16 | Small fixed pool that finalises completed requests; increasing it does not increase download concurrency. |
 | `provider_queue_timeout` | `60` | 5-600 seconds | Maximum broker/adaptive queue wait. It is separate from provider connect/read/pool timeouts. |
 
 For connection tuning, keep
-`provider_max_in_flight` near twice `provider_max_connections`. Test 80
-connections first, then 96, repeating cold-cache runs before choosing a value.
+`provider_max_in_flight` near twice `provider_max_connections`. Compare 128,
+160, and 200 connections with repeated cold-cache runs before choosing a value.
 Counts beyond the provider's throughput knee increase queueing, timeouts, and
 throttling without improving completed JPEGs per second.
 
@@ -131,10 +136,10 @@ origins may continue ramping toward `provider_max_in_flight`.
 # Adaptive per-origin concurrency (broker-side).
 provider_adaptive_concurrency = True
 # Use two-second throughput/latency/error windows instead of legacy AIMD.
-provider_adaptive_controller_v2 = True
-# 0 => start at provider_max_connections and ramp toward the ceiling.
-provider_origin_initial_concurrency = 0
-provider_origin_min_concurrency = 2
+provider_adaptive_controller_v2 = False
+provider_origin_initial_concurrency = 128
+provider_origin_min_concurrency = 64
+provider_transport_trace = False
 # 0 => use provider_max_in_flight as the per-origin ceiling.
 provider_origin_max_concurrency = 0
 provider_origin_increase_step = 1
@@ -146,9 +151,10 @@ provider_origin_cooldown_seconds = 5.0
 | Setting | Default | Range | Notes |
 |---------|---------|-------|-------|
 | `provider_adaptive_concurrency` | `True` | bool | Disable to use a fixed per-origin limit equal to the ceiling. |
-| `provider_adaptive_controller_v2` | `True` | bool | Uses windowed proportional probing and severity-based reductions; disable temporarily for legacy per-response AIMD. |
-| `provider_origin_initial_concurrency` | `0` | 0-1024 | `0` starts at the effective connection budget, preventing an initial request flood while still ramping after successful responses. |
-| `provider_origin_min_concurrency` | `2` | 1-256 | Floor the controller will never drop below. Also clamps the initial value upwards. |
+| `provider_adaptive_controller_v2` | `False` | bool | Uses windowed proportional probing and severity-based reductions. Low-demand windows hold, and latency needs consecutive utilized evidence. |
+| `provider_origin_initial_concurrency` | `128` | 0-1024 | Starting limit for each origin. |
+| `provider_origin_min_concurrency` | `64` | 1-256 | Floor for real overload reductions. Latency-only reductions also respect 50% of the last stable point. |
+| `provider_transport_trace` | `False` | bool | Aggregates supported httpcore connection lifecycle counters without retaining URLs. |
 | `provider_origin_max_concurrency` | `0` | 0-1024 | `0` means `provider_max_in_flight`. Always clamped to the global `max_concurrency`. |
 | `provider_origin_increase_step` | `1` | 1-64 | Permits added per successful ramp step. |
 | `provider_origin_success_threshold` | `8` | 1-4096 | Consecutive successes required before a ramp step. |

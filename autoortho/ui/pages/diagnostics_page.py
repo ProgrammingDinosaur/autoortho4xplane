@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListView,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QStyle,
@@ -58,6 +59,7 @@ class DiagnosticsPage(QWidget):
         self.diagnostics_service = DiagnosticsService(self.report_dir)
         self.report_list_worker = None
         self.report_read_worker = None
+        self.imagery_export_worker = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
@@ -147,6 +149,7 @@ class DiagnosticsPage(QWidget):
         open_report = QPushButton("Open Report")
         open_folder = QPushButton("Open Folder")
         refresh_reports = QPushButton("Refresh")
+        export_imagery = QPushButton("Export imagery comparison")
         open_report.setIcon(
             self.style().standardIcon(
                 QStyle.StandardPixmap.SP_FileIcon
@@ -165,6 +168,7 @@ class DiagnosticsPage(QWidget):
         report_actions.addWidget(open_report)
         report_actions.addWidget(open_folder)
         report_actions.addWidget(refresh_reports)
+        report_actions.addWidget(export_imagery)
         self.report_preview = QTextBrowser()
         reports_layout.addWidget(reports_title)
         reports_layout.addWidget(self.report_combo)
@@ -187,6 +191,7 @@ class DiagnosticsPage(QWidget):
         open_report.clicked.connect(self.open_selected_report)
         open_folder.clicked.connect(self.open_report_folder)
         refresh_reports.clicked.connect(self.refresh_reports)
+        export_imagery.clicked.connect(self._export_imagery_comparison)
         self.refresh_reports()
 
     def _apply_log_filter(self):
@@ -367,10 +372,68 @@ class DiagnosticsPage(QWidget):
             setattr(self, attribute, None)
 
     def shutdown(self):
-        for worker in (self.report_list_worker, self.report_read_worker):
+        for worker in (
+            self.report_list_worker,
+            self.report_read_worker,
+            self.imagery_export_worker,
+        ):
             if worker is not None and worker.isRunning():
                 worker.cancel()
                 worker.wait(1000)
+
+    def _export_imagery_comparison(self):
+        ddm_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select compiled tile metadata",
+            "",
+            "DDS Metadata (*.ddm)",
+        )
+        if not ddm_path:
+            return
+        output_root = QFileDialog.getExistingDirectory(
+            self,
+            "Select imagery comparison output folder",
+            str(self.report_dir),
+        )
+        if not output_root:
+            return
+        worker = ServiceWorker(
+            lambda cancel_event: (
+                self.diagnostics_service.export_imagery_comparison(
+                    ddm_path,
+                    output_root,
+                    cancel_event=cancel_event,
+                )
+            ),
+            self,
+        )
+        self.imagery_export_worker = worker
+        worker.completed.connect(self._imagery_exported)
+        worker.finished.connect(
+            lambda current=worker: self._worker_finished(
+                "imagery_export_worker",
+                current,
+            )
+        )
+        worker.start()
+
+    def _imagery_exported(self, result):
+        if isinstance(result, Exception) or not result.success:
+            message = (
+                str(result)
+                if isinstance(result, Exception)
+                else result.error.message
+            )
+            QMessageBox.warning(
+                self,
+                "Imagery comparison",
+                message,
+            )
+            return
+        self.report_preview.setPlainText(
+            f"Imagery comparison exported to:\n{result.value}"
+        )
+        QDesktopServices.openUrl(QUrl.fromLocalFile(result.value))
 
     def open_selected_report(self):
         report = self._selected_report()

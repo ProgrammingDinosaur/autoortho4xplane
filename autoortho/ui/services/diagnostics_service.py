@@ -1,5 +1,6 @@
 """Performance-report filesystem service."""
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -91,6 +92,34 @@ class DiagnosticsService:
                 error=ServiceError(
                     ServiceErrorCode.FILESYSTEM,
                     "Could not read the performance report.",
+                    str(exc),
+                )
+            )
+
+    def export_imagery_comparison(
+        self,
+        ddm_path: str | Path,
+        output_root: str | Path,
+        *,
+        cancel_event: Event | None = None,
+    ):
+        if cancel_event is not None and cancel_event.is_set():
+            return ServiceResult(
+                error=ServiceError(
+                    ServiceErrorCode.CANCELLED,
+                    "Imagery comparison export cancelled.",
+                )
+            )
+        try:
+            from autoortho.diagnostics import export_imagery_comparison
+
+            output = export_imagery_comparison(ddm_path, output_root)
+            return ServiceResult(str(output))
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            return ServiceResult(
+                error=ServiceError(
+                    ServiceErrorCode.FILESYSTEM,
+                    "Could not export the imagery comparison.",
                     str(exc),
                 )
             )
