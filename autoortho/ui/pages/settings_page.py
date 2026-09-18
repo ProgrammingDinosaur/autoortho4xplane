@@ -48,7 +48,7 @@ class SettingsPage(QWidget):
         self.preset_combo = QComboBox()
         self.preset_combo.addItems(
             [
-                "Choose preset…",
+                "Choose performance profile…",
                 "Balanced",
                 "Quality",
                 "Low Bandwidth",
@@ -57,7 +57,7 @@ class SettingsPage(QWidget):
         )
         title_row.addWidget(title)
         title_row.addStretch()
-        preset_label = QLabel("&Preset")
+        preset_label = QLabel("&Performance profile")
         preset_label.setBuddy(self.preset_combo)
         title_row.addWidget(self.search_edit)
         title_row.addWidget(preset_label)
@@ -71,6 +71,17 @@ class SettingsPage(QWidget):
         self.category_list.setMinimumWidth(180)
         self.category_list.setAccessibleName("Settings categories")
         self.stack = QStackedWidget()
+        self.empty_page = QWidget()
+        empty_layout = QVBoxLayout(self.empty_page)
+        empty_layout.addStretch()
+        self.empty_label = QLabel(
+            "No settings match your search. Try a broader term."
+        )
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setProperty("textRole", "secondary")
+        empty_layout.addWidget(self.empty_label)
+        empty_layout.addStretch()
+        self.stack.addWidget(self.empty_page)
         body.addWidget(self.category_list)
         body.addWidget(self.stack, 1)
         root.addLayout(body, 1)
@@ -100,6 +111,7 @@ class SettingsPage(QWidget):
         *,
         recommendation="",
         numeric_bindings=(),
+        restore_defaults=True,
     ):
         page_content = QWidget()
         content_layout = QVBoxLayout(page_content)
@@ -153,6 +165,7 @@ class SettingsPage(QWidget):
         heading = QLabel(name)
         heading.setProperty("textRole", "sectionTitle")
         restore = QPushButton("Restore Category Defaults")
+        restore.setVisible(bool(restore_defaults))
         restore.clicked.connect(
             lambda checked=False, category=name: (
                 self.restore_defaults_requested.emit(category)
@@ -188,11 +201,27 @@ class SettingsPage(QWidget):
         self._refresh_categories()
 
     def select_category(self, name):
+        aliases = {
+            "Paths & Storage": "Setup & Storage",
+            "Imagery Quality": "Imagery",
+            "Dynamic Zoom": "Imagery",
+            "Prefetching": "Streaming",
+            "Performance": "Streaming",
+            "Compression & Pipeline": "Advanced",
+            "Flight Data": "Connections & Integrations",
+            "Diagnostics": "Logging & Reports",
+            "Platform & Mounting": "Advanced",
+        }
+        name = aliases.get(name, name)
         for row in range(self.category_list.count()):
             item = self.category_list.item(row)
             if item.data(Qt.ItemDataRole.UserRole) == name:
                 self.category_list.setCurrentRow(row)
-                return
+                return True
+        if self.search_edit.text():
+            self.search_edit.clear()
+            return self.select_category(name)
+        return False
 
     def _refresh_categories(self):
         current_name = ""
@@ -210,6 +239,7 @@ class SettingsPage(QWidget):
             self.category_list.addItem(item)
         self.category_list.blockSignals(False)
         if self.category_list.count() == 0:
+            self.stack.setCurrentWidget(self.empty_page)
             return
         target = 0
         for row in range(self.category_list.count()):
@@ -236,8 +266,11 @@ class SettingsPage(QWidget):
         if entry is not None:
             self.stack.setCurrentWidget(entry.page)
 
+    def category_names(self):
+        return [entry.name for entry in self.entries]
+
     def _preset_selected(self, name):
-        if name == "Choose preset…":
+        if name == "Choose performance profile…":
             return
         self.preset_requested.emit(name)
         self.preset_combo.blockSignals(True)

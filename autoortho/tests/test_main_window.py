@@ -80,3 +80,21 @@ def test_shell_page_switching_and_action_signals(qt_app):
     assert signals["docs"] == [True]
     assert signals["about"] == [True]
     assert signals["quit"] == [True]
+
+
+def test_overflow_menu_groups_setup_help_and_exit_actions(qt_app):
+    shell = ApplicationShell()
+    labels = [
+        "|" if action.isSeparator() else action.text()
+        for action in shell.header.overflow_menu.actions()
+    ]
+
+    assert labels == [
+        "Setup Wizard",
+        "|",
+        "Help and Documentation",
+        "Check for Updates",
+        "About",
+        "|",
+        "Quit",
+    ]

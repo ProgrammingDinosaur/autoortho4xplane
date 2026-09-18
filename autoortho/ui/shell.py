@@ -162,7 +162,7 @@ class CompactHeader(QFrame):
         self.overflow_button.setAutoRaise(True)
         self.overflow_menu = QMenu(self)
         self.setup_wizard_action = QAction("Setup Wizard", self)
-        self.docs_action = QAction("Docs", self)
+        self.docs_action = QAction("Help and Documentation", self)
         self.about_action = QAction("About", self)
         self.check_updates_action = QAction("Check for Updates", self)
         self.quit_action = QAction("Quit", self)
@@ -174,7 +174,13 @@ class CompactHeader(QFrame):
             (self.quit_action, self.quitRequested),
         ):
             action.triggered.connect(signal.emit)
-            self.overflow_menu.addAction(action)
+        self.overflow_menu.addAction(self.setup_wizard_action)
+        self.overflow_menu.addSeparator()
+        self.overflow_menu.addAction(self.docs_action)
+        self.overflow_menu.addAction(self.check_updates_action)
+        self.overflow_menu.addAction(self.about_action)
+        self.overflow_menu.addSeparator()
+        self.overflow_menu.addAction(self.quit_action)
         self.overflow_button.setMenu(self.overflow_menu)
         chip_row.addWidget(self.overflow_button)
         top_row.addLayout(chip_row)

@@ -725,7 +725,7 @@ class ConfigUI(QMainWindow):
         self.shell.aboutRequested.connect(self._show_about)
         self.shell.quitRequested.connect(self.close)
         self.shell.fixConfigRequested.connect(
-            lambda: self.navigate_to("settings", "Paths & Storage")
+            lambda: self.navigate_to("settings", "Setup & Storage")
         )
         self.shell.installSceneryRequested.connect(
             lambda: self.navigate_to("scenery-library")
@@ -910,7 +910,7 @@ class ConfigUI(QMainWindow):
             self._open_scenery_options_for_region
         )
         self.scenery_library_page.settings_requested.connect(
-            lambda: self.navigate_to("settings", "Paths & Storage")
+            lambda: self.navigate_to("settings", "Setup & Storage")
         )
         self.shell.add_page(
             self.scenery_library_page,
@@ -936,8 +936,12 @@ class ConfigUI(QMainWindow):
             self._on_inline_dynamic_zoom_changed
         )
         dynamic_group = QGroupBox("Altitude-Based Quality")
+        self.dynamic_zoom_settings_group = dynamic_group
         dynamic_layout = QVBoxLayout(dynamic_group)
         dynamic_layout.addWidget(self.dynamic_zoom_editor)
+        dynamic_group.setVisible(
+            self.max_zoom_mode_combo.currentText() == "Dynamic"
+        )
 
         self.categorized_settings_page = SettingsPage(
             self.apply_button,
@@ -948,15 +952,14 @@ class ConfigUI(QMainWindow):
             "General",
             [self.options_group, self.general_settings_group],
             recommendation=(
-                "General startup behavior and live log verbosity. "
-                "Most users can keep the recommended defaults."
+                "Control how the desktop app opens and behaves while "
+                "streaming."
             ),
         )
         self.categorized_settings_page.add_category(
-            "Paths & Storage",
+            "Setup & Storage",
             [
                 self.paths_group,
-                self.scenery_settings_group,
                 self.cache_settings_group,
             ],
             recommendation=(
@@ -965,15 +968,33 @@ class ConfigUI(QMainWindow):
             ),
             numeric_bindings=(
                 ("Memory cache", self.mem_cache_slider, 1, " GB"),
-                ("File cache limit", self.file_cache_slider, 1, " GB"),
+                ("Disk cache limit", self.file_cache_slider, 1, " GB"),
+            ),
+            restore_defaults=False,
+        )
+        self.categorized_settings_page.add_category(
+            "Scenery",
+            [
+                self.scenery_compatibility_group,
+                self.scenery_settings_group,
+            ],
+            recommendation=(
+                "Compatibility and installation defaults apply to scenery "
+                "packages, not live imagery quality."
             ),
         )
         self.categorized_settings_page.add_category(
-            "Imagery Quality",
-            [self.imagery_settings_group],
+            "Imagery",
+            [
+                self.imagery_source_group,
+                self.imagery_settings_group,
+                dynamic_group,
+                self.night_settings_group,
+            ],
             recommendation=(
                 "Each additional zoom level can multiply imagery, network, "
-                "and VRAM use by approximately four."
+                "and VRAM use by approximately four. Altitude-based quality "
+                "is used when Maximum detail mode is Dynamic."
             ),
             numeric_bindings=(
                 ("Minimum zoom", self.min_zoom_slider, 1, ""),
@@ -987,21 +1008,28 @@ class ConfigUI(QMainWindow):
             ),
         )
         self.categorized_settings_page.add_category(
-            "Dynamic Zoom",
-            [dynamic_group],
+            "Streaming",
+            [
+                self.performance_settings_group,
+                self.prefetch_settings_group,
+            ],
             recommendation=(
-                "Use altitude steps to preserve detail near the ground while "
-                "reducing cruise resource usage."
-            ),
-        )
-        self.categorized_settings_page.add_category(
-            "Prefetching",
-            [self.prefetch_settings_group],
-            recommendation=(
-                "Balanced prefetching reduces stutters without saturating "
-                "the network or CPU."
+                "Loading budgets, fallback policy, and prefetching work "
+                "together to balance quality against stutters and bandwidth."
             ),
             numeric_bindings=(
+                (
+                    "Tile time budget",
+                    self.tile_budget_slider,
+                    1,
+                    " s",
+                ),
+                (
+                    "Per-chunk wait",
+                    self.maxwait_slider,
+                    10,
+                    " s",
+                ),
                 (
                     "Lookahead",
                     self.prefetch_lookahead_slider,
@@ -1017,34 +1045,41 @@ class ConfigUI(QMainWindow):
             ),
         )
         self.categorized_settings_page.add_category(
-            "Performance",
-            [self.performance_settings_group],
-            recommendation=(
-                "Change timeout and fallback behavior only when diagnosing "
-                "loading stalls or missing imagery."
-            ),
-            numeric_bindings=(
-                (
-                    "Tile time budget",
-                    self.tile_budget_slider,
-                    1,
-                    " s",
-                ),
-                (
-                    "Per-chunk wait",
-                    self.maxwait_slider,
-                    10,
-                    " s",
-                ),
-            ),
-        )
-        self.categorized_settings_page.add_category(
             "Seasons",
             [self.scenery_seasons_group, self.seasons_settings_group],
         )
         self.categorized_settings_page.add_category(
-            "Compression & Pipeline",
-            [self.dds_settings_group, self.pipeline_settings_group],
+            "Connections & Integrations",
+            [self.flightdata_settings_group],
+            recommendation=(
+                "These local ports connect AutoOrtho to X-Plane and the map "
+                "service. SimBrief flight operations remain on Flight Plan & Map."
+            ),
+        )
+        self.categorized_settings_page.add_category(
+            "Logging & Reports",
+            [
+                self.logging_settings_group,
+                self.diagnostics_settings_group,
+                self.debug_visuals_group,
+            ],
+            recommendation=(
+                "Keep normal logging and profiling defaults unless collecting "
+                "information for troubleshooting."
+            ),
+        )
+        self.categorized_settings_page.add_category(
+            "Advanced",
+            [
+                self.dds_settings_group,
+                self.partial_dds_settings_group,
+                self.pipeline_settings_group,
+                self.fuse_settings_group,
+            ],
+            recommendation=(
+                "Engine, provider, memory, and mounting controls are intended "
+                "for compatibility testing and measured performance tuning."
+            ),
             numeric_bindings=(
                 (
                     "Tile build workers",
@@ -1059,18 +1094,6 @@ class ConfigUI(QMainWindow):
                     "",
                 ),
             ),
-        )
-        self.categorized_settings_page.add_category(
-            "Flight Data",
-            [self.flightdata_settings_group],
-        )
-        self.categorized_settings_page.add_category(
-            "Diagnostics",
-            [self.diagnostics_settings_group],
-        )
-        self.categorized_settings_page.add_category(
-            "Platform & Mounting",
-            [self.fuse_settings_group, self.night_settings_group],
         )
         self.categorized_settings_page.preset_requested.connect(
             self._apply_settings_preset
@@ -1095,7 +1118,7 @@ class ConfigUI(QMainWindow):
             ),
         )
         self.diagnostics_page.settings_requested.connect(
-            lambda: self.navigate_to("settings", "Diagnostics")
+            lambda: self.navigate_to("settings", "Logging & Reports")
         )
         self.shell.add_page(
             self.diagnostics_page,
@@ -1290,44 +1313,109 @@ class ConfigUI(QMainWindow):
                 "showconfig_check": True,
                 "gui_check": True,
                 "hide_check": True,
-                "console_log_level_combo": "INFO",
-                "file_log_level_combo": "DEBUG",
             },
-            "Imagery Quality": {
+            "Scenery": {
+                "simheaven_compat_check": False,
+                "using_custom_tiles_check": False,
+                "noclean_check": False,
+                "max_download_workers_spin": 4,
+                "storage_safety_margin_spin": 2.0,
+            },
+            "Imagery": {
+                "maptype_combo": "Use tile default",
                 "min_zoom_slider": 12,
+                "max_zoom_mode_combo": "Fixed",
                 "max_zoom_slider": 16,
                 "max_zoom_near_airports_slider": 18,
+                "time_exclusion_enabled_check": False,
+                "time_exclusion_default_check": False,
+                "sun_night_threshold_spin": -12.0,
+                "sun_day_threshold_spin": -10.0,
             },
-            "Prefetching": {
-                "prefetch_enabled_check": True,
-                "prefetch_lookahead_slider": 10,
-                "prefetch_max_chunks_slider": 64,
-                "prefetch_radius_slider": 30,
-            },
-            "Performance": {
+            "Streaming": {
                 "use_time_budget_check": True,
-                "tile_budget_slider": 180,
+                "tile_budget_slider": 60,
                 "maxwait_slider": 20,
-                "native_partial_allow_incomplete_check": False,
-                "persist_partial_dds_cache_check": False,
+                "suspend_maxwait_check": True,
+                "fallback_level_combo": "Cache Only (Balanced)",
+                "fallback_extends_budget_check": False,
+                "fallback_timeout_slider": 30,
+                "prefetch_enabled_check": True,
+                "prefetch_quality_mode_combo": "Responsive",
+                "prefetch_quality_grace_spinbox": 5.0,
+                "strict_target_deadline_spinbox": 120.0,
+                "prefetch_lookahead_slider": 10,
+                "prefetch_interval_slider": 10,
+                "prefetch_max_chunks_slider": 64,
+                "prefetch_admission_burst_spinbox": 64,
+                "prefetch_radius_slider": 30,
+                "predictive_dds_enabled_check": True,
+                "predictive_interval_slider": 250,
+                "background_workers_slider": 2,
+                "predictive_use_fallbacks_check": True,
             },
-            "Compression & Pipeline": {
-                "pipeline_mode_combo": "auto",
+            "Seasons": {
+                "seasons_convert_workers_slider": 4,
+                "compress_dsf_check": True,
+                "seasons_enabled_check": False,
+                "spr_sat_slider": 70,
+                "sum_sat_slider": 100,
+                "fal_sat_slider": 80,
+                "win_sat_slider": 55,
+            },
+            "Connections & Integrations": {
+                "webui_port_edit": "5847",
+                "xplane_udp_port_edit": "49000",
+            },
+            "Logging & Reports": {
+                "console_log_level_combo": "INFO",
+                "file_log_level_combo": "DEBUG",
+                "performance_profiling_check": True,
+                "performance_sample_interval_spin": 1.0,
+                "performance_checkpoint_interval_spin": 10.0,
+                "python_allocation_tracing_check": False,
+            },
+            "Advanced": {
+                "compressor_combo": "ISPC",
                 "format_combo": "BC1",
+                "pipeline_mode_combo": "auto",
                 "live_concurrency_slider": 8,
+                "buffer_pool_slider": 10,
+                "native_partial_allow_incomplete_check": False,
+                "persist_partial_dds_cache_check": True,
+                "provider_inflight_spinbox": 320,
+                "provider_connections_spinbox": 160,
+                "download_dispatch_workers_spinbox": 4,
+                "provider_queue_timeout_spinbox": 60,
+                "provider_adaptive_check": True,
+                "provider_controller_v2_check": False,
+                "provider_initial_concurrency_spinbox": 128,
+                "provider_decrease_factor_spinbox": 0.5,
+                "provider_cooldown_spinbox": 5.0,
+                "live_tile_admission_spinbox": 16,
+                "tile_image_cache_mb_spinbox": 96,
+                "fetch_threads_spinbox": 32,
+                "threading_check": True,
+                "winfsp_check": True,
             },
         }
-        if category == "Dynamic Zoom":
+        if category == "Imagery":
             self.dynamic_zoom_editor.apply_preset("Airliner")
-            return
         for attr, value in defaults.get(category, {}).items():
             widget = getattr(self, attr, None)
+            if widget is None:
+                continue
             if isinstance(widget, QCheckBox):
                 widget.setChecked(bool(value))
             elif isinstance(widget, QComboBox):
                 widget.setCurrentText(str(value))
-            elif widget is not None:
+            elif isinstance(widget, QLineEdit):
+                widget.setText(str(value))
+            else:
                 widget.setValue(value)
+        if category == "Logging & Reports":
+            self.missing_color = QColor(66, 77, 55)
+            self.update_missing_color_button()
         self._on_settings_control_changed()
 
     def navigate_to(self, page, category=None):
@@ -1348,7 +1436,7 @@ class ConfigUI(QMainWindow):
         elif widget is self.settings_widget:
             self.navigate_to("settings")
         elif widget is self.setup_widget:
-            self.navigate_to("settings", "Paths & Storage")
+            self.navigate_to("settings", "Setup & Storage")
 
     def _on_shell_page_changed(self, page):
         self.cfg.general.last_page = {
@@ -1985,10 +2073,10 @@ class ConfigUI(QMainWindow):
 
     def _fix_readiness(self, check_id):
         if check_id == "setup-xplane":
-            self.navigate_to("settings", "Paths & Storage")
+            self.navigate_to("settings", "Setup & Storage")
             self.browse_folder(self.xplane_path_edit)
         elif check_id == "setup-storage":
-            self.navigate_to("settings", "Paths & Storage")
+            self.navigate_to("settings", "Setup & Storage")
             self.scenery_path_edit.setFocus()
         elif check_id == "setup-scenery":
             self.navigate_to("scenery-library")
@@ -2285,13 +2373,13 @@ class ConfigUI(QMainWindow):
 
         layout.addWidget(paths_group)
 
-        # Options group
-        options_group = QGroupBox("Basic Settings")
+        # Startup settings
+        options_group = QGroupBox("Startup and Window")
         self.options_group = options_group
         options_layout = QVBoxLayout()
         options_group.setLayout(options_layout)
 
-        self.showconfig_check = QCheckBox("Always show config menu")
+        self.showconfig_check = QCheckBox("Open the AutoOrtho window at launch")
         self.showconfig_check.setChecked(self.cfg.general.showconfig)
         self.showconfig_check.setObjectName('showconfig')
         self.showconfig_check.setToolTip(
@@ -2303,6 +2391,13 @@ class ConfigUI(QMainWindow):
             "configuration."
         )
         options_layout.addWidget(self.showconfig_check)
+
+        layout.addWidget(options_group)
+
+        # Imagery provider selection belongs with imagery rather than startup.
+        imagery_source_group = QGroupBox("Imagery Source")
+        self.imagery_source_group = imagery_source_group
+        imagery_source_layout = QVBoxLayout(imagery_source_group)
 
         # Map type
         maptype_layout = QHBoxLayout()
@@ -2344,7 +2439,16 @@ class ConfigUI(QMainWindow):
         self.maptype_combo.currentTextChanged.connect(self._on_maptype_combo_changed)
 
         maptype_layout.addStretch()
-        options_layout.addLayout(maptype_layout)
+        imagery_source_layout.addLayout(maptype_layout)
+
+        layout.addWidget(imagery_source_group)
+
+        # Compatibility settings affect installed scenery, not the app shell.
+        scenery_compatibility_group = QGroupBox("Scenery Compatibility")
+        self.scenery_compatibility_group = scenery_compatibility_group
+        scenery_compatibility_layout = QVBoxLayout(
+            scenery_compatibility_group
+        )
 
         self.simheaven_compat_check = QCheckBox("SimHeaven compatibility mode")
         self.simheaven_compat_check.setChecked(self.cfg.autoortho.simheaven_compat)
@@ -2355,13 +2459,14 @@ class ConfigUI(QMainWindow):
             "overlay instead. This is done by changing values within scenery_packs.ini.\n"
             "Use with caution, this may cause issues with other scenery packs."
         )
-        options_layout.addWidget(self.simheaven_compat_check)
+        scenery_compatibility_layout.addWidget(
+            self.simheaven_compat_check
+        )
 
 
         self.simheaven_compat_check.stateChanged.connect(self.on_simheaven_compat_check)
 
-        # add space between options
-        options_layout.addSpacing(10)
+        scenery_compatibility_layout.addSpacing(10)
 
         self.using_custom_tiles_check = QCheckBox(
             "Enable custom Ortho4XP tiles"
@@ -2374,10 +2479,11 @@ class ConfigUI(QMainWindow):
         )
 
         self.using_custom_tiles_check.stateChanged.connect(self.on_using_custom_tiles_check)
-        options_layout.addWidget(self.using_custom_tiles_check)
+        scenery_compatibility_layout.addWidget(
+            self.using_custom_tiles_check
+        )
 
-
-        layout.addWidget(options_group)
+        layout.addWidget(scenery_compatibility_group)
 
         # SimBrief Integration group
         simbrief_group = QGroupBox("SimBrief Integration")
@@ -2643,13 +2749,13 @@ class ConfigUI(QMainWindow):
         # Route Prefetch Radius note (moved to unified setting in Advanced)
         prefetch_note_layout = QHBoxLayout()
         prefetch_note_label = QLabel(
-            "ℹ Prefetch radius is now in Advanced Settings → Prefetching"
+            "ℹ Prefetch radius is in Settings → Streaming"
         )
         prefetch_note_label.setStyleSheet("color: #8ab4f8; font-style: italic;")
         prefetch_note_label.setToolTip(
             "The prefetch radius setting has been unified for both SimBrief\n"
             "and velocity-based prefetching.\n\n"
-            "Go to: Advanced Settings → AutoOrtho → Prefetching → Prefetch radius\n\n"
+            "Go to: Settings → Streaming → Prefetch radius\n\n"
             "This single setting controls how wide a corridor of tiles is\n"
             "prefetched around your flight path, regardless of whether you're\n"
             "using SimBrief flight plans or simple heading-based prediction."
@@ -3092,10 +3198,10 @@ class ConfigUI(QMainWindow):
         pipeline_boundary,
     ):
         groups = {
-            "imagery": QGroupBox("Imagery Quality"),
-            "performance": QGroupBox("Performance"),
-            "prefetch": QGroupBox("Prefetching"),
-            "pipeline": QGroupBox("Compression & Pipeline"),
+            "imagery": QGroupBox("Quality Limits"),
+            "performance": QGroupBox("Loading and Fallbacks"),
+            "prefetch": QGroupBox("Prefetching and Predictive Loading"),
+            "pipeline": QGroupBox("Engine, Network and Memory"),
         }
         layouts = {
             key: QVBoxLayout(group) for key, group in groups.items()
@@ -3157,12 +3263,12 @@ class ConfigUI(QMainWindow):
 
         # File cache size
         file_cache_layout = QHBoxLayout()
-        file_cache_label = QLabel("File cache clean limit (GB):")
+        file_cache_label = QLabel("Disk cache soft limit (GB):")
         file_cache_label.setToolTip(
-            "This is the total size of the imagery files that the cache\n"
-            "clean operation leaves in the file cache after cleaning.\n"
-            "Note that this cache grows without bounds while AutoOrtho is running.\n"
-            "Use the Clean Cache button to reduce the cache to this size.\n"
+            "Target size for the combined disk cache. Background cleanup\n"
+            "evicts the oldest compiled DDS data and source imagery after\n"
+            "the cache exceeds this soft limit. Manual cleanup also uses\n"
+            "this value as its target size.\n"
         )
         file_cache_layout.addWidget(file_cache_label)
         self.file_cache_slider = ModernSlider()
@@ -3205,7 +3311,7 @@ class ConfigUI(QMainWindow):
         self.clean_cache_btn = StyledButton("Clean Cache")
         self.clean_cache_btn.clicked.connect(self.on_clean_cache)
         self.clean_cache_btn.setToolTip(
-            "Delete cache files until the file cache clean limit is reached.\n"
+            "Delete cache files until the disk cache soft limit is reached.\n"
             "This will delete the oldest cached images first.\n"
             "If the cache is smaller than the clean limit, no files are deleted.\n"
             "Note that this can take a long time."
@@ -3612,6 +3718,10 @@ class ConfigUI(QMainWindow):
         # Initially update the enabled state
         self._update_fallback_extends_control()
 
+        partial_dds_group = QGroupBox("Partial DDS Builds")
+        self.partial_dds_settings_group = partial_dds_group
+        partial_dds_layout = QVBoxLayout(partial_dds_group)
+
         partial_quality_layout = QHBoxLayout()
         self.native_partial_allow_incomplete_check = QCheckBox(
             "Allow incomplete native partial builds"
@@ -3641,7 +3751,7 @@ class ConfigUI(QMainWindow):
             self.native_partial_allow_incomplete_check
         )
         partial_quality_layout.addStretch()
-        autoortho_layout.addLayout(partial_quality_layout)
+        partial_dds_layout.addLayout(partial_quality_layout)
 
         partial_cache_layout = QHBoxLayout()
         self.persist_partial_dds_cache_check = QCheckBox(
@@ -3673,7 +3783,9 @@ class ConfigUI(QMainWindow):
             self.persist_partial_dds_cache_check
         )
         partial_cache_layout.addStretch()
-        autoortho_layout.addLayout(partial_cache_layout)
+        partial_dds_layout.addLayout(partial_cache_layout)
+
+        self.settings_layout.addWidget(partial_dds_group)
 
         # Prefetch Settings Sub-section
         prefetch_header = QLabel("Prefetching")
@@ -4611,6 +4723,10 @@ class ConfigUI(QMainWindow):
         threads_layout.addStretch()
         autoortho_layout.addLayout(threads_layout)
 
+        debug_visuals_group = QGroupBox("Visual Troubleshooting")
+        self.debug_visuals_group = debug_visuals_group
+        debug_visuals_layout = QVBoxLayout(debug_visuals_group)
+
         missing_color_layout = QHBoxLayout()
         missing_color_layout.setSpacing(10)
         missing_color_label = QLabel("Missing Tile Color:")
@@ -4638,7 +4754,8 @@ class ConfigUI(QMainWindow):
         missing_color_layout.addWidget(self.missing_color_button)
         missing_color_layout.addWidget(self.reset_color_button)
         missing_color_layout.addStretch()
-        autoortho_layout.addLayout(missing_color_layout)
+        debug_visuals_layout.addLayout(missing_color_layout)
+        self.settings_layout.addWidget(debug_visuals_group)
 
         if self.cfg.autoortho.using_custom_tiles:
             self.info_label = QLabel(
@@ -4832,13 +4949,13 @@ class ConfigUI(QMainWindow):
         self.settings_layout.addWidget(dds_group)
 
         # General Settings group
-        general_group = QGroupBox("General Settings")
+        general_group = QGroupBox("Application Window")
         self.general_settings_group = general_group
         general_layout = QVBoxLayout()
         general_group.setLayout(general_layout)
 
 
-        self.gui_check = QCheckBox("Use GUI at startup")
+        self.gui_check = QCheckBox("Start AutoOrtho with the desktop app")
         self.gui_check.setChecked(self.cfg.general.gui)
         self.gui_check.setObjectName('gui')
         self.gui_check.setToolTip(
@@ -4850,7 +4967,9 @@ class ConfigUI(QMainWindow):
 
         general_layout.addSpacing(10)
 
-        self.hide_check = QCheckBox("Hide window when running")
+        self.hide_check = QCheckBox(
+            "Minimize to the system tray when streaming starts"
+        )
         self.hide_check.setChecked(self.cfg.general.hide)
         self.hide_check.setObjectName('hide')
         self.hide_check.setToolTip(
@@ -4859,6 +4978,12 @@ class ConfigUI(QMainWindow):
             "You can still access it from the system tray."
         )
         general_layout.addWidget(self.hide_check)
+
+        self.settings_layout.addWidget(general_group)
+
+        logging_group = QGroupBox("Log Detail")
+        self.logging_settings_group = logging_group
+        logging_layout = QVBoxLayout(logging_group)
 
         # Console/UI log level
         console_log_level_layout = QHBoxLayout()
@@ -4888,7 +5013,7 @@ class ConfigUI(QMainWindow):
         self.console_log_level_combo.currentTextChanged.connect(self.on_console_log_level_changed)
         console_log_level_layout.addWidget(self.console_log_level_combo)
         console_log_level_layout.addStretch()
-        general_layout.addLayout(console_log_level_layout)
+        logging_layout.addLayout(console_log_level_layout)
 
         # File log level
         file_log_level_layout = QHBoxLayout()
@@ -4919,9 +5044,9 @@ class ConfigUI(QMainWindow):
         self.file_log_level_combo.currentTextChanged.connect(self.on_file_log_level_changed)
         file_log_level_layout.addWidget(self.file_log_level_combo)
         file_log_level_layout.addStretch()
-        general_layout.addLayout(file_log_level_layout)
+        logging_layout.addLayout(file_log_level_layout)
 
-        self.settings_layout.addWidget(general_group)
+        self.settings_layout.addWidget(logging_group)
 
         diagnostics_group = QGroupBox("Performance Diagnostics")
         self.diagnostics_settings_group = diagnostics_group
@@ -6476,6 +6601,8 @@ class ConfigUI(QMainWindow):
         is_dynamic = self.max_zoom_mode_combo.currentText() == "Dynamic"
         self.fixed_zoom_widget.setVisible(not is_dynamic)
         self.dynamic_zoom_widget.setVisible(is_dynamic)
+        if hasattr(self, "dynamic_zoom_settings_group"):
+            self.dynamic_zoom_settings_group.setVisible(is_dynamic)
         # Also hide/show the airport zoom slider (only visible in fixed mode AND not using custom tiles)
         if hasattr(self, 'max_zoom_near_airports_widget'):
             using_custom_tiles = self.cfg.autoortho.using_custom_tiles
@@ -6973,9 +7100,9 @@ class ConfigUI(QMainWindow):
         if errors[0].field == "scenery":
             self.navigate_to("scenery-library")
         elif errors[0].field in ("webui_port", "xplane_udp_port"):
-            self.navigate_to("settings", "Flight Data")
+            self.navigate_to("settings", "Connections & Integrations")
         else:
-            self.navigate_to("settings", "Paths & Storage")
+            self.navigate_to("settings", "Setup & Storage")
         first_widget = widgets.get(errors[0].field)
         if first_widget is not None:
             first_widget.setFocus()
@@ -7249,7 +7376,7 @@ class ConfigUI(QMainWindow):
             if any(check.id == "setup-scenery" for check in blocking):
                 self.navigate_to("scenery-library")
             else:
-                self.navigate_to("settings", "Paths & Storage")
+                self.navigate_to("settings", "Setup & Storage")
             QMessageBox.warning(
                 self,
                 "AutoOrtho Is Not Ready",

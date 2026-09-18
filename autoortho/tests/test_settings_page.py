@@ -41,6 +41,26 @@ def test_settings_categories_search_and_presets(qt_app):
     assert seen == ["Balanced"]
 
 
+def test_search_no_results_shows_empty_state_and_navigation_clears_filter(
+    qt_app,
+):
+    page = SettingsPage(
+        QPushButton("Apply"),
+        QPushButton("Revert"),
+        QLabel("Restart"),
+    )
+    page.add_category("Imagery", [QLabel("Altitude-Based Quality")])
+    page.add_category("Streaming", [QLabel("Prefetch radius")])
+
+    page.search_edit.setText("does-not-exist")
+    assert page.category_list.count() == 0
+    assert page.stack.currentWidget() is page.empty_page
+
+    assert page.select_category("Dynamic Zoom") is True
+    assert page.search_edit.text() == ""
+    assert page.category_list.currentItem().text() == "Imagery"
+
+
 def test_exact_value_emits_underlying_slider_change(qt_app):
     page = SettingsPage(
         QPushButton("Apply"),

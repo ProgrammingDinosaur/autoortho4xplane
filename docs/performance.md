@@ -162,8 +162,8 @@ provider_origin_cooldown_seconds = 5.0
 | `provider_origin_cooldown_seconds` | `5.0` | 0-60 | Suppresses repeated cuts while a reduction settles. |
 
 The three most useful expert controls—initial concurrency, decrease factor, and
-cooldown—are available in **Settings → Performance Tuning → Provider Download
-Transport → Advanced adaptive tuning**. The section is collapsed by default to
+cooldown—are available in **Settings → Advanced → Engine, Network and Memory →
+Provider Download Transport → Advanced adaptive tuning**. The section is collapsed by default to
 keep unsafe tuning away from normal users.
 
 Current limits, active requests and throttle counts are exposed through the
@@ -193,14 +193,15 @@ fallback path). It no longer caps how many downloads can be in flight.
 
 ## Quick Start: Performance Presets
 
-For most users, the easiest way to configure performance is using the **Performance Preset** dropdown in Settings → Performance Tuning:
+For most users, the easiest way to configure performance is using the
+**Performance profile** dropdown at the top of Settings:
 
 | Preset | Best For | Trade-off |
 |--------|----------|-----------|
-| **Fast** | Weak CPUs, slow internet, stutter-free experience | May have occasional missing/low-res tiles |
 | **Balanced** | Most users | Good balance of quality and performance |
 | **Quality** | Fast CPUs, fast internet, maximum image quality | May have longer loading times |
-| **Custom** | Advanced users who want fine-grained control | Manual configuration required |
+| **Low Bandwidth** | Slower or capped internet connections | Fetches fewer chunks concurrently |
+| **Low Resource** | Systems with limited CPU, RAM, or VRAM | Lower detail and less aggressive background work |
 
 ---
 
@@ -265,7 +266,7 @@ memory bounded while retaining spikes and full-session coverage.
 
 ### Configuration
 
-The **Settings → Performance Diagnostics** section controls the normal profiling
+The **Settings → Logging & Reports → Performance Diagnostics** section controls the normal profiling
 options:
 
 ```ini
@@ -569,7 +570,7 @@ Quality Steps define zoom levels for different altitude ranges. Each step specif
 - **Zoom Level**: The maximum zoom level for normal tiles
 - **Airports Zoom Level**: The maximum zoom level near airports (can be higher for detail)
 
-The inline editor under **Settings → Dynamic Zoom** shows the resulting altitude
+The inline editor under **Settings → Imagery → Altitude-Based Quality** shows the resulting altitude
 ranges and preview chart, includes Airliner/General Aviation/Low VRAM presets,
 and supports undo, redo, reset, and keyboard row removal. Changes remain
 transactional until **Apply** is selected.
@@ -679,7 +680,7 @@ These settings work **alongside** the tile time budget to control individual chu
 - **Default:** 5.0
 - **Range:** 0.1 - 10.0
 - **Config file:** `maxwait = 5.0`
-- **UI:** Settings → Performance → Per-chunk max wait
+- **UI:** Settings → Streaming → Loading and Fallbacks → Per-chunk max wait
 
 Maximum time to wait for a **single chunk** to download. This works in combination with the tile time budget:
 
@@ -708,7 +709,7 @@ For each chunk:
 - **Type:** Boolean
 - **Default:** True
 - **Config file:** `suspend_maxwait = True`
-- **UI:** Settings → Performance → "Allow extra loading time during startup"
+- **UI:** Settings → Streaming → Loading and Fallbacks → "Allow extra loading time during startup"
 
 When enabled, AutoOrtho uses significantly longer timeouts during X-Plane's initial scenery load (before the flight starts). This ensures tiles load at full quality before you begin flying.
 
@@ -1021,7 +1022,8 @@ Instead of prefetching based on velocity vector prediction, AutoOrtho follows yo
 
 ### Configuration Options
 
-These settings are available in **Settings** → **Setup** → **SimBrief Integration** when flight data is loaded and the "Use Flight Data" toggle is enabled.
+These settings are available under **Flight Plan & Map → SimBrief Integration**
+when flight data is loaded and the "Use Flight Data" toggle is enabled.
 
 | Setting | Default | Range | Description |
 |---------|---------|-------|-------------|

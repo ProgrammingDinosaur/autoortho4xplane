@@ -66,7 +66,7 @@ class DiagnosticsPage(QWidget):
         title_row = QHBoxLayout()
         title = QLabel("Diagnostics")
         title.setProperty("textRole", "pageTitle")
-        settings = QPushButton("Diagnostics &Settings…")
+        settings = QPushButton("Logging && Report Settings…")
         settings.clicked.connect(self.settings_requested)
         title_row.addWidget(title)
         title_row.addStretch()

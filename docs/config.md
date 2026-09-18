@@ -17,7 +17,7 @@ On a new installation, AutoOrtho opens a guided setup wizard that:
 
 Existing installations with valid paths and dependencies are detected
 automatically and are not forced through the wizard. The wizard remains
-available from the header overflow menu or **Settings → Paths & Storage**.
+available from the header overflow menu or **Settings → Setup & Storage**.
 If setup is interrupted, reopen the wizard from that menu; unaccepted wizard
 changes are discarded and the last applied configuration remains active.
 
@@ -94,7 +94,7 @@ The configuration file `.autoortho` is located in the user's home directory.
 
 ## Performance Tuning
 
-AutoOrtho includes advanced performance settings that allow you to balance image quality against loading times and stuttering. These settings are available under **Settings → Performance** and **Settings → Prefetching**.
+AutoOrtho includes advanced performance settings that allow you to balance image quality against loading times and stuttering. These settings are available under **Settings → Streaming**.
 
 Key settings include:
 - **Tile Time Budget** - Maximum time to wait for a tile before returning results
@@ -269,7 +269,7 @@ AutoOrtho can automatically adjust imagery zoom levels based on your altitude Ab
 - Lower detail (faster loading) imagery at high altitudes
 - Terrain-aware calculations — flying at 10,000ft MSL over 5,000ft mountains uses higher quality than 10,000ft over ocean
 
-Configure quality steps in **Settings → Dynamic Zoom**.
+Configure quality steps in **Settings → Imagery → Altitude-Based Quality**.
 
 See the [Performance Tuning Guide](performance.md#dynamic-zoom-levels) for detailed configuration.
 
@@ -280,7 +280,7 @@ AutoOrtho can integrate with your SimBrief account to use your flight plan data 
 - **Prefetching**: Download tiles along your actual flight path, prioritized by time-to-encounter using SimBrief's calculated flight times
 
 To set up SimBrief integration:
-1. Go to **Settings** → **Setup** tab
+1. Go to **Flight Plan & Map**
 2. Enter your **SimBrief User ID**
 3. Click **Fetch Flight Data** after filing your flight plan
 4. Enable the toggle to use flight data for calculations
@@ -300,7 +300,7 @@ When flight data is loaded and the "Use Flight Data" toggle is enabled, addition
 
 ## Storage safety
 
-**Settings → Paths & Storage** includes a configurable free-space safety margin. AutoOrtho
+**Settings → Scenery** includes a configurable free-space safety margin. AutoOrtho
 shows cache usage and available space, estimates temporary and final package
 requirements, and blocks scenery installation when either destination is too
 small or not writable.

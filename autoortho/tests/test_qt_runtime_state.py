@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 from PySide6.QtCore import QThread
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QDialog, QGroupBox, QPushButton
 from PySide6.QtWidgets import QMessageBox
 
 from aoconfig import AOConfig
@@ -225,15 +225,113 @@ def test_shell_exposes_five_task_oriented_destinations(config_ui):
     ]
     config_ui.navigate_to("diagnostics")
     assert config_ui.shell.current_page() is config_ui.diagnostics_page
-    config_ui.navigate_to("settings", "Dynamic Zoom")
+    config_ui.navigate_to("settings", "Imagery")
     assert (
         config_ui.shell.current_page()
         is config_ui.categorized_settings_page
     )
     assert (
         config_ui.categorized_settings_page.category_list.currentItem().text()
-        == "Dynamic Zoom"
+        == "Imagery"
     )
+
+
+def test_settings_schema_renders_and_each_category_is_navigable(
+    config_ui,
+    qt_app,
+):
+    page = config_ui.categorized_settings_page
+    expected = [
+        "General",
+        "Setup & Storage",
+        "Scenery",
+        "Imagery",
+        "Streaming",
+        "Seasons",
+        "Connections & Integrations",
+        "Logging & Reports",
+        "Advanced",
+    ]
+    expected_groups = {
+        "General": {"Startup and Window", "Application Window"},
+        "Setup & Storage": {"Paths Configuration", "Cache Settings"},
+        "Scenery": {
+            "Scenery Compatibility",
+            "Scenery Installation Settings",
+        },
+        "Imagery": {
+            "Imagery Source",
+            "Quality Limits",
+            "Altitude-Based Quality",
+            "Night Exclusion (Sun Position)",
+        },
+        "Streaming": {
+            "Loading and Fallbacks",
+            "Prefetching and Predictive Loading",
+        },
+        "Seasons": {"Seasons Conversion Settings", "Seasons"},
+        "Connections & Integrations": {"Flight Data Settings"},
+        "Logging & Reports": {
+            "Log Detail",
+            "Performance Diagnostics",
+            "Visual Troubleshooting",
+        },
+        "Advanced": {
+            "DDS Compression Settings",
+            "Partial DDS Builds",
+            "Engine, Network and Memory",
+            "FUSE Settings",
+        },
+    }
+
+    assert page.category_names() == expected
+    config_ui.resize(1280, 850)
+    config_ui.show()
+    config_ui.navigate_to("settings")
+    qt_app.processEvents()
+
+    for name in expected:
+        assert page.select_category(name) is True
+        qt_app.processEvents()
+        assert page.category_list.currentItem().text() == name
+        entry = next(entry for entry in page.entries if entry.name == name)
+        assert page.stack.currentWidget() is entry.page
+        assert entry.page.isVisible()
+        group_titles = {
+            group.title() for group in entry.page.findChildren(QGroupBox)
+        }
+        assert expected_groups[name] <= group_titles
+
+    page.select_category("Imagery")
+    config_ui.max_zoom_mode_combo.setCurrentText("Fixed")
+    qt_app.processEvents()
+    assert config_ui.dynamic_zoom_settings_group.isHidden()
+    config_ui.max_zoom_mode_combo.setCurrentText("Dynamic")
+    qt_app.processEvents()
+    assert config_ui.dynamic_zoom_settings_group.isVisible()
+
+
+def test_category_defaults_are_available_only_when_supported(config_ui):
+    page = config_ui.categorized_settings_page
+    setup_entry = next(
+        entry for entry in page.entries if entry.name == "Setup & Storage"
+    )
+    setup_restore = next(
+        button
+        for button in setup_entry.page.findChildren(QPushButton)
+        if button.text() == "Restore Category Defaults"
+    )
+    assert setup_restore.isHidden()
+
+    config_ui.showconfig_check.setChecked(False)
+    config_ui._restore_category_defaults("General")
+    assert config_ui.showconfig_check.isChecked()
+
+    config_ui.maptype_combo.setCurrentText("BI")
+    config_ui.sun_night_threshold_spin.setValue(-6.0)
+    config_ui._restore_category_defaults("Imagery")
+    assert config_ui.maptype_combo.currentText() == "Use tile default"
+    assert config_ui.sun_night_threshold_spin.value() == -12.0
 
 
 def test_validation_navigates_visible_shell_even_when_legacy_tab_is_stale(
@@ -259,7 +357,7 @@ def test_validation_navigates_visible_shell_even_when_legacy_tab_is_stale(
     )
     assert (
         config_ui.categorized_settings_page.category_list.currentItem().text()
-        == "Paths & Storage"
+        == "Setup & Storage"
     )
 
 
