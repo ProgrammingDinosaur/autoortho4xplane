@@ -2153,3 +2153,64 @@ class TestTerrainTileLookup:
         lookup.clear_cache()
         assert lookup._highzoom_count == 0
         assert len(lookup._highzoom_index) == 0
+
+def test_get_bytes_mid_mipmap_read_builds_a_complete_buffer(tmpdir):
+    """A read past the mipmap boundary must produce a complete mipmap buffer.
+
+    gen_mipmaps() compresses from row 0 over a height derived from
+    compress_bytes, and replaces the mipmap databuffer with the result. Two ways
+    to get this wrong, both ending in missing_color on screen:
+
+    - compose only some chunk rows and compress the whole image: the unfilled
+      rows are compressed in as missing_color;
+    - limit compression to the composed rows: the buffer is then shorter than
+      the mipmap, and DDS.read() pads the remainder with missing_color.
+
+    So for a read that is not at the mipmap boundary, the image must be composed
+    in full and compressed in full. Uses max_zoom=15 / min_zoom=14, where the
+    clamped zoom gives the composed image more chunk rows than the mipmap.
+    """
+    tile = getortho.Tile(2176, 3232, 'BI', 16, min_zoom=14, max_zoom=15,
+                         cache_dir=str(tmpdir))
+
+    calls = {}
+
+    class _Img:
+        size = (256, 256)
+
+        def close(self):
+            pass
+
+    def fake_get_img(mipmap, startrow=0, endrow=None, **kwargs):
+        calls['img'] = (mipmap, startrow, endrow)
+        return _Img()
+
+    def fake_gen_mipmaps(img, startmipmap=0, maxmipmaps=99, compress_bytes=0):
+        calls['compress_bytes'] = compress_bytes
+
+    tile.get_img = fake_get_img
+    tile.dds.gen_mipmaps = fake_gen_mipmaps
+
+    checked = 0
+    for mipmap in range(1, tile.max_mipmap + 1):
+        mm = tile.dds.mipmap_list[mipmap]
+        if mm.length <= 8192:
+            continue
+        calls.clear()
+        tile.get_bytes(mm.startpos + mm.length // 2, 4096)
+        if 'compress_bytes' not in calls:
+            continue
+        checked += 1
+        _, startrow, endrow = calls['img']
+
+        assert calls['compress_bytes'] == 0, (
+            f"mipmap {mipmap}: compression limited to "
+            f"{calls['compress_bytes']} bytes on a mid-mipmap read; the buffer "
+            f"would be shorter than the mipmap and read() would pad it with "
+            f"missing_color")
+        assert (startrow, endrow) == (0, None), (
+            f"mipmap {mipmap}: whole image is compressed but only rows "
+            f"{startrow}-{endrow} were composed; the rest would be stored as "
+            f"missing_color")
+
+    assert checked, "no mipmap exercised the mid-mipmap read path"

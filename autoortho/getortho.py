@@ -7426,11 +7426,11 @@ class Tile(object):
         startrow = mm_offset // bytes_per_chunk_row
         endrow = (mm_offset + max(0, length - 1)) // bytes_per_chunk_row
 
-        # Clamp to valid range of chunk rows for this mipmap
-        chunk_rows_in_mm = base_height_px // 256
-        if chunk_rows_in_mm == 0:
-            log.error(f"Chunk rows in mipmap {mipmap} is 0!  Base height: {base_height_px}  Mipmap: {mipmap}")
+        # A mipmap smaller than one chunk still occupies one row; 0 here made
+        # the clamps below produce -1, slicing chunks from the end of the tile.
+        chunk_rows_in_mm = max(1, base_height_px // 256)
 
+        # Clamp to valid range of chunk rows for this mipmap
         if startrow >= chunk_rows_in_mm:
             startrow = chunk_rows_in_mm - 1
         if endrow >= chunk_rows_in_mm:
@@ -7438,9 +7438,27 @@ class Tile(object):
         if endrow < startrow:
             endrow = startrow
 
+        # The rows above are in mipmap space, but get_img() composes at the zoom
+        # _get_quick_zoom() returns, which min_zoom can clamp upwards. Rescale so
+        # the range spans the image that will actually be built.
+        src_rows = chunk_rows_in_mm
+        try:
+            _, _, _, _src_h, _, _ = self._get_quick_zoom(
+                min(self.max_zoom - mipmap, self.max_zoom), self.min_zoom)
+            src_rows = max(1, int(_src_h))
+        except Exception:
+            src_rows = chunk_rows_in_mm
+
+        if src_rows > chunk_rows_in_mm and chunk_rows_in_mm > 0:
+            scale = src_rows / float(chunk_rows_in_mm)
+            startrow = int(startrow * scale)
+            endrow = min(src_rows - 1, int((endrow + 1) * scale) - 1)
+            if endrow < startrow:
+                endrow = startrow
+
         # Prefetch one extra chunk-row ahead to reduce subsequent stalls
-        if endrow < (chunk_rows_in_mm - 1):
-            endrow = min(endrow + 1, chunk_rows_in_mm - 1)
+        if endrow < (src_rows - 1):
+            endrow = min(endrow + 1, src_rows - 1)
 
         log.debug(f"Startrow: {startrow} Endrow: {endrow} bytes_per_chunk_row: {bytes_per_chunk_row} width_px: {base_width_px} height_px: {base_height_px}")
         
@@ -7463,6 +7481,13 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════
         # PYTHON FALLBACK PATH
         # ═══════════════════════════════════════════════════════════════════
+        # gen_mipmaps() only limits compression when given a non-zero
+        # compress_bytes; otherwise it compresses the whole composed image. A
+        # partially composed image would therefore store its unfilled rows as
+        # missing_color, so compose the whole thing.
+        if offset != 0:
+            startrow, endrow = 0, None
+
         # Pass the per-request budget to get_img (each read() gets its own budget)
         new_im = self.get_img(mipmap, startrow, endrow,
                 maxwait=self.get_maxwait(), time_budget=time_budget)
