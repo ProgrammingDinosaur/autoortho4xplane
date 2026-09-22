@@ -46,7 +46,7 @@ class NavigationRail(QFrame):
         self.setFrameShadow(QFrame.Shadow.Raised)
         self.setMinimumWidth(176)
         self.setSizePolicy(
-            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Minimum,
             QSizePolicy.Policy.Expanding,
         )
 

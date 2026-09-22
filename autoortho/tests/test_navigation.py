@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QSizePolicy
 
 from ui.navigation import NavigationRail
 
@@ -29,6 +29,10 @@ def test_navigation_rail_exposes_five_destinations(qt_app):
     )
     assert rail.button_for("settings").font().pointSize() >= 12
     assert rail.button_for("settings").minimumHeight() >= 42
+    assert (
+        rail.sizePolicy().horizontalPolicy()
+        == QSizePolicy.Policy.Minimum
+    )
 
 
 def test_navigation_rail_emits_selection_changes(qt_app):
