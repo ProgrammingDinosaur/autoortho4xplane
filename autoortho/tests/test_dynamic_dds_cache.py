@@ -158,6 +158,254 @@ def sample_dds_bytes():
     return bytes(data)
 
 
+def _manifest_rows(tile, max_zoom, dds_bytes, missing=(), fallback=()):
+    from autoortho.dds_manifest import MipmapSource, RowBuildManifest
+
+    missing = set(missing or ())
+    fallback = set(fallback or ())
+    mm0 = tile.dds.mipmap_list[0]
+    row_count = max(1, (tile.dds.height + 255) // 256)
+    chunks_per_row = max(1, (tile.dds.width + 255) // 256)
+    row_bytes = mm0.length // row_count
+    manifests = {}
+    for row in range(row_count):
+        sources = []
+        for column in range(chunks_per_row):
+            index = row * chunks_per_row + column
+            if index in missing:
+                source = MipmapSource.MISSING_COLOR
+            elif index in fallback:
+                source = MipmapSource.LOWER_ZL_CACHE
+            else:
+                source = MipmapSource.TARGET_PROVIDER
+            sources.append(source)
+        start = mm0.startpos + row * row_bytes
+        row_data = dds_bytes[start:start + row_bytes]
+        manifests[row] = RowBuildManifest.create(
+            tile_id=tile.id,
+            target_zoom=max_zoom,
+            mipmap=0,
+            row_index=row,
+            build_generation=1,
+            sources=sources,
+            compressed_data=row_data,
+        )
+    return manifests
+
+
+def _manifest_rows_from_mm0(tile, max_zoom, mm0_bytes):
+    from autoortho.dds_manifest import MipmapSource, RowBuildManifest
+
+    row_count = max(1, (tile.dds.height + 255) // 256)
+    chunks_per_row = max(1, (tile.dds.width + 255) // 256)
+    row_bytes = len(mm0_bytes) // row_count
+    return {
+        row: RowBuildManifest.create(
+            tile_id=tile.id,
+            target_zoom=max_zoom,
+            mipmap=0,
+            row_index=row,
+            build_generation=1,
+            sources=bytes(
+                [int(MipmapSource.TARGET_PROVIDER)] * chunks_per_row
+            ),
+            compressed_data=mm0_bytes[
+                row * row_bytes:(row + 1) * row_bytes
+            ],
+        )
+        for row in range(row_count)
+    }
+
+
+@pytest.fixture(autouse=True)
+def supply_immutable_manifests(monkeypatch):
+    """Keep legacy cache-mechanics tests focused on their original concern."""
+    from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+    from autoortho.dds_manifest import MipmapSource, RowBuildManifest
+
+    original_store = DynamicDDSCache.store
+    original_store_from_file = DynamicDDSCache.store_from_file
+    original_append = DynamicDDSCache.append_partial_row
+    original_enqueue = DynamicDDSCache.enqueue_partial_row
+
+    def store(
+        cache,
+        tile_id,
+        max_zoom,
+        dds_bytes,
+        tile,
+        mm0_missing_indices=None,
+        mm0_fallback_indices=None,
+        mm0_manifest=None,
+    ):
+        if (
+            mm0_manifest is None
+            and dds_bytes
+            and len(dds_bytes) >= 128
+            and len(dds_bytes) >= tile.dds.mipmap_list[0].endpos
+        ):
+            mm0_manifest = _manifest_rows(
+                tile,
+                max_zoom,
+                dds_bytes,
+                mm0_missing_indices,
+                mm0_fallback_indices,
+            )
+        return original_store(
+            cache,
+            tile_id,
+            max_zoom,
+            dds_bytes,
+            tile,
+            mm0_missing_indices,
+            mm0_fallback_indices,
+            mm0_manifest,
+        )
+
+    def store_from_file(
+        cache,
+        tile_id,
+        max_zoom,
+        source_path,
+        tile,
+        mm0_missing_indices=None,
+        mm0_fallback_indices=None,
+        mm0_manifest=None,
+    ):
+        if mm0_manifest is None and os.path.isfile(source_path):
+            with open(source_path, "rb") as source_file:
+                dds_bytes = source_file.read()
+            mm0_manifest = _manifest_rows(
+                tile,
+                max_zoom,
+                dds_bytes,
+                mm0_missing_indices,
+                mm0_fallback_indices,
+            )
+        return original_store_from_file(
+            cache,
+            tile_id,
+            max_zoom,
+            source_path,
+            tile,
+            mm0_missing_indices,
+            mm0_fallback_indices,
+            mm0_manifest,
+        )
+
+    def row_manifest(
+        tile,
+        tile_id,
+        max_zoom,
+        row_index,
+        row_data,
+        total,
+        degraded,
+        revision,
+        provenance,
+    ):
+        if provenance is not None:
+            sources = bytes(provenance)
+        else:
+            chunks_per_row = max(1, (tile.dds.width + 255) // 256)
+            source = (
+                MipmapSource.LOWER_ZL_CACHE
+                if degraded
+                else MipmapSource.TARGET_PROVIDER
+            )
+            sources = bytes([int(source)]) * chunks_per_row
+        return RowBuildManifest.create(
+            tile_id=tile_id,
+            target_zoom=max_zoom,
+            mipmap=0,
+            row_index=row_index,
+            build_generation=revision if revision is not None else 1,
+            sources=sources,
+            compressed_data=row_data,
+        )
+
+    def append(
+        cache,
+        tile_id,
+        max_zoom,
+        tile,
+        row_index,
+        data,
+        total,
+        *,
+        manifest=None,
+        degraded=False,
+        revision=None,
+        provenance=None,
+    ):
+        if manifest is None:
+            manifest = row_manifest(
+                tile,
+                tile_id,
+                max_zoom,
+                row_index,
+                bytes(data),
+                total,
+                degraded,
+                revision,
+                provenance,
+            )
+        return original_append(
+            cache,
+            tile_id,
+            max_zoom,
+            tile,
+            row_index,
+            data,
+            total,
+            manifest=manifest,
+        )
+
+    def enqueue(
+        cache,
+        tile_id,
+        max_zoom,
+        tile,
+        row_index,
+        data,
+        total,
+        *,
+        manifest=None,
+        degraded=False,
+        revision=None,
+        provenance=None,
+        completion_callback=None,
+    ):
+        if manifest is None:
+            manifest = row_manifest(
+                tile,
+                tile_id,
+                max_zoom,
+                row_index,
+                bytes(data),
+                total,
+                degraded,
+                revision,
+                provenance,
+            )
+        return original_enqueue(
+            cache,
+            tile_id,
+            max_zoom,
+            tile,
+            row_index,
+            data,
+            total,
+            manifest=manifest,
+            completion_callback=completion_callback,
+        )
+
+    monkeypatch.setattr(DynamicDDSCache, "store", store)
+    monkeypatch.setattr(DynamicDDSCache, "store_from_file", store_from_file)
+    monkeypatch.setattr(DynamicDDSCache, "append_partial_row", append)
+    monkeypatch.setattr(DynamicDDSCache, "enqueue_partial_row", enqueue)
+
+
 # ============================================================================
 # DynamicDDSCache Tests
 # ============================================================================
@@ -178,6 +426,33 @@ class TestDynamicDDSCache:
         loaded = dds_cache.load(tile_id, max_zoom, mock_tile)
         assert loaded is not None
         assert loaded == sample_dds_bytes
+
+    def test_store_updates_disk_budget(
+        self, dds_cache, mock_tile, sample_dds_bytes
+    ):
+        class Budget:
+            def __init__(self):
+                self.changes = []
+
+            def account_dds(self, amount):
+                self.changes.append(amount)
+
+        budget = Budget()
+        dds_cache._budget_manager = budget
+        assert dds_cache.store(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            sample_dds_bytes,
+            mock_tile,
+        )
+
+        assert budget.changes
+        assert budget.changes[-1] > 0
+
+    def test_maintenance_submit_is_safe_after_close(self, dds_cache):
+        dds_cache.close()
+
+        assert dds_cache._submit_maintenance(lambda: None) is False
 
     def test_cache_miss(self, dds_cache, mock_tile):
         """Test that load returns None on cache miss."""
@@ -288,17 +563,20 @@ class TestDynamicDDSCache:
         
         tiles = []
         for i in range(5):
-            tile = MockTile(row=21728 + i, col=34432)
+            tile = MockTile(
+                row=21728 + i,
+                col=34432,
+                dds_width=128,
+                dds_height=128,
+            )
             tile.cache_dir = cache_dir
             tiles.append(tile)
         
         # Store 5 tiles (each ~5.3MB for 4096x4096 BC1... too big)
         # Use small fake data instead
-        small_data = b'DDS ' + b'\x00' * (128 + 10000)  # ~10KB each
+        small_data = b'DDS ' + b'\x00' * (tiles[0].dds.total_size - 4)
         
         for tile in tiles:
-            # Override DDS total_size to match our fake data
-            tile.dds.total_size = len(small_data)
             cache.store(tile.id, tile.max_zoom, small_data, tile)
         
         # Cache should have evicted some entries to stay within ~64KB budget
@@ -375,7 +653,7 @@ class TestDynamicDDSCache:
         with open(ddm_path, 'r') as f:
             meta = json.load(f)
         
-        assert meta['v'] == 3
+        assert meta['v'] == 5
         assert meta['w'] == 4096
         assert meta['h'] == 4096
         assert meta['max_zl'] == 16
@@ -495,7 +773,12 @@ class TestDynamicDDSCacheUpgrade:
         # Perform upgrade
         result = dds_cache.upgrade_zl(
             tile_17.id, old_max_zoom=16, new_max_zoom=17,
-            new_mm0_bytes=new_mm0_bytes, tile=tile_17
+            new_mm0_bytes=new_mm0_bytes, tile=tile_17,
+            new_mm0_manifest=_manifest_rows_from_mm0(
+                tile_17,
+                17,
+                new_mm0_bytes,
+            ),
         )
         
         assert result is not None
@@ -545,8 +828,22 @@ class TestDiskBudgetManager:
         )
         
         report = mgr.usage_report
-        total_budget = report['dds_budget_mb'] + report['jpeg_budget_mb']
-        assert abs(total_budget - 1000) < 1  # Allow rounding
+        assert report['dds_budget_mb'] == pytest.approx(800)
+        assert report['jpeg_budget_mb'] == pytest.approx(200)
+
+    def test_dds_percentage_is_literal(self, cache_dir):
+        """A configured DDS percentage must not be normalized as a weight."""
+        from autoortho.aopipeline.disk_budget_manager import DiskBudgetManager
+
+        mgr = DiskBudgetManager(
+            cache_dir=cache_dir,
+            total_budget_mb=1000,
+            dds_budget_pct=40,
+        )
+
+        report = mgr.usage_report
+        assert report['dds_budget_mb'] == pytest.approx(400)
+        assert report['jpeg_budget_mb'] == pytest.approx(600)
 
     def test_account_dds(self, cache_dir):
         """Test DDS accounting updates usage."""
@@ -575,13 +872,18 @@ class TestDiskBudgetManager:
         
         dds_dir = os.path.join(cache_dir, "dds_cache", "+50+010", "+50+010", "BI")
         os.makedirs(dds_dir, exist_ok=True)
-        with open(os.path.join(dds_dir, "21728_34432_z16.dds"), 'wb') as f:
+        base = os.path.join(dds_dir, "21728_34432_z16")
+        with open(base + ".dds", 'wb') as f:
             f.write(b'\x00' * 20000)
+        with open(base + ".ddm", 'wb') as f:
+            f.write(b'\x00' * 300)
+        with open(base + ".ddm.rows", 'wb') as f:
+            f.write(b'\x00' * 500)
         
         mgr = DiskBudgetManager(cache_dir=cache_dir, total_budget_mb=1000)
         report = mgr.scan_disk_usage()
         
-        assert report.dds_bytes == 20000
+        assert report.dds_bytes == 20800
 
     def test_usage_report_format(self, cache_dir):
         """Test usage_report returns expected keys."""
@@ -612,9 +914,8 @@ class TestDiskBudgetManager:
         )
         
         report = mgr.usage_report
-        # After clamping (90 + 5 = 95) normalized to sum to 1000MB
-        assert report['dds_budget_mb'] > 0
-        assert report['jpeg_budget_mb'] > 0
+        assert report['dds_budget_mb'] == pytest.approx(900)
+        assert report['jpeg_budget_mb'] == pytest.approx(100)
 
 
 # ============================================================================
@@ -742,8 +1043,8 @@ class TestIntegration:
 # DDM v2 Tests
 # ============================================================================
 
-class TestDDMv2:
-    """Tests for DDM version 2 metadata (missing indices, healing fields)."""
+class TestDDMv5:
+    """Tests for DDM v5 healing fields."""
 
     def test_ddm_v2_complete_tile(self, dds_cache, mock_tile, sample_dds_bytes):
         """Test DDM v2 for a fully complete tile (no missing chunks)."""
@@ -756,7 +1057,7 @@ class TestDDMv2:
         with open(ddm_path, 'r') as f:
             meta = json.load(f)
 
-        assert meta['v'] == 3
+        assert meta['v'] == 5
         assert meta['needs_healing'] is False
         assert meta['healing_chunks'] == 0
         assert meta['missing_indices'] == []
@@ -774,7 +1075,7 @@ class TestDDMv2:
         with open(ddm_path, 'r') as f:
             meta = json.load(f)
 
-        assert meta['v'] == 3
+        assert meta['v'] == 5
         assert meta['needs_healing'] is True
         assert meta['healing_chunks'] == 3
         assert meta['missing_indices'] == [0, 3, 7]
@@ -1032,7 +1333,15 @@ class TestDynamicDDSCacheDowngrade:
         tile_15.cache_dir = cache_dir
 
         result = dds_cache.downgrade_zl(
-            tile_15.id, old_max_zoom=16, new_max_zoom=15, tile=tile_15
+            tile_15.id, old_max_zoom=16, new_max_zoom=15, tile=tile_15,
+            new_mm0_manifest=_manifest_rows_from_mm0(
+                tile_15,
+                15,
+                sample_dds_bytes[
+                    tile_16.dds.mipmap_list[1].startpos:
+                    tile_16.dds.mipmap_list[1].endpos
+                ],
+            ),
         )
 
         assert result is not None
@@ -1069,7 +1378,15 @@ class TestDynamicDDSCacheDowngrade:
         tile_15 = MockTile(max_zoom=15, dds_width=2048, dds_height=2048)
         tile_15.cache_dir = cache_dir
         result = dds_cache.downgrade_zl(
-            tile_15.id, old_max_zoom=16, new_max_zoom=15, tile=tile_15
+            tile_15.id, old_max_zoom=16, new_max_zoom=15, tile=tile_15,
+            new_mm0_manifest=_manifest_rows_from_mm0(
+                tile_15,
+                15,
+                sample_dds_bytes[
+                    tile_16.dds.mipmap_list[1].startpos:
+                    tile_16.dds.mipmap_list[1].endpos
+                ],
+            ),
         )
         assert result is not None
         assert not os.path.exists(old_dds_path)
@@ -1084,7 +1401,15 @@ class TestDynamicDDSCacheDowngrade:
         tile_15 = MockTile(max_zoom=15, dds_width=2048, dds_height=2048)
         tile_15.cache_dir = cache_dir
         downgraded = dds_cache.downgrade_zl(
-            tile_15.id, old_max_zoom=16, new_max_zoom=15, tile=tile_15
+            tile_15.id, old_max_zoom=16, new_max_zoom=15, tile=tile_15,
+            new_mm0_manifest=_manifest_rows_from_mm0(
+                tile_15,
+                15,
+                sample_dds_bytes[
+                    tile_16.dds.mipmap_list[1].startpos:
+                    tile_16.dds.mipmap_list[1].endpos
+                ],
+            ),
         )
         assert downgraded is not None
 
@@ -1250,12 +1575,16 @@ class TestZstdCompression:
 
         # Store with compression disabled
         monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'none')
-        cache_none = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+        cache_none = DynamicDDSCache(
+            cache_dir=cache_dir, max_size_mb=100, enabled=True
+        )
         cache_none.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
 
         # Load with compression enabled (new instance reads 'zstd' from config)
         monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'zstd')
-        cache_zstd = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+        cache_zstd = DynamicDDSCache(
+            cache_dir=cache_dir, max_size_mb=100, enabled=True
+        )
         cache_zstd.scan_existing()
 
         loaded = cache_zstd.load(mock_tile.id, mock_tile.max_zoom, mock_tile)
@@ -1267,7 +1596,9 @@ class TestZstdCompression:
         from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
 
         monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'none')
-        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+        cache = DynamicDDSCache(
+            cache_dir=cache_dir, max_size_mb=100, enabled=True
+        )
 
         cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
 
@@ -1281,18 +1612,21 @@ class TestZstdCompression:
             meta = json.load(f)
         assert meta.get('disk_compression') == 'none'
 
-    def test_lru_tracks_compressed_size(self, dds_cache, mock_tile, sample_dds_bytes):
-        """Test that LRU disk usage tracks compressed (on-disk) size, not uncompressed."""
+    def test_lru_tracks_complete_compressed_entry(
+        self, dds_cache, mock_tile, sample_dds_bytes
+    ):
+        """LRU usage includes compressed DDS data and its metadata sidecar."""
         dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
 
-        dds_path, _ = dds_cache._paths_for(
+        dds_path, ddm_path = dds_cache._paths_for(
             mock_tile.row, mock_tile.col, mock_tile.maptype,
             mock_tile.tilename_zoom, mock_tile.max_zoom
         )
         disk_size = os.path.getsize(dds_path)
 
         disk_usage = dds_cache.get_disk_usage()
-        assert disk_usage == disk_size
+        assert disk_usage == dds_cache._entry_disk_size(dds_path, ddm_path)
+        assert disk_usage > disk_size
 
     def test_store_from_file_compressed(self, dds_cache, mock_tile, sample_dds_bytes, cache_dir):
         """Test store_from_file compresses the source file."""
@@ -1327,16 +1661,16 @@ class TestZstdCompression:
 
     def test_incremental_store_compressed(self, dds_cache, mock_tile):
         """Test that incremental stores are compressed when zstd is enabled."""
-        total_size = 128 + 8192
-        mm_data = {0: b'\xAA' * 8192}
-        mm_offsets = {0: (128, 8192)}
+        total_size = 128 + 8192 + 2048
+        mm_data = {1: b'\xAA' * 2048}
+        mm_offsets = {0: (128, 8192), 1: (128 + 8192, 2048)}
 
         dds_cache.store_incremental(
             mock_tile.id, mock_tile.max_zoom,
             mock_tile.row, mock_tile.col, mock_tile.maptype,
             mock_tile.tilename_zoom,
             b'DDS ' + b'\x00' * 124,
-            total_size, 4096, 4096, 1,
+            total_size, 4096, 4096, 2,
             mm_data, mm_offsets
         )
 
@@ -1367,7 +1701,12 @@ class TestZstdCompression:
 
         result = dds_cache.upgrade_zl(
             tile_17.id, old_max_zoom=16, new_max_zoom=17,
-            new_mm0_bytes=new_mm0_bytes, tile=tile_17
+            new_mm0_bytes=new_mm0_bytes, tile=tile_17,
+            new_mm0_manifest=_manifest_rows_from_mm0(
+                tile_17,
+                17,
+                new_mm0_bytes,
+            ),
         )
         assert result is not None
         assert len(result) == tile_17.dds.total_size
@@ -1382,7 +1721,15 @@ class TestZstdCompression:
         tile_15.cache_dir = cache_dir
 
         result = dds_cache.downgrade_zl(
-            tile_15.id, old_max_zoom=16, new_max_zoom=15, tile=tile_15
+            tile_15.id, old_max_zoom=16, new_max_zoom=15, tile=tile_15,
+            new_mm0_manifest=_manifest_rows_from_mm0(
+                tile_15,
+                15,
+                sample_dds_bytes[
+                    tile_16.dds.mipmap_list[1].startpos:
+                    tile_16.dds.mipmap_list[1].endpos
+                ],
+            ),
         )
         assert result is not None
         assert len(result) == tile_15.dds.total_size
@@ -1444,8 +1791,8 @@ class TestZstdCompression:
         assert 1 in meta1['populated_mipmaps']
         assert 0 not in meta1['populated_mipmaps']
 
-        # Second incremental write (mipmap 0) on top of compressed file
-        dds_cache.store_incremental(
+        # Mipmap zero cannot be committed without immutable row manifests.
+        assert not dds_cache.store_incremental(
             mock_tile.id, mock_tile.max_zoom,
             mock_tile.row, mock_tile.col, mock_tile.maptype,
             mock_tile.tilename_zoom,
@@ -1455,6 +1802,401 @@ class TestZstdCompression:
 
         with open(ddm_path, 'r') as f:
             meta2 = json.load(f)
-        assert 0 in meta2['populated_mipmaps']
+        assert 0 not in meta2['populated_mipmaps']
         assert 1 in meta2['populated_mipmaps']
         assert meta2.get('disk_compression') == 'zstd'
+
+
+# ============================================================================
+# DDM v4 partial-row persistence tests
+# ============================================================================
+
+class TestDDMv5PartialRows:
+    def test_v2_and_v3_metadata_are_invalidated(
+        self, dds_cache, mock_tile, sample_dds_bytes
+    ):
+        """Old compiled entries are untrusted and removed."""
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom)
+        for version in (2, 3):
+            assert dds_cache.store(
+                mock_tile.id,
+                mock_tile.max_zoom,
+                sample_dds_bytes,
+                mock_tile,
+            )
+            with open(ddm_path) as metadata_file:
+                current = json.load(metadata_file)
+            legacy = dict(current)
+            legacy["v"] = version
+            legacy.pop("partial_mipmaps", None)
+            if version == 2:
+                legacy.pop("populated_mipmaps", None)
+            with open(ddm_path, "w") as metadata_file:
+                json.dump(legacy, metadata_file)
+            assert dds_cache.load_metadata(
+                mock_tile.id, mock_tile.max_zoom, mock_tile) is None
+            assert not os.path.exists(ddm_path)
+
+    def test_future_metadata_is_a_cache_miss(
+        self, dds_cache, mock_tile, sample_dds_bytes
+    ):
+        assert dds_cache.store(
+            mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        dds_path, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom)
+        with open(ddm_path) as metadata_file:
+            metadata = json.load(metadata_file)
+        metadata["v"] = 99
+        with open(ddm_path, "w") as metadata_file:
+            json.dump(metadata, metadata_file)
+
+        assert os.path.exists(dds_path)
+        assert dds_cache.load_metadata(
+            mock_tile.id, mock_tile.max_zoom, mock_tile) is None
+        assert dds_cache.load(mock_tile.id, mock_tile.max_zoom, mock_tile) is None
+        assert not dds_cache.contains(mock_tile.id, mock_tile.max_zoom, mock_tile)
+
+    def test_partial_rows_are_v5_and_manifest_backed(self, dds_cache, mock_tile):
+        assert dds_cache.append_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 0, b"first", 2,
+            revision=7)
+        metadata = dds_cache.load_metadata(
+            mock_tile.id, mock_tile.max_zoom, mock_tile)
+
+        assert metadata["v"] == 5
+        assert 0 not in metadata["populated_mipmaps"]
+        assert metadata["partial_mipmaps"]["0"] == {
+            "unit": "chunk_row",
+            "total": 2,
+            "covered": [0],
+            "degraded": [],
+            "revision": 7,
+            "row_revisions": {"0": 7},
+        }
+        assert dds_cache.load_partial_rows(
+            mock_tile.id, mock_tile.max_zoom, mock_tile) == {0: b"first"}
+        assert dds_cache.append_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 1, b"second", 2)
+        metadata = dds_cache.load_metadata(
+            mock_tile.id, mock_tile.max_zoom, mock_tile)
+        assert 0 not in metadata["populated_mipmaps"]
+        assert metadata["partial_mipmaps"]["0"]["covered"] == [0, 1]
+        assert dds_cache.load_partial_rows(
+            mock_tile.id, mock_tile.max_zoom, mock_tile
+        ) == {0: b"first", 1: b"second"}
+
+    def test_partial_row_provenance_round_trips(self, dds_cache, mock_tile):
+        from autoortho.dds_manifest import manifests_from_dict
+
+        provenance = bytes([1] * 16)
+        assert dds_cache.append_partial_row(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+            0,
+            b"row",
+            2,
+            provenance=provenance,
+        )
+
+        metadata = dds_cache.load_metadata(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+        )
+
+        manifests = manifests_from_dict(
+            metadata["mm0_manifest"],
+            tile_id=mock_tile.id,
+        )
+        assert manifests[0].sources == provenance
+
+    def test_partial_row_completion_reports_persistence_result(
+        self,
+        dds_cache,
+        mock_tile,
+    ):
+        completed = []
+        assert dds_cache.enqueue_partial_row(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+            0,
+            b"row",
+            2,
+            provenance=bytes([1, 1]),
+            completion_callback=lambda success, row: completed.append(
+                (success, row)
+            ),
+        )
+        assert dds_cache.flush_partial_rows(timeout=2)
+        assert completed == [(True, 0)]
+
+    def test_complete_store_serializes_against_partial_append(
+        self,
+        dds_cache,
+        mock_tile,
+        sample_dds_bytes,
+        monkeypatch,
+    ):
+        entered = threading.Event()
+        release = threading.Event()
+        original_append = dds_cache._append_row_record
+
+        def blocked_append(*args, **kwargs):
+            entered.set()
+            release.wait(1)
+            return original_append(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dds_cache,
+            "_append_row_record",
+            blocked_append,
+        )
+        append_result = []
+        store_result = []
+        append_thread = threading.Thread(
+            target=lambda: append_result.append(
+                dds_cache.append_partial_row(
+                    mock_tile.id,
+                    mock_tile.max_zoom,
+                    mock_tile,
+                    0,
+                    b"row",
+                    2,
+                )
+            )
+        )
+        append_thread.start()
+        assert entered.wait(1)
+        store_thread = threading.Thread(
+            target=lambda: store_result.append(
+                dds_cache.store(
+                    mock_tile.id,
+                    mock_tile.max_zoom,
+                    sample_dds_bytes,
+                    mock_tile,
+                )
+            )
+        )
+        store_thread.start()
+        time.sleep(0.02)
+        release.set()
+        append_thread.join()
+        store_thread.join()
+
+        metadata = dds_cache.load_metadata(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+        )
+        assert append_result == [True]
+        assert store_result == [True]
+        assert 0 in metadata["populated_mipmaps"]
+        assert metadata["partial_mipmaps"] == {}
+        _dds_path, ddm_path = dds_cache._paths_for(
+            mock_tile.row,
+            mock_tile.col,
+            mock_tile.maptype,
+            mock_tile.tilename_zoom,
+            mock_tile.max_zoom,
+        )
+        assert not os.path.exists(dds_cache._row_records_path(ddm_path))
+
+    def test_enqueue_store_transfers_snapshot_without_blocking(
+        self,
+        dds_cache,
+        mock_tile,
+        sample_dds_bytes,
+        monkeypatch,
+    ):
+        entered = threading.Event()
+        release = threading.Event()
+        original_store = dds_cache.store
+
+        def blocked_store(*args, **kwargs):
+            entered.set()
+            release.wait(1)
+            return original_store(*args, **kwargs)
+
+        monkeypatch.setattr(dds_cache, "store", blocked_store)
+        started = time.monotonic()
+        assert dds_cache.enqueue_store(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            sample_dds_bytes,
+            mock_tile,
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.1
+        assert entered.wait(1)
+        release.set()
+
+    def test_partial_row_reader_ignores_corrupt_and_truncated_records(
+        self, dds_cache, mock_tile
+    ):
+        from autoortho.aopipeline import dynamic_dds_cache as cache_module
+
+        assert dds_cache.append_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 0, b"good", 2,
+            revision=1)
+        _, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom)
+        record_path = dds_cache._row_records_path(ddm_path)
+        bad_header = cache_module._ROW_RECORD_HEADER.pack(
+            cache_module._ROW_RECORD_MAGIC, cache_module._ROW_RECORD_SCHEMA,
+            0, 2, 3, b"\0" * 32)
+        with open(record_path, "ab") as records:
+            records.write(bad_header + b"bad")
+            records.write(b"truncated")
+
+        assert dds_cache.load_partial_rows(
+            mock_tile.id, mock_tile.max_zoom, mock_tile) == {0: b"good"}
+
+    def test_newest_referenced_row_revision_wins(self, dds_cache, mock_tile):
+        assert dds_cache.append_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 0, b"old", 2,
+            revision=1)
+        assert dds_cache.append_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 0, b"new", 2,
+            revision=2)
+        assert dds_cache.load_partial_rows(
+            mock_tile.id, mock_tile.max_zoom, mock_tile) == {0: b"new"}
+
+    def test_partial_rows_update_complete_entry_accounting(
+        self, dds_cache, mock_tile
+    ):
+        class Budget:
+            def __init__(self):
+                self.changes = []
+
+            def account_dds(self, amount):
+                self.changes.append(amount)
+
+        budget = Budget()
+        dds_cache._budget_manager = budget
+
+        assert dds_cache.append_partial_row(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+            0,
+            b"row-data",
+            2,
+        )
+        dds_path, ddm_path = dds_cache._paths_for(
+            mock_tile.row,
+            mock_tile.col,
+            mock_tile.maptype,
+            mock_tile.tilename_zoom,
+            mock_tile.max_zoom,
+        )
+        expected = dds_cache._entry_disk_size(dds_path, ddm_path)
+
+        assert expected > len(b"row-data")
+        assert dds_cache.get_disk_usage() == expected
+        assert sum(budget.changes) == expected
+
+    def test_scan_existing_discovers_partial_row_only_entry(
+        self, cache_dir, mock_tile
+    ):
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+
+        writer = DynamicDDSCache(cache_dir, max_size_mb=10)
+        assert writer.append_partial_row(
+            mock_tile.id,
+            mock_tile.max_zoom,
+            mock_tile,
+            0,
+            b"row-data",
+            2,
+        )
+        writer.close()
+
+        reader = DynamicDDSCache(cache_dir, max_size_mb=10)
+        try:
+            assert reader.scan_existing() == 1
+            dds_path, ddm_path = reader._paths_for(
+                mock_tile.row,
+                mock_tile.col,
+                mock_tile.maptype,
+                mock_tile.tilename_zoom,
+                mock_tile.max_zoom,
+            )
+            assert reader.get_disk_usage() == reader._entry_disk_size(
+                dds_path,
+                ddm_path,
+            )
+        finally:
+            reader.close()
+
+    def test_partial_row_eviction_removes_and_counts_sidecars(
+        self, cache_dir, mock_tile
+    ):
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+
+        cache = DynamicDDSCache(cache_dir, max_size_mb=10)
+        try:
+            assert cache.append_partial_row(
+                mock_tile.id,
+                mock_tile.max_zoom,
+                mock_tile,
+                0,
+                b"row-data",
+                2,
+            )
+            tracked = cache.get_disk_usage()
+            assert tracked > 0
+
+            assert cache.evict_lru(1) == tracked
+            assert cache.get_disk_usage() == 0
+            _dds_path, ddm_path = cache._paths_for(
+                mock_tile.row,
+                mock_tile.col,
+                mock_tile.maptype,
+                mock_tile.tilename_zoom,
+                mock_tile.max_zoom,
+            )
+            assert not os.path.exists(ddm_path)
+            assert not os.path.exists(cache._row_records_path(ddm_path))
+        finally:
+            cache.close()
+
+    def test_async_partial_row_queue_coalesces_and_drops(self, cache_dir, mock_tile):
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+
+        cache = DynamicDDSCache(
+            cache_dir, max_size_mb=10, partial_row_queue_bytes=3)
+        started = threading.Event()
+        release = threading.Event()
+        persisted = []
+
+        def blocked_append(*args, **kwargs):
+            started.set()
+            release.wait(2)
+            persisted.append((args[3], args[4]))
+            return True
+
+        cache.append_partial_row = blocked_append
+        assert cache.enqueue_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 0, b"a", 3)
+        assert started.wait(2)
+        assert cache.enqueue_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 1, b"b", 3)
+        assert cache.enqueue_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 1, b"cc", 3)
+        assert not cache.enqueue_partial_row(
+            mock_tile.id, mock_tile.max_zoom, mock_tile, 2, b"dd", 3)
+        release.set()
+        assert cache.flush_partial_rows(2)
+
+        stats = cache.stats
+        assert stats["partial_row_coalesced"] == 1
+        assert stats["partial_row_dropped"] == 1
+        assert sorted(persisted) == [(0, b"a"), (1, b"cc")]
+        cache.close()

@@ -4,9 +4,21 @@
 
 *IMPORTANT*
 
+Use **Scenery Library** to search, filter, install, update, and remove regions.
+AutoOrtho checks the destination and temporary-download folders before an
+installation begins, shows the expected storage requirement, and blocks the
+operation when the destination is not writable or space is clearly
+insufficient.
+
+Installations and patch operations remain visible in the **Activity** panel
+while you navigate elsewhere. A cancelled operation stops at a safe boundary;
+AutoOrtho either preserves resumable download data or cleans incomplete output.
+Completed and failed operations remain visible until dismissed, and failures
+offer the recovery actions that are safe for that operation.
+
 The scenery packs provided with this tool that you download should be setup via the configuration utility.  This does more than simply download and extract the files.
 
-If you do wish to manaually manipulate these scenery packs, you should review the source code (downloader.py in particular) and understand how symlinks and/or junctions work and the limitations of each.
+If you do wish to manually manipulate these scenery packs, you should review the source code (downloader.py in particular) and understand how symlinks and/or junctions work and the limitations of each.
 
 If you manually move things around outside of the configuration utility, things very well might break!
 
@@ -61,5 +73,4 @@ before attempting this!
    On Linux you can use a symlink.  On Windows you can create a shortcut.
 4. Make sure Autoortho is running and start X-Plane.  Double check your
    `scenery_packs.ini` file to assure the directories are seen.
-
 

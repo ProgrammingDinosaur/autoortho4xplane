@@ -1849,6 +1849,36 @@ class TestTimeBudget:
         assert budget.remaining == 0.0
         assert budget.remaining >= 0.0  # Double check
 
+    def test_tile_reuses_one_budget_across_reads(self, monkeypatch):
+        tile = getortho.Tile.__new__(getortho.Tile)
+        tile._tile_time_budget = None
+        tile._fallback_time_budget = None
+        tile._time_budget_lock = getortho.threading.Lock()
+        monkeypatch.setattr(getortho.CFG.autoortho, "use_time_budget", True)
+        monkeypatch.setattr(
+            getortho.CFG.autoortho, "tile_time_budget", "12"
+        )
+        monkeypatch.setattr(
+            getortho.CFG.autoortho, "suspend_maxwait", False
+        )
+
+        first = tile._get_or_create_tile_time_budget()
+        second = tile._get_or_create_tile_time_budget()
+
+        assert first is second
+        assert first.max_seconds == 12
+
+    def test_tile_honors_legacy_budget_mode(self, monkeypatch):
+        tile = getortho.Tile.__new__(getortho.Tile)
+        tile._tile_time_budget = None
+        tile._fallback_time_budget = None
+        tile._time_budget_lock = getortho.threading.Lock()
+        monkeypatch.setattr(
+            getortho.CFG.autoortho, "use_time_budget", False
+        )
+
+        assert tile._get_or_create_tile_time_budget() is None
+
 
 class TestFallbackLevel:
     """Tests for the fallback_level configuration option."""
@@ -1991,8 +2021,7 @@ class TestPerformanceConfig:
         # tile_time_budget should be convertible to float
         tile_budget = float(cfg.autoortho.tile_time_budget)
         assert tile_budget > 0
-        # Default should be 120.0
-        assert tile_budget == 180.0
+        assert tile_budget == 60.0
     
     def test_fallback_level_config_has_correct_default(self, tmpdir):
         """Test that fallback_level config option exists and has correct default."""
@@ -2030,6 +2059,15 @@ class TestPerformanceConfig:
 
 class TestTerrainTileLookup:
     """Tests for TerrainTileLookup coordinate math and spatial index."""
+
+    @staticmethod
+    def _lookup(path):
+        return getortho.TerrainTileLookup(
+            str(path),
+            "test",
+            build_async=False,
+            index_cache_dir=str(path.parent / f"{path.name}-index-cache"),
+        )
 
     def test_latlon_to_tile_grid_alignment(self):
         """All tile coordinates must be aligned to 16-tile grid."""
@@ -2081,7 +2119,7 @@ class TestTerrainTileLookup:
         row16, col16 = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 16)
         (tmp_path / f"{row16}_{col16}_BI16.ter").touch()
 
-        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        lookup = self._lookup(tmp_path)
         assert lookup._highzoom_count == 9, f"Expected 9 indexed tiles, got {lookup._highzoom_count}"
 
     def test_highzoom_query_radius_filter(self, tmp_path):
@@ -2097,7 +2135,7 @@ class TestTerrainTileLookup:
         row_nyc, col_nyc = getortho.TerrainTileLookup._latlon_to_tile(40.6, -73.8, 18)
         (tmp_path / f"{row_nyc}_{col_nyc}_BI18.ter").touch()
 
-        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        lookup = self._lookup(tmp_path)
         assert lookup._highzoom_count == 10
 
         # Query near London - should find 9 tiles, not the NYC one
@@ -2114,7 +2152,7 @@ class TestTerrainTileLookup:
         (tmp_path / f"{row}_{col}_BI18.ter").touch()
         (tmp_path / f"{row}_{col}_EOX18.ter").touch()
 
-        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        lookup = self._lookup(tmp_path)
         assert lookup._highzoom_count == 2
 
         results_bi = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=5.0, maptype_filter="BI")
@@ -2130,14 +2168,16 @@ class TestTerrainTileLookup:
         row, col = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 16)
         (tmp_path / f"{row}_{col}_BI16.ter").touch()
 
-        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        lookup = self._lookup(tmp_path)
         assert lookup._highzoom_count == 0
         results = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=40.0)
         assert len(results) == 0
 
     def test_highzoom_nonexistent_folder(self):
         """Index should handle nonexistent folder gracefully."""
-        lookup = getortho.TerrainTileLookup("/nonexistent/path", "test")
+        lookup = getortho.TerrainTileLookup(
+            "/nonexistent/path", "test", build_async=False
+        )
         assert lookup._highzoom_count == 0
         results = lookup.get_highzoom_tiles_near(51.47, -0.46, radius_nm=40.0)
         assert len(results) == 0
@@ -2147,70 +2187,170 @@ class TestTerrainTileLookup:
         row, col = getortho.TerrainTileLookup._latlon_to_tile(51.47, -0.46, 18)
         (tmp_path / f"{row}_{col}_BI18.ter").touch()
 
-        lookup = getortho.TerrainTileLookup(str(tmp_path), "test")
+        lookup = self._lookup(tmp_path)
         assert lookup._highzoom_count == 1
 
         lookup.clear_cache()
         assert lookup._highzoom_count == 0
         assert len(lookup._highzoom_index) == 0
 
-def test_get_bytes_mid_mipmap_read_builds_a_complete_buffer(tmpdir):
-    """A read past the mipmap boundary must produce a complete mipmap buffer.
+    def test_persistent_index_avoids_rescan(self, tmp_path, monkeypatch):
+        row, col = getortho.TerrainTileLookup._latlon_to_tile(
+            51.47, -0.46, 18
+        )
+        (tmp_path / f"{row}_{col}_BI18.ter").touch()
+        cache_dir = tmp_path.parent / f"{tmp_path.name}-persistent-index"
+        first = getortho.TerrainTileLookup(
+            str(tmp_path),
+            "test",
+            build_async=False,
+            index_cache_dir=str(cache_dir),
+        )
+        assert first._highzoom_count == 1
 
-    gen_mipmaps() compresses from row 0 over a height derived from
-    compress_bytes, and replaces the mipmap databuffer with the result. Two ways
-    to get this wrong, both ending in missing_color on screen:
+        def fail_scan(self):
+            raise AssertionError("terrain directory was rescanned")
 
-    - compose only some chunk rows and compress the whole image: the unfilled
-      rows are compressed in as missing_color;
-    - limit compression to the composed rows: the buffer is then shorter than
-      the mipmap, and DDS.read() pads the remainder with missing_color.
+        monkeypatch.setattr(
+            getortho.TerrainTileLookup,
+            "_scan_highzoom_index",
+            fail_scan,
+        )
+        second = getortho.TerrainTileLookup(
+            str(tmp_path),
+            "test",
+            build_async=False,
+            index_cache_dir=str(cache_dir),
+        )
+        assert second._highzoom_count == 1
 
-    So for a read that is not at the mipmap boundary, the image must be composed
-    in full and compressed in full. Uses max_zoom=15 / min_zoom=14, where the
-    clamped zoom gives the composed image more chunk rows than the mipmap.
-    """
-    tile = getortho.Tile(2176, 3232, 'BI', 16, min_zoom=14, max_zoom=15,
-                         cache_dir=str(tmpdir))
+    def test_async_index_does_not_block_constructor(
+        self, tmp_path, monkeypatch
+    ):
+        release = getortho.threading.Event()
 
+        def delayed_scan(self):
+            release.wait(timeout=2)
+            return {}, 0
+
+        monkeypatch.setattr(
+            getortho.TerrainTileLookup,
+            "_scan_highzoom_index",
+            delayed_scan,
+        )
+        started = time.monotonic()
+        lookup = getortho.TerrainTileLookup(
+            str(tmp_path),
+            "test",
+            build_async=True,
+            index_cache_dir=str(tmp_path.parent / "async-index"),
+        )
+        assert time.monotonic() - started < 0.2
+        assert not lookup.is_ready
+        release.set()
+        assert lookup.wait_until_ready(timeout=2)
+
+    def test_dsf_bounds_select_exact_region_tiles(self, tmp_path):
+        row, col = getortho.TerrainTileLookup._latlon_to_tile(
+            20.5, -99.5, 16
+        )
+        (tmp_path / f"{row}_{col}_BI16.ter").touch()
+        lookup = self._lookup(tmp_path)
+        original = list(getortho._terrain_lookups)
+        try:
+            getortho._terrain_lookups[:] = [lookup]
+            tiles = getortho.get_tiles_for_dsf(
+                "/Earth nav data/+20-100/+20-100.dsf"
+            )
+        finally:
+            getortho._terrain_lookups[:] = original
+
+        assert (row, col, "BI", 16) in tiles
+
+
+def test_get_bytes_mid_mipmap_read_maps_clamped_source_rows(
+    tmpdir,
+    monkeypatch,
+):
+    """Partial sparse writes must compose every source row for the DDS row."""
+    tile = getortho.Tile(
+        2176,
+        3232,
+        "BI",
+        16,
+        min_zoom=14,
+        max_zoom=15,
+        cache_dir=str(tmpdir),
+    )
     calls = {}
 
     class _Img:
-        size = (256, 256)
+        def __init__(self, width, height):
+            self.size = (width, height)
+
+        def data_ptr(self):
+            return b"pixels"
+
+        def reduce_2(self, steps=1):
+            calls["reduction"] = (self.size, steps)
+            return _Img(
+                self.size[0] >> steps,
+                self.size[1] >> steps,
+            )
 
         def close(self):
             pass
 
     def fake_get_img(mipmap, startrow=0, endrow=None, **kwargs):
-        calls['img'] = (mipmap, startrow, endrow)
-        return _Img()
+        requested_zoom = min(tile.max_zoom - mipmap, tile.max_zoom)
+        _, _, width, height, _, _ = tile._get_quick_zoom(
+            requested_zoom,
+            tile.min_zoom,
+        )
+        requested_rows = (
+            height if endrow is None else endrow - startrow + 1
+        )
+        calls["img"] = (mipmap, startrow, endrow)
+        return _Img(width * 256, requested_rows * 256)
 
-    def fake_gen_mipmaps(img, startmipmap=0, maxmipmaps=99, compress_bytes=0):
-        calls['compress_bytes'] = compress_bytes
+    def fake_compress(width, height, data):
+        calls["compressed_size"] = (width, height)
+        return b"\x7f" * (
+            ((width + 3) >> 2)
+            * ((height + 3) >> 2)
+            * tile.dds.blocksize
+        )
 
-    tile.get_img = fake_get_img
-    tile.dds.gen_mipmaps = fake_gen_mipmaps
+    monkeypatch.setattr(getortho, "dynamic_dds_cache", None)
+    monkeypatch.setattr(getortho, "prefetch_coordinator", None)
+    monkeypatch.setattr(getortho, "_get_native_dds", lambda: None)
+    monkeypatch.setattr(tile, "get_img", fake_get_img)
+    monkeypatch.setattr(tile.dds, "compress", fake_compress)
+    monkeypatch.setattr(
+        tile,
+        "_maybe_schedule_read_ahead",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        tile,
+        "_maybe_persist_complete_dds",
+        lambda: None,
+    )
 
-    checked = 0
-    for mipmap in range(1, tile.max_mipmap + 1):
-        mm = tile.dds.mipmap_list[mipmap]
-        if mm.length <= 8192:
-            continue
+    expected = {
+        2: ((2, 3), 1, (512, 256)),
+        3: ((0, 3), 2, (256, 256)),
+        4: ((0, 3), 3, (128, 128)),
+    }
+    for mipmap, (source_rows, steps, compressed_size) in expected.items():
         calls.clear()
-        tile.get_bytes(mm.startpos + mm.length // 2, 4096)
-        if 'compress_bytes' not in calls:
-            continue
-        checked += 1
-        _, startrow, endrow = calls['img']
+        mm = tile.dds.mipmap_list[mipmap]
 
-        assert calls['compress_bytes'] == 0, (
-            f"mipmap {mipmap}: compression limited to "
-            f"{calls['compress_bytes']} bytes on a mid-mipmap read; the buffer "
-            f"would be shorter than the mipmap and read() would pad it with "
-            f"missing_color")
-        assert (startrow, endrow) == (0, None), (
-            f"mipmap {mipmap}: whole image is compressed but only rows "
-            f"{startrow}-{endrow} were composed; the rest would be stored as "
-            f"missing_color")
+        assert tile.get_bytes(
+            mm.startpos + mm.length // 2,
+            min(4096, mm.length - 1),
+        )
 
-    assert checked, "no mipmap exercised the mid-mipmap read path"
+        assert calls["img"][1:] == source_rows
+        assert calls["reduction"][1] == steps
+        assert calls["compressed_size"] == compressed_size

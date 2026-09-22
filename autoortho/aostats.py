@@ -8,6 +8,11 @@ from collections.abc import MutableMapping
 from multiprocessing.managers import BaseManager
 import psutil
 
+try:
+    from autoortho.diagnostics import profile_gauge
+except ImportError:
+    from diagnostics import profile_gauge
+
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
     from autoortho.aoconfig import CFG
@@ -263,7 +268,7 @@ def update_process_memory_stat():
         int: memory value in bytes that was published, or 0 on error.
 
     Writes keys:
-      - proc_mem_rss_bytes:<pid> = memory in bytes (best available metric)
+      - proc_mem_effective_bytes:<pid> = best available memory metric in bytes
       - proc_alive_ts:<pid>     = unix timestamp of last heartbeat
       - proc_mem_mb:<pid>       = human-readable MB value for debugging
       - proc_threads:<pid>      = thread count (diagnostic)
@@ -315,9 +320,12 @@ def update_process_memory_stat():
         if mem_bytes <= 0:
             mem_bytes = proc.memory_info().rss
 
-        set_stat(f"proc_mem_rss_bytes:{pid}", int(mem_bytes))
+        set_stat(f"proc_mem_effective_bytes:{pid}", int(mem_bytes))
         set_stat(f"proc_alive_ts:{pid}", now_ts)
         set_stat(f"proc_mem_mb:{pid}", int(mem_bytes // (1024 * 1024)))
+        set_stat(f"proc_threads:{pid}", proc.num_threads())
+        profile_gauge("process.memory_bytes", mem_bytes)
+        profile_gauge("process.threads", proc.num_threads())
 
         return int(mem_bytes)
 
@@ -329,8 +337,12 @@ def update_process_memory_stat():
 def clear_process_memory_stat():
     """Remove this process's memory/heartbeat keys from the stats store."""
     pid = os.getpid()
+    delete_stat(f"proc_mem_effective_bytes:{pid}")
+    # Remove legacy keys left by earlier builds.
     delete_stat(f"proc_mem_rss_bytes:{pid}")
     delete_stat(f"proc_alive_ts:{pid}")
+    delete_stat(f"proc_mem_mb:{pid}")
+    delete_stat(f"proc_threads:{pid}")
 
 
 def update_decode_pool_stats():
@@ -361,12 +373,24 @@ def update_decode_pool_stats():
             overflow_mb = stats['overflow_bytes'] // (1024 * 1024)
             set_stat('decode_pool_overflow', stats['overflow_count'])
             set_stat('decode_pool_overflow_mb', overflow_mb)
+            for name in (
+                'fixed_count',
+                'available',
+                'acquired',
+                'overflow_count',
+                'overflow_bytes',
+                'memory_limit',
+            ):
+                if name in stats:
+                    profile_gauge(f"decode_pool.{name}", stats[name])
             if stats['overflow_count'] > 0:
                 log.debug(f"Decode pool overflow: {stats['overflow_count']} "
                           f"buffers, {overflow_mb} MB")
+        return stats
     except Exception as e:
         # Best-effort; ignore failures
         log.debug(f"update_decode_pool_stats: {e}")
+        return None
 
 
 class AOStats(object):
@@ -399,7 +423,8 @@ def filter_stats_snapshot(snap: dict) -> dict:
         return (
             isinstance(k, str)
             and (
-                k.startswith('proc_mem_rss_bytes')
+                k.startswith('proc_mem_effective_bytes')
+                or k.startswith('proc_mem_rss_bytes')
                 or k.startswith('proc_alive_ts')
                 or k.startswith('proc_threads')
                 or k.startswith('last_tile_access_ts')

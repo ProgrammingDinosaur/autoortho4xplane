@@ -97,7 +97,13 @@ class DDSBufferPool:
     SIZE_2048x2048_BC1 = 2_797_500   # 8x8 chunks, BC1 format with mipmaps (~2.67 MB)
     SIZE_1024x1024_BC1 = 700_000     # 4x4 chunks, BC1 format with mipmaps (~0.67 MB)
     
-    def __init__(self, buffer_size: int = SIZE_4096x4096_BC1, pool_size: int = 4):
+    def __init__(
+        self,
+        buffer_size: int = SIZE_4096x4096_BC1,
+        pool_size: int = 4,
+        queue_enabled: bool = True,
+        max_waiters: int = 100,
+    ):
         """
         Create a buffer pool.
         
@@ -124,6 +130,8 @@ class DDSBufferPool:
         # sequence_number breaks ties (FIFO within same priority)
         self._waiters = []  # heap queue
         self._waiter_sequence = 0
+        self._queue_enabled = bool(queue_enabled)
+        self._max_waiters = max(1, int(max_waiters))
         
         # Stats for monitoring
         self._live_acquires = 0
@@ -180,6 +188,13 @@ class DDSBufferPool:
                     return self._buffers[buffer_id], buffer_id
             
             # Slow path: need to wait in queue
+            if not self._queue_enabled:
+                raise TimeoutError("DDSBufferPool: queueing is disabled")
+            if len(self._waiters) >= self._max_waiters:
+                raise TimeoutError(
+                    "DDSBufferPool: waiter queue is full "
+                    f"({len(self._waiters)}/{self._max_waiters})"
+                )
             my_event = threading.Event()
             my_sequence = self._waiter_sequence
             self._waiter_sequence += 1
@@ -981,7 +996,7 @@ class StreamingBuilderPool:
             with self._lock:
                 # Fix: Use actual count of created builders, not buggy calculation
                 current_count = self._total_created
-                if current_count < self._pool_size * 2:
+                if current_count < self._pool_size:
                     # Create new builder
                     handle = self._lib.aodds_builder_create(
                         byref(c_config), self._decode_pool
@@ -1187,27 +1202,23 @@ def _calculate_builder_pool_size() -> int:
     Returns:
         Calculated pool size (minimum 2, maximum 64)
     """
-    prefetch_workers = 2  # Default
-    live_concurrency = 4  # Default
-    
+    configured_pool_size = 4
     try:
         # Try to import config - may fail during early initialization
         try:
             from autoortho.aoconfig import CFG
         except ImportError:
             from aoconfig import CFG
-        
-        prefetch_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 4))
-        live_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 8))
+        configured_pool_size = int(
+            getattr(CFG.autoortho, "streaming_builder_pool_size", 4)
+        )
     except Exception:
         # Config not available yet - use defaults
         pass
     
-    # Calculate pool size and clamp to valid range
-    pool_size = prefetch_workers + live_concurrency
-    pool_size = max(2, min(64, pool_size))
+    pool_size = max(2, min(64, configured_pool_size))
     
-    log.debug(f"Builder pool size: {pool_size} (prefetch={prefetch_workers} + live={live_concurrency})")
+    log.debug(f"Builder pool size: {pool_size} (configured)")
     return pool_size
 
 
@@ -2333,7 +2344,7 @@ class SingleMipmapResult(NamedTuple):
     Result from single mipmap building.
     
     Returns raw DXT-compressed bytes (no DDS header) that can be
-    directly written to pydds.DDS.mipmap_list[n].databuffer.
+    written through ``DDS.replace_mipmap_dense``.
     """
     success: bool
     bytes_written: int
@@ -2391,7 +2402,7 @@ def build_single_mipmap(
     
     Returns:
         SingleMipmapResult with raw DXT bytes (no DDS header).
-        The data can be written directly to pydds.DDS.mipmap_list[n].databuffer.
+        The data can be installed with ``DDS.replace_mipmap_dense``.
     
     Example:
         # Build mipmap 2 (64 chunks for a ZL16 tile)
@@ -2399,7 +2410,7 @@ def build_single_mipmap(
         result = build_single_mipmap(jpeg_datas)
         if result.success:
             # Write raw DXT bytes to DDS mipmap buffer
-            tile.dds.mipmap_list[2].databuffer.write(result.data)
+            tile.dds.replace_mipmap_dense(2, result.data)
     """
     import math
     import time
@@ -2520,7 +2531,7 @@ class PartialMipmapResult(NamedTuple):
     specific rows of a mipmap.
     
     Returns raw DXT-compressed bytes that can be written directly
-    to the correct offset in pydds.DDS.mipmap_list[n].databuffer.
+    to the correct offset through ``DDS.write_mipmap_at``.
     """
     success: bool
     bytes_written: int
@@ -2680,6 +2691,114 @@ def build_partial_mipmap(
         )
 
 
+def build_partial_mipmap_v2(
+    sources,
+    chunks_width: int,
+    chunks_height: int,
+    format: str = "BC1",
+    missing_color: Tuple[int, int, int] = (66, 77, 55),
+    pool: Optional[c_void_p] = None,
+) -> PartialMipmapResult:
+    """Build a partial mipmap from JPEGs, prepared pixels, or missing slots.
+
+    Prepared pixels already represent the target child chunk. They are encoded
+    only as an internal transport for the existing native decoder API; callers
+    must not pass an un-cropped lower-ZL parent JPEG into a child slot.
+    """
+    jpeg_datas = []
+    prepared = []
+    for index, source in enumerate(sources):
+        if source is None or isinstance(source, (bytes, bytearray)):
+            jpeg_datas.append(bytes(source) if source else None)
+            continue
+        if not isinstance(source, dict):
+            raise TypeError("partial mipmap source must be bytes, dict, or None")
+        if source.get("jpeg"):
+            jpeg_datas.append(bytes(source["jpeg"]))
+            continue
+        pixels = source.get("pixels")
+        if pixels is None:
+            jpeg_datas.append(None)
+            continue
+        jpeg_datas.append(None)
+        prepared.append((index, source))
+
+    result = build_partial_mipmap(
+        jpeg_datas=jpeg_datas,
+        chunks_width=chunks_width,
+        chunks_height=chunks_height,
+        format=format,
+        missing_color=missing_color,
+        pool=pool,
+    )
+    if not result.success or not result.data or not prepared:
+        return result
+
+    try:
+        try:
+            from autoortho import pydds
+        except ImportError:
+            import pydds
+
+        blocksize = 8 if format.upper() in ("BC1", "DXT1") else 16
+        chunk_blocks = 256 // 4
+        output_row_stride = chunks_width * chunk_blocks * blocksize
+        chunk_stripe_size = chunk_blocks * blocksize
+        patched = bytearray(result.data)
+
+        for index, source in prepared:
+            mode = source.get("mode", "RGBA").upper()
+            width = int(source.get("width", 256))
+            height = int(source.get("height", 256))
+            pixels = bytes(source["pixels"])
+            if (
+                mode != "RGBA"
+                or width != 256
+                or height != 256
+                or len(pixels) != width * height * 4
+            ):
+                continue
+            compressor = pydds.DDS(
+                width,
+                height,
+                ispc=True,
+                dxt_format=format,
+            )
+            try:
+                compressed = compressor.compress(
+                    width,
+                    height,
+                    pixels,
+                )
+                if compressed is None:
+                    continue
+                compressed = bytes(compressed)
+            finally:
+                compressor.close()
+
+            chunk_x = index % chunks_width
+            chunk_y = index // chunks_width
+            for block_row in range(chunk_blocks):
+                source_start = block_row * chunk_stripe_size
+                target_start = (
+                    (chunk_y * chunk_blocks + block_row)
+                    * output_row_stride
+                    + chunk_x * chunk_stripe_size
+                )
+                patched[
+                    target_start:target_start + chunk_stripe_size
+                ] = compressed[
+                    source_start:source_start + chunk_stripe_size
+                ]
+        return result._replace(
+            data=bytes(patched),
+            bytes_written=len(patched),
+        )
+    except Exception as exc:
+        log.debug("Prepared partial source compression failed: %s", exc)
+        return result
+
+
 class MipmapChainResult(NamedTuple):
     """
     Result from mipmap chain building.
@@ -2740,10 +2859,10 @@ def build_mipmap_chain(
         jpeg_datas = [chunk.data for chunk in chunks]
         result = build_mipmap_chain(jpeg_datas)
         if result.success:
-            # Write each mipmap to its DDS buffer
+            # Replace each mipmap through the random-access DDS interface.
             for i in range(result.mipmap_count):
                 mip_data = result.get_mipmap_data(i)
-                tile.dds.mipmap_list[start_mipmap + i].databuffer = BytesIO(mip_data)
+                tile.dds.replace_mipmap_dense(start_mipmap + i, mip_data)
     """
     import math
     import time
@@ -3194,7 +3313,7 @@ def build_from_jpegs_to_file(
     - No allocation overhead (writes incrementally to disk)
     - No copy overhead (data goes straight to file)
     - No Python memory involvement after JPEG data is passed
-    - Perfect integration with EphemeralDDSCache
+    - Perfect integration with DynamicDDSCache
     
     Performance improvement over build_from_jpegs():
     - ~65ms copy overhead eliminated (no buffer → bytes conversion)
@@ -3331,7 +3450,7 @@ def build_tile_to_file(
     - C reads cache files directly
     - C decodes + compresses in parallel
     - C writes directly to disk (no Python involvement)
-    - Perfect integration with EphemeralDDSCache
+    - Perfect integration with DynamicDDSCache
     
     This provides the same optimization as build_from_jpegs_to_file() but for
     native mode where C handles file I/O.

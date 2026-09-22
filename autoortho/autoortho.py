@@ -68,6 +68,32 @@ except ImportError:
     from process_supervisor import AOProcessSupervisor, DEFAULT_WORKER_STOP_TIMEOUT
 
 try:
+    from autoortho.diagnostics import (
+        start_parent_profiler,
+        stop_active_profiler,
+    )
+except ImportError:
+    from diagnostics import start_parent_profiler, stop_active_profiler
+
+try:
+    from autoortho.http2_broker import (
+        HTTP2Broker,
+        BrokerError as HTTP2BrokerError,
+        BrokerStartupError as HTTP2BrokerStartupError,
+    )
+except ImportError:
+    try:
+        from http2_broker import (
+            HTTP2Broker,
+            BrokerError as HTTP2BrokerError,
+            BrokerStartupError as HTTP2BrokerStartupError,
+        )
+    except ImportError:
+        HTTP2Broker = None
+        HTTP2BrokerError = Exception
+        HTTP2BrokerStartupError = Exception
+
+try:
     from autoortho.version import __version__
 except ImportError:
     from version import __version__
@@ -83,9 +109,14 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QIcon
 
 try:
-    from autoortho import config_ui_qt as config_ui
+    from autoortho.ui import main_window as config_ui
 except ImportError:
-    import config_ui_qt as config_ui
+    from ui import main_window as config_ui
+
+try:
+    from autoortho.ui.theme import apply_theme
+except ImportError:
+    from ui.theme import apply_theme
 
 USE_QT = True
 
@@ -265,9 +296,11 @@ def setupmount(mountpoint, systemtype):
             log.warning(f"Failed to cleanup mountpoint {mountpoint}: {e}")
 
 
-def diagnose(CFG):
+def diagnose(CFG, mount_timeout=60.0, retry_interval=0.25):
 
     location = geocoder.ip("me")
+    mount_failed = False
+    provider_failures = []
 
     def _check_mount(mount):
         try:
@@ -278,75 +311,87 @@ def diagnose(CFG):
         except Exception:
             return False
 
-    # Use a small executor so a hung filesystem call (e.g. unresponsive macFUSE
-    # or stale NFS) can be timed out per-attempt instead of blocking forever.
-    pool_size = max(2, len(CFG.scenery_mounts))
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=pool_size, thread_name_prefix="diag_mount"
-    ) as mount_pool:
+    mounts = [s.get('mount') for s in CFG.scenery_mounts]
+    mount_results = [False] * len(mounts)
+    probe_done = [threading.Event() for _ in mounts]
+    deadline = time.monotonic() + max(0.0, float(mount_timeout))
 
-        def _check_mount_with_timeout(mount, timeout):
-            try:
-                return mount_pool.submit(_check_mount, mount).result(timeout=timeout)
-            except (concurrent.futures.TimeoutError, Exception):
-                return False
+    def _probe_mount(index, mount):
+        try:
+            while time.monotonic() < deadline:
+                if _check_mount(mount):
+                    mount_results[index] = True
+                    return
+                probe_done[index].wait(max(0.01, retry_interval))
+        finally:
+            probe_done[index].set()
 
-        def _wait_for_mount(mount, attempts=40, interval=0.25):
-            for _ in range(attempts):
-                if _check_mount_with_timeout(mount, timeout=max(1.0, interval * 4)):
-                    return True
-                time.sleep(interval)
-            return False
+    for index, mount in enumerate(mounts):
+        threading.Thread(
+            target=_probe_mount,
+            args=(index, mount),
+            name=f"diag_mount_{index}",
+            daemon=True,
+        ).start()
 
-        log.info("Waiting for mounts...")
-        log.info("Checking %d mount(s) in parallel (up to 10s)...", len(CFG.scenery_mounts))
-        # Check all mounts in parallel so large regions don't delay smaller ones
-        list(mount_pool.map(_wait_for_mount, [s.get('mount') for s in CFG.scenery_mounts]))
+    log.info("Waiting for mounts...")
+    log.info(
+        "Checking %d mount(s) in parallel (up to %.1fs)...",
+        len(mounts),
+        mount_timeout,
+    )
+    for done in probe_done:
+        remaining = max(0.0, deadline - time.monotonic())
+        done.wait(remaining)
 
-        failed = False
-        log.info("\n\n")
-        log.info("------------------------------------")
-        log.info(" Diagnostic check ...")
-        log.info("------------------------------------")
-        log.info(f"Detected system: {platform.uname()}")
-        log.info(f"Detected location {location.address}")
-        log.info(f"Detected installed scenery:")
-        for scenery in CFG.scenery_mounts:
-            root = scenery.get('root')
-            mount = scenery.get('mount')
-            log.info(f"    {root}")
-            # Retry for mounts that are slow to appear (e.g. large regions still initialising)
-            ret = _wait_for_mount(mount, attempts=12, interval=5.0)
-            log.info(f"        Mounted? {ret}")
-            if not ret:
-                failed = True
+    log.info("\n\n")
+    log.info("------------------------------------")
+    log.info(" Diagnostic check ...")
+    log.info("------------------------------------")
+    log.info(f"Detected system: {platform.uname()}")
+    log.info(f"Detected location {location.address}")
+    log.info(f"Detected installed scenery:")
+    for index, scenery in enumerate(CFG.scenery_mounts):
+        root = scenery.get('root')
+        log.info(f"    {root}")
+        ret = mount_results[index]
+        log.info(f"        Mounted? {ret}")
+        if not ret:
+            mount_failed = True
 
-        log.info(f"Checking maptypes:")
-        import getortho
-        for maptype in MAPTYPES:
-            if maptype in ("Use tile default", "Custom Map"):
-                continue
-            # Use ignore_cleanup_errors=True to handle race with async cache writes
-            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
-                c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
-                ret = c.get()
-                # Give async cache writer a moment to complete or detect deleted dir
-                time.sleep(0.1)
-                if ret:
-                    log.info(f"    Maptype: {maptype} OK!")
-                else:
-                    log.warning(f"    Maptype: {maptype} FAILED!")
-                    failed = True
+    log.info(f"Checking maptypes:")
+    import getortho
+    for maptype in MAPTYPES:
+        if maptype in ("Use tile default", "Custom Map"):
+            continue
+        # Use ignore_cleanup_errors=True to handle race with async cache writes
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
+            ret = c.get()
+            # Give async cache writer a moment to complete or detect deleted dir
+            time.sleep(0.1)
+            if ret:
+                log.info(f"    Maptype: {maptype} OK!")
+            else:
+                log.warning(f"    Maptype: {maptype} FAILED!")
+                provider_failures.append(maptype)
 
     log.info("------------------------------------")
-    if failed:
+    if mount_failed:
         log.warning("***************")
         log.warning("***************")
-        log.warning("FAILURES DETECTED!!")
-        log.warning("Please review logs and setup.")
+        log.warning("MOUNT FAILURES DETECTED!!")
+        log.warning("Please review the filesystem and FUSE setup.")
         log.warning("***************")
         log.warning("***************")
         return False
+    if provider_failures:
+        log.warning(
+            "Optional imagery provider check(s) failed: %s. "
+            "Mounted scenery remains available; provider availability "
+            "does not determine mount health.",
+            ", ".join(provider_failures),
+        )
     log.info(" Diagnostics done.  All checks passed")
     return True
 
@@ -361,6 +406,10 @@ class AOMount:
         self.mac_os_procs = []
         self._active_mountpoints = []
         self.mount_worker_supervisor = AOProcessSupervisor()
+        self._performance_profiler = None
+        self._performance_profiler_env = {}
+        self._download_broker = None
+        self._download_broker_env = {}
 
         # Start shared stats manager and reporter/log servers
         self.start_stats_manager()
@@ -454,8 +503,11 @@ class AOMount:
             stats_auth=None,
             log_addr=None,
     ):
+        self._start_performance_diagnostics()
         log.info(f"AutoOrtho:  root: {root}  mountpoint: {mountpoint}")
         loglevel = getattr(self.cfg.general, 'file_log_level', 'INFO').upper()
+        worker_env = dict(self._performance_profiler_env)
+        worker_env.update(self._download_broker_env)
         handle = self.mount_worker_supervisor.start_mount_worker(
             root,
             mountpoint,
@@ -465,8 +517,14 @@ class AOMount:
             stats_auth=stats_auth,
             log_addr=log_addr,
             loglevel=loglevel,
+            extra_env=worker_env,
         )
         self.mount_workers.append(handle)
+        if self._performance_profiler is not None:
+            self._performance_profiler.register_process(
+                handle.pid,
+                f"mount-worker:{volname}",
+            )
         # Backward-compatible process list used by maptype/custom-map reload code.
         self.mac_os_procs.append(handle.process)
         return handle
@@ -503,20 +561,70 @@ class AOMount:
         self.stop_mount_workers(timeout=timeout)
         return
 
+    def _start_performance_diagnostics(self):
+        if getattr(self, "_performance_profiler", None) is not None:
+            return
+        try:
+            profiler = start_parent_profiler(self.cfg)
+        except Exception as exc:
+            log.error("Could not start performance diagnostics: %s", exc)
+            profiler = None
+        self._performance_profiler = profiler
+        self._performance_profiler_env = (
+            profiler.child_environment() if profiler is not None else {}
+        )
+        if profiler is not None:
+            manager_process = getattr(
+                getattr(self, "stats_manager", None),
+                "_process",
+                None,
+            )
+            manager_pid = getattr(manager_process, "pid", None)
+            if manager_pid:
+                profiler.register_process(manager_pid, "stats-manager")
+
+    def _finish_performance_diagnostics(self):
+        if getattr(self, "_performance_profiler", None) is None:
+            return
+        stats_snapshot = {}
+        try:
+            store = getattr(self, "_shared_store", None)
+            if store is not None:
+                stats_snapshot = store.snapshot()
+        except Exception as exc:
+            log.debug("Could not snapshot final diagnostics counters: %s", exc)
+        try:
+            report_path = stop_active_profiler(
+                stats_snapshot=stats_snapshot,
+                finalize_session=True,
+            )
+            if report_path is not None:
+                log.info("Flight performance report written to %s", report_path)
+        except Exception as exc:
+            log.error("Could not finalize performance diagnostics: %s", exc)
+        finally:
+            self._performance_profiler = None
+            self._performance_profiler_env = {}
+
     def reporter(self):
         while True:
             time.sleep(10)
             snap = self._shared_store.snapshot()
             log.info(f"STATS: {snap}")
 
-    def start_reporter(self, interval_sec: float = 10.0):
-        """Start the periodic global-stats logger (macOS parent)."""
+    def start_reporter(
+        self,
+        interval_sec: float = 10.0,
+        aggregation_interval_sec: float = 1.0,
+    ):
+        """Aggregate process memory frequently while logging less often."""
         if self._reporter_thread and self._reporter_thread.is_alive():
             return
         self._reporter_stop.clear()
 
         def _reporter_loop():
-            while not self._reporter_stop.wait(interval_sec):
+            last_log = time.monotonic()
+            while not self._reporter_stop.wait(aggregation_interval_sec):
                 try:
                     # Update this process's own memory heartbeat so it's counted
                     try:
@@ -531,8 +639,18 @@ class AOMount:
                     try:
                         keys = self._shared_store.keys()
                         for k in keys:
-                            if isinstance(k, str) and k.startswith('proc_mem_rss_bytes:'):
+                            if isinstance(k, str) and (
+                                k.startswith('proc_mem_effective_bytes:')
+                                or k.startswith('proc_mem_rss_bytes:')
+                            ):
                                 pid = k.split(':', 1)[1]
+                                if (
+                                    k.startswith('proc_mem_rss_bytes:')
+                                    and self._shared_store.get(
+                                        f'proc_mem_effective_bytes:{pid}', 0
+                                    )
+                                ):
+                                    continue
                                 # Liveness check: heartbeat within last 45 seconds
                                 alive_ts = self._shared_store.get(f'proc_alive_ts:{pid}', 0)
                                 if isinstance(alive_ts, (int, float)):
@@ -566,6 +684,37 @@ class AOMount:
                     except Exception:
                         pass
 
+                    # Mount workers do not run their own X-Plane UDP listener.
+                    # Publish one bounded snapshot so they can enable predictive
+                    # work only after the parent confirms a valid flight.
+                    try:
+                        try:
+                            from autoortho.datareftrack import dt
+                        except ImportError:
+                            from datareftrack import dt
+                        with dt._lock:
+                            flight_state = {
+                                "connected": bool(dt.connected),
+                                "data_valid": bool(dt.data_valid),
+                                "has_ever_connected": bool(
+                                    dt.has_ever_connected
+                                ),
+                                "lat": float(dt.lat),
+                                "lon": float(dt.lon),
+                                "alt": float(dt.alt),
+                                "hdg": float(dt.hdg),
+                                "spd": float(dt.spd),
+                                "local_time_sec": float(dt.local_time_sec),
+                                "pressure_alt": float(dt.pressure_alt),
+                                "sun_pitch": float(dt.sun_pitch),
+                                "timestamp": time.time(),
+                            }
+                        self._shared_store.set(
+                            "flight_state", flight_state
+                        )
+                    except Exception:
+                        pass
+
                     # Aggregate mm and partial-mm counters into averages and counts
                     try:
                         keys = self._shared_store.keys()
@@ -595,6 +744,9 @@ class AOMount:
                     except Exception:
                         pass
 
+                    if time.monotonic() - last_log < interval_sec:
+                        continue
+                    last_log = time.monotonic()
                     snap = self._shared_store.snapshot()
                     # Hide internal per-process and batching keys from logs
                     # Keep proc_mem_mb for debugging memory issues
@@ -602,6 +754,7 @@ class AOMount:
                         def _is_internal(k):
                             return (
                                 (isinstance(k, str) and (
+                                    k.startswith('proc_mem_effective_bytes') or
                                     k.startswith('proc_mem_rss_bytes') or
                                     k.startswith('proc_alive_ts') or
                                     k.startswith('proc_threads') or
@@ -610,7 +763,11 @@ class AOMount:
                                     k.startswith('mm_time_total_ms:') or
                                     k.startswith('partial_mm_count:') or
                                     k.startswith('partial_mm_time_total_ms:')
-                                )) or k in ('proc_count', 'cur_mem_mb_ts')
+                                )) or k in (
+                                    'proc_count',
+                                    'cur_mem_mb_ts',
+                                    'flight_state',
+                                )
                             )
                         filtered = {k: v for k, v in snap.items() if not _is_internal(k)}
                     except Exception:
@@ -653,7 +810,136 @@ class AOMount:
             self.start_stats_manager()
         if not getattr(self, "log_server", None):
             self.start_log_server()
+        self.start_download_broker()
         self.start_reporter()
+
+    def start_download_broker(self):
+        if self._download_broker is not None:
+            return
+        self._start_performance_diagnostics()
+        enabled = getattr(self.cfg.autoortho, "http2_enabled", True)
+        if isinstance(enabled, str):
+            enabled = enabled.lower().strip() in ("true", "1", "yes", "on")
+        if not enabled:
+            return
+        if HTTP2Broker is None:
+            log.warning(
+                "HTTP/2 broker dependencies are unavailable; using direct "
+                "HTTP/1.1 downloads"
+            )
+            return
+        try:
+            max_in_flight = aoconfig.resolve_provider_setting(
+                "provider_max_in_flight", self.cfg
+            )
+            max_connections = min(
+                max_in_flight,
+                aoconfig.resolve_provider_setting(
+                    "provider_max_connections", self.cfg
+                ),
+            )
+            max_concurrency = max_in_flight
+            origin_max = aoconfig.resolve_provider_setting(
+                "provider_origin_max_concurrency", self.cfg
+            )
+            origin_initial = aoconfig.resolve_provider_setting(
+                "provider_origin_initial_concurrency", self.cfg
+            )
+            if origin_initial <= 0:
+                origin_initial = min(max_in_flight, max_connections)
+            broker_kwargs = {
+                "max_concurrency": max_concurrency,
+                "max_connections": max_connections,
+                "max_pending": max_in_flight,
+                "max_response_bytes": 8 * 1024 * 1024,
+                "profile_environment": dict(
+                    getattr(self, "_performance_profiler_env", {})
+                ),
+                "adaptive_concurrency": aoconfig.resolve_provider_setting(
+                    "provider_adaptive_concurrency", self.cfg
+                ),
+                "adaptive_controller_v2": aoconfig.resolve_provider_setting(
+                    "provider_adaptive_controller_v2", self.cfg
+                ),
+                "transport_trace": aoconfig.resolve_provider_setting(
+                    "provider_transport_trace", self.cfg
+                ),
+                "origin_initial_concurrency": aoconfig.resolve_provider_setting(
+                    "provider_origin_initial_concurrency", self.cfg
+                ),
+                "origin_min_concurrency": aoconfig.resolve_provider_setting(
+                    "provider_origin_min_concurrency", self.cfg
+                ),
+                # 0 means "no separate ceiling"; the broker then clamps to
+                # max_concurrency on its own.
+                "origin_max_concurrency": origin_max or None,
+                "origin_increase_step": aoconfig.resolve_provider_setting(
+                    "provider_origin_increase_step", self.cfg
+                ),
+                "origin_success_threshold": aoconfig.resolve_provider_setting(
+                    "provider_origin_success_threshold", self.cfg
+                ),
+                "origin_decrease_factor": aoconfig.resolve_provider_setting(
+                    "provider_origin_decrease_factor", self.cfg
+                ),
+                "origin_cooldown_seconds": aoconfig.resolve_provider_setting(
+                    "provider_origin_cooldown_seconds", self.cfg
+                ),
+                "queue_timeout": aoconfig.resolve_provider_setting(
+                    "provider_queue_timeout", self.cfg
+                ),
+            }
+            broker_kwargs["origin_initial_concurrency"] = origin_initial
+            broker = HTTP2Broker(**broker_kwargs)
+            try:
+                broker.start()
+                broker_mode = "process"
+            except HTTP2BrokerStartupError as process_exc:
+                log.warning(
+                    "HTTP/2 broker process startup failed; retrying with "
+                    "an in-process selector-loop server: %s",
+                    process_exc,
+                )
+                broker = HTTP2Broker(
+                    in_process=True,
+                    **broker_kwargs,
+                )
+                broker.start()
+                broker_mode = "thread"
+            self._download_broker = broker
+            self._download_broker_env = broker.client_environment()
+            broker_pid = getattr(broker, "pid", None)
+            if broker_pid and self._performance_profiler is not None:
+                self._performance_profiler.register_process(
+                    broker_pid,
+                    "http2-broker",
+                )
+            os.environ.update(self._download_broker_env)
+            log.info(
+                "Shared HTTP/2 broker started "
+                "(mode=%s, concurrency=%d, connections=%d)",
+                broker_mode,
+                max_concurrency,
+                max_connections,
+            )
+        except HTTP2BrokerError as exc:
+            log.warning(
+                "Could not start shared HTTP/2 broker; using direct "
+                "HTTP/1.1 downloads: %s",
+                exc,
+            )
+
+    def stop_download_broker(self):
+        broker = getattr(self, "_download_broker", None)
+        self._download_broker = None
+        self._download_broker_env = {}
+        os.environ.pop("AO_HTTP2_BROKER_ADDR", None)
+        os.environ.pop("AO_HTTP2_BROKER_TOKEN", None)
+        if broker is not None:
+            try:
+                broker.stop()
+            except Exception as exc:
+                log.error("Error stopping shared HTTP/2 broker: %s", exc)
 
     def _launch_scenery_worker(self, root, mountpoint, threading_enabled=True):
         if threading_enabled:
@@ -679,6 +965,7 @@ class AOMount:
         )
 
     def _monitor_mount_workers(self):
+        healthy = True
         while self.mounts_running:
             for handle in list(self.mount_workers):
                 ret = handle.process.poll()
@@ -690,8 +977,17 @@ class AOMount:
                         ret,
                     )
                     self.mounts_running = False
+                    healthy = False
                     break
             time.sleep(0.5)
+        return healthy
+
+    def mount_workers_alive(self):
+        """Return True only when at least one launched mount worker is alive."""
+        return bool(self.mount_workers) and all(
+            handle.process.poll() is None
+            for handle in self.mount_workers
+        )
 
     def mount_single(self, root, mountpoint, threading_enabled=True, blocking=True):
         self._ensure_parent_services()
@@ -726,25 +1022,35 @@ class AOMount:
 
         if not self.cfg.scenery_mounts:
             log.warning(f"No installed sceneries detected.  Exiting.")
-            return
+            return False
 
         self.mounts_running = True
         self._active_mountpoints = []
         self.mount_workers = []
         self.mac_os_procs = []
-        for scenery in self.cfg.scenery_mounts:
-            self._launch_scenery_worker(
-                scenery.get('root'),
-                scenery.get('mount'),
-                self.cfg.fuse.threading,
-            )
+        try:
+            for scenery in self.cfg.scenery_mounts:
+                self._launch_scenery_worker(
+                    scenery.get('root'),
+                    scenery.get('mount'),
+                    self.cfg.fuse.threading,
+                )
+        except Exception:
+            log.exception("Failed to launch scenery mount workers")
+            self.unmount_sceneries(force=True)
+            return False
 
         if not blocking:
             log.info("Running mounts in non-blocking mode.")
             time.sleep(1)
-            diagnose(self.cfg)
-            return
+            healthy = self.mount_workers_alive() and diagnose(self.cfg)
+            if not healthy:
+                log.error("Mount startup diagnostics failed")
+                self.unmount_sceneries(force=True)
+                return False
+            return True
 
+        healthy = True
         try:
             def handle_sigterm(sig, frame):
                 raise(SystemExit)
@@ -755,7 +1061,7 @@ class AOMount:
             # Check things out
             diagnose(self.cfg)
 
-            self._monitor_mount_workers()
+            healthy = self._monitor_mount_workers()
 
         except (KeyboardInterrupt, SystemExit) as err:
             self.mounts_running = False
@@ -763,6 +1069,7 @@ class AOMount:
         finally:
             log.info("Shutting down ...")
             self.unmount_sceneries()
+        return healthy
 
     def unmount_sceneries(self, force=False):
         log.info("Unmounting ...")
@@ -794,6 +1101,14 @@ class AOMount:
             )
 
         self.stop_mount_workers(timeout=DEFAULT_WORKER_STOP_TIMEOUT)
+        self.stop_download_broker()
+
+        remaining_mounts = [
+            mountpoint for mountpoint in mountpoints
+            if safe_ismount(mountpoint)
+        ]
+
+        self._finish_performance_diagnostics()
 
         self.stop_reporter()
 
@@ -802,7 +1117,14 @@ class AOMount:
         self.stop_log_server()
 
         self._active_mountpoints = []
+        if remaining_mounts:
+            log.error(
+                "Unmount incomplete; mountpoints still active: %s",
+                remaining_mounts,
+            )
+            return False
         log.info("Unmount complete")
+        return True
 
     def domount(self, root, mountpoint, threading=True):
         return self._launch_scenery_worker(root, mountpoint, threading)
@@ -848,6 +1170,7 @@ class AOMount:
                         log.warning(f"Windows force unmount failed: {exc}")
             except Exception as exc:
                 log.warning(f"Force unmount attempt failed: {exc}")
+        return not safe_ismount(mountpoint)
 
 
 class AOMountUI(AOMount, config_ui.ConfigUI):
@@ -859,9 +1182,9 @@ class AOMountUI(AOMount, config_ui.ConfigUI):
         """Mount sceneries using AOMount functionality"""
         return AOMount.mount_sceneries(self, blocking)
     
-    def unmount_sceneries(self):
+    def unmount_sceneries(self, force=False):
         """Unmount sceneries using AOMount functionality"""
-        return AOMount.unmount_sceneries(self)
+        return AOMount.unmount_sceneries(self, force=force)
 
 
 def main():
@@ -940,6 +1263,7 @@ def main():
         log.info("Running CFG UI")
         if USE_QT:
             app = QApplication(sys.argv)
+            apply_theme(app)
             
             # Set application icon - required for macOS dock icon visibility
             if system_type == 'darwin':
