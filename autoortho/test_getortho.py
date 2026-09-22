@@ -2266,3 +2266,91 @@ class TestTerrainTileLookup:
             getortho._terrain_lookups[:] = original
 
         assert (row, col, "BI", 16) in tiles
+
+
+def test_get_bytes_mid_mipmap_read_maps_clamped_source_rows(
+    tmpdir,
+    monkeypatch,
+):
+    """Partial sparse writes must compose every source row for the DDS row."""
+    tile = getortho.Tile(
+        2176,
+        3232,
+        "BI",
+        16,
+        min_zoom=14,
+        max_zoom=15,
+        cache_dir=str(tmpdir),
+    )
+    calls = {}
+
+    class _Img:
+        def __init__(self, width, height):
+            self.size = (width, height)
+
+        def data_ptr(self):
+            return b"pixels"
+
+        def reduce_2(self, steps=1):
+            calls["reduction"] = (self.size, steps)
+            return _Img(
+                self.size[0] >> steps,
+                self.size[1] >> steps,
+            )
+
+        def close(self):
+            pass
+
+    def fake_get_img(mipmap, startrow=0, endrow=None, **kwargs):
+        requested_zoom = min(tile.max_zoom - mipmap, tile.max_zoom)
+        _, _, width, height, _, _ = tile._get_quick_zoom(
+            requested_zoom,
+            tile.min_zoom,
+        )
+        requested_rows = (
+            height if endrow is None else endrow - startrow + 1
+        )
+        calls["img"] = (mipmap, startrow, endrow)
+        return _Img(width * 256, requested_rows * 256)
+
+    def fake_compress(width, height, data):
+        calls["compressed_size"] = (width, height)
+        return b"\x7f" * (
+            ((width + 3) >> 2)
+            * ((height + 3) >> 2)
+            * tile.dds.blocksize
+        )
+
+    monkeypatch.setattr(getortho, "dynamic_dds_cache", None)
+    monkeypatch.setattr(getortho, "prefetch_coordinator", None)
+    monkeypatch.setattr(getortho, "_get_native_dds", lambda: None)
+    monkeypatch.setattr(tile, "get_img", fake_get_img)
+    monkeypatch.setattr(tile.dds, "compress", fake_compress)
+    monkeypatch.setattr(
+        tile,
+        "_maybe_schedule_read_ahead",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        tile,
+        "_maybe_persist_complete_dds",
+        lambda: None,
+    )
+
+    expected = {
+        2: ((2, 3), 1, (512, 256)),
+        3: ((0, 3), 2, (256, 256)),
+        4: ((0, 3), 3, (128, 128)),
+    }
+    for mipmap, (source_rows, steps, compressed_size) in expected.items():
+        calls.clear()
+        mm = tile.dds.mipmap_list[mipmap]
+
+        assert tile.get_bytes(
+            mm.startpos + mm.length // 2,
+            min(4096, mm.length - 1),
+        )
+
+        assert calls["img"][1:] == source_rows
+        assert calls["reduction"][1] == steps
+        assert calls["compressed_size"] == compressed_size

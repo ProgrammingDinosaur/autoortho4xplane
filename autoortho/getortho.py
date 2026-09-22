@@ -11830,6 +11830,51 @@ class Tile(object):
         endrow = min(total_rows - 1, end_byte // bytes_per_chunk_row)
         return startrow, max(startrow, endrow), bytes_per_chunk_row, total_rows
 
+    def _partial_composition_rows(self, mipmap, startrow, endrow):
+        """Map target DDS rows to source rows at the effective clamped zoom."""
+        target_width = max(4, int(self.dds.width) >> mipmap)
+        target_height = max(4, int(self.dds.height) >> mipmap)
+        requested_zoom = min(self.max_zoom - mipmap, self.max_zoom)
+        _, _, source_width, source_height, _, _ = self._get_quick_zoom(
+            requested_zoom,
+            self.min_zoom,
+        )
+        source_width *= 256
+        source_height *= 256
+
+        if (
+            source_width % target_width
+            or source_height % target_height
+        ):
+            raise ValueError(
+                f"Cannot map {source_width}x{source_height} source image "
+                f"onto {target_width}x{target_height} mipmap {mipmap}"
+            )
+
+        width_scale = source_width // target_width
+        height_scale = source_height // target_height
+        if (
+            width_scale != height_scale
+            or width_scale < 1
+            or width_scale & (width_scale - 1)
+        ):
+            raise ValueError(
+                f"Invalid source scale {width_scale}x{height_scale} "
+                f"for mipmap {mipmap}"
+            )
+
+        reduction_steps = width_scale.bit_length() - 1
+        source_rows = max(1, source_height // 256)
+        source_startrow = min(
+            source_rows - 1,
+            startrow * width_scale,
+        )
+        source_endrow = min(
+            source_rows - 1,
+            ((endrow + 1) * width_scale) - 1,
+        )
+        return source_startrow, source_endrow, reduction_steps
+
     def _maybe_promote_partial_cache_to_mm0(self, requested_mipmap: int) -> bool:
         """Promote cache-backed work without eagerly materializing mipmap zero."""
         if requested_mipmap != 0:
@@ -12141,8 +12186,29 @@ class Tile(object):
             bytes_per_chunk_row,
             chunk_rows_in_mm,
         ) = self._partial_row_range(mipmap, offset, length)
+        (
+            composition_startrow,
+            composition_endrow,
+            reduction_steps,
+        ) = self._partial_composition_rows(
+            mipmap,
+            startrow,
+            endrow,
+        )
 
-        log.debug(f"Startrow: {startrow} Endrow: {endrow} bytes_per_chunk_row: {bytes_per_chunk_row} width_px: {base_width_px} height_px: {base_height_px}")
+        log.debug(
+            "Startrow: %s Endrow: %s Composition rows: %s-%s "
+            "Reduction steps: %s bytes_per_chunk_row: %s "
+            "width_px: %s height_px: %s",
+            startrow,
+            endrow,
+            composition_startrow,
+            composition_endrow,
+            reduction_steps,
+            bytes_per_chunk_row,
+            base_width_px,
+            base_height_px,
+        )
         bump("partial_rows_requested", endrow - startrow + 1)
         
         # ═══════════════════════════════════════════════════════════════════
@@ -12187,13 +12253,14 @@ class Tile(object):
             return False
 
         new_im = None
+        compression_im = None
         build_succeeded = False
         start_time = time.monotonic()
         try:
             composed = self.get_img(
                 mipmap,
-                startrow,
-                endrow,
+                composition_startrow,
+                composition_endrow,
                 maxwait=self.get_maxwait(),
                 time_budget=time_budget,
                 with_source_manifest=mipmap == 0,
@@ -12211,8 +12278,13 @@ class Tile(object):
             if mipmap == 0:
                 generation = self._mm0_rows.next_generation()
                 self._mm0_rows.mark_building(range(startrow, endrow + 1))
-            img_data = new_im.data_ptr()
-            pixel_width, pixel_height = new_im.size
+            compression_im = new_im
+            if reduction_steps:
+                compression_im = new_im.reduce_2(reduction_steps)
+                if not compression_im:
+                    return False
+            img_data = compression_im.data_ptr()
+            pixel_width, pixel_height = compression_im.size
             dxtdata = self.dds.compress(
                 pixel_width,
                 pixel_height,
@@ -12280,6 +12352,14 @@ class Tile(object):
             self._dds_coverage_revision += 1
             return True
         finally:
+            if (
+                compression_im is not None
+                and compression_im is not new_im
+            ):
+                try:
+                    compression_im.close()
+                except Exception:
+                    pass
             if new_im is not None and mipmap not in self.imgs:
                 try:
                     new_im.close()
