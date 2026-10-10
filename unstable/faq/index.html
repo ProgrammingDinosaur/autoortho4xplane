@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -27,7 +27,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -728,10 +728,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#i-installed-scenery-setup-custom-scenery-and-clicked-run-but-x-plane-did-not-automatically-startup" class="md-nav__link">
+  <a href="#i-installed-scenery-clicked-start-streaming-but-x-plane-did-not-automatically-start" class="md-nav__link">
     <span class="md-ellipsis">
       
-        I installed scenery, setup Custom Scenery, and clicked 'Run' but X-Plane did not automatically startup
+        I installed scenery, clicked "Start Streaming," but X-Plane did not automatically start
       
     </span>
   </a>
@@ -1342,10 +1342,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#i-installed-scenery-setup-custom-scenery-and-clicked-run-but-x-plane-did-not-automatically-startup" class="md-nav__link">
+  <a href="#i-installed-scenery-clicked-start-streaming-but-x-plane-did-not-automatically-start" class="md-nav__link">
     <span class="md-ellipsis">
       
-        I installed scenery, setup Custom Scenery, and clicked 'Run' but X-Plane did not automatically startup
+        I installed scenery, clicked "Start Streaming," but X-Plane did not automatically start
       
     </span>
   </a>
@@ -1710,6 +1710,12 @@ fallback_level = full
 fallback_extends_budget = True
 </code></pre>
 <p><strong>Trade-off Warning:</strong> Higher time budgets and extended fallbacks may cause longer loading times and occasional stuttering. See the <a href="../performance/">Performance Tuning Guide</a> for a detailed explanation of the quality vs. speed trade-off.</p>
+<p>For ZL17, <strong>Allow incomplete native partial builds</strong> is an additional opt-in
+trade-off. Disabled (the default) preserves strict quality and uses the normal
+fallback path if any requested chunk misses its deadline. Enabled, it completes
+the row with cache/lower-ZL imagery and finally the configured missing color, so
+loading may finish sooner but X-Plane can retain a degraded patch for that
+flight.</p>
 <hr />
 <h3 id="why-are-there-so-many-missing-tiles-even-with-full-fallback-enabled">Why are there so many missing tiles even with "Full" fallback enabled?</h3>
 <p>If you're seeing many missing tiles with <code>fallback_level = full</code>, check these:</p>
@@ -1729,19 +1735,19 @@ fallback_extends_budget = True
 <p>Stuttering occurs when X-Plane waits for AutoOrtho to provide imagery. To minimize stutters:</p>
 <ol>
 <li><strong>Use Time Budget System:</strong> Keep <code>use_time_budget = True</code> (default)</li>
-<li><strong>Use reasonable budget:</strong> Set <code>tile_time_budget</code> to 180-300 seconds</li>
+<li><strong>Use a bounded tile budget:</strong> Start with the 60-second default</li>
 <li><strong>Use cache-only fallbacks:</strong> Set <code>fallback_level = cache</code> to avoid network delays during fallbacks</li>
 <li><strong>Enable prefetching:</strong> Keep <code>prefetch_enabled = True</code> to download tiles ahead of your aircraft</li>
 <li><strong>Increase prefetch lookahead:</strong> Set <code>prefetch_lookahead = 30</code> or higher for faster aircraft</li>
 </ol>
 <p><strong>Recommended settings for stutter-free flying:</strong></p>
 <pre><code class="language-ini">use_time_budget = True
-tile_time_budget = 180
+tile_time_budget = 60
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
 prefetch_lookahead = 30
-max_zoom_level = 16
+# Keep the detail level you prefer; performance features apply through ZL17.
 </code></pre>
 <p><strong>Trade-off:</strong> You may see occasional blurry or missing tiles, but your flight will be smoother.</p>
 <hr />
@@ -1754,11 +1760,14 @@ max_zoom_level = 16
 <li><strong>CPU speed:</strong> Slower CPUs = longer decode/compress times</li>
 <li><strong>Time budget:</strong> Higher budgets = more time spent per tile</li>
 </ol>
-<p><strong>To speed up startup:</strong>
-- <strong>Lower your Max Zoom Level</strong> - This has the biggest impact! ZL16→ZL15 is 4× faster
-- Use a lower <code>tile_time_budget</code> (180-300 seconds)
-- Enable <code>suspend_maxwait = True</code> to use extended timeouts only during startup
-- The second time you load the same area will be faster (cached data)</p>
+<p><strong>To speed up startup without lowering detail:</strong>
+- Keep the shared HTTP/2 downloader and DSF-driven prefetch enabled
+- Use the 60-second tile-wide default unless you explicitly want longer waits
+- Keep the persistent compiled DDS cache enabled for repeat visits
+- Enable <strong>Persist partial DDS rows</strong> if you repeatedly load the same ZL17 areas;
+  the first visit still downloads imagery, while later visits can reuse each
+  validated row independently
+- Choose the fallback policy that matches your initial-quality requirement</p>
 <p><strong>Zoom Level Resource Scaling:</strong>
 | Zoom | Chunks/Tile | Relative Load Time |
 |------|-------------|-------------------|
@@ -1811,15 +1820,15 @@ max_zoom_level = 16
 <p>See the <a href="../performance/#native-pipeline-architecture">Native Pipeline Architecture</a> for technical details.</p>
 <hr />
 <h3 id="why-are-apple-maps-downloads-slower-than-other-sources">Why are Apple Maps downloads slower than other sources?</h3>
-<p><strong>Apple Maps always uses the Python HTTP client</strong>, not the native libcurl client. This is intentional because Apple Maps requires:</p>
+<p>Apple Maps uses the shared HTTP/2 broker while retaining its specialized token
+handling:</p>
 <ol>
 <li><strong>Dynamic authentication</strong>: Tokens must be fetched via DuckDuckGo proxy</li>
 <li><strong>Token rotation</strong>: On 403/410 errors, the token must be refreshed</li>
 <li><strong>Special headers</strong>: Requires <code>Authorization: Bearer</code> headers</li>
 </ol>
-<p>The Python path handles all this authentication flow correctly. Other imagery sources (BI, EOX, ARC, NAIP, USGS, FIREFLY, YNDX, GO2) use the faster native HTTP client.</p>
-<p><strong>Impact:</strong> Apple Maps initial loading may be 2-3x slower than other sources. Once cached, performance is identical.</p>
-<p><strong>Workaround:</strong> Consider using an alternative imagery source if download speed is critical.</p>
+<p>Concurrent 403/410 responses share one token refresh, preventing refresh storms.
+Provider-side throttling can still make Apple slower than another source.</p>
 <hr />
 <h3 id="i-changed-the-settings-but-nothing-seems-different">I changed the settings but nothing seems different</h3>
 <ol>
@@ -1854,8 +1863,9 @@ max_zoom_level = 16
 <p><strong>Example:</strong> With <code>maxwait = 1.5s</code> and 256 chunks:
 - Worst case: 256 × 1.5s = 384 seconds (due to serial execution)
 - Actual time varies widely based on parallelism</p>
-<p><strong>Example:</strong> With <code>tile_time_budget = 180s</code>:
-- Always release a tile to X-Plane within 180 seconds (predictable)
+<p><strong>Example:</strong> With <code>tile_time_budget = 60s</code>:
+- Always release a tile to X-Plane within 60 seconds, plus any explicitly
+  configured shared fallback extension
 - May have some missing chunks if network is slow or zoom level is high</p>
 <p><strong>Recommendation:</strong> Keep <code>use_time_budget = True</code> to use the new predictable system.</p>
 <h3 id="time-exclusion-re-activated-after-scenery-reload">Time exclusion re-activated after scenery reload</h3>
@@ -1882,7 +1892,7 @@ unless other issues are seen.</p>
 <p>If in doubt, re-install the scenery packs.</p>
 <h3 id="something-went-wrong-with-scenery-setup-and-id-like-to-start-again-how-do-i-reinstall">Something went wrong with scenery setup and I'd like to start again.  How do I reinstall?</h3>
 <p>AutoOrtho checks for metadata for installed scenery packs in <code>Custom Scenery/z_autoorth/**_info.json</code>  Where '**' is a shortname for each scenery pack installed.  You can delete the corresponding .json file, and re-run the configuration utility and should be able to reinstall the scenery pack</p>
-<h3 id="i-installed-scenery-setup-custom-scenery-and-clicked-run-but-x-plane-did-not-automatically-startup">I installed scenery, setup Custom Scenery, and clicked 'Run' but X-Plane did not automatically startup</h3>
+<h3 id="i-installed-scenery-clicked-start-streaming-but-x-plane-did-not-automatically-start">I installed scenery, clicked "Start Streaming," but X-Plane did not automatically start</h3>
 <p>You have to start X-Plane separately from this tool.  It's also best to start X-Plane <em>after</em> starting autoortho so that all new files and directories are picked up.</p>
 <hr />
 <h2 id="linux-issues">Linux Issues</h2>
@@ -2046,7 +2056,7 @@ Open a discussion with your feature suggestion and maybe someone or me will look
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

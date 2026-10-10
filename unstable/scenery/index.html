@@ -17,7 +17,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -25,7 +25,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -718,8 +718,18 @@
 <h1 id="scenery-setup">Scenery Setup</h1>
 <h2 id="using-provided-sceneries">Using provided sceneries</h2>
 <p><em>IMPORTANT</em></p>
+<p>Use <strong>Scenery Library</strong> to search, filter, install, update, and remove regions.
+AutoOrtho checks the destination and temporary-download folders before an
+installation begins, shows the expected storage requirement, and blocks the
+operation when the destination is not writable or space is clearly
+insufficient.</p>
+<p>Installations and patch operations remain visible in the <strong>Activity</strong> panel
+while you navigate elsewhere. A cancelled operation stops at a safe boundary;
+AutoOrtho either preserves resumable download data or cleans incomplete output.
+Completed and failed operations remain visible until dismissed, and failures
+offer the recovery actions that are safe for that operation.</p>
 <p>The scenery packs provided with this tool that you download should be setup via the configuration utility.  This does more than simply download and extract the files.</p>
-<p>If you do wish to manaually manipulate these scenery packs, you should review the source code (downloader.py in particular) and understand how symlinks and/or junctions work and the limitations of each.</p>
+<p>If you do wish to manually manipulate these scenery packs, you should review the source code (downloader.py in particular) and understand how symlinks and/or junctions work and the limitations of each.</p>
 <p>If you manually move things around outside of the configuration utility, things very well might break!</p>
 <p><em>IMPORTANT</em></p>
 <h2 id="configuring-scenery_packsini">Configuring scenery_packs.ini</h2>
@@ -814,7 +824,7 @@ before attempting this!</p>
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>
