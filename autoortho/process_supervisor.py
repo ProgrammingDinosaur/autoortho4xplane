@@ -18,7 +18,7 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 
-DEFAULT_WORKER_STOP_TIMEOUT = 3.0
+DEFAULT_WORKER_STOP_TIMEOUT = 8.0
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -55,6 +55,7 @@ class AOProcessSupervisor:
         stats_auth=None,
         log_addr=None,
         loglevel="INFO",
+        extra_env=None,
     ) -> WorkerHandle:
         env = os.environ.copy()
         env["AO_RUN_MODE"] = "mount_worker"
@@ -69,11 +70,14 @@ class AOProcessSupervisor:
         if log_addr:
             env["AO_LOG_ADDR"] = log_addr
 
+        if extra_env:
+            env.update({str(key): str(value) for key, value in extra_env.items()})
+
         if _is_frozen():
             cmd = [sys.executable]
             cwd = None
         else:
-            cmd = [sys.executable, str(_REPO_ROOT / "autoortho")]
+            cmd = [sys.executable, "-m", "autoortho"]
             cwd = str(_REPO_ROOT)
 
         cmd += [
@@ -181,6 +185,15 @@ class AOProcessSupervisor:
 
     def stop_all(self, timeout=DEFAULT_WORKER_STOP_TIMEOUT):
         live = [h for h in self.handles if h.process.poll() is None]
+
+        # FUSE has already been unmounted by the caller. Give workers a short
+        # window to persist diagnostics and exit naturally before signaling.
+        natural_exit_deadline = time.monotonic() + min(1.0, max(0.0, timeout))
+        while live and time.monotonic() < natural_exit_deadline:
+            live = [h for h in live if h.process.poll() is None]
+            if live:
+                time.sleep(0.05)
+
         for handle in live:
             self._request_worker_stop(handle)
 

@@ -22,10 +22,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 
 
-# Handle imports for both frozen (PyInstaller) and direct Python execution
-try:
+# Handle imports for both package and direct Python execution.
+if __package__:
     from autoortho.aoconfig import CFG
-except ImportError:
+else:
     from aoconfig import CFG
 
 import logging
@@ -1489,4 +1489,3 @@ if __name__ == "__main__":
         sys.exit(1)
 
     sys.exit(0)
-

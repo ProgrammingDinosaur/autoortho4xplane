@@ -7,7 +7,7 @@ loads skip the expensive JPEG-decode + DXT-compress pipeline entirely.
 The DDS cache stores fully-built textures derived from JPEG tiles.
 
 Key features:
-- Persistent across sessions (unlike EphemeralDDSCache)
+- Persistent across sessions with configurable disk-budget enforcement
 - Staleness detection via DDM metadata sidecar files
 - ZL upgrade support with mipmap shifting (reuses existing mipmaps)
 - LRU eviction when disk budget is exceeded
@@ -16,12 +16,34 @@ Key features:
 """
 
 import json
+import hashlib
 import logging
 import os
+import struct
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
+
+try:
+    from autoortho.dds_manifest import (
+        RowBuildManifest,
+        manifests_from_dict,
+        manifests_to_dict,
+    )
+except ImportError:
+    from dds_manifest import (
+        RowBuildManifest,
+        manifests_from_dict,
+        manifests_to_dict,
+    )
+
+try:
+    from autoortho.diagnostics import profiled_stage
+except ImportError:
+    from diagnostics import profiled_stage
 
 try:
     import zstandard
@@ -34,7 +56,17 @@ log = logging.getLogger(__name__)
 # Current DDM schema version. Bump when the metadata format changes
 # in a backwards-incompatible way.
 # v2 -> v3: added "populated_mipmaps" for incremental DDS persistence
-DDM_VERSION = 3
+# v3 -> v4: adds crash-safe, row-addressable partial mipmap-0 persistence.
+# v4 -> v5: makes immutable, checksummed mipmap-zero row manifests mandatory.
+DDM_VERSION = 5
+_SUPPORTED_DDM_VERSIONS = frozenset((DDM_VERSION,))
+
+# A row record is deliberately endian-explicit and contains no native-sized
+# values, so caches can be moved between Windows and POSIX installations.
+_ROW_RECORD_MAGIC = b"DDRR"
+_ROW_RECORD_SCHEMA = 1
+_ROW_RECORD_HEADER = struct.Struct(">4sBIQI32s")
+_MAX_ROW_RECORD_SIZE = 128 * 1024 * 1024
 
 
 def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
@@ -108,11 +140,22 @@ class DynamicDDSCache:
         + ``os.replace``) prevent corruption from concurrent access or crashes.
     """
 
-    def __init__(self, cache_dir: str, max_size_mb: int = 4096, enabled: bool = True):
+    def __init__(
+        self,
+        cache_dir: str,
+        max_size_mb: int = 4096,
+        enabled: bool = True,
+        *,
+        cleanup_source_jpegs_after_store: bool = False,
+        maintenance_workers: int = 2,
+        partial_row_queue_bytes: int = 16 * 1024 * 1024,
+        partial_row_shutdown_timeout: float = 2.0,
+    ):
         """
         Args:
             cache_dir: Base cache directory (same as CFG.paths.cache_dir).
-            max_size_mb: Maximum disk usage in MB for the DDS cache.
+            max_size_mb: Maximum combined disk usage in MB for DDS data,
+                         DDM metadata, and partial-row sidecars.
                          Set to 0 for unlimited cache size.
             enabled: Master enable flag. When False, all methods are no-ops.
         """
@@ -121,6 +164,29 @@ class DynamicDDSCache:
         self._max_size = max_size_mb * 1024 * 1024 if max_size_mb > 0 else 0  # 0 = unlimited
         self._enabled = enabled
         self._current_size = 0
+        self._cleanup_source_jpegs_after_store = bool(
+            cleanup_source_jpegs_after_store
+        )
+        self._maintenance = ThreadPoolExecutor(
+            max_workers=max(1, min(8, int(maintenance_workers))),
+            thread_name_prefix="dds-cache",
+        )
+        self._maintenance_lock = threading.Lock()
+        self._closed = False
+        self._scan_complete = threading.Event()
+        self._partial_row_queue_limit = max(0, int(partial_row_queue_bytes))
+        self._partial_row_shutdown_timeout = max(0.0, partial_row_shutdown_timeout)
+        self._partial_row_queue = {}
+        self._partial_row_queue_bytes = 0
+        self._partial_row_condition = threading.Condition()
+        self._partial_row_stop = False
+        self._partial_row_active = False
+        self._partial_row_worker = None
+        self._partial_row_coalesced = 0
+        self._partial_row_dropped = 0
+        self._partial_row_persisted = 0
+        self._tile_locks = {}
+        self._tile_locks_guard = threading.Lock()
 
         # LRU tracking: tile_key -> (dds_path, ddm_path, size, last_access)
         # Ordered from oldest to newest access.
@@ -157,8 +223,148 @@ class DynamicDDSCache:
 
         if self._enabled:
             os.makedirs(self._dds_root, exist_ok=True)
+            self._partial_row_worker = threading.Thread(
+                target=self._partial_row_worker_main,
+                name="dds-partial-rows",
+                daemon=True,
+            )
+            self._partial_row_worker.start()
             log.info(f"DynamicDDSCache initialized: {self._dds_root} "
                      f"(max={max_size_mb}MB, compression={self._compression})")
+
+    @staticmethod
+    def _safe_file_size(path: str) -> int:
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    @classmethod
+    def _entry_disk_size(cls, dds_path: str, ddm_path: str) -> int:
+        """Return the complete logical size of one compiled-cache entry."""
+        return sum(
+            cls._safe_file_size(path)
+            for path in (
+                dds_path,
+                ddm_path,
+                cls._row_records_path(ddm_path),
+            )
+        )
+
+    def _record_store(
+        self,
+        key,
+        dds_path: str,
+        ddm_path: str,
+        *,
+        count_store: bool = True,
+    ) -> None:
+        size = self._entry_disk_size(dds_path, ddm_path)
+        old_size = 0
+        with self._lock:
+            if key in self._entries:
+                old_size = self._entries[key][2]
+                self._current_size -= old_size
+            self._entries[key] = (dds_path, ddm_path, size, time.time())
+            self._entries.move_to_end(key)
+            self._current_size += size
+            if count_store:
+                self._stores += 1
+            over_limit = (
+                self._max_size > 0 and self._current_size > self._max_size
+            )
+        if self._budget_manager is not None:
+            self._budget_manager.account_dds(size - old_size)
+        if over_limit:
+            self._evict_lru_async()
+
+    def _remove_entry_files(
+        self,
+        key,
+        dds_path: str,
+        ddm_path: str,
+    ) -> int:
+        """Delete one entry and keep both accounting layers synchronized."""
+        with self._lock:
+            tracked = self._entries.pop(key, None)
+            if tracked is not None:
+                self._current_size = max(
+                    0,
+                    self._current_size - tracked[2],
+                )
+
+        before = self._entry_disk_size(dds_path, ddm_path)
+        with self._tile_file_lock(ddm_path):
+            self._delete_pair(dds_path, ddm_path)
+        remaining = self._entry_disk_size(dds_path, ddm_path)
+        freed = max(0, before - remaining)
+
+        if remaining:
+            with self._lock:
+                self._entries[key] = (
+                    dds_path,
+                    ddm_path,
+                    remaining,
+                    time.time(),
+                )
+                self._entries.move_to_end(key, last=False)
+                self._current_size += remaining
+
+        if freed and self._budget_manager is not None:
+            self._budget_manager.account_dds(-freed)
+        return freed
+
+    def wait_for_scan(self, timeout: Optional[float] = None) -> bool:
+        return self._scan_complete.wait(timeout)
+
+    def close(self) -> None:
+        with self._maintenance_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self.flush_partial_rows(self._partial_row_shutdown_timeout)
+        with self._partial_row_condition:
+            self._partial_row_stop = True
+            self._partial_row_condition.notify_all()
+        if self._partial_row_worker is not None:
+            self._partial_row_worker.join(self._partial_row_shutdown_timeout)
+        self._maintenance.shutdown(wait=True, cancel_futures=False)
+
+    def _submit_maintenance(self, fn, *args, **kwargs) -> bool:
+        with self._maintenance_lock:
+            if self._closed:
+                return False
+            try:
+                self._maintenance.submit(fn, *args, **kwargs)
+            except RuntimeError:
+                return False
+        return True
+
+    def enqueue_store(
+        self,
+        tile_id: str,
+        max_zoom: int,
+        dds_bytes: bytes,
+        tile,
+        mm0_missing_indices=None,
+        mm0_fallback_indices=None,
+        mm0_manifest=None,
+    ) -> bool:
+        """Transfer a DDS snapshot to the maintenance pool without blocking."""
+        try:
+            snapshot = bytes(dds_bytes)
+        except (TypeError, ValueError):
+            return False
+        return self._submit_maintenance(
+            self.store,
+            tile_id,
+            max_zoom,
+            snapshot,
+            tile,
+            mm0_missing_indices,
+            mm0_fallback_indices,
+            mm0_manifest,
+        )
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -184,25 +390,161 @@ class DynamicDDSCache:
         )
         return base + ".dds", base + ".ddm"
 
+    @staticmethod
+    def _row_records_path(ddm_path: str) -> str:
+        """Return the append-only row-record path associated with a DDM."""
+        return ddm_path + ".rows"
+
+    @contextmanager
+    def _tile_file_lock(self, ddm_path: str):
+        """Serialize row data and metadata updates across processes."""
+        lock_path = ddm_path + ".lock"
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        with self._tile_locks_guard:
+            thread_lock = self._tile_locks.setdefault(lock_path, threading.Lock())
+        with thread_lock:
+            with open(lock_path, "a+b") as lock_file:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        lock_file.seek(0)
+                        if os.path.getsize(lock_path) == 0:
+                            lock_file.write(b"\0")
+                            lock_file.flush()
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                    yield
+                finally:
+                    try:
+                        if os.name == "nt":
+                            import msvcrt
+                            lock_file.seek(0)
+                            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+
     # ------------------------------------------------------------------
     # DDM metadata helpers
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _validate_ddm(meta: object) -> bool:
+        """Validate the DDM portion needed to safely consume a cache entry."""
+        if not isinstance(meta, dict):
+            return False
+        version = meta.get("v")
+        if not isinstance(version, int) or version not in _SUPPORTED_DDM_VERSIONS:
+            return False
+
+        populated = meta.get("populated_mipmaps", [])
+        partial = meta.get("partial_mipmaps", {})
+        if not isinstance(populated, list) or not isinstance(partial, dict):
+            return False
+        if any(not isinstance(mipmap, int) or mipmap < 0 for mipmap in populated):
+            return False
+        for mipmap, entry in partial.items():
+            if (not isinstance(mipmap, str) or not mipmap.isdigit() or
+                    not isinstance(entry, dict)):
+                return False
+            if entry.get("unit") != "chunk_row":
+                return False
+            total = entry.get("total")
+            covered = entry.get("covered")
+            if (not isinstance(total, int) or total <= 0 or
+                    not isinstance(covered, list) or
+                    any(not isinstance(row, int) or row < 0 or row >= total
+                        for row in covered) or
+                    len(set(covered)) != len(covered) or
+                    not isinstance(entry.get("degraded"), list) or
+                    any(
+                        not isinstance(row, int)
+                        or row < 0
+                        or row >= total
+                        for row in entry.get("degraded", [])
+                    ) or
+                    not isinstance(entry.get("revision"), int) or
+                    entry["revision"] < 0):
+                return False
+            revisions = entry.get("row_revisions", {})
+            if not isinstance(revisions, dict):
+                return False
+            if set(revisions) != {str(row) for row in covered}:
+                return False
+            if any(not isinstance(revision, int) or revision < 0
+                   for revision in revisions.values()):
+                return False
+            if int(mipmap) in populated:
+                return False
+        try:
+            tile_id = (
+                f"{int(meta['tile_row'])}_{int(meta['tile_col'])}_"
+                f"{meta['map']}_{int(meta['zl'])}"
+            )
+            manifests = manifests_from_dict(
+                meta["mm0_manifest"],
+                tile_id=tile_id,
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        target_zoom = meta["mm0_manifest"].get("target_zoom")
+        if target_zoom != meta.get("max_zl"):
+            return False
+        total_rows = max(1, (int(meta.get("h", 0)) + 255) // 256)
+        if any(
+            row < 0
+            or row >= total_rows
+            or len(manifest.sources) != max(
+                1,
+                (int(meta.get("w", 0)) + 255) // 256,
+            )
+            for row, manifest in manifests.items()
+        ):
+            return False
+        if 0 in populated and set(manifests) != set(range(total_rows)):
+            return False
+        partial_mm0 = partial.get("0")
+        if partial_mm0 is not None and set(manifests) != set(
+            partial_mm0.get("covered", [])
+        ):
+            return False
+        return True
+
+    @staticmethod
     def _build_ddm(tile, max_zoom: int,
                    dds_format: str, compressor: str,
-                   mm0_missing_indices: Optional[List[int]] = None,
-                   mm0_fallback_indices: Optional[List[int]] = None,
+                   mm0_manifest,
                    disk_compression: str = "none") -> dict:
-        """Build a DDM v3 metadata dict from a tile and current config."""
+        """Build DDM metadata exclusively from immutable row manifests."""
         dds_ref = tile.dds
         width = dds_ref.width if dds_ref else 0
         height = dds_ref.height if dds_ref else 0
         mm_count = dds_ref.mipMapCount if dds_ref else 0
-
-        missing = mm0_missing_indices or []
-        fallback = mm0_fallback_indices or []
-        total_chunks = getattr(tile, 'chunks_per_row', 0) ** 2
+        manifests = dict(mm0_manifest or {})
+        expected_rows = max(1, (height + 255) // 256)
+        if set(manifests) != set(range(expected_rows)):
+            raise ValueError("complete DDS requires every mipmap-zero row manifest")
+        chunks_per_row = max(1, (width + 255) // 256)
+        if any(
+            manifest.tile_id != tile.id
+            or manifest.target_zoom != max_zoom
+            or manifest.mipmap != 0
+            or len(manifest.sources) != chunks_per_row
+            for manifest in manifests.values()
+        ):
+            raise ValueError("mipmap-zero manifest does not match the DDS")
+        missing = []
+        fallback = []
+        for row_index, manifest in manifests.items():
+            base = row_index * chunks_per_row
+            missing.extend(base + index for index in manifest.missing_indices)
+            fallback.extend(base + index for index in manifest.fallback_indices)
+        total_chunks = chunks_per_row * expected_rows
 
         mipmaps = []
         for i in range(mm_count):
@@ -228,11 +570,16 @@ class DynamicDDSCache:
             "tile_col": tile.col,
             "mipmaps": mipmaps,
             "populated_mipmaps": list(range(mm_count)),
+            "partial_mipmaps": {},
             "needs_healing": len(missing) > 0 or len(fallback) > 0,
             "healing_chunks": len(missing) + len(fallback),
             "missing_indices": missing,
             "fallback_indices": fallback,
             "disk_compression": disk_compression,
+            "mm0_manifest": manifests_to_dict(
+                manifests,
+                target_zoom=max_zoom,
+            ),
         }
 
     @staticmethod
@@ -241,8 +588,10 @@ class DynamicDDSCache:
                                width: int, height: int, mm_count: int,
                                dds_format: str, compressor: str,
                                populated_mipmaps: List[int],
-                               disk_compression: str = "none") -> dict:
-        """Build a lightweight DDM v3 dict for incremental saves.
+                               disk_compression: str = "none",
+                               partial_mipmaps: Optional[dict] = None,
+                               mm0_manifest: Optional[dict] = None) -> dict:
+        """Build a lightweight DDM v4 dict for incremental saves.
 
         Unlike ``_build_ddm``, this does not require the tile DDS object,
         making it safe to call outside the tile lock with captured values.
@@ -268,11 +617,16 @@ class DynamicDDSCache:
             "tile_col": col,
             "mipmaps": mipmaps,
             "populated_mipmaps": sorted(populated_mipmaps),
+            "partial_mipmaps": partial_mipmaps or {},
             "needs_healing": False,
             "healing_chunks": 0,
             "missing_indices": [],
             "fallback_indices": [],
             "disk_compression": disk_compression,
+            "mm0_manifest": mm0_manifest or {
+                "target_zoom": max_zoom,
+                "rows": {},
+            },
         }
 
     @staticmethod
@@ -290,6 +644,22 @@ class DynamicDDSCache:
         if meta.get("missing_indices") or meta.get("fallback_indices"):
             return False
 
+        try:
+            tile_id = (
+                f"{int(meta['tile_row'])}_{int(meta['tile_col'])}_"
+                f"{meta['map']}_{int(meta['zl'])}"
+            )
+            manifests = manifests_from_dict(
+                meta["mm0_manifest"],
+                tile_id=tile_id,
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not manifests or not all(
+            manifest.is_exact for manifest in manifests.values()
+        ):
+            return False
+
         mipmaps = meta.get("mipmaps") or []
         if mipmaps:
             mm0 = mipmaps[0]
@@ -303,12 +673,45 @@ class DynamicDDSCache:
         return True
 
     @staticmethod
+    def _validate_mm0_manifest_bytes(
+        tile,
+        max_zoom: int,
+        dds_bytes: bytes,
+        manifests,
+    ) -> bool:
+        try:
+            manifest_map = dict(manifests or {})
+            mm0 = tile.dds.mipmap_list[0]
+            row_count = max(1, (tile.dds.height + 255) // 256)
+            row_bytes = mm0.length // row_count
+            if set(manifest_map) != set(range(row_count)):
+                return False
+            for row, manifest in manifest_map.items():
+                if (
+                    manifest.tile_id != tile.id
+                    or manifest.target_zoom != max_zoom
+                    or manifest.mipmap != 0
+                    or manifest.row_index != row
+                ):
+                    return False
+                start = mm0.startpos + row * row_bytes
+                if not manifest.validate_data(
+                    dds_bytes[start:start + row_bytes]
+                ):
+                    return False
+            return True
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    @staticmethod
     def _write_ddm(ddm_path: str, meta: dict) -> None:
         """Write DDM metadata atomically."""
         tmp = ddm_path + f".tmp.{os.getpid()}"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(meta, f, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, ddm_path)
         except Exception:
             # Clean up temp file on failure
@@ -323,8 +726,9 @@ class DynamicDDSCache:
         """Read and parse DDM metadata. Returns None on any error."""
         try:
             with open(ddm_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+                meta = json.load(f)
+            return meta if DynamicDDSCache._validate_ddm(meta) else None
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
             return None
 
     # ------------------------------------------------------------------
@@ -383,6 +787,7 @@ class DynamicDDSCache:
     # Public API
     # ------------------------------------------------------------------
 
+    @profiled_stage("cache.dds_load", tile_arg=1)
     def load(self, tile_id: str, max_zoom: int, tile) -> Optional[bytes]:
         """
         Load a cached DDS from disk.
@@ -410,10 +815,13 @@ class DynamicDDSCache:
                 tile.row, tile.col, tile.maptype,
                 tile.tilename_zoom, max_zoom
             )
+            key = self._tile_key(tile_id, max_zoom)
 
             # Check if DDM exists for the requested ZL
             meta = self._read_ddm(ddm_path)
             if meta is None:
+                if os.path.exists(ddm_path):
+                    self._remove_entry_files(key, dds_path, ddm_path)
                 # No entry at requested ZL. Check for adjacent-ZL candidates.
                 self._check_upgrade_candidate(tile_id, max_zoom, tile)
                 self._check_downgrade_candidate(tile_id, max_zoom, tile)
@@ -422,7 +830,7 @@ class DynamicDDSCache:
 
             # Staleness checks (excludes ZL mismatch, handled separately)
             if self._is_stale(meta, tile, dds_path):
-                self._delete_pair(dds_path, ddm_path)
+                self._remove_entry_files(key, dds_path, ddm_path)
                 self._misses += 1
                 return None
 
@@ -440,7 +848,7 @@ class DynamicDDSCache:
                     log.debug(f"DDS cache: ZL downgrade available {tile_id} "
                               f"z{cached_zl} -> z{max_zoom}")
                 else:
-                    self._delete_pair(dds_path, ddm_path)
+                    self._remove_entry_files(key, dds_path, ddm_path)
                 self._misses += 1
                 return None
 
@@ -467,7 +875,7 @@ class DynamicDDSCache:
                 with open(dds_path, "rb") as f:
                     raw_bytes = f.read()
             except (FileNotFoundError, OSError):
-                self._delete_pair(dds_path, ddm_path)
+                self._remove_entry_files(key, dds_path, ddm_path)
                 self._misses += 1
                 return None
 
@@ -476,7 +884,7 @@ class DynamicDDSCache:
                 dds_bytes = self._decompress_dds(raw_bytes, meta)
             except Exception:
                 log.debug(f"DDS cache: decompression failed for {tile_id}, removing")
-                self._delete_pair(dds_path, ddm_path)
+                self._remove_entry_files(key, dds_path, ddm_path)
                 self._misses += 1
                 return None
 
@@ -484,15 +892,39 @@ class DynamicDDSCache:
             if tile.dds is not None and len(dds_bytes) != tile.dds.total_size:
                 log.debug(f"DDS cache: size mismatch for {tile_id} "
                           f"({len(dds_bytes)} vs {tile.dds.total_size})")
-                self._delete_pair(dds_path, ddm_path)
+                self._remove_entry_files(key, dds_path, ddm_path)
+                self._misses += 1
+                return None
+
+            try:
+                manifests = manifests_from_dict(
+                    meta["mm0_manifest"],
+                    tile_id=tile_id,
+                )
+                mm0 = tile.dds.mipmap_list[0]
+                row_count = max(1, (tile.dds.height + 255) // 256)
+                row_bytes = mm0.length // row_count
+                for row in range(row_count):
+                    manifest = manifests[row]
+                    start = mm0.startpos + row * row_bytes
+                    row_data = dds_bytes[start:start + row_bytes]
+                    if not manifest.validate_data(row_data):
+                        raise ValueError("cached mipmap-zero row checksum mismatch")
+            except (KeyError, TypeError, ValueError):
+                log.debug(
+                    "DDS cache: invalid mipmap-zero manifest for %s",
+                    tile_id,
+                )
+                self._remove_entry_files(key, dds_path, ddm_path)
                 self._misses += 1
                 return None
 
             tile._dds_needs_healing = False
             tile._dds_missing_indices = []
             tile._dds_fallback_indices = []
+            tile._loaded_mm0_manifests = manifests
 
-            # DDM v3: partial DDS awareness -- tell the tile which mipmaps
+            # DDM v3/v4: partial DDS awareness -- tell the tile which mipmaps
             # actually contain data so _populate_dds_from_prebuilt() can
             # skip unpopulated slots (avoids allocating zero-filled buffers).
             populated = meta.get("populated_mipmaps")
@@ -502,9 +934,8 @@ class DynamicDDSCache:
                 tile._dds_populated_mipmaps = None  # v2 compat: all populated
 
             # Update LRU tracking
-            key = self._tile_key(tile_id, max_zoom)
             with self._lock:
-                size = len(dds_bytes)
+                size = self._entry_disk_size(dds_path, ddm_path)
                 if key in self._entries:
                     self._entries.move_to_end(key)
                     # Update access time
@@ -524,6 +955,7 @@ class DynamicDDSCache:
             self._misses += 1
             return None
 
+    @profiled_stage("cache.dds_metadata", tile_arg=1)
     def load_metadata(self, tile_id: str, max_zoom: int, tile) -> Optional[dict]:
         """Read DDM metadata without loading the DDS file.
 
@@ -533,12 +965,301 @@ class DynamicDDSCache:
         if not self._enabled:
             return None
         try:
-            _, ddm_path = self._paths_for(
+            dds_path, ddm_path = self._paths_for(
                 tile.row, tile.col, tile.maptype,
                 tile.tilename_zoom, max_zoom)
-            return self._read_ddm(ddm_path)
+            meta = self._read_ddm(ddm_path)
+            if meta is None and os.path.exists(ddm_path):
+                self._remove_entry_files(
+                    self._tile_key(tile_id, max_zoom),
+                    dds_path,
+                    ddm_path,
+                )
+            return meta
         except Exception:
             return None
+
+    @staticmethod
+    def _read_row_records(records_path: str) -> dict:
+        """Read valid records, retaining only the newest revision for each row."""
+        rows = {}
+        try:
+            with open(records_path, "rb") as records:
+                while True:
+                    header = records.read(_ROW_RECORD_HEADER.size)
+                    if not header:
+                        break
+                    if len(header) != _ROW_RECORD_HEADER.size:
+                        break
+                    magic, schema, row, revision, length, checksum = (
+                        _ROW_RECORD_HEADER.unpack(header))
+                    if (magic != _ROW_RECORD_MAGIC or schema != _ROW_RECORD_SCHEMA or
+                            length > _MAX_ROW_RECORD_SIZE):
+                        break
+                    data = records.read(length)
+                    if len(data) != length:
+                        break
+                    if hashlib.sha256(data).digest() != checksum:
+                        continue
+                    previous = rows.get(row)
+                    if previous is None or revision >= previous[0]:
+                        rows[row] = (revision, data)
+        except (FileNotFoundError, OSError):
+            pass
+        return rows
+
+    @staticmethod
+    def _append_row_record(records_path: str, row: int, revision: int,
+                           data: bytes) -> None:
+        checksum = hashlib.sha256(data).digest()
+        header = _ROW_RECORD_HEADER.pack(
+            _ROW_RECORD_MAGIC, _ROW_RECORD_SCHEMA, row, revision,
+            len(data), checksum)
+        with open(records_path, "ab") as records:
+            records.write(header)
+            records.write(data)
+            # Data must reach disk before the DDM starts referencing it.
+            records.flush()
+            os.fsync(records.fileno())
+
+    def _new_partial_ddm(self, tile, max_zoom: int) -> dict:
+        dds_format, compressor = self._get_format_and_compressor()
+        dds_ref = getattr(tile, "dds", None)
+        return self._build_ddm_incremental(
+            tile.row, tile.col, tile.maptype, tile.tilename_zoom, max_zoom,
+            getattr(dds_ref, "width", 0), getattr(dds_ref, "height", 0),
+            getattr(dds_ref, "mipMapCount", 0), dds_format, compressor, [])
+
+    def append_partial_row(self, tile_id: str, max_zoom: int, tile,
+                           row_index: int, data: bytes, total: int,
+                           *, manifest: Optional[RowBuildManifest] = None,
+                           degraded: bool = False,
+                           revision: Optional[int] = None,
+                           provenance: Optional[bytes] = None) -> bool:
+        """Append one exact mipmap-zero row and atomically expose its manifest.
+
+        ``total`` is the number of chunk rows in mipmap 0.  A row becomes
+        visible only after its record has been flushed; mipmap 0 is added to
+        ``populated_mipmaps`` only once all rows are covered.
+        """
+        if (not self._enabled or not isinstance(row_index, int) or
+                not isinstance(total, int) or total <= 0 or
+                row_index < 0 or row_index >= total):
+            return False
+        try:
+            row_data = bytes(data)
+        except (TypeError, ValueError):
+            return False
+        if (
+            len(row_data) > _MAX_ROW_RECORD_SIZE
+            or manifest is None
+            or not manifest.is_exact
+            or manifest.tile_id != tile_id
+            or manifest.target_zoom != max_zoom
+            or manifest.mipmap != 0
+            or manifest.row_index != row_index
+            or not manifest.validate_data(row_data)
+        ):
+            return False
+
+        try:
+            dds_path, ddm_path = self._paths_for(
+                tile.row, tile.col, tile.maptype, tile.tilename_zoom, max_zoom)
+            records_path = self._row_records_path(ddm_path)
+            os.makedirs(os.path.dirname(ddm_path), exist_ok=True)
+            with self._tile_file_lock(ddm_path):
+                meta = self._read_ddm(ddm_path)
+                if meta is None:
+                    meta = self._new_partial_ddm(tile, max_zoom)
+                elif meta.get("v") != DDM_VERSION or 0 in meta.get(
+                        "populated_mipmaps", []):
+                    return False
+
+                partial = meta.setdefault("partial_mipmaps", {})
+                entry = partial.get("0")
+                if entry is None:
+                    entry = {
+                        "unit": "chunk_row",
+                        "total": total,
+                        "covered": [],
+                        "degraded": [],
+                        "revision": 0,
+                        "row_revisions": {},
+                    }
+                    partial["0"] = entry
+                if entry.get("total") != total:
+                    return False
+
+                current_revision = max(
+                    [entry.get("revision", 0)] +
+                    list(entry.get("row_revisions", {}).values()))
+                row_revision = manifest.build_generation
+                if not isinstance(row_revision, int) or row_revision < 0:
+                    return False
+                if row_revision < entry["row_revisions"].get(str(row_index), -1):
+                    return True
+
+                self._append_row_record(
+                    records_path, row_index, row_revision, row_data)
+                covered = set(entry["covered"])
+                covered.add(row_index)
+                entry["covered"] = sorted(covered)
+                entry["degraded"] = []
+                entry["revision"] = max(entry["revision"], row_revision)
+                entry["row_revisions"][str(row_index)] = row_revision
+                mm0_manifest = meta.setdefault(
+                    "mm0_manifest",
+                    {"target_zoom": max_zoom, "rows": {}},
+                )
+                if mm0_manifest.get("target_zoom") != max_zoom:
+                    return False
+                mm0_manifest.setdefault("rows", {})[
+                    str(row_index)
+                ] = manifest.to_dict()
+
+                # Row records are not a normal DDS file. Keep mipmap 0 out of
+                # populated_mipmaps until the live tile promotes and stores a
+                # complete DDS, so older readers can never advertise partial
+                # row storage as a complete texture.
+                meta["populated_mipmaps"] = sorted(
+                    mipmap for mipmap in meta.get("populated_mipmaps", [])
+                    if mipmap != 0)
+                if meta.get("mipmaps"):
+                    meta["mipmaps"][0]["complete"] = False
+                self._write_ddm(ddm_path, meta)
+            key = self._tile_key(tile_id, max_zoom)
+            self._record_store(
+                key,
+                dds_path,
+                ddm_path,
+                count_store=False,
+            )
+            return True
+        except (OSError, ValueError, struct.error) as exc:
+            log.debug("DDS partial-row append failed for %s: %s", tile_id, exc)
+            return False
+
+    def load_partial_rows(self, tile_id: str, max_zoom: int, tile) -> dict:
+        """Return DDM-referenced mipmap-0 partial rows keyed by chunk-row."""
+        if not self._enabled:
+            return {}
+        try:
+            _, ddm_path = self._paths_for(
+                tile.row, tile.col, tile.maptype, tile.tilename_zoom, max_zoom)
+            meta = self._read_ddm(ddm_path)
+            if meta is None or meta.get("v") != DDM_VERSION:
+                return {}
+            entry = meta.get("partial_mipmaps", {}).get("0")
+            if entry is None:
+                return {}
+            records = self._read_row_records(self._row_records_path(ddm_path))
+            referenced = entry["row_revisions"]
+            manifests = manifests_from_dict(
+                meta["mm0_manifest"],
+                tile_id=tile_id,
+            )
+            loaded = {}
+            for row, record in records.items():
+                manifest = manifests.get(row)
+                if (
+                    str(row) in referenced
+                    and referenced[str(row)] == record[0]
+                    and manifest is not None
+                    and manifest.is_exact
+                    and manifest.validate_data(record[1])
+                ):
+                    loaded[row] = record[1]
+            return loaded
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def enqueue_partial_row(self, tile_id: str, max_zoom: int, tile,
+                            row_index: int, data: bytes, total: int,
+                            *, manifest: Optional[RowBuildManifest] = None,
+                            degraded: bool = False,
+                            revision: Optional[int] = None,
+                            provenance: Optional[bytes] = None,
+                            completion_callback=None) -> bool:
+        """Queue a row for non-blocking, coalesced background persistence."""
+        if not self._enabled or self._partial_row_queue_limit <= 0:
+            return False
+        try:
+            row_data = bytes(data)
+        except (TypeError, ValueError):
+            return False
+        if (not isinstance(row_index, int) or not isinstance(total, int) or
+                total <= 0 or row_index < 0 or row_index >= total or
+                len(row_data) > _MAX_ROW_RECORD_SIZE or manifest is None or
+                not manifest.is_exact or
+                manifest.tile_id != tile_id or
+                manifest.target_zoom != max_zoom or
+                manifest.row_index != row_index or
+                not manifest.validate_data(row_data)):
+            return False
+        key = (tile_id, max_zoom, tile.row, tile.col, tile.maptype,
+               tile.tilename_zoom)
+        with self._partial_row_condition:
+            if self._partial_row_stop or self._closed:
+                return False
+            pending = self._partial_row_queue.setdefault(
+                key, {"tile": tile, "rows": {}})
+            old = pending["rows"].get(row_index)
+            queued_bytes = self._partial_row_queue_bytes - (
+                len(old["data"]) if old is not None else 0)
+            if queued_bytes + len(row_data) > self._partial_row_queue_limit:
+                self._partial_row_dropped += 1
+                if not pending["rows"]:
+                    self._partial_row_queue.pop(key, None)
+                return False
+            if old is not None:
+                self._partial_row_coalesced += 1
+            pending["rows"][row_index] = {
+                "data": row_data, "total": total, "manifest": manifest,
+                "completion_callback": completion_callback,
+            }
+            self._partial_row_queue_bytes = queued_bytes + len(row_data)
+            self._partial_row_condition.notify()
+        return True
+
+    def _partial_row_worker_main(self) -> None:
+        while True:
+            with self._partial_row_condition:
+                while not self._partial_row_queue and not self._partial_row_stop:
+                    self._partial_row_condition.wait()
+                if self._partial_row_stop and not self._partial_row_queue:
+                    return
+                _key, pending = self._partial_row_queue.popitem()
+                self._partial_row_queue_bytes -= sum(
+                    len(item["data"]) for item in pending["rows"].values())
+                self._partial_row_active = True
+            for row_index, item in pending["rows"].items():
+                success = self.append_partial_row(
+                        _key[0], _key[1], pending["tile"], row_index,
+                        item["data"], item["total"],
+                        manifest=item["manifest"])
+                if success:
+                    with self._partial_row_condition:
+                        self._partial_row_persisted += 1
+                callback = item.get("completion_callback")
+                if callback is not None:
+                    try:
+                        callback(bool(success), row_index)
+                    except Exception:
+                        log.exception("Partial-row completion callback failed")
+            with self._partial_row_condition:
+                self._partial_row_active = False
+                self._partial_row_condition.notify_all()
+
+    def flush_partial_rows(self, timeout: Optional[float] = None) -> bool:
+        """Wait for queued rows to persist, stopping after ``timeout`` seconds."""
+        deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+        with self._partial_row_condition:
+            while self._partial_row_queue or getattr(self, "_partial_row_active", False):
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._partial_row_condition.wait(remaining)
+        return True
 
     def contains(self, tile_id: str, max_zoom: int, tile) -> bool:
         """Check if a COMPLETE tile exists in the cache.
@@ -561,10 +1282,9 @@ class DynamicDDSCache:
             # Read DDM sidecar to check if mm0 is populated and fully native.
             # If no DDM exists, assume complete (v2 compat / pre-DDM entries).
             meta = self._read_ddm(ddm_path)
-            if meta is not None:
-                return self._mm0_cache_complete(meta)
-
-            return True
+            if meta is None:
+                return not os.path.exists(ddm_path)
+            return self._mm0_cache_complete(meta)
         except Exception:
             return False
 
@@ -706,10 +1426,12 @@ class DynamicDDSCache:
             if i >= len(chunks) or not getattr(chunks[i], 'permanent_failure', False)
         ]
 
+    @profiled_stage("cache.dds_store", tile_arg=1)
     def store(self, tile_id: str, max_zoom: int, dds_bytes: bytes,
               tile,
               mm0_missing_indices: Optional[List[int]] = None,
-              mm0_fallback_indices: Optional[List[int]] = None) -> bool:
+              mm0_fallback_indices: Optional[List[int]] = None,
+              mm0_manifest=None) -> bool:
         """
         Store a DDS build result in the persistent cache.
         
@@ -734,6 +1456,17 @@ class DynamicDDSCache:
 
         if not dds_bytes or len(dds_bytes) < 128:
             return False
+        if not mm0_manifest:
+            log.debug("DDS cache store rejected without a mipmap-zero manifest")
+            return False
+        if not self._validate_mm0_manifest_bytes(
+            tile,
+            max_zoom,
+            dds_bytes,
+            mm0_manifest,
+        ):
+            log.debug("DDS cache store rejected a mismatched row manifest")
+            return False
 
         try:
             dds_path, ddm_path = self._paths_for(
@@ -756,33 +1489,39 @@ class DynamicDDSCache:
             tmp_dds = dds_path + f".tmp.{os.getpid()}"
             with open(tmp_dds, "wb") as f:
                 f.write(disk_bytes)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_dds, dds_path)
 
             # Build and write DDM metadata atomically
-            mm0_missing_indices = self._filter_healable_missing(
-                mm0_missing_indices, tile, max_zoom)
             meta = self._build_ddm(tile, max_zoom,
                                    dds_format, compressor,
-                                   mm0_missing_indices=mm0_missing_indices,
-                                   mm0_fallback_indices=mm0_fallback_indices,
+                                   mm0_manifest=mm0_manifest,
                                    disk_compression=disk_compression)
-            self._write_ddm(ddm_path, meta)
+            with self._tile_file_lock(ddm_path):
+                self._write_ddm(ddm_path, meta)
+                try:
+                    os.remove(self._row_records_path(ddm_path))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    log.debug(
+                        "Could not remove promoted partial rows for %s",
+                        tile_id,
+                    )
 
-            # Update LRU tracking (use on-disk size for accurate budget)
+            # Update LRU tracking using the DDS, metadata, and row sidecar.
             key = self._tile_key(tile_id, max_zoom)
-            size = len(disk_bytes)
-            with self._lock:
-                if key in self._entries:
-                    old_size = self._entries[key][2]
-                    self._current_size -= old_size
-                self._entries[key] = (dds_path, ddm_path, size, time.time())
-                self._entries.move_to_end(key)
-                self._current_size += size
-                self._stores += 1
+            self._record_store(key, dds_path, ddm_path)
 
-            log.debug(f"DDS cache STORE: {tile_id} z{max_zoom} ({size} bytes)")
+            log.debug(
+                "DDS cache STORE: %s z%s (%d bytes)",
+                tile_id,
+                max_zoom,
+                self._entry_disk_size(dds_path, ddm_path),
+            )
 
-            if not mm0_missing_indices and not mm0_fallback_indices:
+            if self._mm0_cache_complete(meta):
                 try:
                     self._cleanup_jpegs_async(tile)
                 except Exception as e:
@@ -799,6 +1538,7 @@ class DynamicDDSCache:
                 pass
             return False
 
+    @profiled_stage("cache.dds_store_incremental", tile_arg=1)
     def store_incremental(self, tile_id: str, max_zoom: int,
                           row: int, col: int, maptype: str,
                           tilename_zoom: int,
@@ -832,6 +1572,11 @@ class DynamicDDSCache:
             return False
 
         if not mipmap_data:
+            return False
+        if 0 in mipmap_data:
+            log.debug(
+                "Incremental DDS store rejected mipmap zero without manifests"
+            )
             return False
 
         try:
@@ -927,23 +1672,50 @@ class DynamicDDSCache:
 
             # 4. Update DDM *after* data writes (crash-safe ordering)
             dds_format, compressor = self._get_format_and_compressor()
+            partial_mipmaps = {}
+            mm0_manifest = None
+            if (existing_meta is not None and
+                    existing_meta.get("v") == DDM_VERSION and
+                    0 not in new_mipmaps):
+                partial_mipmaps = existing_meta.get("partial_mipmaps", {})
+                mm0_manifest = existing_meta.get("mm0_manifest")
             meta = self._build_ddm_incremental(
                 row, col, maptype, tilename_zoom, max_zoom,
                 width, height, mm_count, dds_format, compressor,
-                merged_populated, disk_compression=disk_compression
+                merged_populated, disk_compression=disk_compression,
+                partial_mipmaps=partial_mipmaps,
+                mm0_manifest=mm0_manifest,
             )
-            self._write_ddm(ddm_path, meta)
+            with self._tile_file_lock(ddm_path):
+                latest_meta = self._read_ddm(ddm_path)
+                if (
+                    latest_meta is not None
+                    and latest_meta.get("v") == DDM_VERSION
+                    and 0 not in new_mipmaps
+                ):
+                    meta["partial_mipmaps"] = latest_meta.get(
+                        "partial_mipmaps",
+                        {},
+                    )
+                    meta["mm0_manifest"] = latest_meta.get(
+                        "mm0_manifest",
+                        meta["mm0_manifest"],
+                    )
+                self._write_ddm(ddm_path, meta)
+                if 0 in merged_populated:
+                    try:
+                        os.remove(self._row_records_path(ddm_path))
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        log.debug(
+                            "Could not remove promoted partial rows for %s",
+                            tile_id,
+                        )
 
-            # 5. LRU tracking (use actual on-disk size)
+            # 5. LRU tracking includes DDS metadata and partial-row records.
             key = self._tile_key(tile_id, max_zoom)
-            with self._lock:
-                if key in self._entries:
-                    old_size = self._entries[key][2]
-                    self._current_size -= old_size
-                self._entries[key] = (dds_path, ddm_path, disk_size, time.time())
-                self._entries.move_to_end(key)
-                self._current_size += disk_size
-                self._stores += 1
+            self._record_store(key, dds_path, ddm_path)
 
             log.debug(f"DDS cache STORE_INCR: {tile_id} z{max_zoom} "
                       f"mipmaps={sorted(new_mipmaps.keys())} "
@@ -959,7 +1731,8 @@ class DynamicDDSCache:
     def store_from_file(self, tile_id: str, max_zoom: int,
                         source_path: str, tile,
                         mm0_missing_indices: Optional[List[int]] = None,
-                        mm0_fallback_indices: Optional[List[int]] = None) -> bool:
+                        mm0_fallback_indices: Optional[List[int]] = None,
+                        mm0_manifest=None) -> bool:
         """
         Store a DDS build result from an existing file on disk.
         
@@ -992,6 +1765,24 @@ class DynamicDDSCache:
 
         if source_size < 128:
             return False
+        if not mm0_manifest:
+            log.debug(
+                "DDS cache file store rejected without a mipmap-zero manifest"
+            )
+            return False
+        try:
+            with open(source_path, "rb") as source_file:
+                source_bytes = source_file.read()
+        except OSError:
+            return False
+        if not self._validate_mm0_manifest_bytes(
+            tile,
+            max_zoom,
+            source_bytes,
+            mm0_manifest,
+        ):
+            log.debug("DDS cache file store rejected a mismatched row manifest")
+            return False
 
         try:
             dds_path, ddm_path = self._paths_for(
@@ -1007,14 +1798,15 @@ class DynamicDDSCache:
 
             if self._compression == "zstd" and _HAS_ZSTD:
                 # Read source, compress, write compressed version
-                with open(source_path, "rb") as f:
-                    raw_bytes = f.read()
+                raw_bytes = source_bytes
                 disk_bytes = self._compress_dds(raw_bytes)
                 disk_compression = self._compression if len(disk_bytes) < len(raw_bytes) else "none"
                 if disk_compression == "none":
                     disk_bytes = raw_bytes
                 with open(tmp_dds, "wb") as f:
                     f.write(disk_bytes)
+                    f.flush()
+                    os.fsync(f.fileno())
                 disk_size = len(disk_bytes)
             else:
                 disk_compression = "none"
@@ -1036,29 +1828,32 @@ class DynamicDDSCache:
                     shutil.copy2(source_path, tmp_dds)
                 disk_size = source_size
 
+            with open(tmp_dds, "rb") as committed_dds:
+                os.fsync(committed_dds.fileno())
+
             os.replace(tmp_dds, dds_path)
 
-            # Write DDM metadata
+            # Write DDM metadata and retire any superseded partial rows.
             dds_format, compressor = self._get_format_and_compressor()
-            mm0_missing_indices = self._filter_healable_missing(
-                mm0_missing_indices, tile, max_zoom)
             meta = self._build_ddm(tile, max_zoom,
                                    dds_format, compressor,
-                                   mm0_missing_indices=mm0_missing_indices,
-                                   mm0_fallback_indices=mm0_fallback_indices,
+                                   mm0_manifest=mm0_manifest,
                                    disk_compression=disk_compression)
-            self._write_ddm(ddm_path, meta)
+            with self._tile_file_lock(ddm_path):
+                self._write_ddm(ddm_path, meta)
+                try:
+                    os.remove(self._row_records_path(ddm_path))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    log.debug(
+                        "Could not remove promoted partial rows for %s",
+                        tile_id,
+                    )
 
-            # Update LRU tracking (use on-disk size for accurate budget)
+            # Update LRU tracking using the complete cache-entry footprint.
             key = self._tile_key(tile_id, max_zoom)
-            with self._lock:
-                if key in self._entries:
-                    old_size = self._entries[key][2]
-                    self._current_size -= old_size
-                self._entries[key] = (dds_path, ddm_path, disk_size, time.time())
-                self._entries.move_to_end(key)
-                self._current_size += disk_size
-                self._stores += 1
+            self._record_store(key, dds_path, ddm_path)
 
             log.debug(f"DDS cache STORE (from file): {tile_id} z{max_zoom} "
                       f"({disk_size} bytes, compression={disk_compression})")
@@ -1080,7 +1875,8 @@ class DynamicDDSCache:
             return False
 
     def upgrade_zl(self, tile_id: str, old_max_zoom: int, new_max_zoom: int,
-                   new_mm0_bytes: bytes, tile) -> Optional[bytes]:
+                   new_mm0_bytes: bytes, tile,
+                   new_mm0_manifest=None) -> Optional[bytes]:
         """
         Upgrade a cached DDS from one zoom level to the next.
         
@@ -1106,6 +1902,11 @@ class DynamicDDSCache:
             log.debug(f"DDS upgrade: only single-step upgrades supported "
                       f"({old_max_zoom} -> {new_max_zoom})")
             return None
+        if not new_mm0_manifest:
+            log.debug(
+                "DDS upgrade rejected without a new mipmap-zero manifest"
+            )
+            return None
 
         try:
             # Load old DDS
@@ -1130,7 +1931,12 @@ class DynamicDDSCache:
                 old_dds_bytes = self._decompress_dds(old_raw, old_meta)
             except Exception:
                 log.debug(f"DDS upgrade: decompression failed for {old_dds_path}")
-                self._delete_pair(old_dds_path, old_ddm_path)
+                old_key = self._tile_key(tile_id, old_max_zoom)
+                self._remove_entry_files(
+                    old_key,
+                    old_dds_path,
+                    old_ddm_path,
+                )
                 return None
 
             old_width = old_meta.get("w", 0)
@@ -1189,15 +1995,21 @@ class DynamicDDSCache:
             new_dds_bytes = bytes(new_dds)
 
             # Store the upgraded DDS
-            if self.store(tile_id, new_max_zoom, new_dds_bytes, tile):
+            if self.store(
+                tile_id,
+                new_max_zoom,
+                new_dds_bytes,
+                tile,
+                mm0_manifest=new_mm0_manifest,
+            ):
                 # Remove old entry
-                self._delete_pair(old_dds_path, old_ddm_path)
                 old_key = self._tile_key(tile_id, old_max_zoom)
+                self._remove_entry_files(
+                    old_key,
+                    old_dds_path,
+                    old_ddm_path,
+                )
                 with self._lock:
-                    if old_key in self._entries:
-                        old_size = self._entries[old_key][2]
-                        del self._entries[old_key]
-                        self._current_size -= old_size
                     self._upgrades += 1
 
                 log.info(f"DDS upgrade: {tile_id} z{old_max_zoom} -> z{new_max_zoom} "
@@ -1211,7 +2023,7 @@ class DynamicDDSCache:
             return None
 
     def downgrade_zl(self, tile_id: str, old_max_zoom: int, new_max_zoom: int,
-                     tile) -> Optional[bytes]:
+                     tile, new_mm0_manifest=None) -> Optional[bytes]:
         """Downgrade a cached DDS from one zoom level to the next lower one.
 
         Inverse of ``upgrade_zl()``: strips mm0 and shifts remaining mipmaps
@@ -1227,6 +2039,12 @@ class DynamicDDSCache:
         if old_max_zoom - new_max_zoom != 1:
             log.debug(f"DDS downgrade: only single-step downgrades supported "
                       f"({old_max_zoom} -> {new_max_zoom})")
+            return None
+        if not new_mm0_manifest:
+            log.debug(
+                "DDS downgrade rejected because the shifted mipmap has no "
+                "independently verified source manifest"
+            )
             return None
 
         try:
@@ -1254,7 +2072,12 @@ class DynamicDDSCache:
                 old_dds_bytes = self._decompress_dds(old_raw, old_meta)
             except Exception:
                 log.debug(f"DDS downgrade: decompression failed for {old_dds_path}")
-                self._delete_pair(old_dds_path, old_ddm_path)
+                old_key = self._tile_key(tile_id, old_max_zoom)
+                self._remove_entry_files(
+                    old_key,
+                    old_dds_path,
+                    old_ddm_path,
+                )
                 return None
 
             old_width = old_meta.get("w", 0)
@@ -1294,14 +2117,19 @@ class DynamicDDSCache:
 
             new_dds_bytes = bytes(new_dds)
 
-            if self.store(tile_id, new_max_zoom, new_dds_bytes, tile):
-                self._delete_pair(old_dds_path, old_ddm_path)
+            if self.store(
+                tile_id,
+                new_max_zoom,
+                new_dds_bytes,
+                tile,
+                mm0_manifest=new_mm0_manifest,
+            ):
                 old_key = self._tile_key(tile_id, old_max_zoom)
-                with self._lock:
-                    if old_key in self._entries:
-                        old_size = self._entries[old_key][2]
-                        del self._entries[old_key]
-                        self._current_size -= old_size
+                self._remove_entry_files(
+                    old_key,
+                    old_dds_path,
+                    old_ddm_path,
+                )
 
                 log.info(f"DDS downgrade: {tile_id} z{old_max_zoom} -> z{new_max_zoom} "
                          f"({old_width}x{old_height} -> {new_width}x{new_height})")
@@ -1328,15 +2156,12 @@ class DynamicDDSCache:
 
         key = self._tile_key(tile_id, max_zoom)
         with self._lock:
-            entry = self._entries.pop(key, None)
-            if entry is not None:
-                self._current_size -= entry[2]
-                dds_path, ddm_path = entry[0], entry[1]
-            else:
-                return False
-
-        self._delete_pair(dds_path, ddm_path)
-        return True
+            entry = self._entries.get(key)
+        if entry is None:
+            return False
+        dds_path, ddm_path = entry[0], entry[1]
+        self._remove_entry_files(key, dds_path, ddm_path)
+        return self._entry_disk_size(dds_path, ddm_path) == 0
 
     def evict_lru(self, bytes_to_free: int) -> int:
         """
@@ -1365,6 +2190,8 @@ class DynamicDDSCache:
 
         if freed > 0:
             log.debug(f"DDS cache evicted {len(to_delete)} entries, freed {freed / (1024*1024):.1f}MB")
+            if self._budget_manager is not None:
+                self._budget_manager.account_dds(-freed)
         return freed
 
     def get_disk_usage(self) -> int:
@@ -1380,6 +2207,13 @@ class DynamicDDSCache:
         with self._lock:
             entries = len(self._entries)
             size = self._current_size
+        with self._partial_row_condition:
+            partial_queue_bytes = self._partial_row_queue_bytes
+            partial_queue_rows = sum(
+                len(item["rows"]) for item in self._partial_row_queue.values())
+            partial_coalesced = self._partial_row_coalesced
+            partial_dropped = self._partial_row_dropped
+            partial_persisted = self._partial_row_persisted
         return {
             "hits": self._hits,
             "misses": self._misses,
@@ -1390,6 +2224,11 @@ class DynamicDDSCache:
             "disk_usage_mb": size / (1024 * 1024),
             "max_size_mb": self._max_size / (1024 * 1024),
             "hit_rate": hit_rate,
+            "partial_row_queue_bytes": partial_queue_bytes,
+            "partial_row_queue_rows": partial_queue_rows,
+            "partial_row_coalesced": partial_coalesced,
+            "partial_row_dropped": partial_dropped,
+            "partial_row_persisted": partial_persisted,
         }
 
     # ------------------------------------------------------------------
@@ -1407,29 +2246,56 @@ class DynamicDDSCache:
             Number of entries discovered
         """
         if not self._enabled:
+            self._scan_complete.set()
             return 0
 
         count = 0
         try:
             for dirpath, _dirnames, filenames in os.walk(self._dds_root):
+                filename_set = set(filenames)
                 for fname in filenames:
-                    if not fname.endswith(".dds"):
+                    if fname.endswith(".dds"):
+                        ddm_name = fname[:-4] + ".ddm"
+                        if ddm_name not in filename_set:
+                            try:
+                                os.remove(os.path.join(dirpath, fname))
+                            except OSError:
+                                pass
+                    elif fname.endswith(".ddm.rows"):
+                        ddm_name = fname[:-5]
+                        if ddm_name not in filename_set:
+                            try:
+                                os.remove(os.path.join(dirpath, fname))
+                            except OSError:
+                                pass
+
+                for fname in filenames:
+                    if not fname.endswith(".ddm"):
                         continue
 
-                    dds_path = os.path.join(dirpath, fname)
-                    ddm_path = dds_path[:-4] + ".ddm"
-
-                    # Need DDM to track properly
-                    if not os.path.exists(ddm_path):
-                        # Orphan DDS without metadata - remove it
-                        try:
-                            os.remove(dds_path)
-                        except OSError:
-                            pass
-                        continue
-
+                    ddm_path = os.path.join(dirpath, fname)
+                    dds_path = ddm_path[:-4] + ".dds"
+                    rows_path = self._row_records_path(ddm_path)
                     meta = self._read_ddm(ddm_path)
                     if meta is None:
+                        self._delete_pair(dds_path, ddm_path)
+                        continue
+
+                    has_dds = os.path.isfile(dds_path)
+                    if (
+                        os.path.isfile(rows_path)
+                        and not meta.get("partial_mipmaps")
+                    ):
+                        try:
+                            os.remove(rows_path)
+                        except OSError:
+                            pass
+                    has_partial_rows = (
+                        os.path.isfile(rows_path)
+                        and bool(meta.get("partial_mipmaps"))
+                    )
+                    if not has_dds and not has_partial_rows:
+                        self._delete_pair(dds_path, ddm_path)
                         continue
 
                     # Reconstruct the tile key from metadata
@@ -1445,25 +2311,37 @@ class DynamicDDSCache:
                     tile_id = f"{row}_{col}_{maptype}_{zl}"
                     key = self._tile_key(tile_id, max_zl)
 
-                    try:
-                        size = os.path.getsize(dds_path)
-                    except OSError:
+                    size = self._entry_disk_size(dds_path, ddm_path)
+                    if size <= 0:
                         continue
 
                     # Use file mtime as access time for initial ordering
-                    try:
-                        atime = os.path.getmtime(dds_path)
-                    except OSError:
-                        atime = time.time()
+                    mtimes = []
+                    for path in (dds_path, ddm_path, rows_path):
+                        try:
+                            mtimes.append(os.path.getmtime(path))
+                        except OSError:
+                            pass
+                    atime = max(mtimes) if mtimes else time.time()
 
                     with self._lock:
-                        if key not in self._entries:
-                            self._entries[key] = (dds_path, ddm_path, size, atime)
-                            self._current_size += size
+                        old = self._entries.get(key)
+                        if old is None:
                             count += 1
+                        else:
+                            self._current_size -= old[2]
+                        self._entries[key] = (
+                            dds_path,
+                            ddm_path,
+                            size,
+                            atime,
+                        )
+                        self._current_size += size
 
         except Exception as e:
             log.warning(f"DDS cache scan error: {e}")
+        finally:
+            self._scan_complete.set()
 
         if count > 0:
             # Sort by access time (oldest first for LRU)
@@ -1539,14 +2417,12 @@ class DynamicDDSCache:
                         if row is not None and col is not None:
                             tile_id = f"{row}_{col}_{maptype}_{zl}"
                             key = self._tile_key(tile_id, max_zl)
-                            new_size = len(compressed)
-                            with self._lock:
-                                if key in self._entries:
-                                    old_entry = self._entries[key]
-                                    self._current_size -= old_entry[2]
-                                    self._entries[key] = (
-                                        dds_path, ddm_path, new_size, old_entry[3])
-                                    self._current_size += new_size
+                            self._record_store(
+                                key,
+                                dds_path,
+                                ddm_path,
+                                count_store=False,
+                            )
 
                         saved_bytes += original_size - len(compressed)
                         migrated += 1
@@ -1723,14 +2599,13 @@ class DynamicDDSCache:
                             dds_data[file_offset:file_offset + stripe_bytes] = stripe
 
                             # Write to in-memory mipmap buffer
-                            if mm.databuffer is not None:
+                            if mm.buffer is not None:
                                 mem_offset = file_offset - mm.startpos
-                                try:
-                                    buf = mm.databuffer.getbuffer()
-                                    buf[mem_offset:mem_offset + stripe_bytes] = stripe
-                                except Exception:
-                                    mm.databuffer.seek(mem_offset)
-                                    mm.databuffer.write(stripe)
+                                mm.write_at(
+                                    mem_offset,
+                                    stripe,
+                                    dds_ref.blocksize,
+                                )
 
                     patched += 1
 
@@ -1793,14 +2668,13 @@ class DynamicDDSCache:
                                 f.seek(file_offset)
                                 f.write(stripe)
 
-                                if mm.databuffer is not None:
+                                if mm.buffer is not None:
                                     mem_offset = file_offset - mm.startpos
-                                    try:
-                                        buf = mm.databuffer.getbuffer()
-                                        buf[mem_offset:mem_offset + stripe_bytes] = stripe
-                                    except Exception:
-                                        mm.databuffer.seek(mem_offset)
-                                        mm.databuffer.write(stripe)
+                                    mm.write_at(
+                                        mem_offset,
+                                        stripe,
+                                        dds_ref.blocksize,
+                                    )
 
                         patched += 1
 
@@ -2006,8 +2880,9 @@ class DynamicDDSCache:
 
     @staticmethod
     def _delete_pair(dds_path: str, ddm_path: str) -> None:
-        """Delete DDS + DDM file pair, ignoring missing files."""
-        for path in (dds_path, ddm_path):
+        """Delete a DDS entry and its partial-row records, if any."""
+        for path in (dds_path, ddm_path,
+                     DynamicDDSCache._row_records_path(ddm_path)):
             try:
                 os.remove(path)
             except OSError:
@@ -2015,19 +2890,24 @@ class DynamicDDSCache:
 
     def _cleanup_jpegs_async(self, tile) -> None:
         """Schedule JPEG cleanup for a tile whose DDS is now complete."""
+        if not self._cleanup_source_jpegs_after_store:
+            return
         jpeg_cache_dir = getattr(tile, 'cache_dir', None)
         if not jpeg_cache_dir:
             return
-        t = threading.Thread(
-            target=cleanup_source_jpegs,
-            args=(jpeg_cache_dir, tile.col, tile.row,
-                  tile.tilename_zoom, tile.max_zoom,
-                  getattr(tile, 'min_zoom', 12),
-                  getattr(tile, 'width', 1), getattr(tile, 'height', 1),
-                  tile.maptype),
-            kwargs={'budget_manager': self._budget_manager},
-            daemon=True)
-        t.start()
+        self._submit_maintenance(
+            cleanup_source_jpegs,
+            jpeg_cache_dir,
+            tile.col,
+            tile.row,
+            tile.tilename_zoom,
+            tile.max_zoom,
+            getattr(tile, 'min_zoom', 12),
+            getattr(tile, 'width', 1),
+            getattr(tile, 'height', 1),
+            tile.maptype,
+            budget_manager=self._budget_manager,
+        )
 
     def _evict_lru_async(self) -> None:
         """Schedule LRU eviction in a background thread."""
@@ -2036,5 +2916,4 @@ class DynamicDDSCache:
         excess = self._current_size - target
         if excess <= 0:
             return
-        t = threading.Thread(target=self.evict_lru, args=(excess,), daemon=True)
-        t.start()
+        self._submit_maintenance(self.evict_lru, excess)

@@ -37,6 +37,9 @@ def test_sections(cfg):
     assert cfg.pydds
     assert cfg.fuse
     assert cfg.general
+    assert cfg.diagnostics
+    assert cfg.diagnostics.performance_profiling is True
+    assert cfg.diagnostics.python_allocation_tracing is False
     assert cfg.general.gui
 
     assert type(cfg.fuse.threading) == bool

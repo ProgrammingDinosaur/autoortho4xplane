@@ -8,15 +8,12 @@ import uuid
 from logging import getLogger
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
-# Handle imports for both frozen (PyInstaller) and direct Python execution
-try:
+# Handle imports for both package and direct Python execution.
+if __package__ and __package__.startswith("autoortho."):
     from autoortho.aoconfig import CFG
-except ImportError:
-    from aoconfig import CFG
-
-try:
     from autoortho.utils.constants import system_type
-except ImportError:
+else:
+    from aoconfig import CFG
     from utils.constants import system_type
 
 from enum import Enum

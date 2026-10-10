@@ -6,15 +6,12 @@ import pprint
 import configparser
 from types import SimpleNamespace
 
-# Handle imports for both frozen (PyInstaller) and direct Python execution
-try:
+# Handle imports for both package and direct Python execution.
+if __package__:
     from autoortho.utils.constants import system_type
-except ImportError:
-    from utils.constants import system_type
-
-try:
     from autoortho.worker_modes import is_mount_worker_mode
-except ImportError:
+else:
+    from utils.constants import system_type
     from worker_modes import is_mount_worker_mode
 
 import logging
@@ -99,6 +96,15 @@ class AOConfig(object):
 gui = True
 # Show config setup at startup everytime
 showconfig = True
+# First-run setup was completed or inferred from an existing valid config
+setup_complete = False
+# Application shell state
+window_width = 1100
+window_height = 760
+window_x = 100
+window_y = 100
+last_page = Home
+dismissed_update_version =
 # Hide when running
 hide = True
 # Console/UI log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
@@ -169,8 +175,9 @@ use_time_budget = True
 # Lower = faster loading, but may have more partial/blurry tiles
 # Higher = better quality, but longer initial load times
 # Recommended: 15.0 (very fast), 30.0 (balanced), 60.0 (quality)
-# Note: Higher values (120+) can cause multi-minute stalls when cache eviction occurs
-tile_time_budget = 180.0
+# Higher values remain available for users who explicitly prioritize completeness,
+# but 60 seconds is the safe default for a responsive initial load.
+tile_time_budget = 60.0
 # Fallback level when chunks fail to download in time:
 # none = Skip all fallbacks (fastest, may have missing tiles)
 # cache = Use disk cache and already-built mipmaps, no network (balanced)
@@ -190,23 +197,39 @@ fallback_extends_budget = False
 # Range: 10 - 120 seconds
 # Recommended: 3.0 (balanced), 5.0 (quality), 1.5 (fast)
 fallback_timeout = 30.0
+# Allow a native row build to finish after its shared deadline by using
+# cache/lower-ZL fallbacks and finally missing_color for unresolved positions.
+# Disabled by default to preserve strict 100% native partial-build quality.
+native_partial_allow_incomplete = False
 # Spatial prefetching - proactively downloads tiles ahead of aircraft
 # Enable/disable prefetching (True/False)
 prefetch_enabled = True
+# Unified bounded candidate/admission pipeline. Disable only as a temporary
+# rollback while diagnosing a provider- or scenery-specific regression.
+prefetch_pipeline_v2 = True
 # How far ahead to prefetch in minutes of flight time (1-60)
 # Higher = more tiles prefetched ahead, uses more bandwidth and memory
 # Lower = fewer tiles prefetched, less resource usage
-# Recommended: 15 (fast aircraft), 30 (balanced), 60 (slow internet or long haul)
-# Set to 0 for Unlimited lookahead (continues until max_chunks or other limits)
-prefetch_lookahead = 0
+# Set to 0 for unlimited route discovery. Retained candidates and admitted work
+# remain bounded even in unlimited mode.
+prefetch_lookahead = 10
 # How often to check for prefetch opportunities in seconds (0.5-10)
 prefetch_interval = 1.0
-# Maximum chunks to prefetch per cycle (32-4096)
-prefetch_max_chunks = 512
+# Maximum chunks admitted in one coordinator cycle. This does not size queues.
+prefetch_max_chunks = 64
+# Maximum chunks materialized by one candidate admission pass.
+prefetch_admission_burst = 64
 # Prefetch radius in nautical miles (10-150)
 # Tiles within this radius of the flight path are prefetched
 # Used by both velocity-based and SimBrief prefetching
-prefetch_radius_nm = 40
+prefetch_radius_nm = 30
+# Live imagery quality policy:
+# responsive = bounded wait with lower-ZL fallback (existing behavior)
+# prefer_target = pause distant work and grant a short exact-quality grace period
+# strict_target = never substitute lower-ZL data into mipmap zero
+prefetch_quality_mode = responsive
+prefetch_quality_grace_sec = 5.0
+strict_target_deadline_sec = 120.0
 # Predictive DDS generation - pre-build DDS textures in background after prefetch
 # When enabled, tiles are compressed to DDS in the background, eliminating stutters
 # when X-Plane loads new scenery areas. Falls back gracefully on cache miss.
@@ -221,14 +244,25 @@ predictive_dds_build_interval_ms = 250
 # These run in the background to pre-build tiles ahead of where you're flying
 # Higher values = faster prefetch throughput, but more CPU usage during flight
 # Lower values = less CPU impact, slower prefetch
-# Recommended: 2 (low-end CPU or battery saving), 8 (balanced, default), 12-16 (fast CPU)
-background_builder_workers = 8
+# This is a maximum; the predictive byte budget may admit fewer concurrently.
+background_builder_workers = 2
+# Estimated decoded/native working-set budget for predictive builds.
+predictive_dds_memory_mb = 512
 # Number of concurrent tile build workers (1-32)
 # Controls how many tiles can be built simultaneously by the native pipeline
 # Higher values = faster tile processing, more CPU/RAM usage
 # Lower values = less resource usage, potential stutters
 # Recommended: 4 (low-end), 8 (mid-range, default), 16-32 (high-end CPU)
 live_builder_concurrency = 8
+# End-to-end live tile requests admitted before allocating composition state.
+# Keep this high enough to saturate downloads while bounding ZL17 working memory.
+live_tile_admission = 16
+# Maximum retained RGBA fallback imagery per tile. ZL17 mipmap 0 alone is
+# 256MB and is therefore composed, compressed, and released instead of cached.
+tile_image_cache_mb = 96
+# Bound immutable JPEG bytes waiting for local and optional long-term cache I/O.
+cache_write_buffer_mb = 256
+long_term_cache_write_buffer_mb = 128
 # Apply fallbacks when pre-building DDS (True/False)
 # True (default): Apply same fallback logic as live requests (cache search, lower zoom, etc.)
 #   - Pro: Prebuilt tiles have best possible quality with fallbacks for failed chunks
@@ -237,21 +271,28 @@ live_builder_concurrency = 8
 #   - Pro: Faster prebuilds, no extra I/O
 #   - Con: Failed chunks show missing color instead of fallback data
 predictive_dds_use_fallbacks = True
-# Disk cache size for pre-built DDS textures in MB (1024-16384)
-# Pre-built DDS files are stored on disk (SSD reads are ~1-2ms, fast enough)
-# The OS file cache naturally keeps hot files in RAM when memory is available
-# Uses temp directory, auto-cleaned on session end
-# Recommended: 4096 (balanced), 8192 (large flights), 16384 (max capacity)
+# Deprecated compatibility alias for older configurations. The runtime uses the
+# persistent DynamicDDSCache and the shared disk budget below.
 ephemeral_dds_cache_mb = 4096
 # Persistent DDS cache - stores pre-built DDS textures across sessions
 # Eliminates JPEG decode + DXT compress on subsequent loads (~1-2ms read vs ~390ms rebuild)
 # Set to 0 for unlimited cache (recommended). Uses disk budget manager for cleanup.
 persistent_dds_cache_mb = 0
+# Persist compressed mipmap-0 chunk rows asynchronously for repeat ZL17 loads.
+# Exact compressed rows are safe to reuse across sessions.
+persist_partial_dds_cache = True
+partial_cache_promote_startup_max_tiles = 0
+# Delete source JPEG chunks only after a complete DDS is durably stored. Keeping
+# sources improves rebuild resilience when compiled DDS entries are evicted.
+cleanup_source_jpegs_after_dds = False
+# Bounded workers for DDS eviction and optional JPEG cleanup.
+dds_cache_maintenance_workers = 2
 # Disk budget enforcement - automatically cleans up old cache data
 # When total cache exceeds file_cache_size, oldest data is evicted
 # Categories: DDS cache (compiled textures), JPEGs (source images)
 disk_budget_enabled = True
-# Percentage of file_cache_size allocated to persistent DDS cache (10-90)
+# Literal percentage of file_cache_size allocated to persistent DDS cache
+# (10-90). JPEG source files receive the remainder.
 dds_budget_pct = 80
 # Maximum threads for native pipeline operations (per concurrent build)
 # 0 = auto (dynamically divides CPU cores across concurrent builds)
@@ -328,6 +369,50 @@ tile_queue_enabled = True
 # Higher = more tiles can wait, but uses more memory for tracking
 # Recommended: 100 (default)
 tile_queue_max_size = 100
+# Shared HTTP/2 transport. The parent owns one broker used by all mount workers.
+http2_enabled = True
+# Maximum broker requests that may be in flight (pending a reply) at once.
+# This is the real download-concurrency knob: it is not bounded by the number
+# of downloader threads because broker requests are dispatched asynchronously.
+provider_max_in_flight = 320
+# Maximum reusable HTTP connections owned by the broker. HTTP/2 multiplexes
+# many requests per connection, so this stays well below provider_max_in_flight.
+provider_max_connections = 160
+# Threads used to apply broker responses (cache write, decode hand-off).
+# This is a coordination pool, not a download pool; keep it small.
+download_dispatch_workers = 4
+# Maximum time a request may wait for broker/provider admission before its
+# network timeout begins. Queue time is deliberately separate from HTTP time.
+provider_queue_timeout = 60.0
+# Adaptive per-provider concurrency. The broker tracks each origin
+# (scheme://host) separately: it adds provider_origin_increase_step permits
+# after provider_origin_success_threshold consecutive good responses and
+# multiplies the limit by provider_origin_decrease_factor when the origin
+# reports overload (429, 5xx, timeouts). 403/410 are provider policy answers
+# and never shrink the limit.
+provider_adaptive_concurrency = True
+# Windowed v2 observes two-second throughput/latency/error windows. Disable
+# temporarily to restore the legacy per-response AIMD controller.
+provider_adaptive_controller_v2 = False
+# Aggregate supported httpcore connection lifecycle events. Detailed request
+# tracing remains disabled and no request URLs or tokens are retained.
+provider_transport_trace = False
+# Starting per-origin limit. 0 starts at provider_max_connections and ramps
+# toward provider_origin_max_concurrency after successful responses.
+provider_origin_initial_concurrency = 128
+# Floor for a throttled origin, so a bad patch cannot starve it completely.
+provider_origin_min_concurrency = 64
+# Ceiling for one origin. 0 means "use provider_max_in_flight".
+provider_origin_max_concurrency = 0
+provider_origin_increase_step = 1
+provider_origin_success_threshold = 8
+provider_origin_decrease_factor = 0.5
+# Consecutive overload signals inside this window cause a single decrease.
+provider_origin_cooldown_seconds = 5.0
+# Legacy aliases for the two settings above. They are honoured only when the
+# modern setting is still at its packaged default.
+max_concurrent_downloads = 256
+http2_max_connections = 64
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
@@ -358,6 +443,8 @@ noclean = False
 # Higher values download more files simultaneously, saturating bandwidth faster
 # Recommended: 4 (default), 2 (slow connection), 8 (fast connection)
 max_download_workers = 4
+# Minimum free-space reserve used by setup and scenery installation checks
+storage_safety_margin_gb = 2
 
 [fuse]
 # Enable or disable multi-threading when using FUSE
@@ -379,6 +466,27 @@ file_cache_size = 30
 cache_mem_limit = 4
 # Auto clean cache on AutoOrtho exit
 auto_clean_cache = False
+
+[diagnostics]
+# Record per-stage tile latency and per-process memory/CPU usage for each mounted
+# flight session. Reports are written when AutoOrtho unmounts the scenery.
+performance_profiling = True
+# Process resource sampling interval. One second provides useful flight timelines
+# with low overhead.
+sample_interval_seconds = 1.0
+# Persist worker stage/gauge checkpoints so useful profiles survive forced exits.
+checkpoint_interval_seconds = 10.0
+# Keep the slowest operations whose duration exceeds this threshold.
+slow_operation_ms = 250.0
+# Maximum slow operations retained per process. Histograms still include all calls.
+max_slow_operations = 200
+# Track Python allocation sites. This adds material overhead and does not include
+# native image/DDS buffers, so enable only for a dedicated diagnostic flight.
+python_allocation_tracing = False
+# Output directory for Markdown and raw JSON flight reports.
+report_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "reports")}
+# Number of completed profiling sessions to retain.
+max_reports = 20
 
 [seasons]
 seasons_convert_workers = 4
@@ -435,6 +543,11 @@ route_prefetch_radius_nm = 40
 """
 
     def __init__(self, conf_file=None):
+        self.config = configparser.ConfigParser(
+            strict=False,
+            allow_no_value=True,
+            comment_prefixes='/',
+        )
         if not conf_file:
             self.conf_file = os.path.join(os.path.expanduser("~"), ".autoortho")
         else:
@@ -453,12 +566,23 @@ route_prefetch_radius_nm = 40
 
     def load(self):
         self.config.read_string(self._defaults)
+        user_config = configparser.ConfigParser(
+            strict=False,
+            allow_no_value=True,
+            comment_prefixes='/',
+        )
         if os.path.isfile(self.conf_file):
             log.info(f"Config file found {self.conf_file} reading...")
+            user_config.read(self.conf_file)
             self.config.read(self.conf_file)
         else:
             log.info("No config file found. Using defaults...")
 
+        self._explicit_options = {
+            section: set(user_config.options(section))
+            for section in user_config.sections()
+        }
+        _migrate_legacy_provider_options(self, user_config)
         self.get_config()
         return True
 
@@ -561,7 +685,21 @@ route_prefetch_radius_nm = 40
                 self.config.sections()}
         #pprint.pprint(config_dict)
         self.__dict__.update(**config_dict)
+        self.refresh_derived_paths(create_missing=True)
 
+        # If we patched any values during load, persist them now so next run is stable.
+        # Only save in the main process - workers must not write config files.
+        if getattr(self, "_patched_during_load", False):
+            if not is_mount_worker_mode():
+                try:
+                    self.save()
+                except Exception as e:
+                    log.error(f"Failed to persist patched config defaults: {e}")
+            self._patched_during_load = False
+        return
+
+    def refresh_derived_paths(self, create_missing=True):
+        """Refresh mount definitions without necessarily creating directories."""
         self.ao_scenery_path = os.path.join(
                 self.paths.scenery_path,
                 "z_autoortho",
@@ -591,24 +729,16 @@ route_prefetch_radius_nm = 40
         } for s in sceneries]
 
 
-        if self.paths.scenery_path and not os.path.exists(self.ao_scenery_path):
+        if (
+            create_missing
+            and self.paths.scenery_path
+            and not os.path.exists(self.ao_scenery_path)
+        ):
             try:
                 log.info(f"Creating dir {self.ao_scenery_path}")
                 os.makedirs(self.ao_scenery_path)
             except OSError as e:
                 log.warning(f"Could not create scenery dir {self.ao_scenery_path}: {e}")
-
-        # If we patched any values during load, persist them now so next run is stable.
-        # Only save in the main process - workers must not write config files.
-        if getattr(self, "_patched_during_load", False):
-            if not is_mount_worker_mode():
-                try:
-                    self.save()
-                except Exception as e:
-                    log.error(f"Failed to persist patched config defaults: {e}")
-            self._patched_during_load = False
-        return
-
 
     def save(self):
         log.info("Saving config ... ")
@@ -629,7 +759,253 @@ route_prefetch_radius_nm = 40
                     continue
                 self.config[sect][k] = str(v)
 
+# ---------------------------------------------------------------------------
+# Provider throughput settings
+# ---------------------------------------------------------------------------
+# Each entry maps a modern setting to its packaged default, its clamp range and
+# the legacy key that used to control the same behaviour.  Legacy keys stay
+# authoritative only while the modern key is untouched, so an explicit new
+# value is never silently overridden by a stale legacy one.
+PROVIDER_SETTINGS = {
+    "provider_max_in_flight": {
+        "default": 320,
+        "range": (8, 1024),
+        "legacy": ("max_concurrent_downloads", 256),
+    },
+    "provider_max_connections": {
+        "default": 160,
+        "range": (1, 256),
+        "legacy": ("http2_max_connections", 64),
+    },
+    "download_dispatch_workers": {
+        "default": 4,
+        "range": (1, 16),
+        "legacy": None,
+    },
+    "provider_queue_timeout": {
+        "type": float,
+        "default": 60.0,
+        "range": (5.0, 600.0),
+        "legacy": None,
+    },
+    # Adaptive per-origin concurrency (enforced by the broker server).
+    "provider_adaptive_concurrency": {
+        "type": bool,
+        "default": True,
+        "legacy": None,
+    },
+    "provider_adaptive_controller_v2": {
+        "type": bool,
+        "default": False,
+        "legacy": None,
+    },
+    "provider_transport_trace": {
+        "type": bool,
+        "default": False,
+        "legacy": None,
+    },
+    "provider_origin_initial_concurrency": {
+        "default": 128,
+        "range": (0, 1024),
+        "legacy": None,
+    },
+    "provider_origin_min_concurrency": {
+        "default": 64,
+        "range": (1, 256),
+        "legacy": None,
+    },
+    "provider_origin_max_concurrency": {
+        "default": 0,  # 0 => use provider_max_in_flight as the ceiling
+        "range": (0, 1024),
+        "legacy": None,
+    },
+    "provider_origin_increase_step": {
+        "default": 1,
+        "range": (1, 64),
+        "legacy": None,
+    },
+    "provider_origin_success_threshold": {
+        "default": 8,
+        "range": (1, 4096),
+        "legacy": None,
+    },
+    "provider_origin_decrease_factor": {
+        "type": float,
+        "default": 0.5,
+        "range": (0.1, 0.95),
+        "legacy": None,
+    },
+    "provider_origin_cooldown_seconds": {
+        "type": float,
+        "default": 5.0,
+        "range": (0.0, 60.0),
+        "legacy": None,
+    },
+}
+
+
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "y"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off", "n"})
+
+
+def _coerce_setting(value, kind, key):
+    """Parse one configured value, or raise ValueError for a bad one."""
+
+    if kind is bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in _TRUE_VALUES:
+            return True
+        if text in _FALSE_VALUES:
+            return False
+        raise ValueError(f"{value!r} is not a boolean")
+    if kind is float:
+        return float(str(value).strip())
+    return int(str(value).strip())
+
+
+def _read_setting(section, key, default, kind=int):
+    if section is None:
+        return default
+    value = getattr(section, key, None)
+    if value is None:
+        return default
+    try:
+        return _coerce_setting(value, kind, key)
+    except (TypeError, ValueError):
+        log.warning(
+            "Ignoring invalid value for autoortho.%s: %r", key, value
+        )
+        return default
+
+
+def _read_int_setting(section, key, default):
+    return _read_setting(section, key, default, int)
+
+
+def resolve_provider_setting(name, cfg=None):
+    """Resolve a provider throughput setting, honouring legacy aliases.
+
+    ``cfg`` may be any object exposing an ``autoortho`` attribute; it defaults
+    to the process-wide :data:`CFG`.  Unknown or malformed values fall back to
+    the packaged default instead of raising, because this is called from hot
+    startup paths where a bad config must not abort the download stack.
+    """
+
+    spec = PROVIDER_SETTINGS[name]
+    default = spec["default"]
+    kind = spec.get("type", int)
+    config_object = cfg if cfg is not None else CFG
+    section = getattr(config_object, "autoortho", None)
+    explicit_options = getattr(
+        config_object,
+        "_explicit_options",
+        {},
+    ).get("autoortho", set())
+
+    if kind is bool:
+        return _read_setting(section, name, default, bool)
+
+    low, high = spec["range"]
+    value = _read_setting(section, name, default, kind)
+    if name in explicit_options or value != default:
+        return max(low, min(high, value))
+
+    legacy = spec["legacy"]
+    if legacy is not None:
+        legacy_key, legacy_default = legacy
+        legacy_value = _read_setting(section, legacy_key, legacy_default, kind)
+        if legacy_value != legacy_default:
+            if name == "provider_max_in_flight" and legacy_value > 256:
+                log.warning(
+                    "Clamping legacy autoortho.%s=%s to 256 while migrating "
+                    "to %s; set the modern key explicitly to opt into a "
+                    "higher tested limit",
+                    legacy_key,
+                    legacy_value,
+                    name,
+                )
+                legacy_value = 256
+            log.info(
+                "Using legacy setting autoortho.%s=%s for %s",
+                legacy_key,
+                legacy_value,
+                name,
+            )
+            return max(low, min(high, legacy_value))
+
+    return max(low, min(high, default))
+
+
+def _migrate_legacy_provider_options(cfg, user_config):
+    """Persist deprecated provider aliases once instead of resolving per call."""
+    section_name = "autoortho"
+    explicit = cfg._explicit_options.setdefault(section_name, set())
+    if not user_config.has_section(section_name):
+        return
+
+    for modern_name, spec in PROVIDER_SETTINGS.items():
+        legacy = spec.get("legacy")
+        if legacy is None:
+            continue
+        legacy_name, legacy_default = legacy
+        if legacy_name not in explicit:
+            continue
+
+        kind = spec.get("type", int)
+        parsed_section = SectionParser(
+            **dict(cfg.config.items(section_name))
+        )
+        legacy_value = _read_setting(
+            parsed_section,
+            legacy_name,
+            legacy_default,
+            kind,
+        )
+        if legacy_value == legacy_default:
+            continue
+
+        if modern_name in explicit:
+            cfg.config.set(
+                section_name,
+                legacy_name,
+                str(legacy_default),
+            )
+            log.debug(
+                "Normalized deprecated autoortho.%s because modern %s is "
+                "present",
+                legacy_name,
+                modern_name,
+            )
+            continue
+
+        low, high = spec["range"]
+        migrated_value = max(low, min(high, legacy_value))
+        if modern_name == "provider_max_in_flight":
+            migrated_value = min(256, migrated_value)
+        cfg.config.set(
+            section_name,
+            modern_name,
+            str(migrated_value),
+        )
+        cfg.config.set(
+            section_name,
+            legacy_name,
+            str(legacy_default),
+        )
+        explicit.add(modern_name)
+        log.warning(
+            "Migrated deprecated autoortho.%s=%s to %s=%s",
+            legacy_name,
+            legacy_value,
+            modern_name,
+            migrated_value,
+        )
+
+
 CFG = AOConfig()
+
 
 # Note: The test code below is obsolete and has been commented out
 # if __name__ == "__main__":

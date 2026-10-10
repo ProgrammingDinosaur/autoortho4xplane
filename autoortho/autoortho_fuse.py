@@ -8,6 +8,10 @@ import math
 import errno
 import ctypes
 import threading
+import inspect
+import queue
+import heapq
+import itertools
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
@@ -45,6 +49,11 @@ try:
     from autoortho import getortho
 except ImportError:
     import getortho
+
+try:
+    from autoortho.diagnostics import profile_span, record_stage
+except ImportError:
+    from diagnostics import profile_span, record_stage
 
 def _rgb_to_rgb565(r: int, g: int, b: int) -> int:
     """Convert RGB888 to RGB565 format used by BC1/DXT1 compression."""
@@ -290,6 +299,460 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
     return options
 
 
+class DSFPrefetchScheduler:
+    """Bounded, demand-aware scheduler for DSF prefetch submissions."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    DEFERRED = "deferred"
+    WAITING_FOR_FLIGHT = "waiting_for_flight"
+    COMPLETE = "complete"
+
+    def __init__(
+        self,
+        submit,
+        runtime_allowed,
+        live_demand=None,
+        runtime_gate=None,
+        before_submit=None,
+        worker_count=1,
+        queue_size=16,
+        grace_period=2.0,
+        retry_delay=0.25,
+        max_retry_delay=5.0,
+        max_retries=3,
+        poll_interval=0.1,
+        clock=None,
+    ):
+        self._submit = submit
+        self._runtime_allowed = runtime_allowed
+        self._live_demand = live_demand or (lambda: False)
+        self._runtime_gate = runtime_gate
+        self._before_submit = before_submit
+        self._worker_count = max(1, min(2, int(worker_count)))
+        self._queue_size = max(1, int(queue_size))
+        self._queue = queue.Queue(maxsize=self._queue_size)
+        self._max_entries = max(self._queue_size, self._queue_size * 4)
+        self._grace_period = max(0.0, float(grace_period))
+        self._retry_delay = max(0.0, float(retry_delay))
+        self._max_retry_delay = max(
+            self._retry_delay, float(max_retry_delay)
+        )
+        self._max_retries = max(0, int(max_retries))
+        self._poll_interval = max(0.01, float(poll_interval))
+        self._clock = clock or time.monotonic
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._workers = []
+        self._entries = {}
+        self._deferred_heap = []
+        self._deferred_sequence = itertools.count()
+        self._completed = OrderedDict()
+        self._completed_ttl = 600.0
+        self._completed_limit = max(64, self._queue_size * 4)
+        self._allowed_since = None
+        self._cursor_arg = self._find_cursor_arg()
+
+    @staticmethod
+    def _bump(name, value=1):
+        try:
+            getortho.bump(name, value)
+        except Exception:
+            pass
+
+    def _report_depth(self):
+        try:
+            getortho.profile_gauge(
+                "dsf_prefetch.queue_depth",
+                self._queue.qsize(),
+            )
+        except Exception:
+            pass
+
+    def _find_cursor_arg(self):
+        try:
+            parameters = inspect.signature(self._submit).parameters
+        except (TypeError, ValueError):
+            return None
+        if "cursor" in parameters:
+            return "cursor"
+        if "state" in parameters:
+            return "state"
+        if "prefetch_state" in parameters:
+            return "prefetch_state"
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return "cursor"
+        return None
+
+    def schedule(self, path):
+        """Schedule a path once; duplicate pending/running paths are coalesced."""
+        path = os.path.normcase(os.path.abspath(path))
+        with self._lock:
+            if self._stop.is_set():
+                return False
+            now = self._clock()
+            self._purge_completed_locked(now)
+            if path in self._entries or path in self._completed:
+                self._bump("dsf_prefetch_coalesced")
+                return False
+            if len(self._entries) >= self._max_entries:
+                self._bump("dsf_prefetch_backpressure")
+                return False
+            entry = {
+                "state": self.PENDING,
+                "cursor": None,
+                "retries": 0,
+                "pressure_retries": 0,
+                "next_attempt": now,
+                "revision": 0,
+            }
+            self._entries[path] = entry
+            try:
+                self._queue.put_nowait(path)
+            except queue.Full:
+                self._defer(entry, self._poll_interval, pressure=True, path=path)
+            self._start_workers_locked()
+            self._report_depth()
+            return True
+
+    def state(self, path):
+        """Return a path state for diagnostics and focused tests."""
+        with self._lock:
+            entry = self._entries.get(path)
+            if entry:
+                return entry["state"]
+            self._purge_completed_locked(self._clock())
+            return self.COMPLETE if path in self._completed else None
+
+    def worker_count(self):
+        return len(self._workers)
+
+    def shutdown(self, timeout=1.0):
+        """Cancel queued/deferred work and wait briefly for active workers."""
+        self._stop.set()
+        if self._runtime_gate is not None:
+            try:
+                self._runtime_gate.notify_state_change()
+            except Exception:
+                pass
+        with self._lock:
+            self._entries.clear()
+            self._deferred_heap.clear()
+            self._completed.clear()
+            workers = tuple(self._workers)
+        for _worker in workers:
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                break
+        for worker in workers:
+            worker.join(timeout=max(0.0, timeout))
+
+    close = shutdown
+
+    def _start_workers_locked(self):
+        if self._workers:
+            return
+        for index in range(self._worker_count):
+            worker = threading.Thread(
+                target=self._worker,
+                name=f"DSFPrefetchWorker-{index + 1}",
+                daemon=True,
+            )
+            self._workers.append(worker)
+            worker.start()
+
+    def _defer(self, entry, delay, pressure=False, path=None):
+        entry["state"] = self.DEFERRED
+        entry["next_attempt"] = self._clock() + max(0.0, delay)
+        entry["revision"] += 1
+        if path is None:
+            path = next(
+                (
+                    candidate
+                    for candidate, current in self._entries.items()
+                    if current is entry
+                ),
+                None,
+            )
+        if path is not None:
+            heapq.heappush(
+                self._deferred_heap,
+                (
+                    entry["next_attempt"],
+                    next(self._deferred_sequence),
+                    path,
+                    entry["revision"],
+                ),
+            )
+        if pressure:
+            entry["pressure_retries"] += 1
+            self._bump("dsf_prefetch_backpressure")
+        self._bump("dsf_prefetch_retries")
+
+    def _defer_delay(self, attempts):
+        return min(
+            self._retry_delay * (2 ** max(0, attempts - 1)),
+            self._max_retry_delay,
+        )
+
+    def _promote_deferred(self):
+        now = self._clock()
+        with self._lock:
+            while self._deferred_heap and self._deferred_heap[0][0] <= now:
+                next_attempt, sequence, path, revision = heapq.heappop(
+                    self._deferred_heap
+                )
+                entry = self._entries.get(path)
+                if (
+                    entry is None
+                    or entry["state"] != self.DEFERRED
+                    or entry["revision"] != revision
+                ):
+                    continue
+                try:
+                    self._queue.put_nowait(path)
+                except queue.Full:
+                    heapq.heappush(
+                        self._deferred_heap,
+                        (next_attempt, sequence, path, revision),
+                    )
+                    self._bump("dsf_prefetch_backpressure")
+                    return
+                entry["state"] = self.PENDING
+                self._report_depth()
+
+    def _next_wait(self):
+        now = self._clock()
+        with self._lock:
+            while self._deferred_heap:
+                deadline, _sequence, path, revision = self._deferred_heap[0]
+                entry = self._entries.get(path)
+                if (
+                    entry is not None
+                    and entry["state"] == self.DEFERRED
+                    and entry["revision"] == revision
+                ):
+                    return min(
+                        self._poll_interval,
+                        max(0.0, deadline - now),
+                    )
+                heapq.heappop(self._deferred_heap)
+        return self._poll_interval
+
+    def _purge_completed_locked(self, now):
+        while self._completed:
+            path, deadline = next(iter(self._completed.items()))
+            if deadline > now:
+                break
+            self._completed.pop(path, None)
+
+    def _can_run(self):
+        if (
+            not self._runtime_allowed()
+            or self._live_demand()
+        ):
+            self._allowed_since = None
+            return False, self._poll_interval
+        now = self._clock()
+        if self._allowed_since is None:
+            self._allowed_since = now
+        remaining = self._grace_period - (now - self._allowed_since)
+        return remaining <= 0.0, max(0.0, remaining)
+
+    def _call_submit(self, path, cursor):
+        if cursor is not None and self._cursor_arg:
+            return self._submit(path, **{self._cursor_arg: cursor})
+        return self._submit(path)
+
+    @staticmethod
+    def _submission_result(result):
+        """Normalize legacy integer and optional progress-aware API responses."""
+        if isinstance(result, int):
+            return result, True, False, None
+        if isinstance(result, tuple):
+            submitted = int(result[0]) if result else 0
+            if len(result) == 2:
+                second = result[1]
+                if isinstance(second, bool):
+                    return submitted, second, not second, None
+                return submitted, False, True, second
+            if len(result) >= 3:
+                second, third = result[1:3]
+                if isinstance(second, bool):
+                    return submitted, second, not second, third
+                return submitted, bool(third), not bool(third), second
+            return submitted, True, False, None
+        if isinstance(result, dict):
+            cursor = result.get(
+                "cursor",
+                result.get(
+                    "state",
+                    result.get(
+                        "next_cursor",
+                        result.get("next_state", result.get("prefetch_state")),
+                    ),
+                ),
+            )
+            complete = result.get(
+                "complete", result.get("completed", result.get("done"))
+            )
+            pressure = bool(
+                result.get("pressure")
+                or result.get("deferred")
+                or result.get("partial")
+            )
+            if complete is None:
+                complete = not pressure and cursor is None
+            return (
+                int(result.get("submitted", result.get("count", 0))),
+                bool(complete),
+                pressure or not bool(complete),
+                cursor,
+            )
+        cursor = getattr(
+            result,
+            "cursor",
+            getattr(
+                result,
+                "state",
+                getattr(
+                    result,
+                    "next_cursor",
+                    getattr(result, "next_state", None),
+                ),
+            ),
+        )
+        complete = getattr(
+            result,
+            "complete",
+            getattr(result, "completed", getattr(result, "done", None)),
+        )
+        pressure = bool(
+            getattr(result, "pressure", False)
+            or getattr(result, "deferred", False)
+            or getattr(result, "partial", False)
+        )
+        if complete is None:
+            complete = not pressure and cursor is None
+        return (
+            int(getattr(result, "submitted", getattr(result, "count", 0))),
+            bool(complete),
+            pressure or not bool(complete),
+            cursor,
+        )
+
+    def _worker(self):
+        while not self._stop.is_set():
+            self._promote_deferred()
+            try:
+                path = self._queue.get(timeout=self._next_wait())
+            except queue.Empty:
+                continue
+            self._report_depth()
+            if path is None:
+                return
+            with self._lock:
+                entry = self._entries.get(path)
+                if not entry or entry["state"] != self.PENDING:
+                    continue
+                entry["state"] = self.RUNNING
+                cursor = entry["cursor"]
+            if (
+                self._runtime_gate is not None
+                and not self._runtime_allowed()
+            ):
+                with self._lock:
+                    current = self._entries.get(path)
+                    if current is not None:
+                        current["state"] = self.WAITING_FOR_FLIGHT
+                self._bump("dsf_prefetch_waiting_for_flight")
+                if not self._runtime_gate.wait_until_allowed(self._stop):
+                    return
+                if not self._runtime_allowed():
+                    with self._lock:
+                        current = self._entries.get(path)
+                        if current is not None:
+                            self._defer(
+                                current,
+                                self._poll_interval,
+                                path=path,
+                            )
+                    continue
+                with self._lock:
+                    current = self._entries.get(path)
+                    if current is None:
+                        continue
+                    current["state"] = self.RUNNING
+                    cursor = current["cursor"]
+            allowed, delay = self._can_run()
+            if not allowed:
+                with self._lock:
+                    if path in self._entries:
+                        self._defer(
+                            entry,
+                            delay or self._poll_interval,
+                            path=path,
+                        )
+                continue
+            try:
+                if self._before_submit:
+                    self._before_submit()
+                result = self._call_submit(path, cursor)
+                submitted, complete, pressure, next_cursor = (
+                    self._submission_result(result)
+                )
+            except Exception as exc:
+                with self._lock:
+                    entry = self._entries.get(path)
+                    if not entry:
+                        continue
+                    entry["retries"] += 1
+                    if entry["retries"] > self._max_retries:
+                        del self._entries[path]
+                        log.error(
+                            "DSF prefetch failed permanently for %s: %s",
+                            path,
+                            exc,
+                        )
+                    else:
+                        self._defer(
+                            entry,
+                            self._defer_delay(entry["retries"]),
+                            path=path,
+                        )
+                continue
+
+            with self._lock:
+                entry = self._entries.get(path)
+                if not entry:
+                    continue
+                if complete:
+                    self._entries.pop(path, None)
+                    self._completed[path] = (
+                        self._clock() + self._completed_ttl
+                    )
+                    self._completed.move_to_end(path)
+                    while len(self._completed) > self._completed_limit:
+                        self._completed.popitem(last=False)
+                    log.info(
+                        "DSF prefetch queued %d chunks for %s", submitted, path
+                    )
+                else:
+                    if next_cursor is not None:
+                        entry["cursor"] = next_cursor
+                    entry["retries"] = 0
+                    self._defer(
+                        entry,
+                        self._defer_delay(entry["pressure_retries"] + 1),
+                        pressure=pressure,
+                        path=path,
+                    )
+
+
 class AutoOrtho(Operations):
 
     open_paths = []
@@ -324,13 +787,26 @@ class AutoOrtho(Operations):
         # Critical for predictive DDS: ensures we prefetch the exact tiles X-Plane will request
         terrain_folder = os.path.join(self.root, "terrain")
         scenery_name = os.path.basename(self.root)
-        getortho.register_terrain_index(terrain_folder, scenery_name)
-        
-        # Start spatial prefetcher for proactive tile loading
-        getortho.start_prefetcher(self.tc)
-        
-        # Start predictive DDS generation (pre-builds DDS in background)
-        getortho.start_predictive_dds(self.tc)
+        self._scenery_name = scenery_name
+        self._terrain_lookup = getortho.register_terrain_index(
+            terrain_folder, scenery_name
+        )
+        self._runtime_services_started = False
+        self._runtime_services_lock = threading.Lock()
+        self._dsf_prefetch_scheduler = kwargs.get(
+            "dsf_prefetch_scheduler"
+        ) or DSFPrefetchScheduler(
+            getattr(getortho, "prefetch_dsf", lambda _path: 0),
+            runtime_allowed=getattr(
+                getortho, "is_flight_runtime_allowed", lambda: False
+            ),
+            runtime_gate=getattr(getortho, "flight_runtime_gate", None),
+            live_demand=getattr(getortho, "has_live_pressure", lambda: False),
+            before_submit=self._ensure_runtime_services,
+            worker_count=kwargs.get("dsf_prefetch_workers", 1),
+            queue_size=kwargs.get("dsf_prefetch_queue_size", 16),
+            grace_period=kwargs.get("dsf_prefetch_grace_period", 2.0),
+        )
     
         #self.path_condition = threading.Condition()
         #self.read_lock = threading.Lock()
@@ -362,6 +838,27 @@ class AutoOrtho(Operations):
         except ImportError:
             from datareftrack import dt as datareftracker
         time_exclusion_manager.set_dataref_tracker(datareftracker)
+
+    def _ensure_runtime_services(self):
+        if self._runtime_services_started:
+            return
+        with self._runtime_services_lock:
+            if self._runtime_services_started:
+                return
+            getortho.start_prefetcher(self.tc, self._scenery_name)
+            getortho.start_predictive_dds(self.tc)
+            self._runtime_services_started = True
+
+    def _schedule_dsf_prefetch(self, path):
+        if not self._dsf_prefetch_scheduler.schedule(path):
+            log.debug("DSF prefetch already scheduled or stopped: %s", path)
+
+    def shutdown(self):
+        """Stop background DSF scheduling when this FUSE runtime exits."""
+        self._dsf_prefetch_scheduler.shutdown()
+
+    def destroy(self, path=None):
+        self.shutdown()
 
     # Helpers
     # =======
@@ -933,11 +1430,13 @@ class AutoOrtho(Operations):
             
             # Normal mode - serve AutoOrtho ortho scenery
             log.info(f"OPEN: DSF [{path}]{pid_text} opened in ORTHO mode (AutoOrtho scenery)")
+            self._schedule_dsf_prefetch(path)
             # Register this DSF as being in use (prevents redirect during active use)
             time_exclusion_manager.register_dsf_open(path)
         
         dds_match = self.dds_re.match(path)
         if dds_match:
+            self._ensure_runtime_services()
             row, col, maptype, zoom = dds_match.groups()
             row = int(row)
             col = int(col)
@@ -949,7 +1448,13 @@ class AutoOrtho(Operations):
             if maptype != "BI":
                 getortho.register_discovered_maptype(maptype)
 
-            t = self.tc._open_tile(row, col, maptype, zoom)
+            tile_id = f"{row}_{col}_{maptype}_{zoom}"
+            with profile_span(
+                "fuse.dds_open",
+                tile_id=tile_id,
+                details={"path": path},
+            ):
+                t = self.tc._open_tile(row, col, maptype, zoom)
             try:
                 self._set_dds_size_cached(row, col, maptype, zoom, t.dds.total_size)
             except Exception:
@@ -986,6 +1491,8 @@ class AutoOrtho(Operations):
                 log.info(f"Shutdown in progress, returning fallback data for {path}")
                 return _generate_fallback_dds_bytes(offset, length)
             key = self._tile_key(row, col, maptype, zoom)
+            tile_id = f"{row}_{col}_{maptype}_{zoom}"
+            request_started = time.monotonic()
             lock = self._tile_locks[key]
             
             # Calculate build_timeout dynamically based on tile_time_budget
@@ -997,8 +1504,30 @@ class AutoOrtho(Operations):
             # - Any processing overhead
             # - Margin of safety to prevent premature lock timeout
             build_timeout = self._calculate_build_timeout()
+            request_deadline = request_started + build_timeout
 
-            if not lock.acquire(timeout=build_timeout):
+            lock_started = time.monotonic()
+            if not lock.acquire(
+                timeout=max(0.0, request_deadline - time.monotonic())
+            ):
+                lock_wait_ms = (time.monotonic() - lock_started) * 1000.0
+                record_stage(
+                    "fuse.tile_lock_wait",
+                    lock_wait_ms,
+                    tile_id=tile_id,
+                    outcome="timeout",
+                )
+                record_stage(
+                    "fuse.dds_read",
+                    (time.monotonic() - request_started) * 1000.0,
+                    tile_id=tile_id,
+                    outcome="fallback",
+                    details={
+                        "reason": "tile_lock_timeout",
+                        "offset": offset,
+                        "length": length,
+                    },
+                )
                 # CRITICAL FIX: Instead of raising EIO (which causes CTD on Windows
                 # due to EXCEPTION_IN_PAGE_ERROR), return fallback placeholder data.
                 # X-Plane will show a gray/missing texture, but won't crash.
@@ -1029,22 +1558,66 @@ class AutoOrtho(Operations):
 
                 return _generate_fallback_dds_bytes(offset, length)
 
+            record_stage(
+                "fuse.tile_lock_wait",
+                (time.monotonic() - lock_started) * 1000.0,
+                tile_id=tile_id,
+            )
+            read_outcome = "ok"
+            admitted = False
+            lock_held = True
             try:
-                t = self.tc._get_tile(row, col, maptype, zoom)
+                admitted = getortho.acquire_live_tile_slot(
+                    max(0.0, request_deadline - time.monotonic())
+                )
+                if not admitted:
+                    read_outcome = "fallback"
+                    log.error(
+                        "Live tile admission timeout for %s after %ss",
+                        key,
+                        build_timeout,
+                    )
+                    return _generate_fallback_dds_bytes(offset, length)
+                with profile_span(
+                    "tile.cache_lookup",
+                    tile_id=tile_id,
+                ):
+                    t = self.tc._get_tile(row, col, maptype, zoom)
+                # Tile/build coordinators provide the fine-grained safety below.
+                # Release the FUSE lookup lock before cache, network, decode, or
+                # compression work so disjoint row reads can proceed together.
+                lock.release()
+                lock_held = False
                 data = t.read_dds_bytes(offset, length)
                 if data is None:
+                    read_outcome = "fallback"
                     log.error(f"Tile read returned None for {key} - returning fallback data")
                     return _generate_fallback_dds_bytes(offset, length)
                 return data
             except FuseOSError:
+                read_outcome = "fallback"
                 log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
                 return _generate_fallback_dds_bytes(offset, length)
             except Exception as e:
+                read_outcome = "fallback"
                 log.error(f"Tile read/build failed for {key} - returning fallback data to prevent CTD")
                 log.exception("cause:", exc_info=e)
                 return _generate_fallback_dds_bytes(offset, length)
             finally:
-                lock.release()
+                if admitted:
+                    getortho.release_live_tile_slot()
+                if lock_held:
+                    lock.release()
+                record_stage(
+                    "fuse.dds_read",
+                    (time.monotonic() - request_started) * 1000.0,
+                    tile_id=tile_id,
+                    outcome=read_outcome,
+                    details={
+                        "offset": offset,
+                        "length": length,
+                    },
+                )
 
         # Regular file passthrough
         with self.fh_locks.setdefault(fh, threading.Lock()):
@@ -1118,8 +1691,10 @@ class AutoOrtho(Operations):
         return self.flush(path, fh)
 
 
-    def close(self, path, fh):
+    def close(self, path=None, fh=None):
         log.debug(f"CLOSE: {path}")
+        if path is None and fh is None:
+            self.shutdown()
         return 0
 
 
@@ -1146,3 +1721,5 @@ def run(ao, mountpoint, name="", nothreads=False):
     except Exception as e:
         log.error(f"FUSE mount failed with non-negotiable error: {e}")
         raise
+    finally:
+        ao.shutdown()

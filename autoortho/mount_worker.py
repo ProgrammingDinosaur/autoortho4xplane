@@ -1,5 +1,4 @@
 import argparse
-import ctypes
 import gc
 import logging
 import logging.handlers
@@ -211,11 +210,25 @@ def _runtime_for_platform():
         if not systemtype or not libpath:
             raise RuntimeError("No usable Windows FUSE backend was found")
 
+        # mfusepy configures ctypes signatures and binds fuse_main_real while it
+        # imports. Replacing mfusepy._libfuse afterwards leaves those bindings
+        # pointing at different CDLL instances and makes fuse_get_context return
+        # a plain integer. Select the backend before importing mfusepy instead.
+        os.environ["FUSE_LIBRARY_PATH"] = os.path.abspath(libpath)
         try:
             from autoortho import mfusepy
         except ImportError:
             import mfusepy
-        mfusepy._libfuse = ctypes.CDLL(libpath)
+
+        loaded_path = os.path.normcase(
+            os.path.abspath(str(getattr(mfusepy, "_libfuse_path", "")))
+        )
+        requested_path = os.path.normcase(os.path.abspath(libpath))
+        if loaded_path != requested_path:
+            raise RuntimeError(
+                "mfusepy was imported before the selected Windows FUSE backend "
+                f"was configured (loaded={loaded_path!r}, requested={requested_path!r})"
+            )
     elif system_type == "darwin":
         systemtype = "macOS"
     else:
@@ -271,6 +284,14 @@ def main():
 
     mount_name = args.volname or os.path.basename(os.path.abspath(args.mountpoint))
     configure_worker_logging(mount_name, args.loglevel)
+    try:
+        try:
+            from autoortho.diagnostics import start_worker_profiler_from_env
+        except ImportError:
+            from diagnostics import start_worker_profiler_from_env
+        start_worker_profiler_from_env(mount_name)
+    except Exception as exc:
+        log.error("Could not start worker performance diagnostics: %s", exc)
     _install_crash_handler()
     _install_signal_handlers()
     _start_reload_poll_thread()
@@ -305,6 +326,16 @@ def main():
         log.error("FUSE mount failed with non-negotiable error: %s", exc)
         raise
     finally:
+        # Persist flight timings before subsystem cleanup. The parent may signal
+        # this process as soon as the mount disappears.
+        try:
+            try:
+                from autoortho.diagnostics import stop_active_profiler
+            except ImportError:
+                from diagnostics import stop_active_profiler
+            stop_active_profiler()
+        except Exception as exc:
+            log.error("Could not finalize worker performance diagnostics: %s", exc)
         _begin_worker_shutdown("worker exit")
         _shutdown_getortho()
         try:
