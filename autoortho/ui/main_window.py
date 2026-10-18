@@ -1294,7 +1294,7 @@ class ConfigUI(QMainWindow):
             self.fallback_extends_budget_check.setChecked(False)
             self.suspend_maxwait_check.setChecked(False)
         self.provider_adaptive_check.setChecked(True)
-        self.native_partial_allow_incomplete_check.setChecked(False)
+        self.native_partial_allow_incomplete_check.setChecked(True)
         self.persist_partial_dds_cache_check.setChecked(
             name != "Low Resource"
         )
@@ -1381,7 +1381,7 @@ class ConfigUI(QMainWindow):
                 "pipeline_mode_combo": "auto",
                 "live_concurrency_slider": 8,
                 "buffer_pool_slider": 10,
-                "native_partial_allow_incomplete_check": False,
+                "native_partial_allow_incomplete_check": True,
                 "persist_partial_dds_cache_check": True,
                 "provider_inflight_spinbox": 320,
                 "provider_connections_spinbox": 160,
@@ -3456,6 +3456,7 @@ class ConfigUI(QMainWindow):
         
         self.dynamic_zoom_summary = QLabel("No steps configured")
         self.dynamic_zoom_summary.setStyleSheet("color: #6da4e3; padding-left: 5px;")
+        self.dynamic_zoom_summary.setWordWrap(True)
         dynamic_zoom_layout.addWidget(self.dynamic_zoom_summary)
         
         autoortho_layout.addWidget(self.dynamic_zoom_widget)
@@ -3530,9 +3531,9 @@ class ConfigUI(QMainWindow):
         self.tile_budget_label_title.setToolTip(
             "Maximum wall-clock time for a COMPLETE tile (all mipmaps combined).\n"
             "When this time is reached, the tile is built with whatever has been downloaded.\n\n"
-            "This measures ACTIVE PROCESSING TIME only - queue wait time doesn't count.\n"
-            "The budget starts when chunks actually begin downloading, not when the\n"
-            "tile is first requested. This ensures fair time allocation.\n\n"
+            "The budget only advances while X-Plane is reading this tile; time\n"
+            "spent on other tiles between reads does not count, and reopening\n"
+            "the tile starts a fresh budget.\n\n"
             "Lower values = faster loading, but may have more missing/blurry areas\n"
             "Higher values = better quality, but longer initial load times\n\n"
             "Recommended values:\n"
@@ -3729,7 +3730,7 @@ class ConfigUI(QMainWindow):
         native_partial_value = getattr(
             self.cfg.autoortho,
             "native_partial_allow_incomplete",
-            False,
+            True,
         )
         if isinstance(native_partial_value, str):
             native_partial_value = (
@@ -3744,8 +3745,8 @@ class ConfigUI(QMainWindow):
         )
         self.native_partial_allow_incomplete_check.setToolTip(
             "After a row deadline, finish with cached lower-resolution imagery\n"
-            "and the configured missing color. This can reduce stalls, but X-Plane\n"
-            "may retain lower-quality areas for the current flight."
+            "and the configured missing color only where nothing else exists.\n"
+            "Degraded rows are rebuilt when X-Plane loads the tile again."
         )
         partial_quality_layout.addWidget(
             self.native_partial_allow_incomplete_check
@@ -6643,6 +6644,12 @@ class ConfigUI(QMainWindow):
             )
             if len(sorted_steps) > 3:
                 text += f" (+{len(sorted_steps)-3} more)"
+            # The fixed-mode airport slider is hidden in dynamic mode; say so,
+            # because each step's airport zoom silently replaces it.
+            text += (
+                "\nAirport zoom comes from each step's second value; the fixed-mode "
+                "'Max zoom near airports' setting is not used in dynamic mode."
+            )
             self.dynamic_zoom_summary.setText(text)
 
     def _update_fallback_extends_control(self):

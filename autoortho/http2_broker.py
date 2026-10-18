@@ -153,6 +153,7 @@ __all__ = [
     "BrokerShutdownError",
     "BrokerCancelledError",
     "BrokerCapacityError",
+    "BrokerTransportError",
     "ResponseTooLargeError",
 ]
 
@@ -208,6 +209,17 @@ DEFAULT_ORIGIN_COOLDOWN_SECONDS = 5.0
 # signals. They must never shrink an origin's concurrency budget.
 _NEUTRAL_STATUS_CODES = frozenset({403, 410})
 
+# httpcore multiplexes every request for one origin onto a single HTTP/2
+# connection, and imagery CDNs commonly advertise
+# SETTINGS_MAX_CONCURRENT_STREAMS = 100 (Bing does). Admitting more requests
+# than that only parks them inside httpcore, where they burn their timeouts,
+# so HTTP/2 origins are capped a little below the common server limit.
+DEFAULT_HTTP2_STREAM_LIMIT = 90
+# A request rejected locally because the connection had no free stream never
+# reached the provider. It is re-queued this many times before failing.
+_STREAM_CAPACITY_RETRIES = 3
+_STREAM_CAPACITY_RETRY_DELAY = 0.05
+
 # Header names (case-insensitive) that must never be written verbatim to logs.
 _REDACT_HEADER_NAMES = frozenset({
     "authorization",
@@ -257,6 +269,10 @@ class BrokerCapacityError(BrokerError):
     """A request was refused because the client's pending budget is full."""
 
 
+class BrokerTransportError(BrokerError):
+    """The provider connection failed (reset, refused or protocol error)."""
+
+
 class ResponseTooLargeError(BrokerProtocolError):
     """A response body exceeded the configured maximum size."""
 
@@ -271,7 +287,21 @@ _ERROR_TYPE_MAP: Dict[str, type] = {
     "BrokerShutdownError": BrokerShutdownError,
     "BrokerCancelledError": BrokerCancelledError,
     "BrokerCapacityError": BrokerCapacityError,
+    "BrokerTransportError": BrokerTransportError,
     "ResponseTooLargeError": ResponseTooLargeError,
+    # httpx transport failures. Without these, connection resets and
+    # protocol errors arrive as generic BrokerProtocolError and are retried
+    # with no backoff.
+    "ConnectError": BrokerTransportError,
+    "ReadError": BrokerTransportError,
+    "WriteError": BrokerTransportError,
+    "CloseError": BrokerTransportError,
+    "NetworkError": BrokerTransportError,
+    "ProxyError": BrokerTransportError,
+    "ProtocolError": BrokerTransportError,
+    "LocalProtocolError": BrokerTransportError,
+    "RemoteProtocolError": BrokerTransportError,
+    "TransportError": BrokerTransportError,
     # Common httpx timeout exceptions collapse to a single client-side type.
     "ConnectTimeout": BrokerTimeoutError,
     "ReadTimeout": BrokerTimeoutError,
@@ -1070,6 +1100,7 @@ class _CoalescedEntry:
     cancelled: bool = False
     parked: bool = False
     started: bool = False
+    stream_capacity_retries: int = 0
     queued_at: float = field(default_factory=time.monotonic)
 
 
@@ -1197,6 +1228,10 @@ def _classify_origin_outcome(
         if httpx is not None:
             if isinstance(error, httpx.TimeoutException):
                 return "throttle"
+            if isinstance(error, httpx.LocalProtocolError):
+                # Raised by our own HTTP/2 stack (for example a full stream
+                # table); it says nothing about the provider's capacity.
+                return "neutral"
             if isinstance(error, httpx.TransportError):
                 return "throttle"
         return "neutral"
@@ -1235,10 +1270,24 @@ class _AdaptiveConcurrencyController:
         decrease_factor: float = DEFAULT_ORIGIN_DECREASE_FACTOR,
         cooldown: float = DEFAULT_ORIGIN_COOLDOWN_SECONDS,
         connection_limit: Optional[int] = None,
+        http2_stream_limit: Optional[int] = None,
+        live_reserved_fraction: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.enabled = bool(enabled)
         self._maximum = max(1, int(maximum))
+        # Streams one HTTP/2 connection can carry. None leaves HTTP/2 origins
+        # bounded only by ``maximum`` (injected test transports).
+        self._http2_stream_limit = (
+            max(1, int(http2_stream_limit))
+            if http2_stream_limit
+            else None
+        )
+        # Share of each origin's permits that background work may not use, so
+        # in-flight prefetch can never occupy every slot a live request needs.
+        self._live_reserved_fraction = min(
+            0.9, max(0.0, float(live_reserved_fraction))
+        )
         self._minimum = max(1, min(self._maximum, int(minimum)))
         initial_value = int(initial)
         # 0 (or negative) means "start at the ceiling" -- react to overload
@@ -1275,10 +1324,17 @@ class _AdaptiveConcurrencyController:
         if state is None:
             state = _OriginState(
                 limit=self._initial,
-                ceiling=self._maximum,
+                ceiling=self._http2_ceiling(),
             )
             self._origins[origin] = state
         return state
+
+    def _http2_ceiling(self) -> int:
+        # Origins start with the HTTP/2 cap: the first wave of requests is
+        # admitted before any response has revealed the protocol version.
+        if self._http2_stream_limit is None:
+            return self._maximum
+        return min(self._maximum, self._http2_stream_limit)
 
     def note_http_version(
         self,
@@ -1307,7 +1363,11 @@ class _AdaptiveConcurrencyController:
                 if candidate.http_version.startswith("HTTP/1")
             )
         elif version.startswith("HTTP/2"):
-            state.ceiling = self._maximum
+            state.ceiling = self._http2_ceiling()
+            if state.limit > state.ceiling:
+                state.limit = state.ceiling
+                state.successes = 0
+                self._report(origin, state, "protocol_cap")
 
     def limit_for(self, origin: str) -> int:
         state = self._state(origin)
@@ -1317,9 +1377,18 @@ class _AdaptiveConcurrencyController:
     def active_for(self, origin: str) -> int:
         return self._state(origin).active
 
-    def available(self, origin: str) -> int:
+    def _limit_for_priority(self, origin: str, live: bool) -> int:
+        limit = self.limit_for(origin)
+        if live or self._live_reserved_fraction <= 0.0 or limit < 4:
+            return limit
+        return max(1, limit - int(limit * self._live_reserved_fraction))
+
+    def available(self, origin: str, live: bool = True) -> int:
         state = self._state(origin)
-        available = max(0, self.limit_for(origin) - state.active)
+        available = max(
+            0,
+            self._limit_for_priority(origin, live) - state.active,
+        )
         if state.http_version.startswith("HTTP/1"):
             available = min(
                 available,
@@ -1329,9 +1398,9 @@ class _AdaptiveConcurrencyController:
 
     # -- permits --------------------------------------------------------
 
-    def try_acquire(self, origin: str) -> bool:
+    def try_acquire(self, origin: str, live: bool = True) -> bool:
         state = self._state(origin)
-        if state.active >= self.limit_for(origin):
+        if state.active >= self._limit_for_priority(origin, live):
             return False
         if (
             state.http_version.startswith("HTTP/1")
@@ -1481,6 +1550,8 @@ class _AdaptiveConcurrencyController:
             "cooldown": self._cooldown,
             "http1_connection_limit": self._connection_limit,
             "http1_active": self._http1_active,
+            "http2_stream_limit": self._http2_stream_limit,
+            "live_reserved_fraction": self._live_reserved_fraction,
         }
 
 
@@ -1924,6 +1995,80 @@ class _TransportLifecycleMetrics:
         return result
 
 
+_httpcore_stream_reset_installed = False
+
+
+def _install_httpcore_stream_reset() -> bool:
+    """Reset HTTP/2 streams that httpcore abandons before they complete.
+
+    httpcore 1.0.x frees its stream semaphore when a response is closed early
+    (timeout, cancellation, read error) but never resets the stream, so h2
+    keeps counting it as open. Every abandoned request therefore leaks one of
+    the server's concurrent-stream slots, and DATA that later arrives for it
+    is dropped without returning connection flow-control credit. Once enough
+    leak, each new request on the connection fails with
+    "Max outbound streams is 100, 100 open" until the connection closes.
+
+    Resetting the stream closes it in h2 immediately; the RST_STREAM frame is
+    flushed with the connection's next write, and h2 acknowledges any late
+    DATA on reset streams itself. Pure Python and idempotent; returns False
+    when the installed httpcore does not have the expected internals.
+    """
+    global _httpcore_stream_reset_installed
+    if _httpcore_stream_reset_installed:
+        return True
+    try:
+        from httpcore._async import http2 as httpcore_http2
+        import h2.errors
+        import h2.exceptions
+    except ImportError:
+        return False
+    connection_cls = getattr(httpcore_http2, "AsyncHTTP2Connection", None)
+    original = getattr(connection_cls, "_response_closed", None)
+    if original is None:
+        return False
+    if getattr(original, "_autoortho_stream_reset", False):
+        _httpcore_stream_reset_installed = True
+        return True
+
+    async def _response_closed(self, stream_id: int) -> None:
+        try:
+            stream = self._h2_state.streams.get(stream_id)
+            if stream is not None and not stream.closed:
+                self._h2_state.reset_stream(
+                    stream_id,
+                    error_code=h2.errors.ErrorCodes.CANCEL,
+                )
+        except (AttributeError, h2.exceptions.ProtocolError):
+            pass
+        await original(self, stream_id)
+
+    _response_closed._autoortho_stream_reset = True
+    connection_cls._response_closed = _response_closed
+    _httpcore_stream_reset_installed = True
+    return True
+
+
+def _is_stream_capacity_error(exc: BaseException) -> bool:
+    """True when the local HTTP/2 stack had no free stream for the request."""
+    current: Optional[BaseException] = exc
+    for _depth in range(4):
+        if current is None:
+            return False
+        if h2 is not None:
+            too_many = getattr(
+                getattr(h2, "exceptions", None),
+                "TooManyStreamsError",
+                None,
+            )
+            if too_many is not None and isinstance(current, too_many):
+                return True
+        if "Max outbound streams" in str(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 class _BrokerCore:
     """Owns the httpx client, priority queue and coalescing/cancellation state."""
 
@@ -1939,6 +2084,11 @@ class _BrokerCore:
         transport_trace: bool = False,
     ):
         _require_dependencies(require_http2=transport is None)
+        if transport is None and not _install_httpcore_stream_reset():
+            log.warning(
+                "httpcore internals changed; abandoned HTTP/2 streams will "
+                "not be reset"
+            )
         limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections)
         client_kwargs: Dict[str, Any] = {
             "http2": transport is None,
@@ -1969,6 +2119,13 @@ class _BrokerCore:
         adaptive_kwargs = dict(adaptive or {})
         adaptive_kwargs.setdefault("maximum", self._max_concurrency)
         adaptive_kwargs.setdefault("connection_limit", self._max_connections)
+        if transport is None:
+            adaptive_kwargs.setdefault(
+                "http2_stream_limit", DEFAULT_HTTP2_STREAM_LIMIT
+            )
+        adaptive_kwargs.setdefault(
+            "live_reserved_fraction", DEFAULT_RESERVED_LIVE_FRACTION
+        )
         adaptive_kwargs["maximum"] = min(
             self._max_concurrency, max(1, int(adaptive_kwargs["maximum"]))
         )
@@ -2190,6 +2347,7 @@ class _BrokerCore:
         if not backlog:
             return
         slots = self._limiter.available(origin)
+        background_slots = self._limiter.available(origin, live=False)
         while backlog and slots > 0:
             _priority, _seq, revision, entry = heapq.heappop(backlog)
             if (
@@ -2199,6 +2357,16 @@ class _BrokerCore:
                 or not entry.waiters
             ):
                 continue
+            if not self._is_live(entry):
+                if background_slots <= 0:
+                    # The heap is priority ordered: everything left is
+                    # background work, and only live-reserved permits remain.
+                    heapq.heappush(
+                        backlog,
+                        (_priority, _seq, revision, entry),
+                    )
+                    break
+                background_slots -= 1
             entry.parked = False
             self._queue.put_nowait(
                 (
@@ -2242,6 +2410,27 @@ class _BrokerCore:
             )
         ]
         heapq.heapify(backlog)
+
+    @staticmethod
+    def _is_live(entry: _CoalescedEntry) -> bool:
+        return entry.priority < DEFAULT_LIVE_PRIORITY_THRESHOLD
+
+    def _requeue_after_stream_capacity(self, entry: _CoalescedEntry) -> None:
+        # The entry stayed registered while it waited, so new submissions
+        # coalesced onto it and cancellations already pruned its waiters.
+        if (
+            self._stopping
+            or entry.cancelled
+            or not entry.waiters
+            or self._entries.get(entry.key) is not entry
+        ):
+            if not entry.waiters and self._entries.get(entry.key) is entry:
+                self._entries.pop(entry.key, None)
+            return
+        entry.priority_revision += 1
+        self._queue.put_nowait(
+            (entry.priority, entry.seq, entry.priority_revision, entry)
+        )
 
     def _backlog_depth(self) -> int:
         return sum(
@@ -2302,7 +2491,10 @@ class _BrokerCore:
                     or entry.started
                 ):
                     continue
-                if not self._limiter.try_acquire(entry.origin):
+                if not self._limiter.try_acquire(
+                    entry.origin,
+                    live=self._is_live(entry),
+                ):
                     self._park(entry)
                     continue
                 acquired = True
@@ -2343,6 +2535,7 @@ class _BrokerCore:
         body: Optional[bytes] = None
         request_started = time.monotonic()
         outcome = "ok"
+        requeue_delay: Optional[float] = None
         self._active_requests += 1
         profile_gauge("broker.active_requests", self._active_requests)
         try:
@@ -2476,18 +2669,42 @@ class _BrokerCore:
                 },
             }
         except Exception as exc:
-            outcome = "failed"
-            self._limiter.on_outcome(
-                entry.origin,
-                error=exc,
-                is_live=(
-                    entry.priority < DEFAULT_LIVE_PRIORITY_THRESHOLD
-                ),
-                queue_depth=self._queue.qsize(),
-            )
-            message = {"type": "ERROR", "error": {"type": type(exc).__name__, "message": str(exc)}}
+            if (
+                _is_stream_capacity_error(exc)
+                and entry.stream_capacity_retries < _STREAM_CAPACITY_RETRIES
+                and not self._stopping
+            ):
+                # The request never left this process: the connection's
+                # stream table was full. Re-queue it locally instead of
+                # failing the chunk or penalising the provider.
+                entry.stream_capacity_retries += 1
+                entry.started = False
+                requeue_delay = (
+                    _STREAM_CAPACITY_RETRY_DELAY
+                    * entry.stream_capacity_retries
+                )
+                outcome = "deferred"
+            else:
+                outcome = "failed"
+                self._limiter.on_outcome(
+                    entry.origin,
+                    error=exc,
+                    is_live=(
+                        entry.priority < DEFAULT_LIVE_PRIORITY_THRESHOLD
+                    ),
+                    queue_depth=self._queue.qsize(),
+                )
+                detail = str(exc) or repr(exc)
+                message = {
+                    "type": "ERROR",
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": f"{type(exc).__name__}: {detail}",
+                    },
+                }
         finally:
-            self._entries.pop(entry.key, None)
+            if requeue_delay is None:
+                self._entries.pop(entry.key, None)
             self._active_requests = max(0, self._active_requests - 1)
             profile_gauge("broker.active_requests", self._active_requests)
             profile_gauge("broker.queue_depth", self._queue.qsize())
@@ -2505,6 +2722,14 @@ class _BrokerCore:
                     "origin": entry.origin,
                 },
             )
+
+        if requeue_delay is not None:
+            asyncio.get_running_loop().call_later(
+                requeue_delay,
+                self._requeue_after_stream_capacity,
+                entry,
+            )
+            return
 
         if message is not None:
             for request_id, identity in dict(entry.waiters).items():
