@@ -296,6 +296,32 @@ class RowStateCoordinator:
                 manifests.append(manifest)
             return reader(), tuple(manifests)
 
+    def unseal_for_reopen(self) -> tuple[int, ...]:
+        """Release first-serve seals when the texture is opened again.
+
+        Sealing keeps one open's reads consistent with the provenance it
+        reported. A new open is a new texture load, so rows that were served
+        missing or degraded may be rebuilt with imagery that arrived since.
+        Exact rows stay installed. Returns the rows that may now be rebuilt.
+        """
+        with self._condition:
+            if self._closed:
+                return ()
+            rebuildable = []
+            for row, state in self._states.items():
+                if state == RowState.SERVED_EXACT:
+                    self._states[row] = RowState.READY_EXACT
+                elif state == RowState.SERVED_DEGRADED:
+                    self._states[row] = RowState.READY_DEGRADED
+                    rebuildable.append(row)
+                elif state == RowState.SERVED_MISSING:
+                    self._states[row] = RowState.UNREQUESTED
+                    self._manifests.pop(row, None)
+                    rebuildable.append(row)
+            if rebuildable:
+                self._condition.notify_all()
+            return tuple(rebuildable)
+
     def manifest(self, row: int) -> RowBuildManifest | None:
         with self._condition:
             return self._manifests.get(int(row))

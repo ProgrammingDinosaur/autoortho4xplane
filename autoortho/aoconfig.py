@@ -86,6 +86,11 @@ class SectionParser(object):
         return NotImplemented
 
 
+# Bump when a release changes a default that existing configs must pick up,
+# and add the step to _migrate_config_revision.
+CONFIG_REVISION = 1
+
+
 class AOConfig(object):
     config = configparser.ConfigParser(strict=False, allow_no_value=True, comment_prefixes='/')
 
@@ -98,6 +103,8 @@ gui = True
 showconfig = True
 # First-run setup was completed or inferred from an existing valid config
 setup_complete = False
+# Internal: schema revision used for one-time default migrations. Do not edit.
+config_revision = {CONFIG_REVISION}
 # Application shell state
 window_width = 1100
 window_height = 760
@@ -167,11 +174,10 @@ suspend_maxwait = True
 # providing more predictable loading times. When disabled, falls back to legacy
 # per-chunk maxwait timing.
 use_time_budget = True
-# Maximum wall-clock time in seconds for a COMPLETE tile (all 5 mipmap levels).
-# IMPORTANT: This measures ACTIVE PROCESSING time only - queue wait time doesn't count.
-# The budget starts when chunks actually begin downloading, not when the tile is first requested.
-# This ensures fair time allocation when many tiles are requested simultaneously.
-# After this time, the tile is built with whatever has been downloaded.
+# Maximum time in seconds X-Plane may spend waiting on a COMPLETE tile (all 5 mipmap levels).
+# The budget only advances while X-Plane is reading the tile: gaps between reads
+# (while X-Plane works on other tiles) do not count, and reopening a tile starts a
+# fresh budget. After this time, the tile is built with whatever has been downloaded.
 # Lower = faster loading, but may have more partial/blurry tiles
 # Higher = better quality, but longer initial load times
 # Recommended: 15.0 (very fast), 30.0 (balanced), 60.0 (quality)
@@ -199,8 +205,10 @@ fallback_extends_budget = False
 fallback_timeout = 30.0
 # Allow a native row build to finish after its shared deadline by using
 # cache/lower-ZL fallbacks and finally missing_color for unresolved positions.
-# Disabled by default to preserve strict 100% native partial-build quality.
-native_partial_allow_incomplete = False
+# Enabled by default: a strict build rejects the whole row when one chunk is
+# late, and the row is then rebuilt slowly or served as missing color. Rows
+# served degraded are rebuilt when X-Plane opens the tile again.
+native_partial_allow_incomplete = True
 # Spatial prefetching - proactively downloads tiles ahead of aircraft
 # Enable/disable prefetching (True/False)
 prefetch_enabled = True
@@ -583,6 +591,8 @@ route_prefetch_radius_nm = 40
             for section in user_config.sections()
         }
         _migrate_legacy_provider_options(self, user_config)
+        if os.path.isfile(self.conf_file):
+            _migrate_config_revision(self, user_config)
         self.get_config()
         return True
 
@@ -744,9 +754,79 @@ route_prefetch_radius_nm = 40
         log.info("Saving config ... ")
         self.set_config()
 
+        text = self.render_config_text()
         with open(self.conf_file, 'w') as h:
-            self.config.write(h)
+            h.write(text)
         log.info(f"Wrote config file: {self.conf_file}")
+
+    def render_config_text(self):
+        """Render the config using the packaged template's layout.
+
+        Comments are parsed as option keys (``comment_prefixes='/'``), so a
+        comment containing ``:`` or ``=`` collapses into one shared key per
+        section and old comments survive forever in their original position.
+        Writing from the template keeps every comment verbatim next to the
+        setting it describes and drops stale ones. Values come from the live
+        config; settings the template does not know are kept at the end of
+        their section.
+        """
+        lines = []
+        written = {}
+        section = None
+
+        def flush_extras(sect):
+            if sect is None or not self.config.has_section(sect):
+                return
+            seen = written.get(sect, set())
+            for key in self.config.options(sect):
+                if key.startswith('#') or key in seen:
+                    continue
+                lines.append(self._format_option(sect, key))
+                seen.add(key)
+
+        for raw_line in self._defaults.splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith('[') and stripped.endswith(']'):
+                flush_extras(section)
+                if lines and lines[-1] != '':
+                    lines.append('')
+                section = stripped[1:-1].strip()
+                written.setdefault(section, set())
+                lines.append(stripped)
+                continue
+            if not stripped or stripped.startswith('#') or section is None:
+                if stripped:
+                    lines.append(stripped)
+                continue
+            key = self.config.optionxform(
+                stripped.split('=', 1)[0].split(':', 1)[0].strip()
+            )
+            if (
+                self.config.has_section(section)
+                and self.config.has_option(section, key)
+            ):
+                lines.append(self._format_option(section, key))
+            else:
+                lines.append(stripped)
+            written[section].add(key)
+        flush_extras(section)
+
+        for sect in self.config.sections():
+            if sect in written:
+                continue
+            if lines and lines[-1] != '':
+                lines.append('')
+            lines.append(f"[{sect}]")
+            written[sect] = set()
+            flush_extras(sect)
+        return "\n".join(lines) + "\n"
+
+    def _format_option(self, section, key):
+        value = self.config.get(section, key, raw=True, fallback=None)
+        if value is None:
+            return key
+        value = str(value).replace('\n', '\n\t')
+        return f"{key} = {value}"
 
 
     def set_config(self):
@@ -936,6 +1016,44 @@ def resolve_provider_setting(name, cfg=None):
             return max(low, min(high, legacy_value))
 
     return max(low, min(high, default))
+
+
+def _migrate_config_revision(cfg, user_config):
+    """Apply one-time default changes to configs saved by older releases.
+
+    Every save writes every setting, so a saved value cannot tell a user's
+    choice from an old default. The revision marks which changes a file has
+    already seen; each step runs once and the next save records the new
+    revision.
+    """
+    try:
+        revision = int(
+            user_config.get("general", "config_revision", fallback="0")
+        )
+    except (TypeError, ValueError):
+        revision = 0
+    if revision >= CONFIG_REVISION:
+        return
+    if revision < 1:
+        # 3.0.1: strict native partial builds rejected a whole row when one
+        # chunk was late, which served large areas as missing color.
+        current = cfg.config.get(
+            "autoortho",
+            "native_partial_allow_incomplete",
+            fallback="True",
+        )
+        if str(current).strip().lower() in SectionParser.false:
+            cfg.config.set(
+                "autoortho",
+                "native_partial_allow_incomplete",
+                "True",
+            )
+            log.info(
+                "Enabled autoortho.native_partial_allow_incomplete "
+                "(new default; rows that miss their deadline now use "
+                "lower-resolution imagery instead of the missing color)"
+            )
+    cfg.config.set("general", "config_revision", str(CONFIG_REVISION))
 
 
 def _migrate_legacy_provider_options(cfg, user_config):

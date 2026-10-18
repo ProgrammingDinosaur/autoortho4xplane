@@ -203,3 +203,78 @@ def test_existing_scenery_does_not_skip_new_region_storage_check(
     assert readiness.installed_scenery_present is True
     assert readiness.by_id("setup-scenery").status == ReadinessStatus.ERROR
     assert readiness.can_finish is False
+
+
+def _fake_find_library(available):
+    return lambda name: available.get(name)
+
+
+def test_mac_dependency_detects_fuse_t_only_install(monkeypatch):
+    # FUSE-T installs /usr/local/lib/libfuse-t.dylib and nothing macFUSE-like.
+    from ui import readiness
+
+    monkeypatch.delenv("FUSE_LIBRARY_PATH", raising=False)
+    monkeypatch.setattr(
+        readiness.ctypes.util,
+        "find_library",
+        _fake_find_library({"fuse-t": "/usr/local/lib/libfuse-t.dylib"}),
+    )
+
+    check = readiness._mac_dependency_state()
+
+    assert check.status == ReadinessStatus.SUCCESS
+    assert check.details["backend"] == "FUSE-T"
+    assert check.details["library"] == "/usr/local/lib/libfuse-t.dylib"
+
+
+def test_mac_dependency_prefers_macfuse_like_mfusepy(monkeypatch):
+    from ui import readiness
+
+    monkeypatch.delenv("FUSE_LIBRARY_PATH", raising=False)
+    monkeypatch.setattr(
+        readiness.ctypes.util,
+        "find_library",
+        _fake_find_library({
+            "fuse": "/usr/local/lib/libfuse.dylib",
+            "fuse-t": "/usr/local/lib/libfuse-t.dylib",
+        }),
+    )
+
+    check = readiness._mac_dependency_state()
+
+    assert check.status == ReadinessStatus.SUCCESS
+    assert check.details["backend"] == "macFUSE"
+    assert check.details["library"] == "/usr/local/lib/libfuse.dylib"
+
+
+def test_mac_dependency_reports_missing_library(monkeypatch):
+    from ui import readiness
+
+    monkeypatch.delenv("FUSE_LIBRARY_PATH", raising=False)
+    monkeypatch.setattr(readiness.ctypes.util, "find_library", _fake_find_library({}))
+
+    check = readiness._mac_dependency_state()
+
+    assert check.status == ReadinessStatus.ERROR
+    assert check.is_blocking
+
+
+def test_mac_dependency_honors_fuse_library_path(tmp_path, monkeypatch):
+    from ui import readiness
+
+    lib = tmp_path / "libfuse-t.dylib"
+    lib.write_bytes(b"")
+    monkeypatch.setenv("FUSE_LIBRARY_PATH", str(lib))
+    monkeypatch.setattr(readiness.ctypes.util, "find_library", _fake_find_library({}))
+
+    assert readiness._mac_dependency_state().status == ReadinessStatus.SUCCESS
+
+    # A stale override is fatal for mfusepy, so it must not fall back here.
+    monkeypatch.setenv("FUSE_LIBRARY_PATH", str(tmp_path / "missing.dylib"))
+    monkeypatch.setattr(
+        readiness.ctypes.util,
+        "find_library",
+        _fake_find_library({"fuse": "/usr/local/lib/libfuse.dylib"}),
+    )
+
+    assert readiness._mac_dependency_state().status == ReadinessStatus.ERROR

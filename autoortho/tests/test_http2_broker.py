@@ -2069,3 +2069,171 @@ def test_cancelling_parked_requests_does_not_strand_the_origin():
 
     gate.set()
     assert broker.get("http://cancel.test/after").content == b"/after"
+
+
+# ---------------------------------------------------------------------------
+# HTTP/2 stream capacity
+# ---------------------------------------------------------------------------
+
+def test_controller_caps_http2_origins_to_stream_limit():
+    ctl, _ = _controller(
+        initial=0,
+        maximum=320,
+        minimum=64,
+        http2_stream_limit=90,
+    )
+    origin = "https://tiles.test"
+
+    # Before any response reveals the protocol, the first wave is capped too.
+    assert ctl.limit_for(origin) == 90
+    ctl.note_http_version(origin, "HTTP/2", connection_limit=160)
+    for _ in range(500):
+        ctl.on_outcome(origin, status_code=200)
+    assert ctl.limit_for(origin) == 90
+
+
+def test_controller_http1_origins_are_not_bound_by_stream_limit():
+    ctl, _ = _controller(initial=0, maximum=200, http2_stream_limit=90)
+    origin = "https://tiles.test"
+
+    ctl.note_http_version(origin, "HTTP/1.1", connection_limit=160)
+    assert ctl.limit_for(origin) == 160
+
+
+def test_controller_reserves_permits_for_live_requests():
+    ctl, _ = _controller(initial=8, maximum=8, live_reserved_fraction=0.25)
+    origin = "https://tiles.test"
+
+    for _ in range(6):
+        assert ctl.try_acquire(origin, live=False)
+    assert not ctl.try_acquire(origin, live=False)
+    assert ctl.available(origin, live=False) == 0
+    assert ctl.available(origin, live=True) == 2
+    assert ctl.try_acquire(origin, live=True)
+    assert ctl.try_acquire(origin, live=True)
+    assert not ctl.try_acquire(origin, live=True)
+
+
+def test_local_protocol_error_does_not_throttle_origin():
+    ctl, _ = _controller(initial=10)
+    origin = "https://tiles.test"
+
+    verdict = ctl.on_outcome(
+        origin,
+        error=httpx.LocalProtocolError("Max outbound streams is 100, 100 open"),
+    )
+    assert verdict == "neutral"
+    assert ctl.limit_for(origin) == 10
+
+
+def test_stream_capacity_error_is_detected_through_exception_chain():
+    h2_exceptions = pytest.importorskip("h2.exceptions")
+    try:
+        try:
+            raise h2_exceptions.TooManyStreamsError("full")
+        except h2_exceptions.TooManyStreamsError as inner:
+            raise httpx.LocalProtocolError("wrapped") from inner
+    except httpx.LocalProtocolError as exc:
+        assert hb._is_stream_capacity_error(exc)
+    assert hb._is_stream_capacity_error(
+        httpx.LocalProtocolError("Max outbound streams is 100, 100 open")
+    )
+    assert not hb._is_stream_capacity_error(httpx.ReadError(""))
+
+
+def test_stream_capacity_error_is_requeued_instead_of_failing():
+    calls = 0
+    lock = threading.Lock()
+
+    async def handler(request):
+        nonlocal calls
+        with lock:
+            calls += 1
+            attempt = calls
+        if attempt <= 2:
+            raise httpx.LocalProtocolError(
+                "Max outbound streams is 100, 100 open"
+            )
+        return httpx.Response(200, content=b"tile")
+
+    broker = make_broker(handler, max_concurrency=4)
+
+    assert broker.get("http://streams.test/tile").content == b"tile"
+    assert calls == 3
+
+
+def test_stream_capacity_error_fails_after_bounded_retries():
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        raise httpx.LocalProtocolError("Max outbound streams is 100, 100 open")
+
+    broker = make_broker(handler, max_concurrency=4)
+
+    with pytest.raises(hb.BrokerTransportError) as excinfo:
+        broker.get("http://streams.test/never")
+    assert calls == hb._STREAM_CAPACITY_RETRIES + 1
+    assert "LocalProtocolError" in str(excinfo.value)
+
+
+def test_transport_errors_map_to_typed_client_error():
+    async def handler(request):
+        raise httpx.ReadError("")
+
+    broker = make_broker(handler, max_concurrency=4)
+
+    with pytest.raises(hb.BrokerTransportError) as excinfo:
+        broker.get("http://reset.test/tile")
+    # Empty exception messages still identify the failure type.
+    assert "ReadError" in str(excinfo.value)
+
+
+def test_httpcore_stream_reset_closes_abandoned_h2_stream():
+    h2_connection = pytest.importorskip("h2.connection")
+    h2_config = pytest.importorskip("h2.config")
+    httpcore_http2 = pytest.importorskip("httpcore._async.http2")
+    sync = pytest.importorskip("httpcore._synchronization")
+
+    assert hb._install_httpcore_stream_reset()
+    assert hb._install_httpcore_stream_reset()  # idempotent
+
+    state = h2_connection.H2Connection(
+        config=h2_config.H2Configuration(client_side=True)
+    )
+    state.initiate_connection()
+    state.send_headers(
+        1,
+        [
+            (":method", "GET"),
+            (":path", "/"),
+            (":scheme", "https"),
+            (":authority", "tiles.test"),
+        ],
+        end_stream=True,
+    )
+    assert state.open_outbound_streams == 1
+
+    class _FakeConnection:
+        _h2_state = state
+        _events = {1: []}
+        _connection_terminated = None
+        _state = httpcore_http2.HTTPConnectionState.ACTIVE
+        _keepalive_expiry = None
+        _used_all_stream_ids = False
+
+        def __init__(self):
+            self._max_streams_semaphore = sync.AsyncSemaphore(1)
+            self._state_lock = sync.AsyncLock()
+
+    fake = _FakeConnection()
+
+    async def _close():
+        await fake._max_streams_semaphore.acquire()
+        await httpcore_http2.AsyncHTTP2Connection._response_closed(fake, 1)
+
+    asyncio.run(_close())
+
+    assert state.open_outbound_streams == 0
+    assert 1 not in fake._events

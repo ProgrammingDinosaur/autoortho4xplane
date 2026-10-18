@@ -94,6 +94,7 @@ try:
         BrokerCancelledError,
         BrokerCapacityError,
         BrokerTimeoutError,
+        BrokerTransportError,
         BrokerShutdownError,
         BrokerError,
     )
@@ -105,6 +106,7 @@ except ImportError:
             BrokerCancelledError,
             BrokerCapacityError,
             BrokerTimeoutError,
+            BrokerTransportError,
             BrokerShutdownError,
             BrokerError,
         )
@@ -122,6 +124,9 @@ except ImportError:
             """Placeholder used when the broker package is unavailable."""
 
         class BrokerCapacityError(BrokerError):
+            """Placeholder used when the broker package is unavailable."""
+
+        class BrokerTransportError(BrokerError):
             """Placeholder used when the broker package is unavailable."""
 
         class BrokerShutdownError(BrokerError):
@@ -504,6 +509,10 @@ PRIORITY_LIVE = 0       # Live tiles requested by X-Plane (premium, front of que
 PRIORITY_PREFETCH = 100 # Prefetch/pre-built tiles (low priority, back of queue)
 PRIORITY_BACKGROUND_DDS = PRIORITY_PREFETCH
 PRIORITY_CACHE_REPAIR = 500
+# Chunks a degraded row may submit for repair even while prefetch admission is
+# saturated, and how many starved rows a tile remembers for a later retry.
+_HEALING_RESERVED_CHUNKS = 8
+_MAX_DEFERRED_HEALING_ROWS = 64
 PRIORITY_NETWORK_HEALING = 600
 
 
@@ -2093,6 +2102,48 @@ class TimeBudget:
                 f"exhausted={self.exhausted})")
 
 
+class ReadActiveTimeBudget(TimeBudget):
+    """Tile budget that only advances while X-Plane is blocked reading it.
+
+    A wall-clock budget started at the first read (usually the header) kept
+    running while X-Plane was busy with other tiles, so later mipmap-zero
+    reads of the same tile often found it exhausted and were built at once
+    from whatever had arrived (striped rows). Counting only time spent inside
+    reads keeps the "one budget per tile load" contract without billing a
+    tile for time nobody was waiting on it. Overlapping reads count once.
+    """
+
+    def __init__(self, max_seconds: float):
+        super().__init__(max_seconds)
+        self._active_lock = threading.Lock()
+        self._active_reads = 0
+        self._accrued = 0.0
+        self._active_since = None
+
+    def begin_read(self) -> None:
+        with self._active_lock:
+            if self._active_reads == 0:
+                self._active_since = time.monotonic()
+            self._active_reads += 1
+
+    def end_read(self) -> None:
+        with self._active_lock:
+            if self._active_reads <= 0:
+                return
+            self._active_reads -= 1
+            if self._active_reads == 0 and self._active_since is not None:
+                self._accrued += time.monotonic() - self._active_since
+                self._active_since = None
+
+    @property
+    def elapsed(self) -> float:
+        with self._active_lock:
+            elapsed = self._accrued
+            if self._active_since is not None:
+                elapsed += time.monotonic() - self._active_since
+            return elapsed
+
+
 class _AsyncDownload(object):
     """Bookkeeping for one chunk download owned by :class:`_BrokerDownloadStage`."""
 
@@ -3051,9 +3102,11 @@ class Getter(object):
                     )
                     obj._profile_queued_at = None
 
-                # Mark chunk as in-flight (Chunk always has these attributes)
-                obj.in_queue = False
+                # Mark chunk as in-flight (Chunk always has these attributes).
+                # Set in_flight first so no observer sees an idle chunk that
+                # could be revived and submitted twice.
                 obj.in_flight = True
+                obj.in_queue = False
                 with self._inflight_objs_lock:
                     self._inflight_objs.add(obj)
 
@@ -3306,6 +3359,21 @@ class Getter(object):
             else PrefetchSubmitStatus.NO_CAPACITY
         )
 
+def _revive_for_request(chunk) -> bool:
+    """Re-arm *chunk* for a caller that needs its pixels now.
+
+    See ``Chunk.revive_if_abandoned``. Call before any ``ready`` check that
+    decides whether to submit, because a cancelled chunk is marked ready.
+    """
+    if not getattr(chunk, "cancelled", False) or is_shutdown_requested():
+        return False
+    revive = getattr(chunk, "revive_if_abandoned", None)
+    if revive is None or not revive():
+        return False
+    bump("chunk_revived_after_cancel")
+    return True
+
+
 class ChunkGetter(Getter):
     # Track in-progress chunk_ids GLOBALLY to prevent queueing duplicates
     _queued_chunk_ids = set()
@@ -3471,6 +3539,10 @@ class ChunkGetter(Getter):
         if getattr(obj, 'prefetch', False) and getattr(obj, 'priority', 0) < PRIORITY_PREFETCH:
             obj.prefetch = False
             became_foreground = True
+        if not getattr(obj, 'prefetch', False):
+            # A live request for rows whose earlier download was cancelled
+            # at a deadline: retry it instead of serving a permanent hole.
+            _revive_for_request(obj)
         if obj.permanent_failure:
             bump('submit_skip_permanent_failure')
             return False
@@ -7137,6 +7209,21 @@ class BackgroundDDSBuilder:
             
             # Phase 2: Process remaining chunks with transition handling
             # Key difference from live: NO initial time budget, but may get one on transition
+            # The tile budget only advances during X-Plane reads, so this
+            # thread also keeps a wall-clock deadline once the tile is live.
+            live_wall_deadline = None
+
+            def live_budget_spent(budget):
+                nonlocal live_wall_deadline
+                if budget is None:
+                    return False
+                if live_wall_deadline is None:
+                    live_wall_deadline = time.monotonic() + budget.remaining
+                return (
+                    budget.exhausted
+                    or time.monotonic() >= live_wall_deadline
+                )
+
             for i in pending_indices:
                 chunk = chunks[i]
                 _defer_background_build_if_live(tile)
@@ -7145,7 +7232,7 @@ class BackgroundDDSBuilder:
                 # If tile became live, use its time budget for remaining work
                 time_budget = tile._tile_time_budget if tile._is_live else None
                 
-                if tile._is_live and time_budget and time_budget.exhausted:
+                if tile._is_live and live_budget_spent(time_budget):
                     builder.mark_missing(i)
                     prefetch_mm0_missing.append(i)
                     continue
@@ -7159,7 +7246,7 @@ class BackgroundDDSBuilder:
                     # Check for live transition
                     if tile._is_live:
                         time_budget = tile._tile_time_budget
-                        if time_budget and time_budget.exhausted:
+                        if live_budget_spent(time_budget):
                             break  # Budget exhausted, move on
                 
                 # Determine fallback budget (None if prefetching, from tile if live)
@@ -9300,9 +9387,37 @@ class Chunk(object):
                         f"backoff {backoff:.1f}s: {error}")
             return _AttemptOutcome(requeue_delay=backoff)
 
-        log.warning(f"Failed to get chunk {self} on server {request.server}. "
-                    f"Err: {error} URL: {self.url}")
-        return _AttemptOutcome()
+        if not isinstance(
+            error,
+            (BrokerError, requests.exceptions.RequestException),
+        ):
+            log.warning(
+                "Failed to get chunk %s on server %s. Err: %s: %s URL: %s",
+                self,
+                request.server,
+                type(error).__name__,
+                error,
+                self.url,
+            )
+            return _AttemptOutcome()
+
+        # Transport and protocol failures (connection resets, GOAWAY, broker
+        # protocol errors) used to be resubmitted with no delay, which burned
+        # every attempt within a second while the connection recovered.
+        backoff = min(5.0, 0.25 * (2 ** min(self.attempt, 4)))
+        bump("chunk_transport_error_backoff")
+        log.warning(
+            "Failed to get chunk %s on server %s (attempt %d), backoff "
+            "%.2fs. Err: %s: %s URL: %s",
+            self,
+            request.server,
+            self.attempt,
+            backoff,
+            type(error).__name__,
+            error,
+            self.url,
+        )
+        return _AttemptOutcome(requeue_delay=backoff)
 
     @profiled_stage("chunk.resolve")
     def get(self, idx=0, session=requests, timeout=None, max_attempts=None):
@@ -9399,6 +9514,48 @@ class Chunk(object):
             self._settled = False
             self._settled_callbacks.clear()
         return True
+
+    def release_after_deadline(self):
+        """Stop waiting for this chunk without discarding a started download.
+
+        A request that already left the local queue is left to finish so its
+        bytes reach the cache for the next read or a healing pass; cancelling
+        it would throw away a download that is usually moments from done.
+        Work that has not started is cancelled to free its queue slot, and
+        ``revive_if_abandoned`` re-arms it when the rows are requested again.
+        """
+        if self.ready.is_set() or self.cancelled:
+            return
+        on_wire = bool(self._broker_request_id) or (
+            self.in_flight and _get_http2_client() is None
+        )
+        if self.download_started.is_set() and on_wire:
+            # Nobody waits for it now: any retry goes at background priority
+            # so it cannot crowd out the next live read.
+            if self.priority is None or self.priority < PRIORITY_PREFETCH:
+                self.priority = PRIORITY_PREFETCH
+            self.prefetch = True
+            bump('chunk_deadline_left_in_flight')
+            return
+        # Queued locally, waiting for broker capacity or in retry backoff:
+        # nothing is on the wire yet, so free the slot.
+        self.cancel()
+
+    def revive_if_abandoned(self):
+        """Re-arm a chunk whose download was cancelled before producing data.
+
+        Cancellation marks a chunk ready with empty data so waiters unblock;
+        without this, a chunk cancelled at one read's deadline stayed a hole
+        for every later read of the same tile.
+        """
+        if (
+            not self.cancelled
+            or self.permanent_failure
+            or self.data
+            or not self.ready.is_set()
+        ):
+            return False
+        return self.reset_for_retry()
 
     def cancel(self):
         """Cancel this chunk's download.
@@ -9513,6 +9670,23 @@ class MipmapBuildCoordinator:
                     )
             self._condition.notify_all()
 
+    def uncover(self, rows):
+        """Mark rows as needing a rebuild without invalidating other builds."""
+        with self._condition:
+            if self.state == self.CLOSED:
+                return
+            self.covered_rows.difference_update(int(row) for row in rows)
+            if (
+                self.state == self.COMPLETE
+                and len(self.covered_rows) < self.total_rows
+            ):
+                self.state = (
+                    self.PARTIAL_BUILDING
+                    if self._inflight_rows
+                    else self.IDLE
+                )
+            self._condition.notify_all()
+
     def restore_coverage(self, rows):
         with self._condition:
             if self.state == self.CLOSED:
@@ -9621,6 +9795,9 @@ class Tile(object):
         self.imgs = {}
         self._imgs_order = []  # Track insertion order for LRU eviction
         self._img_sizes = {}
+        # Composition provenance of a cached complete mm0 image, so crops
+        # served from it report the sources they were actually built from.
+        self._cached_mm0_sources = None
         self._cached_image_bytes = 0
         try:
             self._image_cache_limit_bytes = max(
@@ -9678,6 +9855,7 @@ class Tile(object):
         # When X-Plane requests a tile that's being prefetched, we transition
         # to "live" mode: apply time budget, boost chunk priorities
         self._is_live = False                           # True when X-Plane requests via FUSE
+        self._fallback_warm_requested = False
         self._live_transition_event = None              # Event to signal transition
         self._active_streaming_builder = None           # Reference for transition coordination
         
@@ -9731,6 +9909,9 @@ class Tile(object):
         self._exact_row_states = {}
         self._exact_row_lock = threading.Lock()
         self._future_healing_rows = set()
+        # Degraded rows whose healing found no prefetch capacity; retried on
+        # later reads instead of being dropped.
+        self._deferred_healing_manifests = {}
 
         #self.tile_condition = threading.Condition()
         if min_zoom:
@@ -10109,6 +10290,63 @@ class Tile(object):
         bump("future_cache_exact_rows_built")
         return True
 
+    def _mipmap_rows_all_covered(self, mipmap):
+        """True unless some mm0 rows still await a rebuild after reopen.
+
+        Bytes for every row can be present (degraded rows are written too),
+        so buffer completeness alone would mark the mipmap retrieved and make
+        later reads skip the rows ``prepare_for_reopen`` released.
+        """
+        if mipmap != 0:
+            return True
+        with self._mipmap_builds_guard:
+            coordinator = self._mipmap_builds.get(0)
+        if coordinator is None:
+            return True
+        with coordinator._condition:
+            return len(coordinator.covered_rows) >= coordinator.total_rows
+
+    def prepare_for_reopen(self):
+        """Let rows served missing/degraded by an earlier open be rebuilt.
+
+        Called by the tile cache when X-Plane opens a cached tile again. It
+        only flips in-memory state (no I/O), so it is safe under the cache
+        lock. The next read of those rows rebuilds them from chunks that
+        arrived since, instead of replaying the old missing color.
+        """
+        if self._closed or self.dds is None:
+            return 0
+        rows = self._mm0_rows.unseal_for_reopen()
+        if not rows:
+            return 0
+        with self._mipmap_builds_guard:
+            coordinator = self._mipmap_builds.get(0)
+        if coordinator is not None:
+            coordinator.uncover(rows)
+        with self._lock:
+            if self.dds.mipmap_list:
+                self.dds.mipmap_list[0].retrieved = False
+        # A cached mm0 composite still holds the old missing color for these
+        # rows; rebuilding from it would replay exactly what is being healed.
+        self._forget_cached_image(0)
+        with self._exact_row_lock:
+            self._future_healing_rows.difference_update(rows)
+            for row in rows:
+                self._deferred_healing_manifests.pop(row, None)
+        bump("mm0_rows_unsealed_on_reopen", len(rows))
+        return len(rows)
+
+    def _drain_deferred_healing(self, limit=2):
+        with self._exact_row_lock:
+            pending = list(self._deferred_healing_manifests.values())[:limit]
+            for manifest in pending:
+                self._deferred_healing_manifests.pop(
+                    manifest.row_index,
+                    None,
+                )
+        for manifest in pending:
+            self._schedule_future_cache_healing(manifest)
+
     def _schedule_future_cache_healing(self, manifest):
         row_index = manifest.row_index
         if manifest.is_exact or self._closed:
@@ -10120,11 +10358,23 @@ class Tile(object):
         try:
             capacity = chunk_getter.prefetch_capacity_snapshot()
             available = max(0, int(capacity.admission_available))
+            live_pressure = bool(capacity.live_pressure)
         except Exception:
             available = 0
+            live_pressure = True
+        if available <= 0 and not live_pressure:
+            # Saturated prefetch must not starve repair of rows X-Plane has
+            # already been shown as missing; take a small bounded share.
+            available = _HEALING_RESERVED_CHUNKS
+            bump("future_cache_healing_reserved_quota")
         if available <= 0:
             with self._exact_row_lock:
                 self._future_healing_rows.discard(row_index)
+                if (
+                    len(self._deferred_healing_manifests)
+                    < _MAX_DEFERRED_HEALING_ROWS
+                ):
+                    self._deferred_healing_manifests[row_index] = manifest
             bump("future_cache_healing_deferred_capacity")
             return
 
@@ -10143,10 +10393,12 @@ class Tile(object):
                 continue
             if chunk.ready.is_set() and chunk.data:
                 continue
-            if chunk.ready.is_set() and not chunk.reset_for_retry():
-                continue
+            # Check the quota before re-arming: a chunk reset and then left
+            # unsubmitted is neither ready nor queued, so nothing completes it.
             if submitted >= available:
                 break
+            if chunk.ready.is_set() and not chunk.reset_for_retry():
+                continue
             chunk.priority = PRIORITY_CACHE_REPAIR
             chunk.prefetch = True
             chunk.add_settled_callback(row_progressed)
@@ -10157,12 +10409,27 @@ class Tile(object):
             ):
                 submitted += 1
             else:
+                if (
+                    not chunk.ready.is_set()
+                    and not chunk.in_queue
+                    and not chunk.in_flight
+                ):
+                    # Rejected after the reset: settle it again so waiters
+                    # unblock; a later live read revives it.
+                    chunk.cancel()
                 break
         if all(chunk.ready.is_set() and chunk.data for chunk in chunks):
             row_progressed(None)
         elif submitted == 0:
             with self._exact_row_lock:
                 self._future_healing_rows.discard(row_index)
+                if (
+                    not self._closed
+                    and len(self._deferred_healing_manifests)
+                    < _MAX_DEFERRED_HEALING_ROWS
+                ):
+                    self._deferred_healing_manifests[row_index] = manifest
+            bump("future_cache_healing_deferred_capacity")
         bump("future_cache_healing_chunks_submitted", submitted)
 
     def _load_partial_dds_rows(self, metadata):
@@ -10554,6 +10821,26 @@ class Tile(object):
         )
         return True
 
+    def _forget_cached_image(self, mipmap: int) -> None:
+        """Stop serving a cached image without closing it.
+
+        The image may still be in use by a concurrent compressor, so it is
+        left for garbage collection like other replaced cache entries.
+        """
+        with self._lock:
+            if self.imgs.pop(mipmap, None) is None:
+                return
+            self._cached_image_bytes = max(
+                0,
+                self._cached_image_bytes - self._img_sizes.pop(mipmap, 0),
+            )
+            try:
+                self._imgs_order.remove(mipmap)
+            except ValueError:
+                pass
+            if mipmap == 0:
+                self._cached_mm0_sources = None
+
     def _release_composition_images(self) -> None:
         with self._lock:
             images = list(self.imgs.values())
@@ -10561,6 +10848,7 @@ class Tile(object):
             self._imgs_order.clear()
             self._img_sizes.clear()
             self._cached_image_bytes = 0
+            self._cached_mm0_sources = None
         for img_data in images:
             image = img_data[0] if isinstance(img_data, tuple) else img_data
             if image is not None and hasattr(image, "close"):
@@ -10839,6 +11127,8 @@ class Tile(object):
         # Submit all missing chunks for high-priority download
         for i in missing_indices:
             chunk = chunks[i]
+            if self._is_live:
+                _revive_for_request(chunk)
             if not chunk.in_queue and not chunk.in_flight and not chunk.ready.is_set():
                 chunk.priority = 0  # Highest priority for live requests
                 chunk_getter.submit(chunk)
@@ -11581,11 +11871,17 @@ class Tile(object):
         if time_budget is not None:
             self._tile_time_budget = time_budget
         
-        # Boost priority of any queued/in-flight background downloads.
-        chunks = self.chunks.get(self.max_zoom, [])
+        # Boost priority of any queued/in-flight background downloads at every
+        # zoom: lower-mipmap chunks feed the mipmaps X-Plane reads first and
+        # the fallbacks mipmap zero needs, so leaving them at prefetch
+        # priority delayed exactly the imagery that avoids missing color.
+        with self._lock:
+            grids = tuple(self.chunks.values())
         reprioritize = False
-        for chunk in chunks:
-            if hasattr(chunk, 'priority') and (hasattr(chunk, 'in_flight') or hasattr(chunk, 'in_queue')):
+        for grid in grids:
+            for chunk in grid:
+                if not hasattr(chunk, 'priority'):
+                    continue
                 if getattr(chunk, 'in_flight', False) or getattr(chunk, 'in_queue', False):
                     chunk.priority = PRIORITY_LIVE
                     chunk.prefetch = False
@@ -12360,7 +12656,10 @@ class Tile(object):
                     compression_im.close()
                 except Exception:
                     pass
-            if new_im is not None and mipmap not in self.imgs:
+            if new_im is not None and not self._is_cached_image(
+                mipmap,
+                new_im,
+            ):
                 try:
                     new_im.close()
                 except Exception:
@@ -12378,6 +12677,7 @@ class Tile(object):
                         mm.buffer is not None
                         and mm.buffer.is_complete()
                         and not mm.retrieved
+                        and self._mipmap_rows_all_covered(mipmap)
                     ):
                         dense = mm.buffer.read_at(0, mm.length)
                         self.dds.replace_mipmap_dense(
@@ -12416,10 +12716,21 @@ class Tile(object):
 
     @profiled_stage("tile.dds_read")
     def _read_dds_bytes_inner(self, offset, length):
-        # Every read for the same open tile shares one wall-clock budget. This
-        # matches the user-facing "complete tile" contract and prevents X-Plane's
-        # block-oriented reads from multiplying the configured timeout.
+        # Every read for the same open tile shares one budget. This matches the
+        # user-facing "complete tile" contract and prevents X-Plane's
+        # block-oriented reads from multiplying the configured timeout. The
+        # budget only advances while a read is in progress.
         request_budget = self._get_or_create_tile_time_budget()
+        begin_read = getattr(request_budget, "begin_read", None)
+        if begin_read is None:
+            return self._read_dds_bytes_budgeted(offset, length, request_budget)
+        begin_read()
+        try:
+            return self._read_dds_bytes_budgeted(offset, length, request_budget)
+        finally:
+            request_budget.end_read()
+
+    def _read_dds_bytes_budgeted(self, offset, length, request_budget):
 
         # Track when this tile was first requested (for stats only)
         if self.first_request_time is None:
@@ -12504,6 +12815,8 @@ class Tile(object):
         for manifest in manifests:
             if not manifest.is_exact:
                 self._schedule_future_cache_healing(manifest)
+        if self._deferred_healing_manifests:
+            self._drain_deferred_healing()
         return data
 
     def _record_mipmap_provenance(self, offset, length):
@@ -12632,7 +12945,7 @@ class Tile(object):
                             )
                         ),
                     )
-                self._tile_time_budget = TimeBudget(budget_seconds)
+                self._tile_time_budget = ReadActiveTimeBudget(budget_seconds)
             return self._tile_time_budget
 
     def _get_or_create_fallback_time_budget(self):
@@ -12773,25 +13086,16 @@ class Tile(object):
         with self._lock:
             cached_img_data = self.imgs.get(mipmap)
         if cached_img_data is not None:
-            # Unpack tuple format (new) or return directly (old format, backward compat)
-            if isinstance(cached_img_data, tuple):
-                img = cached_img_data[0]  # Extract just the image
-                log.debug(f"GET_IMG: Found saved image: {img}")
-                if with_source_manifest and mipmap == 0:
-                    return ComposedImageResult(
-                        img,
-                        self._mm0_provenance.snapshot(),
-                    )
-                return img
-            else:
-                # Old format: just the image without metadata
-                log.debug(f"GET_IMG: Found saved image (old format): {cached_img_data}")
-                if with_source_manifest and mipmap == 0:
-                    return ComposedImageResult(
-                        cached_img_data,
-                        self._mm0_provenance.snapshot(),
-                    )
-                return cached_img_data
+            cached = self._cached_image_for_request(
+                mipmap,
+                cached_img_data,
+                startrow,
+                endrow,
+                zoom,
+                with_source_manifest,
+            )
+            if cached is not None:
+                return cached
 
         log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
         with self._lock:
@@ -12855,6 +13159,8 @@ class Tile(object):
         data_updated = False
         log.debug(f"GET_IMG: {self} submitting chunks for zoom {zoom}.")
         for chunk in chunks:
+            if self._is_live:
+                _revive_for_request(chunk)
             if not chunk.ready.is_set():
                 log.debug(f"GET_IMG: Submitting chunk {chunk} for zoom {zoom}")
                 # INVERTED: Lower detail (higher mipmap) = lower priority number (more urgent)
@@ -12880,6 +13186,8 @@ class Tile(object):
                 data_updated = True
             else:
                 log.debug(f"GET_IMG: Chunk {chunk} already ready - reusing for mipmap {mipmap}")
+        if data_updated and mipmap == 0 and self._is_live:
+            self._warm_fallback_mipmap_chunks()
 
         # We've already determined this mipmap is not marked as 'retrieved' so we should create 
         # a new image, regardless here.
@@ -12919,8 +13227,12 @@ class Tile(object):
         new_im = None
         prefill_source_mm = None
         
-        if complete_img and mipmap == 0 and fallback_level >= 1:
-            # Try to find the best available lower mipmap to use as base
+        if mipmap == 0 and fallback_level >= 1:
+            # Try to find the best available lower mipmap to use as base.
+            # Partial (row-range) reads are the normal X-Plane access pattern,
+            # so they get the matching band of the lower mipmap; otherwise
+            # every chunk that misses its deadline would show missing color.
+            full_img_height = 256 * height
             for source_mm in [1, 2, 3, 4]:
                 if source_mm > self.max_mipmap:
                     continue
@@ -12955,7 +13267,7 @@ class Tile(object):
 
                 # Calculate scale factor from actual dimensions
                 scale_factor_w = img_width // expected_source_width
-                scale_factor_h = img_height // expected_source_height
+                scale_factor_h = full_img_height // expected_source_height
                 if scale_factor_w != scale_factor_h or scale_factor_w < 1:
                     log.debug(f"GET_IMG: Prefill skipping mipmap {source_mm} - non-uniform scale: "
                               f"{scale_factor_w}x{scale_factor_h}")
@@ -12967,7 +13279,22 @@ class Tile(object):
                          f"({source_img._width}x{source_img._height} -> {img_width}x{img_height}, scale={scale_factor}x)")
                 
                 try:
-                    new_im = source_img.scale(scale_factor)
+                    if complete_img:
+                        new_im = source_img.scale(scale_factor)
+                    elif (
+                        scale_factor >= 2
+                        and partial_row_offset % scale_factor == 0
+                        and img_height % scale_factor == 0
+                    ):
+                        new_im = source_img.crop_and_upscale(
+                            0,
+                            partial_row_offset // scale_factor,
+                            expected_source_width,
+                            img_height // scale_factor,
+                            scale_factor,
+                        )
+                    else:
+                        new_im = None
                     if new_im is not None and new_im._width == img_width and new_im._height == img_height:
                         prefill_source_mm = source_mm
                         bump(f'mipmap0_prefill_from_mm{source_mm}')
@@ -13110,9 +13437,10 @@ class Tile(object):
                 if now >= pass2_deadline:
                     log.debug(f"GET_IMG: Pass 2 deadline reached after {now - pass2_start:.2f}s, "
                              f"{len(still_waiting)} chunks moving to fallback")
-                    # Cancel all remaining chunks to free worker slots
+                    # Stop waiting. Downloads already in progress finish into
+                    # the cache; queued work is cancelled to free its slot.
                     for chunk, _, _ in still_waiting:
-                        chunk.cancel()
+                        chunk.release_after_deadline()
                     break
 
                 newly_ready = []
@@ -13170,7 +13498,7 @@ class Tile(object):
                 if id(chunk) in chunks_with_images:
                     continue
                 if time_budget.exhausted and not fallback_extends_budget:
-                    chunk.cancel()  # Free worker slot
+                    chunk.release_after_deadline()
                     time_budget.record_chunk_skipped()
                     bump('chunk_budget_skipped')
                     continue
@@ -13265,8 +13593,9 @@ class Tile(object):
                         )
                     time_budget.record_chunk_processed()
                 else:
-                    # All fallbacks exhausted — cancel chunk to free worker slot
-                    chunk.cancel()
+                    # All fallbacks exhausted for this read. A download still
+                    # in progress may heal the row later, so keep it.
+                    chunk.release_after_deadline()
                     bump('chunk_missing_count')
                     if is_permanent_failure:
                         log.info(f"Chunk {chunk} permanently failed and all fallbacks exhausted")
@@ -13275,12 +13604,12 @@ class Tile(object):
         if pass3_ready > 0:
             log.debug(f"GET_IMG: Pass 3 (fallback): {pass3_ready} additional chunks recovered")
 
-        # Cancel any remaining unprocessed chunks to free worker slots.
-        # This catches chunks that were never processed (e.g. fallback_level=0)
-        # or that fell through all passes without getting an image.
+        # Release any remaining unprocessed chunks. This catches chunks that
+        # were never processed (e.g. fallback_level=0) or that fell through
+        # all passes without getting an image.
         for chunk in chunks:
             if id(chunk) not in chunks_with_images and not chunk.ready.is_set():
-                chunk.cancel()
+                chunk.release_after_deadline()
 
         # === DEFERRED LAZY BUILD ===
         # If any executor thread signaled that lazy build is needed, do it now.
@@ -13338,6 +13667,8 @@ class Tile(object):
                     mipmap,
                     (new_im, col, row, zoom),
                 )
+                if should_cache and mipmap == 0 and composed_sources is not None:
+                    self._cached_mm0_sources = bytes(composed_sources)
 
         # Log budget summary including fallback budget if used
         if fallback_budget is not None:
@@ -13363,6 +13694,125 @@ class Tile(object):
         if with_source_manifest and mipmap == 0:
             return ComposedImageResult(new_im, bytes(composed_sources))
         return new_im
+
+    def _is_cached_image(self, mipmap, img):
+        with self._lock:
+            cached = self.imgs.get(mipmap)
+        if isinstance(cached, tuple):
+            cached = cached[0] if cached else None
+        return cached is img
+
+    def _cached_image_for_request(
+        self,
+        mipmap,
+        cached_img_data,
+        startrow,
+        endrow,
+        zoom,
+        with_source_manifest,
+    ):
+        """Serve a get_img request from a cached complete mipmap image.
+
+        Partial (row-range) requests get a cropped copy of just those rows:
+        returning the whole image made every later partial read compress the
+        full mipmap, fail its length check and serve missing color even
+        though the imagery was already in memory. Returns None when the cache
+        cannot serve the request and the caller should compose normally.
+        """
+        if isinstance(cached_img_data, tuple):
+            img = cached_img_data[0]
+            cached_zoom = (
+                cached_img_data[3] if len(cached_img_data) > 3 else zoom
+            )
+        else:
+            img = cached_img_data
+            cached_zoom = zoom
+        if img is None or getattr(img, "_freed", False):
+            return None
+
+        complete_request = startrow == 0 and endrow is None
+        if not complete_request:
+            if cached_zoom != zoom:
+                return None
+            img_rows = img._height // 256
+            first = max(0, int(startrow))
+            last = img_rows - 1 if endrow is None else int(endrow)
+            if first > last or last >= img_rows:
+                return None
+            cropped = AoImage.new(
+                "RGBA",
+                (img._width, (last - first + 1) * 256),
+                (0, 0, 0),
+            )
+            if cropped is None:
+                return None
+            if not img.crop(cropped, (0, first * 256)):
+                cropped.close()
+                return None
+            bump("cached_image_partial_crop")
+            img = cropped
+
+        if seasons_enabled:
+            saturation = 0.01 * season_saturation_locked(
+                self.row,
+                self.col,
+                self.tilename_zoom,
+            )
+            if saturation < 1.0:
+                # Cached images are stored before desaturation; serve the
+                # same colors a freshly composed image would get.
+                if img is cached_img_data or (
+                    isinstance(cached_img_data, tuple)
+                    and img is cached_img_data[0]
+                ):
+                    img = img.copy()
+                if img is not None:
+                    img = img.desaturate(saturation)
+                if img is None:
+                    return None
+
+        log.debug(f"GET_IMG: Found saved image for mipmap {mipmap}: {img}")
+        if with_source_manifest and mipmap == 0:
+            with self._lock:
+                sources = self._cached_mm0_sources
+            if sources is None:
+                sources = self._mm0_provenance.snapshot()
+            if not complete_request:
+                width = self._mm0_provenance.width
+                sources = sources[first * width:(last + 1) * width]
+            return ComposedImageResult(img, sources)
+        return img
+
+    def _warm_fallback_mipmap_chunks(self):
+        """Fetch the fallback mipmap's chunks once a live mm0 row must wait.
+
+        The fallback zoom (mipmap 2, or the deepest available) needs 1/16 of
+        mipmap zero's downloads. Queuing it while the row waits for its own
+        chunks means a row that misses its deadline can be upscaled from
+        cached lower-zoom imagery instead of being served as missing color.
+        Runs once per tile; reads served entirely from cache never pay for it.
+        """
+        if self._fallback_warm_requested or self.get_fallback_level() < 1:
+            return 0
+        self._fallback_warm_requested = True
+        target_mipmap = min(2, self.max_mipmap)
+        if target_mipmap <= 0 or target_mipmap in self.imgs:
+            return 0
+        grid = self._get_chunk_grid(self.max_zoom - target_mipmap)
+        submitted = 0
+        for chunk in grid.ensure_all():
+            if chunk.ready.is_set() or chunk.in_queue or chunk.in_flight:
+                continue
+            chunk.priority = _calculate_spatial_priority(
+                chunk.row,
+                chunk.col,
+                chunk.zoom,
+                self.max_mipmap - target_mipmap,
+            )
+            if chunk_getter.submit(chunk):
+                submitted += 1
+        bump("fallback_mipmap_warm_chunks", submitted)
+        return submitted
 
     def _try_lazy_build_fallback_mipmap(self, time_budget=None):
         """
@@ -14194,6 +14644,8 @@ class Tile(object):
                 missing_chunks_indices = []
                 for i in need_cache_read:
                     chunk = chunks[i]
+                    if jpeg_datas[i] is None and self._is_live:
+                        _revive_for_request(chunk)
                     if jpeg_datas[i] is None and not chunk.ready.is_set():
                         # Submit for download if not already in queue
                         if not getattr(chunk, 'in_queue', False) and not getattr(chunk, 'in_flight', False):
@@ -14532,12 +14984,20 @@ class Tile(object):
 
         row_chunks = grid.ensure_rows(startrow, endrow)
         # Submit downloads for any chunks not ready
+        pending = False
         for chunk in row_chunks:
+            if priority == PRIORITY_LIVE:
+                _revive_for_request(chunk)
             if not chunk.ready.is_set():
+                pending = True
                 if not getattr(chunk, 'in_queue', False) and not getattr(chunk, 'in_flight', False):
                     chunk.priority = priority
                     chunk.prefetch = priority != PRIORITY_LIVE
                     chunk_getter.submit(chunk)
+        if pending and priority == PRIORITY_LIVE and zoom == self.max_zoom:
+            # The row may miss its deadline: fetch the cheap fallback zoom
+            # now so it is cached by then.
+            self._warm_fallback_mipmap_chunks()
 
         if deadline is None:
             deadline = self._row_deadline(
@@ -14733,7 +15193,7 @@ class Tile(object):
             allow_incomplete = _get_bool_config(
                 CFG.autoortho,
                 "native_partial_allow_incomplete",
-                False,
+                True,
             )
 
             if valid_count < chunk_count and not allow_incomplete:
@@ -14884,16 +15344,28 @@ class Tile(object):
 
             build_succeeded = True
             build_time = time.monotonic() - build_start
-            log.debug(f"_try_native_partial_mipmap_build: SUCCESS rows {startrow}-{endrow} "
-                     f"({result.bytes_written} bytes at offset {row_offset}, "
-                     f"{result.elapsed_ms:.1f}ms native, {build_time*1000:.1f}ms total)")
-            
-            
+            log.debug(
+                "_try_native_partial_mipmap_build: SUCCESS rows %d-%d "
+                "(%d bytes at offset %d, %.1fms native, %.1fms total)",
+                startrow,
+                endrow,
+                result.bytes_written,
+                startrow * bytes_per_chunk_row,
+                result.elapsed_ms,
+                build_time * 1000,
+            )
             return True
         except Exception as e:
-            log.debug(f"_try_native_partial_mipmap_build: Exception: {e}")
+            log.debug(
+                "_try_native_partial_mipmap_build: %s: %s",
+                type(e).__name__,
+                e,
+            )
             bump('native_partial_mipmap_exception')
-            return False
+            # Rows already committed to the DDS are valid; reporting failure
+            # here would make the caller rebuild them through the slow Python
+            # path and skip read-ahead.
+            return build_succeeded
         finally:
             coordinator.finish_partial(
                 startrow,
@@ -14908,6 +15380,7 @@ class Tile(object):
                         mm.buffer is not None
                         and mm.buffer.is_complete()
                         and not mm.retrieved
+                        and self._mipmap_rows_all_covered(mipmap)
                     ):
                         dense = mm.buffer.read_at(0, mm.length)
                         self.dds.replace_mipmap_dense(
@@ -15235,6 +15708,7 @@ class Tile(object):
 
         # 6) Reset state flags for potential tile reuse
         self._lazy_build_attempted = False
+        self._fallback_warm_requested = False
         self._aopipeline_attempted = False
         self._tile_time_budget = None
         self._fallback_time_budget = None
@@ -15375,6 +15849,20 @@ class TileCacher(object):
             if step_count > 0:
                 log.info(f"  Steps: {self.dynamic_zoom_manager.get_summary()}")
                 log.info("  Zoom levels will be adjusted based on predicted altitude")
+                airport_zooms = sorted({
+                    int(step.zoom_level_airports)
+                    for step in self.dynamic_zoom_manager.get_steps()
+                })
+                fixed_airport_zoom = int(
+                    getattr(CFG.autoortho, "max_zoom_near_airports", 18)
+                )
+                if fixed_airport_zoom not in airport_zooms:
+                    log.info(
+                        "  Airport zoom comes from the steps (ZL%s); the fixed-mode "
+                        "max_zoom_near_airports=ZL%d is not used in dynamic mode",
+                        "/".join(str(zoom) for zoom in airport_zooms),
+                        fixed_airport_zoom,
+                    )
             else:
                 log.warning("  No quality steps configured - using default zoom")
             log.info("=" * 60)
@@ -16084,6 +16572,7 @@ class TileCacher(object):
         idx = self._to_tile_id(row, col, map_type, zoom)
 
         log.debug(f"Get_tile: {idx}")
+        reopened = False
         with self.tc_lock:
             tile = self.tiles.get(idx)
             if not tile:
@@ -16122,8 +16611,13 @@ class TileCacher(object):
                 # exhausted budget from a previous (possibly failed) request.
                 tile._tile_time_budget = None
                 tile._fallback_time_budget = None
+                reopened = True
 
             tile.refs += 1
+        if reopened:
+            # Outside tc_lock: takes tile-level locks. The ref taken above
+            # keeps the tile from being evicted meanwhile.
+            tile.prepare_for_reopen()
         return tile
 
     

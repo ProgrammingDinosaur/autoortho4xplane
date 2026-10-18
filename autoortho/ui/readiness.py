@@ -435,30 +435,38 @@ def _check_paths(values: Any) -> ReadinessCheck:
     )
 
 
+# Same names, same order, that mfusepy probes on macOS when it is imported by
+# the mount worker. Mirroring it keeps the wizard in agreement with what will
+# actually be loaded at mount time, without dlopen()ing a FUSE library in the
+# UI process.
+_MAC_FUSE_LIBRARY_NAMES = ("fuse4x", "osxfuse", "fuse", "fuse-t")
+
+
+def _find_mac_fuse_library() -> str | None:
+    override = os.environ.get("FUSE_LIBRARY_PATH")
+    if override:
+        # mfusepy uses the override as-is and never falls back to discovery.
+        return override if os.path.isfile(override) else None
+    for name in _MAC_FUSE_LIBRARY_NAMES:
+        path = ctypes.util.find_library(name)
+        if path:
+            return path
+    return None
+
+
 def _mac_dependency_state() -> ReadinessCheck:
-    candidates = [
-        shutil.which("mount_macfuse"),
-        shutil.which("mount_fusefs"),
-        shutil.which("fuse-t"),
-        "/usr/local/bin/fuse-t",
-        "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse",
-        "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_fusefs",
-        "/Library/Filesystems/osxfuse.fs",
-        "/Library/Filesystems/macfuse.fs",
-        ctypes.util.find_library("osxfuse"),
-        ctypes.util.find_library("macfuse"),
-    ]
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate):
-            return ReadinessCheck(
-                id="setup-dependencies",
-                title="Virtual drive driver (FUSE)",
-                status=ReadinessStatus.SUCCESS,
-                message=f"Found macFUSE/FUSE-T support at {candidate}.",
-                fix_action="",
-                last_checked=_now(),
-                details={"backend": candidate},
-            )
+    libpath = _find_mac_fuse_library()
+    if libpath:
+        backend = "FUSE-T" if "fuse-t" in os.path.basename(libpath).lower() else "macFUSE"
+        return ReadinessCheck(
+            id="setup-dependencies",
+            title="Virtual drive driver (FUSE)",
+            status=ReadinessStatus.SUCCESS,
+            message=f"Found {backend} at {libpath}.",
+            fix_action="",
+            last_checked=_now(),
+            details={"backend": backend, "library": libpath},
+        )
     return ReadinessCheck(
         id="setup-dependencies",
         title="Virtual drive driver (FUSE)",
