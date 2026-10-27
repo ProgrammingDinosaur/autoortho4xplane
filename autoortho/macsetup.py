@@ -87,35 +87,36 @@ def setup_macfuse_mount(path):
 
 
 def is_macfuse_mount(path: str) -> bool:
-    """Return True if the given path is mounted via macFUSE/osxfuse.
+    """Recognize macFUSE and FUSE-T's local NFS backend at this mountpoint.
 
-    Parses the output of the macOS 'mount' command and verifies the FS type
-    at the specific mount point contains a FUSE indicator (fuse, fusefs,
-    osxfuse, macfuse).
+    FUSE-T's NFS mounts have no 'fuse' marker in their filesystem type.
+    Accept the 'fuse-t:' alias or loopback NFS at the exact path, not remote
+    NFS volumes. This is a readiness check, not proof of server identity.
     """
     try:
         import subprocess
-        abs_path = os.path.abspath(os.path.expanduser(path))
-        try:
-            output = subprocess.check_output(["mount"], text=True, errors="ignore")
-        except Exception:
-            return False
+        abs_path = os.path.realpath(os.path.expanduser(path))
+        output = subprocess.check_output(
+            ["mount"], text=True, errors="ignore", timeout=5,
+        )
 
-        needle = f" on {abs_path} "
         for line in output.splitlines():
-            if needle in line:
-                # Example line:
-                #   dev on /Volumes/MyMount (osxfuse, local, nodev, nosuid)
-                if "(" in line and ")" in line:
-                    inside = line[line.find("(") + 1: line.rfind(")")]
-                    parts = [p.strip().lower() for p in inside.split(",")]
-                    return any(
-                        p.startswith("fuse") or "osxfuse" in p or "macfuse" in p or "fusefs" in p
-                        for p in parts
-                    )
-                # If no parentheses, fall back to a substring heuristic
-                ln = line.lower()
-                return ("fuse" in ln) or ("osxfuse" in ln) or ("macfuse" in ln) or ("fusefs" in ln)
+            # Split from the right: mountpoint names may contain spaces or '('.
+            location, separator, options = line.rpartition(" (")
+            if not separator or not options.endswith(")"):
+                continue
+            source, separator, mountpoint = location.partition(" on ")
+            if not separator or os.path.realpath(mountpoint) != abs_path:
+                continue
+            fstype = options[:-1].split(",", 1)[0].strip().lower()
+            if (fstype.startswith("fuse") or fstype in {"osxfuse", "macfuse"}):
+                return True
+            if fstype == "nfs":
+                # FUSE-T serves NFS on loopback; a remote NFS share is not FUSE-T.
+                return source.lower().startswith(
+                    ("fuse-t:", "localhost:", "127.0.0.1:", "[::1]:", "::1:")
+                )
+            return False
         return False
     except Exception as e:
         log.debug(f"is_macfuse_mount failed for {path}: {e}")
