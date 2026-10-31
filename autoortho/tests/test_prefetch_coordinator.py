@@ -613,6 +613,26 @@ def test_quality_deadline_policy_distinguishes_modes():
     ) == 20.0
 
 
+def test_strict_row_wait_survives_spent_tile_budget():
+    class Spent:
+        remaining = 0.0
+
+    class Large:
+        remaining = 500.0
+
+    # Earlier rows spent the tile budget; this row still waits for exact data.
+    assert QualityDeadlinePolicy.wait_seconds(
+        "strict_target", Spent(), 2.0, 5.0, 60.0, True
+    ) == 7.0
+    assert QualityDeadlinePolicy.wait_seconds(
+        "strict_target", Large(), 2.0, 5.0, 60.0, True
+    ) == 60.0
+    # Lower mipmaps keep the responsive bound.
+    assert QualityDeadlinePolicy.wait_seconds(
+        "strict_target", Spent(), 2.0, 5.0, 60.0, False
+    ) == 0.0
+
+
 def test_permanent_hole_parks_after_bounded_attempts():
     coordinator, _, _ = make_coordinator(count=2, burst=2)
     key = publish(coordinator)

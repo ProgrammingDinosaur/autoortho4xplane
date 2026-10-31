@@ -28,7 +28,7 @@ import queue
 from queue import PriorityQueue, Empty, Full
 from functools import wraps, lru_cache
 from pathlib import Path
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 try:
     from autoortho.prefetch import (
@@ -265,7 +265,8 @@ def _batch_read_cache_files(paths: list) -> dict:
     # Try native batch read first (OpenMP parallel, fastest)
     if native is not None:
         try:
-            results = native.batch_read_cache(paths, max_threads=0, validate_jpeg=True)
+            with _native_build_context() as threads:
+                results = native.batch_read_cache(paths, max_threads=threads, validate_jpeg=True)
             output = {}
             for path, (data, success) in zip(paths, results):
                 if success:
@@ -514,6 +515,18 @@ PRIORITY_CACHE_REPAIR = 500
 _HEALING_RESERVED_CHUNKS = 8
 _MAX_DEFERRED_HEALING_ROWS = 64
 PRIORITY_NETWORK_HEALING = 600
+# Local lower-ZL lookups for one partial row, after its target wait expired.
+_PARTIAL_FALLBACK_RESOLVE_SECONDS = 1.0
+
+
+def _partial_fallback_resolve_seconds():
+    try:
+        fallback_timeout = float(
+            getattr(CFG.autoortho, "fallback_timeout", 30.0)
+        )
+    except (TypeError, ValueError):
+        fallback_timeout = 30.0
+    return max(0.01, min(_PARTIAL_FALLBACK_RESOLVE_SECONDS, fallback_timeout))
 
 
 def reset_dds_buffer_pool():
@@ -1077,6 +1090,17 @@ _active_native_builds = 0
 _active_native_thread_count = 0
 _peak_native_thread_count = 0
 _active_native_builds_lock = threading.Lock()
+_native_build_condition = threading.Condition(_active_native_builds_lock)
+_native_build_waiters = deque()
+
+
+def _native_cpu_budget():
+    """Divide CPU capacity between the independently spawned scenery workers."""
+    try:
+        workers = max(1, int(os.getenv("AO_MOUNT_WORKER_COUNT", "1")))
+    except ValueError:
+        workers = 1
+    return max(1, CURRENT_CPU_COUNT // workers)
 
 
 def _native_thread_load() -> tuple:
@@ -1306,6 +1330,8 @@ def begin_shutdown(reason="shutdown"):
     """Signal shutdown and unblock queued/waiting chunk work immediately."""
     global _exact_row_executor
     _shutdown_requested.set()
+    with _native_build_condition:
+        _native_build_condition.notify_all()
     live_pressure_controller.notify_state_change()
     try:
         flight_runtime_gate.stop()
@@ -1562,17 +1588,17 @@ def _thread_budget_for(active: int) -> int:
     """Per-build OpenMP thread count given the number of active builds (including self).
 
     Divides CPU cores across active concurrent builds so total threads ~ cpu_count.
-    Returns at least 2 to ensure each build makes progress.
-    If native_pipeline_threads config is > 0, uses that as a fixed override.
+    Leave capacity for a second build. Explicit settings are capped by the
+    worker's share; reservations enforce the sum, not only each call's size.
     """
     try:
         explicit = int(getattr(CFG.autoortho, 'native_pipeline_threads', 0))
         if explicit > 0:
-            return explicit
+            return min(explicit, _native_cpu_budget())
     except (ValueError, TypeError, AttributeError):
         pass
 
-    return max(2, CURRENT_CPU_COUNT // max(1, active))
+    return max(1, _native_cpu_budget() // max(2, active))
 
 
 class _BackgroundBuildDeferred(Exception):
@@ -1582,21 +1608,48 @@ class _BackgroundBuildDeferred(Exception):
 class _native_build_context:
     """``__enter__`` returns the per-build OpenMP thread budget under the same lock
     that increments the active-build counter, so each build sees itself in the count."""
+    def __init__(self, threads=None):
+        self._requested_threads = threads
+
     def __enter__(self):
         global _active_native_builds, _active_native_thread_count, _peak_native_thread_count
-        with _active_native_builds_lock:
-            _active_native_builds += 1
-            self._threads = _thread_budget_for(_active_native_builds)
-            _active_native_thread_count += self._threads
-            if _active_native_thread_count > _peak_native_thread_count:
-                _peak_native_thread_count = _active_native_thread_count
+        with _native_build_condition:
+            budget = _native_cpu_budget()
+            required = min(budget, max(1, self._requested_threads or 1))
+            ticket = object()
+            _native_build_waiters.append(ticket)
+            _native_build_condition.notify_all()
+            try:
+                # FIFO prevents small background builds from continually
+                # overtaking a partial build waiting for its full reservation.
+                while (
+                    _native_build_waiters[0] is not ticket
+                    or budget - _active_native_thread_count < required
+                ):
+                    if is_shutdown_requested():
+                        raise _BackgroundBuildDeferred("shutdown requested")
+                    _native_build_condition.wait(0.1)
+                if is_shutdown_requested():
+                    raise _BackgroundBuildDeferred("shutdown requested")
+                _active_native_builds += 1
+                self._threads = min(
+                    self._requested_threads or _thread_budget_for(_active_native_builds),
+                    budget - _active_native_thread_count,
+                )
+                _active_native_thread_count += self._threads
+                if _active_native_thread_count > _peak_native_thread_count:
+                    _peak_native_thread_count = _active_native_thread_count
+            finally:
+                _native_build_waiters.remove(ticket)
+                _native_build_condition.notify_all()
         return self._threads
 
     def __exit__(self, *exc):
         global _active_native_builds, _active_native_thread_count
-        with _active_native_builds_lock:
+        with _native_build_condition:
             _active_native_builds -= 1
             _active_native_thread_count -= self._threads
+            _native_build_condition.notify_all()
         return False
 
 
@@ -9092,7 +9145,8 @@ class Chunk(object):
             "EOX": f"https://s2maps-tiles.eu/wmts?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
             "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
             "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
-            "ARC": f"http://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
+            # The http:// endpoint answers every tile with a 301 to https://.
+            "ARC": f"https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
             "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
@@ -12917,10 +12971,10 @@ class Tile(object):
                     suspend_maxwait = suspend_maxwait.lower().strip() in (
                         "true", "1", "yes", "on"
                     )
-                if (
-                    suspend_maxwait
-                    and not getattr(datareftracker, "has_ever_connected", False)
-                ):
+                initial_load = suspend_maxwait and not getattr(
+                    datareftracker, "has_ever_connected", False
+                )
+                if initial_load:
                     budget_seconds = min(budget_seconds * 10.0, 1800.0)
                 quality_mode = _prefetch_quality_mode()
                 if quality_mode == PrefetchQualityMode.PREFER_TARGET:
@@ -12945,6 +12999,8 @@ class Tile(object):
                             )
                         ),
                     )
+                    if initial_load:
+                        budget_seconds = min(budget_seconds * 10.0, 1800.0)
                 self._tile_time_budget = ReadActiveTimeBudget(budget_seconds)
             return self._tile_time_budget
 
@@ -15058,8 +15114,14 @@ class Tile(object):
                     downloader=None,
                 )
                 resolver.set_mipmap_images(self.imgs)
+                # The wait for target chunks has normally spent the row
+                # deadline by now. The resolver only reads the disk cache and
+                # scales mipmaps (no downloader), so it gets its own allowance.
                 budget = FBTimeBudget(
-                    max(0.01, deadline - time.monotonic())
+                    max(
+                        deadline - time.monotonic(),
+                        _partial_fallback_resolve_seconds(),
+                    )
                 )
             except Exception:
                 resolver = None
@@ -15255,7 +15317,9 @@ class Tile(object):
                 source
                 for source in partial_sources
                 if isinstance(source, (bytes, bytearray))
-            ):
+            ), _native_build_context(threads=_native_cpu_budget()):
+                # The partial-build ABI has no max_threads argument. Reserve
+                # its full OpenMP default (bounded in the worker environment).
                 if (
                     allow_incomplete
                     and hasattr(native_dds, "build_partial_mipmap_v2")
@@ -15869,6 +15933,7 @@ class TileCacher(object):
         else:
             log.info("Using fixed max zoom level (ZL%d)", self.target_zoom_level)
 
+        self._clean_stop = threading.Event()
         self.clean_t = threading.Thread(target=self.clean, daemon=True)
         self.clean_t.start()
 
@@ -15876,6 +15941,12 @@ class TileCacher(object):
             # Windows doesn't handle FS cache the same way so enable here.
             self.enable_cache = True
             self.cache_tile_lim = 50
+
+    def stop(self):
+        """Stop periodic work before clearing tile state or the stats manager."""
+        self._clean_stop.set()
+        if self.clean_t is not threading.current_thread():
+            self.clean_t.join(timeout=1.0)
 
     def _compute_dynamic_zoom(self, row: int, col: int, tile_zoom: int) -> int:
         """
@@ -16341,7 +16412,7 @@ class TileCacher(object):
         # If stats are older than this, they're considered unreliable
         global_stat_max_age_sec = 30
 
-        while True:
+        while not self._clean_stop.is_set() and not is_shutdown_requested():
             process = psutil.Process(os.getpid())
             cur_mem = _get_process_mem_bytes(process)
             total_evicted = 0
@@ -16358,7 +16429,7 @@ class TileCacher(object):
             self.show_stats()
 
             if not self.enable_cache:
-                time.sleep(poll_interval)
+                self._clean_stop.wait(poll_interval)
                 continue
 
             # Use aggregated memory across all workers when available; otherwise local RSS
@@ -16553,7 +16624,7 @@ class TileCacher(object):
                 poll_interval = poll_interval_fast
             else:
                 poll_interval = poll_interval_normal
-            time.sleep(poll_interval)
+            self._clean_stop.wait(poll_interval)
 
     def _get_tile(self, row, col, map_type, zoom):
         
@@ -16787,6 +16858,7 @@ def shutdown():
     for obj in gc.get_objects():
         try:
             if isinstance(obj, TileCacher):
+                obj.stop()
                 with obj.tc_lock:
                     for tile in list(obj.tiles.values()):
                         tile.close()

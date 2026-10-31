@@ -26,6 +26,43 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 RELOAD_GENERATION_STAT = "worker_reload_config_generation"
+_worker_stopping = threading.Event()
+
+
+def _start_control_thread(mountpoint):
+    if os.getenv("AO_WORKER_CONTROL_STDIN") != "1":
+        return
+
+    def control():
+        try:
+            descriptor = os.getenv("AO_WORKER_CONTROL_FD")
+            if descriptor is not None:
+                stream = os.fdopen(int(descriptor), "rb", buffering=0)
+            else:
+                # Windows workers use the redirected stdin pipe. GUI builds
+                # may set sys.stdin=None even though descriptor 0 is valid.
+                stream = os.fdopen(os.dup(0), "rb", buffering=0)
+            command = stream.readline()
+            if command in (b"shutdown\n", "shutdown\n", b"", ""):
+                _worker_stopping.set()
+                _begin_worker_shutdown("parent requested shutdown")
+                if not command and system_type == "darwin":
+                    # Parent disappeared: detach through the OS, with the FUSE
+                    # loop still alive. Never exit FUSE from a file callback.
+                    try:
+                        from autoortho.macsetup import unmount_macfuse
+                    except ImportError:
+                        from macsetup import unmount_macfuse
+                    unmount_macfuse(mountpoint)
+        except (OSError, ValueError) as exc:
+            log.debug("Worker control channel closed: %s", exc)
+        finally:
+            if "stream" in locals():
+                stream.close()
+
+    thread = threading.Thread(target=control, name="AO-WorkerControl", daemon=True)
+    thread.start()
+    return thread
 
 
 def configure_worker_logging(mount_name, loglevel: str):
@@ -185,8 +222,7 @@ def _start_reload_poll_thread():
 
     def _poll():
         nonlocal last_seen
-        while True:
-            time.sleep(1.0)
+        while not _worker_stopping.wait(1.0):
             try:
                 generation = get_stat(RELOAD_GENERATION_STAT)
                 if generation and generation != last_seen:
@@ -314,8 +350,10 @@ def main():
             pass
 
         with setupmount(args.mountpoint, mount_systemtype) as mountpoint:
+            ao = AutoOrtho(args.root, use_ns=True)
+            _start_control_thread(os.path.abspath(mountpoint))
             FUSE(
-                AutoOrtho(args.root, use_ns=True),
+                ao,
                 os.path.abspath(mountpoint),
                 **additional_args,
             )
@@ -326,6 +364,7 @@ def main():
         log.error("FUSE mount failed with non-negotiable error: %s", exc)
         raise
     finally:
+        _worker_stopping.set()
         # Persist flight timings before subsystem cleanup. The parent may signal
         # this process as soon as the mount disappears.
         try:

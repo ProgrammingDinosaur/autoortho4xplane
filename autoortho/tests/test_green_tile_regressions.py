@@ -198,10 +198,13 @@ def test_in_flight_cancelled_chunk_is_not_revived(tmp_path):
 # Native partial build success path
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("startrow,row_count", [(0, 1), (1, 1), (2, 2), (15, 1)])
 def test_native_partial_build_success_returns_true(
     no_dynamic_cache,
     tmp_path,
     monkeypatch,
+    startrow,
+    row_count,
 ):
     tile = _tile(tmp_path, 16, 16)
     mm = tile.dds.mipmap_list[0]
@@ -212,11 +215,11 @@ def test_native_partial_build_success_returns_true(
     monkeypatch.setattr(
         tile,
         "_collect_row_chunk_jpegs",
-        lambda *args, **kwargs: ([b"jpeg"] * width, width, 1),
+        lambda *args, **kwargs: ([b"jpeg"] * width * row_count, width, row_count),
     )
     monkeypatch.setattr(tile, "_queue_partial_rows", lambda results: None)
 
-    data = b"\x11" * bytes_per_chunk_row
+    data = b"\x11" * bytes_per_chunk_row * row_count
     fake_native = types.SimpleNamespace(
         build_partial_mipmap=lambda **kwargs: types.SimpleNamespace(
             success=True,
@@ -230,12 +233,14 @@ def test_native_partial_build_success_returns_true(
 
     assert tile._try_native_partial_mipmap_build(
         0,
-        0,
-        0,
+        startrow,
+        startrow + row_count - 1,
         bytes_per_chunk_row,
         None,
     )
-    assert tile.dds.read_at(mm.startpos, bytes_per_chunk_row) == data
+    assert tile.dds.read_at(
+        mm.startpos + startrow * bytes_per_chunk_row, len(data)
+    ) == data
 
 
 # ---------------------------------------------------------------------------
@@ -339,3 +344,95 @@ def test_reopen_keeps_mipmap_unretrieved_until_rows_rebuilt(
     assert not tile._mipmap_rows_all_covered(0)
     coordinator.restore_coverage([3])
     assert tile._mipmap_rows_all_covered(0)
+
+
+# ---------------------------------------------------------------------------
+# Lower-ZL fallback after a row deadline expired
+# ---------------------------------------------------------------------------
+
+def test_partial_fallback_resolves_after_row_deadline_expired(
+    no_dynamic_cache,
+    tmp_path,
+    monkeypatch,
+):
+    from autoortho.aopipeline import fallback_resolver
+
+    budgets = []
+
+    class Resolver:
+        def __init__(self, **kwargs):
+            pass
+
+        def set_mipmap_images(self, images):
+            pass
+
+        def resolve_with_source(self, *args, time_budget=None, **kwargs):
+            budgets.append(time_budget.remaining)
+            getortho.time.sleep(0.02)  # disk read and upscale
+            return b"\x00" * (256 * 256 * 4), "lower_zl_cache"
+
+    monkeypatch.setattr(fallback_resolver, "FallbackResolver", Resolver)
+    tile = _tile(tmp_path, 16, 16)
+    monkeypatch.setattr(tile, "get_fallback_level", lambda: 1)
+    width = tile.chunks_per_row
+
+    # The wait for target chunks spent the whole row deadline.
+    deadline = getortho.time.monotonic() - 5.0
+    sources, fallback, missing, provenance = tile._resolve_partial_sources(
+        [None] * width,
+        0,
+        width,
+        tile.max_zoom,
+        deadline,
+    )
+
+    assert missing == []
+    assert len(fallback) == width
+    assert all(source is not None for source in sources)
+    assert budgets[0] > 0.5
+    assert set(provenance.values()) == {
+        pydds.MipmapProvenance.LOWER_ZL_CACHE
+    }
+
+
+# ---------------------------------------------------------------------------
+# Strict quality mode during X-Plane's initial scenery load
+# ---------------------------------------------------------------------------
+
+def test_strict_tile_budget_keeps_initial_load_extension(
+    no_dynamic_cache,
+    tmp_path,
+    monkeypatch,
+):
+    from autoortho.prefetch import PrefetchQualityMode
+
+    monkeypatch.setattr(
+        getortho,
+        "_prefetch_quality_mode",
+        lambda: PrefetchQualityMode.STRICT_TARGET,
+    )
+    monkeypatch.setattr(getortho.CFG.autoortho, "use_time_budget", True)
+    monkeypatch.setattr(getortho.CFG.autoortho, "suspend_maxwait", True)
+    monkeypatch.setattr(
+        getortho.CFG.autoortho, "strict_target_deadline_sec", 120.0
+    )
+    monkeypatch.setattr(
+        getortho.datareftracker, "has_ever_connected", False, raising=False
+    )
+
+    budget = _tile(tmp_path, 16, 16)._get_or_create_tile_time_budget()
+    assert budget.max_seconds == pytest.approx(1200.0)
+
+    monkeypatch.setattr(
+        getortho.datareftracker, "has_ever_connected", True, raising=False
+    )
+    budget = _tile(tmp_path, 16, 16)._get_or_create_tile_time_budget()
+    assert budget.max_seconds == pytest.approx(120.0)
+
+
+def test_arcgis_requests_use_https(tmp_path):
+    chunk = getortho.Chunk(
+        10, 20, "ARC", 17, cache_dir=str(tmp_path), skip_cache_check=True
+    )
+    url, _headers, _server, _generation = chunk._build_tile_url(0)
+    assert url.startswith("https://services.arcgisonline.com/")
