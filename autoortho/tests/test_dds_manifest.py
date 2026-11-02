@@ -128,6 +128,26 @@ def test_concurrent_readers_observe_one_committed_manifest():
         reader.join()
 
     assert observed == [(b"exact", (result.manifest,))] * 8
+
+
+def test_partial_commit_preserves_served_rows_without_rejecting_new_rows():
+    coordinator = RowStateCoordinator(2)
+    sources = bytes([MipmapSource.TARGET_PROVIDER]) * 2
+    first = _result(0, 1, sources, b"served")
+    replacement = _result(0, 2, sources, b"must-not-install")
+    new_row = _result(1, 2, sources, b"new-row")
+    assert coordinator.commit((first,), lambda rows: None)
+    coordinator.seal_and_read((0,), lambda: first.data, lambda row: None)
+    installed = []
+    assert coordinator.commit(
+        (replacement, new_row), lambda rows: installed.extend(rows),
+        preserve_served=True,
+    )
+    assert installed == [new_row]
+    assert coordinator.manifest(0) == first.manifest
+    assert coordinator.state(0) == RowState.SERVED_EXACT
+    assert coordinator.manifest(1) == new_row.manifest
+    assert coordinator.state(1) == RowState.READY_EXACT
     assert coordinator.state(0) == RowState.SERVED_EXACT
 
 

@@ -21,6 +21,11 @@ try:
 except ImportError:
     from dds_manifest import MipmapSource as MipmapProvenance
 
+try:
+    from autoortho.dxt_upscale import upscale_blocks, numpy_module as dxt_numpy
+except ImportError:
+    from dxt_upscale import upscale_blocks, numpy_module as dxt_numpy
+
 #from functools import lru_cache, cache
 
 #from memory_profiler import profile
@@ -340,6 +345,13 @@ class DenseMipmapBuffer(_CursorCompatibilityMixin, MipmapBuffer):
         with self._lock:
             return {0} if len(self._data) == self.logical_length else set()
 
+    def gaps(self, start, end):
+        """Byte ranges in ``[start, end)`` that were never written."""
+        with self._lock:
+            written = 0 if self._closed else len(self._data)
+        start = max(start, written)
+        return [(start, end)] if start < end else []
+
     def is_complete(self):
         with self._lock:
             return len(self._data) == self.logical_length
@@ -483,6 +495,25 @@ class SparseMipmapBuffer(_CursorCompatibilityMixin, MipmapBuffer):
 
     def is_complete(self):
         return len(self.coverage()) == self.total_units
+
+    def gaps(self, start, end):
+        """Byte ranges in ``[start, end)`` that were never written."""
+        with self._lock:
+            segments = () if self._closed else self._segments
+        gaps = []
+        cursor = start
+        for seg_start, seg_data in segments:
+            seg_end = seg_start + len(seg_data)
+            if seg_end <= cursor:
+                continue
+            if seg_start >= end:
+                break
+            if seg_start > cursor:
+                gaps.append((cursor, seg_start))
+            cursor = max(cursor, seg_end)
+        if cursor < end:
+            gaps.append((cursor, end))
+        return gaps
 
     def allocated_bytes(self):
         with self._lock:
@@ -693,6 +724,16 @@ class MipMap(object):
 
     def allocated_bytes(self):
         return self._buffer.allocated_bytes() if self._buffer is not None else 0
+
+    def gaps(self, start=0, end=None):
+        """Mipmap-relative byte ranges that were never built."""
+        end = self.length if end is None else min(int(end), self.length)
+        start = max(0, int(start))
+        if start >= end:
+            return []
+        if self._buffer is None:
+            return [(start, end)]
+        return self._buffer.gaps(start, end)
 
     def __repr__(self):
         return f"MipMap({self.idx}, {self.startpos}, {self.endpos}, {self.length}, {self.retrieved}, {self.databuffer})"
@@ -935,6 +976,137 @@ class DDS(Structure):
                 )
             )
         return bytes(out)
+
+    def read_served(self, offset, length, exclude_sources=()):
+        """``read_at`` for bytes handed to X-Plane.
+
+        Ranges no build ever wrote are upscaled from the nearest lower
+        mipmap that holds built data; missing color remains only where no
+        lower mipmap covers them. ``exclude_sources`` lists mipmaps not to
+        upscale from (they hold missing color). Never persist this output:
+        it is a display substitute, not built imagery.
+        """
+        data = self.read_at(offset, length)
+        offset = max(0, int(offset))
+        end = offset + len(data)
+        patched = None
+        for mipmap in self.mipmap_list:
+            start = max(offset, mipmap.startpos)
+            stop = min(end, mipmap.endpos)
+            if start >= stop:
+                continue
+            for gap_start, gap_end in mipmap.gaps(
+                start - mipmap.startpos,
+                stop - mipmap.startpos,
+            ):
+                synthesized, _covered = self.synthesize_mipmap_range(
+                    mipmap.idx, gap_start, gap_end, exclude_sources
+                )
+                if synthesized is None:
+                    continue
+                if patched is None:
+                    patched = bytearray(data)
+                at = mipmap.startpos + gap_start - offset
+                patched[at:at + len(synthesized)] = synthesized
+        return data if patched is None else bytes(patched)
+
+    def _block_geometry(self, idx):
+        """``(width_blocks, height_blocks)`` of a mipmap of 4x4 or more."""
+        width = self.width >> idx
+        height = self.height >> idx
+        if width < 4 or height < 4:
+            return None
+        width_blocks = width // 4
+        height_blocks = height // 4
+        if (
+            width_blocks * height_blocks * self.blocksize
+            != self.mipmap_list[idx].length
+        ):
+            return None
+        return width_blocks, height_blocks
+
+    def synthesize_mipmap_range(self, idx, start, end, exclude_sources=()):
+        """Upscale mipmap-relative bytes ``[start, end)`` of mipmap ``idx``
+        from the closest lower mipmaps holding built blocks.
+
+        Returns ``(bytes, covered)``: ``covered`` is a boolean array with one
+        entry per block overlapping the range, True where lower-mipmap
+        imagery was used (missing color elsewhere). ``(None, None)`` when no
+        block could be covered.
+        """
+        np = dxt_numpy()
+        geometry = self._block_geometry(idx)
+        if np is None or geometry is None or start >= end:
+            return None, None
+        width_blocks, _height_blocks = geometry
+        bs = self.blocksize
+        first_block = start // bs
+        block_count = (end - 1) // bs - first_block + 1
+        out = np.frombuffer(
+            _get_fallback_slice(first_block * bs, block_count * bs, bs),
+            dtype=np.uint8,
+        ).reshape(block_count, bs).copy()
+        covered = np.zeros(block_count, dtype=bool)
+        pending = np.arange(first_block, first_block + block_count)
+
+        for source_idx in range(idx + 1, len(self.mipmap_list)):
+            if pending.size == 0:
+                break
+            source_geometry = self._block_geometry(source_idx)
+            if source_geometry is None:
+                break
+            if source_idx in exclude_sources:
+                continue
+            levels = source_idx - idx
+            source_width, source_height = source_geometry
+            # Only the source block rows this range samples.
+            first_row = min(
+                ((int(pending[0]) // width_blocks) * 4 >> levels) >> 2,
+                source_height - 1,
+            )
+            last_row = min(
+                (((int(pending[-1]) // width_blocks) * 4 + 3) >> levels) >> 2,
+                source_height - 1,
+            )
+            row_bytes = source_width * bs
+            read_start = first_row * row_bytes
+            read_end = (last_row + 1) * row_bytes
+            source_mm = self.mipmap_list[source_idx]
+            source_gaps = source_mm.gaps(read_start, read_end)
+            if source_gaps == [(read_start, read_end)]:
+                continue
+            source = source_mm.read_at(read_start, read_end - read_start, bs)
+            blocks, sampled = upscale_blocks(
+                source,
+                source_width,
+                source_height,
+                pending,
+                width_blocks,
+                levels,
+                bs,
+                source_first_row=first_row,
+            )
+            if blocks is None:
+                break
+            built = np.ones((read_end - read_start) // bs, dtype=bool)
+            for gap_start, gap_end in source_gaps:
+                built[
+                    (gap_start - read_start) // bs:
+                    (gap_end - 1 - read_start) // bs + 1
+                ] = False
+            usable = built[sampled - first_row * source_width]
+            if usable.any():
+                slots = pending[usable] - first_block
+                out[slots] = np.frombuffer(blocks, dtype=np.uint8).reshape(
+                    -1, bs
+                )[usable]
+                covered[slots] = True
+            pending = pending[~usable]
+
+        if not covered.any():
+            return None, None
+        trim = start - first_block * bs
+        return out.tobytes()[trim:trim + (end - start)], covered
 
     def read(self, length):
         log.debug(f"PYDDS: READ: {self.position} {length} bytes")

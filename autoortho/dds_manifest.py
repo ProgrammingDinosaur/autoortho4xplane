@@ -241,15 +241,28 @@ class RowStateCoordinator:
         self,
         results: Iterable[CompressedRowResult],
         installer: Callable[[tuple[CompressedRowResult, ...]], None],
+        *,
+        preserve_served: bool = False,
     ) -> bool:
+        """Install atomically, optionally keeping rows sealed by earlier reads."""
         rows = tuple(results)
         if not rows:
             return False
         row_indices = self._validate_results(rows)
         with self._condition:
-            if self._closed or any(
-                self._states[row] in _SERVED_STATES for row in row_indices
-            ):
+            if self._closed:
+                return False
+            if preserve_served:
+                # A kernel read can straddle an immutable row and a new row.
+                # Install the new rows atomically without replacing any bytes
+                # already served during this open.
+                rows = tuple(
+                    result for result in rows
+                    if self._states[result.manifest.row_index] not in _SERVED_STATES
+                )
+                if not rows:
+                    return False
+            elif any(self._states[row] in _SERVED_STATES for row in row_indices):
                 return False
             installer(rows)
             for result in rows:

@@ -2,9 +2,10 @@
 
 The shutdown report identifies a reproducible application shutdown defect, with
 possible additional macFUSE/kernel involvement. The changes in this checkout
-remove the unsafe shutdown sequence and add bounded failure handling. They
-still require validation with a real macFUSE mount before a release can claim
-the reboot-level failure is resolved.
+remove the unsafe shutdown sequence and add bounded failure handling. Local
+live-mount checks passed on macFUSE 5.0.6, as detailed below. Validation of the
+built app on the reported macOS 27/macFUSE 5.4.0 combination is still required
+before claiming the reboot-level failure is resolved.
 
 ## Evidence
 
@@ -52,6 +53,7 @@ written report and the corresponding source code.
 | P1 | Partial builds/cache reads bypass native accounting | Cache batch reads use reserved thread counts. Partial builds reserve their full OpenMP default because their native ABI has no thread-count argument. Worker environment limits are set before native libraries load. |
 | P1 | OpenMP workers spin while idle | Workers default to `OMP_WAIT_POLICY=PASSIVE` and `KMP_BLOCKTIME=0`. User-specified wait policies remain supported. |
 | P1 | Periodic threads continue after shutdown | Tile cleaners have a wakeable stop event and are joined before tile state is cleared. Worker reload polling stops on quiescence. Stats batchers join their background thread after flushing. |
+| P1 | A read crossing an already-served row returns missing-color pixels for the next row | Found during live DDS testing. Partial commits now atomically preserve sealed rows while installing new rows; only installed rows are queued for persistence. Both native and Python partial builders have regression coverage. |
 | P2 | `row_offset` NameError in partial mipmap success path | The current source already uses `startrow * bytes_per_chunk_row` instead of that undefined variable. Regression coverage now includes the first, intermediate, multiple, and last rows, checking actual DDS byte offsets. |
 | P2 | `.app` metadata reports 1.0.0 | Bundle version fields derive from release `VERNAME`, or the project version for local builds. |
 
@@ -90,7 +92,47 @@ While running tests locally, loading the installed `/usr/local/lib/libfuse.2.dyl
 without mounting also caused `CFRelease(NULL)` in a process-exit destructor.
 That is separate evidence about this machine's native library environment,
 not proof of the reported macFUSE kernel failure. Callback unit tests use a
-stub driver; live driver integration remains necessary.
+stub driver. The subsequent live checks exercised the normal source worker
+entrypoint, which exits without running that native destructor.
+
+## Live local check — October 31, 2026
+
+Environment: macOS 26.7.1, Apple Silicon, 10 logical CPUs, Python 3.14.6,
+macFUSE 5.0.6, `/usr/local/lib/libfuse.2.dylib`. The test used temporary backing
+directories and actual macFUSE mounts, production worker supervision, shared
+statistics and download-broker services, and the production parent shutdown
+method. It reused mountpoints across cycles without launching X-Plane.
+
+| Scenario | Successful cycles | Total shutdown time |
+| --- | --- | --- |
+| One mount, verified file read | 20 | 0.76–1.29 s |
+| Six mounts, verified file reads | 3 | 1.17–1.24 s |
+| One mount, native partial DDS reads | 3 | 1.18–1.40 s |
+| Six mounts, concurrent native partial DDS reads | 3 | 0.96–1.16 s |
+
+The DDS input consisted of 341 cached JPEG chunks across ZL12–16. Reads checked
+the DDS header, 4096×4096 dimensions, and mipmap-zero rows 0, 1, 7, and 15.
+Identical source rows had identical compressed checksums. No network imagery
+was needed. Each successful cycle verified worker exit code zero, reaped PIDs,
+and disappearance of every test mount. The final independent process check
+found no test workers, brokers, managers, or mounts remaining. No force-kill or
+reboot was required for successful cycles, and no oversubscription messages or
+native partial exceptions were recorded.
+
+The first DDS attempt exposed a real boundary defect: a 32 KiB kernel read at
+offset 507904 crosses the first 524288-byte data row, which begins after the
+128-byte DDS header. Row zero was already sealed by an earlier read, so the
+combined row-zero/row-one commit was rejected and row one was served missing.
+The fix preserves row zero while committing row one. The subsequent DDS cycles
+passed, and regression tests reproduce the same read sequence for both native
+and Python builders. A harmless `winreg` import error logged on macOS was also
+corrected by restricting that import to Windows.
+
+Detailed JSON results, logs, and the isolated test harness are saved locally
+under `logs/macos-smoke-20261031/`. These checks exercise source workers, cached
+imagery, and an older driver than the report. They do not cover a packaged-app
+bootloader, a 30-minute flight, or network stalls. The test used a three-second
+tile budget and disabled speculative prefetch during the DDS phase.
 
 ## Validation before release
 
@@ -101,12 +143,13 @@ admission/cancellation, and exact partial DDS row placement. Run parent/UI
 tests separately from package-based texture tests: the existing suite mixes
 `autoortho.py` imports with namespace-package imports.
 
-Local verification passed 212 focused tests in two cleanly exiting runs:
-148 texture/runtime/download/queue tests and 64 mount/supervisor/UI lifecycle
-tests. Syntax checks passed for the 11 implementation/build files, and
+The expanded local verification passed 311 focused tests in two cleanly exiting
+runs: 247 texture/runtime/download/queue/cache tests and 64
+mount/supervisor/UI lifecycle tests. Syntax checks passed for implementation/build files, and
 `git diff --check` passed. The Darwin mount-table ABI was checked against the
 local SDK (2,168 bytes), and the cached API returned the APFS root entry.
-No live FUSE mounts were created for this verification.
+The automated regression runs use stubbed mounts; the live checks above were
+run separately against the installed driver.
 
 The broader Qt runtime suite aborted inside native `QWizard` code while opening
 the setup wizard during settings rendering. The selected asynchronous

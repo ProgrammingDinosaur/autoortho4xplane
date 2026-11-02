@@ -108,6 +108,28 @@ def test_mount_worker_command_frozen(monkeypatch, tmp_path):
     supervisor.stop_all(timeout=0)
 
 
+def test_worker_openmp_limit_respects_share_even_with_inherited_override(monkeypatch, tmp_path):
+    import process_supervisor as ps
+
+    monkeypatch.setattr(ps.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(ps.os, "cpu_count", lambda: 32)
+    monkeypatch.setenv("OMP_NUM_THREADS", "64")
+    monkeypatch.setenv("OMP_THREAD_LIMIT", "99")
+    captured = {}
+    def fake_popen(cmd, **kwargs):
+        captured.update(kwargs["env"])
+        return DummyProcess()
+    monkeypatch.setattr(ps.subprocess, "Popen", fake_popen)
+    supervisor = AOProcessSupervisor()
+    handle = supervisor.start_mount_worker(
+        "/ao/root", "/xp/z_ao_na", "z_ao_na", False,
+        extra_env={"AO_MOUNT_WORKER_COUNT": "6"},
+    )
+    assert captured["OMP_THREAD_LIMIT"] == "5"
+    handle.process.returncode = 0
+    supervisor.stop_all(timeout=0)
+
+
 def test_posix_stop_retains_worker_stuck_after_sigkill(monkeypatch):
     import process_supervisor as ps
 
