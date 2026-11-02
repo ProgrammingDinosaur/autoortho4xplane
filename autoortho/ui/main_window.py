@@ -7333,21 +7333,36 @@ class ConfigUI(QMainWindow):
         if self.runtime_state != RuntimeState.RUNNING:
             return
         handles = list(getattr(self, "mount_workers", []))
-        dead = [
-            handle for handle in handles
-            if handle.process.poll() is not None
-        ]
+        dead = []
+        for handle in handles:
+            exit_code = handle.process.poll()
+            if exit_code is not None:
+                dead.append((handle, exit_code))
         if handles and not dead:
             return
 
         self.mount_monitor_timer.stop()
         if dead:
+            # Record the initiating failure before cleanup changes the other
+            # workers' state. The status-bar message is emitted after cleanup.
+            for handle, exit_code in dead:
+                log.error(
+                    "Mount worker failed before streaming cleanup: "
+                    "mount=%s pid=%s exit_code=%d (0x%08X)",
+                    handle.mountpoint,
+                    getattr(handle.process, "pid", "unknown"),
+                    exit_code,
+                    exit_code & 0xFFFFFFFF,
+                )
+            handle, exit_code = dead[0]
             detail = (
-                f"Mount worker for {dead[0].mountpoint} exited with "
-                f"code {dead[0].process.poll()}."
+                f"Mount worker for {handle.mountpoint} "
+                f"(PID {getattr(handle.process, 'pid', 'unknown')}) exited with "
+                f"code {exit_code} (0x{exit_code & 0xFFFFFFFF:08X})."
             )
         else:
             detail = "No active mount workers remain."
+            log.error("Streaming failed before cleanup: %s", detail)
         self._runtime_error_message = detail
         self._start_mount_control(
             "stop",

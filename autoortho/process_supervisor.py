@@ -30,6 +30,8 @@ class WorkerHandle:
     volname: str
     stdout_file: Optional[BinaryIO] = None
     job_handle: Optional[int] = None
+    shutdown_requested: bool = False
+    control_stream: Optional[BinaryIO] = None
 
     @property
     def pid(self) -> int:
@@ -59,6 +61,7 @@ class AOProcessSupervisor:
     ) -> WorkerHandle:
         env = os.environ.copy()
         env["AO_RUN_MODE"] = "mount_worker"
+        env["AO_WORKER_CONTROL_STDIN"] = "1"
 
         if stats_addr:
             env["AO_STATS_ADDR"] = stats_addr
@@ -72,6 +75,22 @@ class AOProcessSupervisor:
 
         if extra_env:
             env.update({str(key): str(value) for key, value in extra_env.items()})
+
+        try:
+            workers = max(1, int(env.get("AO_MOUNT_WORKER_COUNT", "1")))
+        except ValueError:
+            workers = 1
+        cpu_budget = max(1, (os.cpu_count() or 1) // workers)
+        # Set BEFORE the child imports any OpenMP-backed native libraries.
+        # Partial builds and warmup use the runtime defaults, not max_threads.
+        env.setdefault("OMP_NUM_THREADS", str(cpu_budget))
+        try:
+            thread_limit = max(1, int(env.get("OMP_THREAD_LIMIT", cpu_budget)))
+        except ValueError:
+            thread_limit = cpu_budget
+        env["OMP_THREAD_LIMIT"] = str(min(cpu_budget, thread_limit))
+        env.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+        env.setdefault("KMP_BLOCKTIME", "0")
 
         if _is_frozen():
             cmd = [sys.executable]
@@ -100,9 +119,12 @@ class AOProcessSupervisor:
 
         popen_kwargs = {
             "env": env,
+            "stdin": subprocess.PIPE,
             "stdout": std_file,
             "stderr": std_file,
         }
+        control_read = None
+        control_stream = None
         if cwd:
             popen_kwargs["cwd"] = cwd
         if os.name == "nt":
@@ -112,6 +134,13 @@ class AOProcessSupervisor:
             )
         else:
             popen_kwargs["start_new_session"] = True
+            # A private fd survives GUI/windowed bootloaders which replace or
+            # disable sys.stdin. Nothing in the mounted filesystem is touched.
+            control_read, control_write = os.pipe()
+            control_stream = os.fdopen(control_write, "wb", buffering=0)
+            env["AO_WORKER_CONTROL_FD"] = str(control_read)
+            popen_kwargs["pass_fds"] = (control_read,)
+            popen_kwargs["stdin"] = subprocess.DEVNULL
 
         log.debug(
             "Launching mount worker: frozen=%s exe=%s cwd=%s cmd=%s",
@@ -124,7 +153,11 @@ class AOProcessSupervisor:
             process = subprocess.Popen(cmd, **popen_kwargs)
         except Exception:
             _close_quietly(std_file)
+            _close_quietly(control_stream)
             raise
+        finally:
+            if control_read is not None:
+                os.close(control_read)
 
         handle = WorkerHandle(
             process=process,
@@ -132,6 +165,7 @@ class AOProcessSupervisor:
             mountpoint=os.path.expanduser(mountpoint),
             volname=str(volname or ""),
             stdout_file=std_file,
+            control_stream=control_stream,
         )
 
         if os.name == "nt":
@@ -141,10 +175,25 @@ class AOProcessSupervisor:
         log.info("Mount worker for %s started with pid: %s", volname, process.pid)
         return handle
 
+    def prepare_shutdown(self):
+        """Cancel expensive work out of band while keeping FUSE responsive."""
+        for handle in list(self.handles):
+            if handle.poll() is not None or handle.shutdown_requested:
+                continue
+            stream = handle.control_stream or getattr(handle.process, "stdin", None)
+            if stream is None:
+                continue
+            try:
+                stream.write(b"shutdown\n")
+                stream.flush()
+                handle.shutdown_requested = True
+            except (OSError, ValueError) as exc:
+                log.warning("Cannot quiesce worker pid %s: %s", handle.pid, exc)
+
     def stop_worker(self, handle: WorkerHandle, timeout=DEFAULT_WORKER_STOP_TIMEOUT):
         if handle.process.poll() is not None:
             self._cleanup_handle(handle)
-            return
+            return True
 
         self._request_worker_stop(handle)
         try:
@@ -161,7 +210,9 @@ class AOProcessSupervisor:
             except Exception:
                 pass
         finally:
-            self._cleanup_handle(handle)
+            if handle.poll() is not None:
+                self._cleanup_handle(handle)
+        return handle.poll() is not None
 
     def kill_worker_tree(self, handle: WorkerHandle):
         if handle.process.poll() is not None:
@@ -215,15 +266,18 @@ class AOProcessSupervisor:
                 )
                 self.kill_worker_tree(handle)
 
+        kill_deadline = time.monotonic() + max(0.0, timeout)
         for handle in list(self.handles):
             if handle.process.poll() is None:
                 try:
-                    handle.process.wait(timeout=timeout)
+                    handle.process.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
                 except Exception:
                     pass
-            self._cleanup_handle(handle)
-
-        self.handles = []
+            if handle.poll() is not None:
+                self._cleanup_handle(handle)
+            else:
+                log.error("Worker pid %s is still alive after kill; retaining its handle", handle.pid)
+        return not self.handles
 
     def _request_worker_stop(self, handle: WorkerHandle):
         if handle.process.poll() is not None:
@@ -256,6 +310,9 @@ class AOProcessSupervisor:
                 pass
 
         _close_quietly(handle.stdout_file)
+        _close_quietly(getattr(handle.process, "stdin", None))
+        _close_quietly(handle.control_stream)
+        handle.control_stream = None
         handle.stdout_file = None
 
         if os.name == "nt" and handle.job_handle:

@@ -29,12 +29,14 @@ from typing import List, Optional, Tuple
 
 try:
     from autoortho.dds_manifest import (
+        MipmapSource,
         RowBuildManifest,
         manifests_from_dict,
         manifests_to_dict,
     )
 except ImportError:
     from dds_manifest import (
+        MipmapSource,
         RowBuildManifest,
         manifests_from_dict,
         manifests_to_dict,
@@ -1828,8 +1830,10 @@ class DynamicDDSCache:
                     shutil.copy2(source_path, tmp_dds)
                 disk_size = source_size
 
-            with open(tmp_dds, "rb") as committed_dds:
-                os.fsync(committed_dds.fileno())
+                # Windows requires a writable handle for fsync/_commit.
+                # The compression branch already synced its writable handle.
+                with open(tmp_dds, "r+b") as committed_dds:
+                    os.fsync(committed_dds.fileno())
 
             os.replace(tmp_dds, dds_path)
 
@@ -2484,9 +2488,13 @@ class DynamicDDSCache:
     # ------------------------------------------------------------------
 
     def patch_missing_chunks(self, tile_id: str, max_zoom: int, tile,
-                             chunk_jpegs: dict) -> bool:
+                             chunk_jpegs: dict, sources: dict = None) -> bool:
         """In-place patch missing chunks into an existing DDS file and
-        in-memory buffer.  Full implementation in Phase 3.
+        in-memory buffer.
+
+        ``sources`` maps chunk index to the ``MipmapSource`` of its JPEG;
+        chunks not listed are target-zoom provider imagery. Substitutes
+        (upscaled lower zoom) stay listed for healing.
 
         Returns True if all chunks were patched successfully.
         """
@@ -2495,12 +2503,14 @@ class DynamicDDSCache:
             return False
         self._healing_in_progress.add(key)
         try:
-            return self._do_patch(tile_id, max_zoom, tile, chunk_jpegs)
+            return self._do_patch(
+                tile_id, max_zoom, tile, chunk_jpegs, sources
+            )
         finally:
             self._healing_in_progress.discard(key)
 
     def _do_patch(self, tile_id: str, max_zoom: int, tile,
-                  chunk_jpegs: dict) -> bool:
+                  chunk_jpegs: dict, sources: dict = None) -> bool:
         """Core in-place DXT block patching logic.
 
         For each missing chunk: decode JPEG → resize per mipmap → DXT compress
@@ -2511,13 +2521,6 @@ class DynamicDDSCache:
         Compressed files are decompressed into memory, patched, then
         recompressed and written back atomically.
         """
-        from io import BytesIO
-        try:
-            from PIL import Image
-        except ImportError:
-            log.debug(f"Healing: PIL not available, cannot patch {tile_id}")
-            return False
-
         dds_ref = tile.dds
         if dds_ref is None:
             return False
@@ -2533,6 +2536,7 @@ class DynamicDDSCache:
         blocksize = dds_ref.blocksize
         mm_list = dds_ref.mipmap_list
         patched = 0
+        patched_ok = set()
 
         # Determine if the on-disk file is compressed
         meta = self._read_ddm(ddm_path)
@@ -2553,9 +2557,8 @@ class DynamicDDSCache:
                     cx = idx % chunks_per_row
                     cy = idx // chunks_per_row
 
-                    try:
-                        rgba_img = Image.open(BytesIO(jpeg_data)).convert("RGBA")
-                    except Exception:
+                    levels = self._patch_rgba_levels(jpeg_data)
+                    if levels is None:
                         log.debug(f"Healing: JPEG decode failed for chunk {idx}")
                         continue
 
@@ -2577,14 +2580,10 @@ class DynamicDDSCache:
                         block_y = cy * blocks_per_side
                         stripe_bytes = blocks_per_side * blocksize
 
-                        if mm_idx == 0:
-                            resized = rgba_img.resize((chunk_pixels, chunk_pixels), Image.LANCZOS) \
-                                if rgba_img.size != (chunk_pixels, chunk_pixels) else rgba_img
-                        else:
-                            resized = rgba_img.resize((chunk_pixels, chunk_pixels), Image.LANCZOS)
-
+                        if mm_idx >= len(levels):
+                            break
                         dxt_data = dds_ref.compress(chunk_pixels, chunk_pixels,
-                                                    resized.tobytes())
+                                                    levels[mm_idx])
                         if dxt_data is None:
                             log.debug(f"Healing: DXT compress failed for chunk {idx} mm{mm_idx}")
                             continue
@@ -2608,6 +2607,11 @@ class DynamicDDSCache:
                                 )
 
                     patched += 1
+                    patched_ok.add(idx)
+
+                read_row = lambda start, length: bytes(
+                    dds_data[start:start + length]
+                )
 
                 # Recompress and write back atomically
                 compressed = self._compress_dds(bytes(dds_data))
@@ -2623,9 +2627,8 @@ class DynamicDDSCache:
                         cx = idx % chunks_per_row
                         cy = idx // chunks_per_row
 
-                        try:
-                            rgba_img = Image.open(BytesIO(jpeg_data)).convert("RGBA")
-                        except Exception:
+                        levels = self._patch_rgba_levels(jpeg_data)
+                        if levels is None:
                             log.debug(f"Healing: JPEG decode failed for chunk {idx}")
                             continue
 
@@ -2647,14 +2650,10 @@ class DynamicDDSCache:
                             block_y = cy * blocks_per_side
                             stripe_bytes = blocks_per_side * blocksize
 
-                            if mm_idx == 0:
-                                resized = rgba_img.resize((chunk_pixels, chunk_pixels), Image.LANCZOS) \
-                                    if rgba_img.size != (chunk_pixels, chunk_pixels) else rgba_img
-                            else:
-                                resized = rgba_img.resize((chunk_pixels, chunk_pixels), Image.LANCZOS)
-
+                            if mm_idx >= len(levels):
+                                break
                             dxt_data = dds_ref.compress(chunk_pixels, chunk_pixels,
-                                                        resized.tobytes())
+                                                        levels[mm_idx])
                             if dxt_data is None:
                                 log.debug(f"Healing: DXT compress failed for chunk {idx} mm{mm_idx}")
                                 continue
@@ -2677,24 +2676,44 @@ class DynamicDDSCache:
                                     )
 
                         patched += 1
+                        patched_ok.add(idx)
 
                     f.flush()
+                    with open(dds_path, "rb") as patched_file:
+                        row_data = {}
+                        for start, length in self._patched_row_ranges(
+                            tile, patched_ok
+                        ):
+                            patched_file.seek(start)
+                            row_data[start] = patched_file.read(length)
+                    read_row = lambda start, length: row_data[start]
 
         except (FileNotFoundError, OSError) as e:
             log.debug(f"Healing: file I/O error for {tile_id}: {e}")
             return False
 
-        patched_set = set(chunk_jpegs.keys())
+        target = int(MipmapSource.TARGET_PROVIDER)
+        patched_sources = {
+            idx: int((sources or {}).get(idx, target)) for idx in patched_ok
+        }
+        exact = {idx for idx, src in patched_sources.items() if src == target}
         remaining_missing = [i for i in (getattr(tile, '_dds_missing_indices', []) or [])
-                             if i not in patched_set]
+                             if i not in patched_ok]
         remaining_fallback = [i for i in (getattr(tile, '_dds_fallback_indices', []) or [])
-                              if i not in patched_set]
+                              if i not in exact]
+        # Substitutes fill the hole but still need the real imagery.
+        remaining_fallback.extend(
+            sorted(set(patched_ok) - exact - set(remaining_fallback))
+        )
         remaining_total = len(remaining_missing) + len(remaining_fallback)
 
         if patched == len(chunk_jpegs):
             # All requested chunks patched — check if anything remains
             meta = self._read_ddm(ddm_path)
             if meta is not None:
+                self._rewrite_patched_manifests(
+                    meta, tile, patched_sources, read_row
+                )
                 meta["needs_healing"] = remaining_total > 0
                 meta["healing_chunks"] = remaining_total
                 meta["missing_indices"] = remaining_missing
@@ -2719,6 +2738,9 @@ class DynamicDDSCache:
         # Partial patch — update DDM with remaining indices
         meta = self._read_ddm(ddm_path)
         if meta is not None:
+            self._rewrite_patched_manifests(
+                meta, tile, patched_sources, read_row
+            )
             meta["missing_indices"] = remaining_missing
             meta["fallback_indices"] = remaining_fallback
             meta["healing_chunks"] = remaining_total
@@ -2737,13 +2759,133 @@ class DynamicDDSCache:
         return False
 
     @staticmethod
-    def _jpeg_exists_on_disk(idx: int, tile, cache_dir: str,
+    def _patch_rgba_levels(payload):
+        """RGBA pixels of one 256 px chunk at every mipmap size down to 4 px.
+
+        ``payload`` is JPEG bytes or raw 256x256 RGBA (healing substitutes
+        are already decoded). Uses the bundled AoImage decoder and a 2x2 box
+        filter, so healing does not depend on Pillow.
+        """
+        import numpy as np
+
+        data = bytes(payload)
+        if data[:3] == b"\xff\xd8\xff":
+            try:
+                from autoortho.aoimage import AoImage
+            except ImportError:
+                from aoimage import AoImage
+            try:
+                img = AoImage.load_from_memory(data)
+            except Exception:
+                img = None
+            if img is None:
+                return None
+            try:
+                if img.size != (256, 256):
+                    return None
+                data = img.tobytes()
+            finally:
+                img.close()
+        if len(data) != 256 * 256 * 4:
+            return None
+        level = np.frombuffer(data, dtype=np.uint8).reshape(256, 256, 4)
+        levels = []
+        while level.shape[0] >= 4:
+            levels.append(level.tobytes())
+            half = level.shape[0] // 2
+            level = (
+                (
+                    level.reshape(half, 2, half, 2, 4)
+                    .astype(np.uint16)
+                    .sum(axis=(1, 3))
+                    + 2
+                )
+                // 4
+            ).astype(np.uint8)
+        return levels
+
+    @staticmethod
+    def _patched_row_ranges(tile, indices):
+        """``(file_offset, length)`` of each mipmap-zero chunk row touched."""
+        dds_ref = tile.dds
+        rows_total = max(1, (dds_ref.height + 255) // 256)
+        chunks_per_row = tile.chunks_per_row
+        mm0 = dds_ref.mipmap_list[0]
+        row_bytes = mm0.length // rows_total
+        rows = sorted({idx // chunks_per_row for idx in indices})
+        return [(mm0.startpos + row * row_bytes, row_bytes) for row in rows]
+
+    def _rewrite_patched_manifests(self, meta, tile, patched_sources, read_row):
+        """Record patched chunks in the mipmap-zero row manifests.
+
+        Serving requires every row manifest to be exact, so without this a
+        fully healed DDS would stay a cache miss forever. Checksums are
+        recomputed from the patched bytes.
+        """
+        if not patched_sources:
+            return
+        try:
+            tile_id = (
+                f"{int(meta['tile_row'])}_{int(meta['tile_col'])}_"
+                f"{meta['map']}_{int(meta['zl'])}"
+            )
+            manifests = manifests_from_dict(
+                meta["mm0_manifest"], tile_id=tile_id
+            )
+            target_zoom = int(meta["mm0_manifest"]["target_zoom"])
+        except (KeyError, TypeError, ValueError):
+            return
+        chunks_per_row = tile.chunks_per_row
+        by_row = {}
+        for idx, source in patched_sources.items():
+            by_row.setdefault(idx // chunks_per_row, {})[
+                idx % chunks_per_row
+            ] = source
+        ranges = dict(
+            zip(
+                sorted(by_row),
+                self._patched_row_ranges(tile, patched_sources),
+            )
+        )
+        for row, columns in by_row.items():
+            old = manifests.get(row)
+            if old is None:
+                continue
+            row_sources = bytearray(old.sources)
+            for column, source in columns.items():
+                if column < len(row_sources):
+                    row_sources[column] = source
+            start, length = ranges[row]
+            manifests[row] = RowBuildManifest.create(
+                tile_id=old.tile_id,
+                target_zoom=old.target_zoom,
+                mipmap=0,
+                row_index=row,
+                build_generation=old.build_generation,
+                sources=row_sources,
+                compressed_data=read_row(start, length),
+            )
+        meta["mm0_manifest"] = manifests_to_dict(
+            manifests, target_zoom=target_zoom
+        )
+
+    @staticmethod
+    def _chunk_coords(tile, idx: int, chunks_per_row: int):
+        """Absolute max_zoom chunk coordinates of a mipmap-zero chunk index.
+
+        ``tile.col``/``tile.row`` are in tile-name zoom units, which differ
+        from max_zoom whenever the target zoom is capped or raised.
+        """
+        coords = getattr(tile, "_max_zoom_chunk_coords", None)
+        if coords is not None:
+            return coords(idx)
+        return tile.col + idx % chunks_per_row, tile.row + idx // chunks_per_row
+
+    @classmethod
+    def _jpeg_exists_on_disk(cls, idx: int, tile, cache_dir: str,
                              chunks_per_row: int, max_zoom: int) -> bool:
         """Check whether a full-resolution JPEG exists on disk for a chunk index."""
-        cx = idx % chunks_per_row
-        cy = idx // chunks_per_row
-        col = tile.col + cx
-        row = tile.row + cy
+        col, row = cls._chunk_coords(tile, idx, chunks_per_row)
         jpeg_path = os.path.join(
             cache_dir,
             f"{col}_{row}_{max_zoom}_{tile.maptype}.jpg")
@@ -2852,10 +2994,7 @@ class DynamicDDSCache:
         chunk_jpegs = {}
 
         for idx in missing:
-            cx = idx % chunks_per_row
-            cy = idx // chunks_per_row
-            col = tile.col + cx
-            row = tile.row + cy
+            col, row = self._chunk_coords(tile, idx, chunks_per_row)
             jpeg_path = os.path.join(
                 tile.cache_dir,
                 f"{col}_{row}_{max_zoom}_{tile.maptype}.jpg")

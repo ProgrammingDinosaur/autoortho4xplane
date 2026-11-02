@@ -28,6 +28,25 @@ _local_stats = {}
 
 _manager = None
 _store = None
+_REMOTE_UNAVAILABLE = object()
+
+
+def _remote_call(store, method, *args):
+    """Telemetry must not kill filesystem/prefetch threads if its manager dies."""
+    global _store, _manager
+    if store is None:
+        return _REMOTE_UNAVAILABLE
+    try:
+        return getattr(store, method)(*args)
+    except (EOFError, OSError):
+        with _local_lock:
+            if _store is store:
+                _store = None
+                _manager = None
+                log.warning("Shared stats connection lost; using local statistics")
+            if getattr(STATS, "_remote", None) is store:
+                STATS._remote = None
+        return _REMOTE_UNAVAILABLE
 
 
 def _connect_manager_from_env():
@@ -54,9 +73,10 @@ def bind_local_store(store):
     instance (not a proxy). All helpers (get/set/inc) and STATS[...] will
     use this store from now on.
     """
-    global _store, STATS
+    global _store
     _store = store
-    STATS = _StatsMapping(_store)
+    # Keep imported STATS references valid across stop/start cycles.
+    STATS._remote = store
     log.info("aostats: bound to shared StatsStore")
 
 
@@ -73,50 +93,65 @@ class _StatsMapping(MutableMapping):
 
     def __getitem__(self, key):
         if self._remote:
-            val = self._remote.get(key, None)
-            if val is None: raise KeyError(key)
-            return val
+            val = _remote_call(self._remote, "get", key, None)
+            if val is not _REMOTE_UNAVAILABLE:
+                if val is None: raise KeyError(key)
+                return val
+            self._remote = None
         with _local_lock:
             return _local_stats[key]
 
     def __setitem__(self, key, value):
         if self._remote:
-            self._remote.set(key, value)
-            return
+            if _remote_call(self._remote, "set", key, value) is not _REMOTE_UNAVAILABLE:
+                return
+            self._remote = None
         with _local_lock:
             _local_stats[key] = value
 
     def __delitem__(self, key):
         if self._remote:
-            self._remote.delete(key)
-            return
+            if _remote_call(self._remote, "delete", key) is not _REMOTE_UNAVAILABLE:
+                return
+            self._remote = None
         with _local_lock:
             del _local_stats[key]
 
     def __iter__(self):
         if self._remote:
             # Remote has no native iter; snapshot for iteration
-            return iter(self._remote.snapshot().keys())
+            snap = _remote_call(self._remote, "snapshot")
+            if snap is not _REMOTE_UNAVAILABLE:
+                return iter(snap)
+            self._remote = None
         with _local_lock:
             return iter(dict(_local_stats).keys())
 
     def __len__(self):
         if self._remote:
-            return len(self._remote.keys())
+            keys = _remote_call(self._remote, "keys")
+            if keys is not _REMOTE_UNAVAILABLE:
+                return len(keys)
+            self._remote = None
         with _local_lock:
             return len(_local_stats)
 
     # Provide dict-like helpers
     def get(self, key, default=None):
         if self._remote:
-            val = self._remote.get(key, None)
-            return default if val is None else val
+            val = _remote_call(self._remote, "get", key, None)
+            if val is not _REMOTE_UNAVAILABLE:
+                return default if val is None else val
+            self._remote = None
         with _local_lock:
             return _local_stats.get(key, default)
 
     def items(self):
         if self._remote:
-            return self._remote.snapshot().items()
+            snap = _remote_call(self._remote, "snapshot")
+            if snap is not _REMOTE_UNAVAILABLE:
+                return snap.items()
+            self._remote = None
         with _local_lock:
             return dict(_local_stats).items()
 
@@ -125,23 +160,18 @@ STATS = _StatsMapping(_store)
 
 
 def set_stat(stat, value):
-    if _store:
-        _store.set(stat, value)
-    else:
-        with _local_lock:
-            _local_stats[stat] = value
+    STATS[stat] = value
 
 
 def get_stat(stat):
-    if _store:
-        return _store.get(stat, 0)
-    with _local_lock:
-        return _local_stats.get(stat, 0)
+    return STATS.get(stat, 0)
 
 
 def inc_stat(stat, amount=1):
     if _store:
-        return _store.inc(stat, amount)  # atomic on the shared store
+        result = _remote_call(_store, "inc", stat, amount)
+        if result is not _REMOTE_UNAVAILABLE:
+            return result
     with _local_lock:
         _local_stats[stat] = _local_stats.get(stat, 0) + amount
         return _local_stats[stat]
@@ -150,23 +180,20 @@ def inc_stat(stat, amount=1):
 def inc_many(items: dict):
     """Batch increment for workers; falls back to local dict when no manager."""
     if _store and hasattr(_store, "inc_many"):
-        _store.inc_many(items)
-    else:
-        with _local_lock:
-            for k, v in items.items():
-                _local_stats[k] = _local_stats.get(k, 0) + int(v)
+        if _remote_call(_store, "inc_many", items) is not _REMOTE_UNAVAILABLE:
+            return
+    with _local_lock:
+        for k, v in items.items():
+            _local_stats[k] = _local_stats.get(k, 0) + int(v)
 
 
 def delete_stat(stat: str):
     """Delete a stat from the shared store or local fallback."""
     if _store:
-        try:
-            _store.delete(stat)
-        except Exception:
-            pass
-    else:
-        with _local_lock:
-            _local_stats.pop(stat, None)
+        if _remote_call(_store, "delete", stat) is not _REMOTE_UNAVAILABLE:
+            return
+    with _local_lock:
+        _local_stats.pop(stat, None)
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +580,8 @@ class StatsBatcher:
         # detect the stop flag and discard the buffer instead of flushing
         self.flush()
         self._stop.set()
+        if self._t is not threading.current_thread():
+            self._t.join(timeout=1.0)
 
     def _flush_unlocked(self):
         if not self._buf:

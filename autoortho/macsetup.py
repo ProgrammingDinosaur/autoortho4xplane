@@ -1,5 +1,13 @@
 import os
 import logging
+import subprocess
+import threading
+import time
+
+try:
+    from autoortho.utils.macos_mounts import find_mount, mount_path
+except ImportError:
+    from utils.macos_mounts import find_mount, mount_path
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
@@ -11,6 +19,61 @@ log = logging.getLogger(__name__)
 
 _IGNORE_FILES = {".DS_Store", ".metadata_never_index"}
 _AO_PLACEHOLDER_ITEMS = {"Earth nav data", "terrain", "textures", ".AO_PLACEHOLDER"}
+_pending_unmounts = {}
+_unmount_lock = threading.Lock()
+
+
+def unmount_macfuse(path, force=False, timeout=8.0):
+    """Detach while the FUSE worker can still answer kernel requests.
+
+    A helper is essential: an unmount syscall can itself stick in the kernel.
+    Do not use subprocess.run or a Popen context manager here: after a timeout
+    both wait without a deadline for a killed helper, which may never exit.
+    """
+    path = mount_path(path)
+    with _unmount_lock:
+        previous = _pending_unmounts.get(path)
+        if previous is not None and previous.poll() is None:
+            log.error("Unmount helper still blocked for %s; leaving worker alive", path)
+            return False
+    if not safe_ismount(path):
+        return True
+    deadline = time.monotonic() + max(0.0, timeout)
+    for forced in ([True] if force else [False, True]):
+        with _unmount_lock:
+            previous = _pending_unmounts.get(path)
+            if previous is not None and previous.poll() is None:
+                log.error("Unmount helper still blocked for %s; leaving worker alive", path)
+                return False
+            command = ["/sbin/umount"] + (["-f"] if forced else []) + [path]
+            try:
+                process = subprocess.Popen(
+                    command, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                log.error("Cannot start unmount helper for %s: %s", path, exc)
+                return False
+            _pending_unmounts[path] = process
+        try:
+            result = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            log.error("Unmount timed out for %s; keeping the FUSE worker alive", path)
+            # A signal cannot recover a kernel deadlock. Never wait unboundedly
+            # here, or launch more helpers against the same stuck filesystem.
+            try:
+                process.kill()
+            except OSError:
+                pass
+            return False
+        if result == 0:
+            with _unmount_lock:
+                _pending_unmounts.pop(path, None)
+            return not safe_ismount(path)
+        if time.monotonic() >= deadline:
+            break
+    log.error("macOS could not unmount %s", path)
+    return False
 
 
 
@@ -94,29 +157,15 @@ def is_macfuse_mount(path: str) -> bool:
     NFS volumes. This is a readiness check, not proof of server identity.
     """
     try:
-        import subprocess
-        abs_path = os.path.realpath(os.path.expanduser(path))
-        output = subprocess.check_output(
-            ["mount"], text=True, errors="ignore", timeout=5,
-        )
-
-        for line in output.splitlines():
-            # Split from the right: mountpoint names may contain spaces or '('.
-            location, separator, options = line.rpartition(" (")
-            if not separator or not options.endswith(")"):
-                continue
-            source, separator, mountpoint = location.partition(" on ")
-            if not separator or os.path.realpath(mountpoint) != abs_path:
-                continue
-            fstype = options[:-1].split(",", 1)[0].strip().lower()
-            if (fstype.startswith("fuse") or fstype in {"osxfuse", "macfuse"}):
-                return True
-            if fstype == "nfs":
-                # FUSE-T serves NFS on loopback; a remote NFS share is not FUSE-T.
-                return source.lower().startswith(
-                    ("fuse-t:", "localhost:", "127.0.0.1:", "[::1]:", "::1:")
-                )
+        entry = find_mount(path)
+        if entry is None:
             return False
+        if entry.fstype.startswith("fuse") or entry.fstype in {"osxfuse", "macfuse"}:
+            return True
+        if entry.fstype == "nfs":
+            return entry.source.lower().startswith(
+                ("fuse-t:", "localhost:", "127.0.0.1:", "[::1]:", "::1:")
+            )
         return False
     except Exception as e:
         log.debug(f"is_macfuse_mount failed for {path}: {e}")

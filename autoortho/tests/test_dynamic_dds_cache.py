@@ -689,6 +689,103 @@ class TestDynamicDDSCache:
             mock_tile.id, 16, "/nonexistent/path.dds", mock_tile)
         assert result is False
 
+    @pytest.mark.parametrize("placement", ["hardlink", "copy", "zstd"])
+    def test_store_from_file_flushes_once_with_write_access(
+        self, dds_cache, mock_tile, sample_dds_bytes, cache_dir,
+        monkeypatch, placement,
+    ):
+        """Windows rejects flushing a read-only handle, even after a write."""
+        import builtins
+        import errno
+        from autoortho.aopipeline import dynamic_dds_cache as module
+
+        # An uncompressed 4K DDS exceeds the fixture's 10 MiB eviction budget.
+        monkeypatch.setattr(dds_cache, "_max_size", 32 * 1024 * 1024)
+        if placement == "zstd" and not module._HAS_ZSTD:
+            pytest.skip("zstandard unavailable")
+        monkeypatch.setattr(
+            dds_cache, "_compression", "zstd" if placement == "zstd" else "none"
+        )
+        if placement == "copy":
+            def no_hardlinks(*args):
+                raise OSError(errno.EXDEV, "Cross-device link")
+            monkeypatch.setattr(module.os, "link", no_hardlinks)
+
+        source_path = os.path.join(cache_dir, "ephemeral_tile.dds")
+        with open(source_path, "wb") as source:
+            source.write(sample_dds_bytes)
+        dds_path, _ = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom,
+        )
+        tmp_dds = dds_path + f".tmp.{os.getpid()}"
+        handles, events = {}, []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def tracked_open(path, *args, **kwargs):
+            handle = builtins.open(path, *args, **kwargs)
+            handles[handle.fileno()] = (os.fspath(path), handle)
+            return handle
+
+        def windows_fsync(fd):
+            path, handle = handles[fd]
+            if not handle.writable():
+                raise OSError(errno.EBADF, "Bad file descriptor")
+            if path == tmp_dds:
+                events.append("flush")
+            real_fsync(fd)
+
+        def replace(source, target):
+            if target == dds_path:
+                events.append("replace")
+            return real_replace(source, target)
+
+        monkeypatch.setattr(module, "open", tracked_open, raising=False)
+        monkeypatch.setattr(module.os, "fsync", windows_fsync)
+        monkeypatch.setattr(module.os, "replace", replace)
+
+        assert dds_cache.store_from_file(
+            mock_tile.id, mock_tile.max_zoom, source_path, mock_tile
+        )
+        assert events == ["flush", "replace"]
+        assert dds_cache.load(
+            mock_tile.id, mock_tile.max_zoom, mock_tile
+        ) == sample_dds_bytes
+        with open(source_path, "rb") as source:
+            assert source.read() == sample_dds_bytes
+        assert not os.path.exists(tmp_dds)
+
+    def test_store_from_file_flush_failure_preserves_sources(
+        self, dds_cache, mock_tile, sample_dds_bytes, cache_dir, monkeypatch,
+    ):
+        import errno
+        from autoortho.aopipeline import dynamic_dds_cache as module
+
+        monkeypatch.setattr(dds_cache, "_compression", "none")
+        cleaned = []
+        monkeypatch.setattr(dds_cache, "_cleanup_jpegs_async", cleaned.append)
+        source_path = os.path.join(cache_dir, "ephemeral_tile.dds")
+        with open(source_path, "wb") as source:
+            source.write(sample_dds_bytes)
+
+        def failed_flush(fd):
+            raise OSError(errno.EIO, "Simulated flush failure")
+
+        monkeypatch.setattr(module.os, "fsync", failed_flush)
+        assert not dds_cache.store_from_file(
+            mock_tile.id, mock_tile.max_zoom, source_path, mock_tile
+        )
+        dds_path, ddm_path = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom,
+        )
+        assert not os.path.exists(dds_path)
+        assert not os.path.exists(ddm_path)
+        assert not os.path.exists(dds_path + f".tmp.{os.getpid()}")
+        with open(source_path, "rb") as source:
+            assert source.read() == sample_dds_bytes
+        assert cleaned == []
+
     def test_atomic_write_no_partial_files(self, dds_cache, mock_tile, sample_dds_bytes):
         """Test that no .tmp files are left after successful store."""
         dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
@@ -2200,3 +2297,61 @@ class TestDDMv5PartialRows:
         assert stats["partial_row_dropped"] == 1
         assert sorted(persisted) == [(0, b"a"), (1, b"cc")]
         cache.close()
+
+
+class TestHealingRestoresServableEntries:
+    """Healing must update the row manifests that gate serving."""
+
+    @staticmethod
+    def _jpeg(directory):
+        from autoortho.aoimage import AoImage
+
+        path = os.path.join(directory, "heal_source.jpg")
+        AoImage.new("RGBA", (256, 256), (90, 120, 60)).write_jpg(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        os.remove(path)
+        return data
+
+    def test_heal_rewrites_manifests_until_exact(
+        self, dds_cache, mock_tile, sample_dds_bytes
+    ):
+        from autoortho.dds_manifest import MipmapSource, manifests_from_dict
+
+        mock_tile.dds.compress = (
+            lambda w, h, data: b"\x07" * (max(1, w * h >> 4) * 8)
+        )
+        missing = [1, 17]
+        dds_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
+                        mock_tile, mm0_missing_indices=missing)
+        tile = MockTile()
+        tile.cache_dir = mock_tile.cache_dir
+        tile.dds.compress = mock_tile.dds.compress
+        for mm in tile.dds.mipmap_list:
+            mm.buffer = None
+        assert dds_cache.load(tile.id, tile.max_zoom, tile) is None
+        jpeg = self._jpeg(mock_tile.cache_dir)
+
+        # Chunk 1 gets real imagery, chunk 17 only an upscaled substitute.
+        dds_cache.patch_missing_chunks(
+            tile.id, tile.max_zoom, tile, {1: jpeg, 17: jpeg},
+            {17: int(MipmapSource.LOWER_ZL_CACHE)},
+        )
+        meta = dds_cache.load_metadata(tile.id, tile.max_zoom, tile)
+        manifests = manifests_from_dict(meta["mm0_manifest"], tile_id=tile.id)
+        assert manifests[0].sources[1] == int(MipmapSource.TARGET_PROVIDER)
+        assert manifests[1].sources[1] == int(MipmapSource.LOWER_ZL_CACHE)
+        assert meta["missing_indices"] == []
+        assert meta["fallback_indices"] == [17]
+        reloaded = MockTile()
+        reloaded.cache_dir = mock_tile.cache_dir
+        assert dds_cache.load(reloaded.id, reloaded.max_zoom, reloaded) is None
+
+        # The real chunk 17 arrives later: the entry becomes servable.
+        dds_cache.patch_missing_chunks(tile.id, tile.max_zoom, tile, {17: jpeg})
+        meta = dds_cache.load_metadata(tile.id, tile.max_zoom, tile)
+        assert meta["fallback_indices"] == []
+        assert not meta["needs_healing"]
+        served = MockTile()
+        served.cache_dir = mock_tile.cache_dir
+        assert dds_cache.load(served.id, served.max_zoom, served) is not None

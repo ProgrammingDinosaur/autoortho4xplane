@@ -17,7 +17,6 @@ import pickle
 import struct
 
 
-from contextlib import contextmanager
 from multiprocessing.managers import BaseManager
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
@@ -175,125 +174,11 @@ def _get_or_create_stats_store():
     return _SERVER_STATS_STORE
 
 
-@contextmanager
-def setupmount(mountpoint, systemtype):
-    mountpoint = os.path.expanduser(mountpoint)
-    placeholder_path = os.path.join(mountpoint, ".AO_PLACEHOLDER")
-    created_mount_dir = False
-    had_placeholder = False
-
-    # Preflight: ensure mount dir is a directory and not currently mounted
-    if safe_ismount(mountpoint):
-        log.warning(f"{mountpoint} is already mounted; attempting to unmount")
-        try:
-            if systemtype in ("winfsp-FUSE", "dokan-FUSE"):
-                try:
-                    winsetup.force_unmount(mountpoint)
-                except Exception as exc:
-                    log.debug(f"Windows force_unmount preflight failed: {exc}")
-            elif systemtype == "macOS":
-                try:
-                    import subprocess
-                    subprocess.run(["diskutil", "unmount", "force", mountpoint],
-                                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception as exc:
-                    log.debug(f"macOS preflight unmount failed: {exc}")
-            elif systemtype == "Linux-FUSE":
-                try:
-                    import subprocess
-                    if shutil.which("fusermount"):
-                        subprocess.run(["fusermount", "-u", "-z", mountpoint],
-                                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    else:
-                        subprocess.run(["umount", "-l", mountpoint],
-                                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception as exc:
-                    log.debug(f"Linux preflight unmount failed: {exc}")
-        except Exception as exc:
-            log.debug(f"Preflight unmount exception (ignored): {exc}")
-        # Wait briefly for unmount to complete
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if not safe_ismount(mountpoint):
-                break
-            time.sleep(0.5)
-        if safe_ismount(mountpoint):
-            raise MountError(f"{mountpoint} is already mounted")
-    # For WinFsp, the directory must NOT exist; let winsetup handle removal of placeholders.
-    if systemtype != "winfsp-FUSE":
-        if not os.path.exists(mountpoint):
-            os.makedirs(mountpoint, exist_ok=True)
-        elif not os.path.isdir(mountpoint):
-            raise MountError(f"{mountpoint} exists but is not a directory")
-
-        # If it's not empty and doesn't look like our placeholder, refuse
-        if os.listdir(mountpoint):
-            # Treat certain metadata or stale control files as ignorable
-            try:
-                entries = [e for e in os.listdir(mountpoint) if e not in ('.DS_Store', '.metadata_never_index', '.poison')]
-            except Exception:
-                entries = os.listdir(mountpoint)
-
-            # If only ignorable files remain, clean them up and proceed
-            if not entries:
-                try:
-                    poison_fp = os.path.join(mountpoint, '.poison')
-                    if os.path.exists(poison_fp):
-                        os.remove(poison_fp)
-                except Exception:
-                    pass
-            elif os.path.exists(placeholder_path):
-                # Remove our placeholder content to ensure an empty dir for FUSE
-                try:
-                    for name in ('Earth nav data', 'terrain', 'textures'):
-                        p = os.path.join(mountpoint, name)
-                        if os.path.isdir(p) and not os.path.islink(p):
-                            shutil.rmtree(p, ignore_errors=True)
-                        elif os.path.exists(p):
-                            try:
-                                os.remove(p)
-                            except Exception:
-                                pass
-                    # Remove the placeholder marker file/dir last
-                    try:
-                        if os.path.isdir(placeholder_path) and not os.path.islink(placeholder_path):
-                            shutil.rmtree(placeholder_path, ignore_errors=True)
-                        elif os.path.exists(placeholder_path):
-                            os.remove(placeholder_path)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    log.warning(f"Failed to cleanup placeholder content at {mountpoint}: {e}")
-                # After cleanup, verify directory is now empty
-                if any(e for e in os.listdir(mountpoint) if e not in ('.DS_Store', '.metadata_never_index')):
-                    raise MountError(f"Mount point {mountpoint} is not empty after cleanup")
-            else:
-                raise MountError(f"Mount point {mountpoint} exists and is not empty")
-
-    # Platform-specific setup
-    if systemtype == "Linux-FUSE":
-        pass
-    elif systemtype == "dokan-FUSE":
-        if not winsetup.setup_dokan_mount(mountpoint):
-            raise MountError(f"Failed to setup mount point {mountpoint}!")
-    elif systemtype == "winfsp-FUSE":
-        if not winsetup.setup_winfsp_mount(mountpoint):
-            raise MountError(f"Failed to setup mount point {mountpoint}!")
-    elif systemtype == "macOS":
-        if not macsetup.setup_macfuse_mount(mountpoint):
-            raise MountError(f"Failed to setup mount point {mountpoint}!")
-    else:
-        raise MountError(f"Unknown system type: {systemtype} for mount {mountpoint}")
-
-    try:
-        yield mountpoint
-
-    finally:
-        # Do not remove if still mounted; just try to present placeholder content.
-        try:
-            cleanup_mountpoint(mountpoint)
-        except Exception as e:
-            log.warning(f"Failed to cleanup mountpoint {mountpoint}: {e}")
+# Share one mount setup implementation with subprocess workers.
+try:
+    from autoortho.mount_setup import setupmount
+except ImportError:
+    from mount_setup import setupmount
 
 
 def diagnose(CFG, mount_timeout=60.0, retry_interval=0.25):
@@ -480,6 +365,7 @@ class AOMount:
         return
 
     def stop_stats_manager(self, join_timeout: float = 2.0):
+        aostats.bind_local_store(None)
         mgr = getattr(self, "stats_manager", None)
         if mgr:
             try:
@@ -508,6 +394,10 @@ class AOMount:
         loglevel = getattr(self.cfg.general, 'file_log_level', 'INFO').upper()
         worker_env = dict(self._performance_profiler_env)
         worker_env.update(self._download_broker_env)
+        worker_env["AO_MOUNT_WORKER_COUNT"] = str(getattr(
+            self, "_worker_cpu_share_count",
+            max(1, len(getattr(self.cfg, "scenery_mounts", []))),
+        ))
         handle = self.mount_worker_supervisor.start_mount_worker(
             root,
             mountpoint,
@@ -551,11 +441,11 @@ class AOMount:
 
     def stop_mount_workers(self, timeout: float = DEFAULT_WORKER_STOP_TIMEOUT):
         log.info("Stopping mount workers...")
-        self.mount_worker_supervisor.stop_all(timeout=timeout)
-        self.mount_workers = []
-        self.mac_os_procs = []
+        stopped = self.mount_worker_supervisor.stop_all(timeout=timeout)
+        self.mount_workers = list(self.mount_worker_supervisor.handles)
+        self.mac_os_procs = [h.process for h in self.mount_workers]
         self.mount_threads = []
-        return
+        return stopped
 
     def stop_macfuse_workers(self, timeout: float = DEFAULT_WORKER_STOP_TIMEOUT):
         self.stop_mount_workers(timeout=timeout)
@@ -990,11 +880,14 @@ class AOMount:
         )
 
     def mount_single(self, root, mountpoint, threading_enabled=True, blocking=True):
+        if self.mount_workers or self._active_mountpoints:
+            raise MountError("Previous mount workers have not stopped")
         self._ensure_parent_services()
         self.mounts_running = True
         self._active_mountpoints = []
         self.mount_workers = []
         self.mac_os_procs = []
+        self._worker_cpu_share_count = 1
         handle = self._launch_scenery_worker(root, mountpoint, threading_enabled)
         if not blocking:
             return handle
@@ -1010,6 +903,9 @@ class AOMount:
         return handle
 
     def mount_sceneries(self, blocking=True):
+        if self.mount_workers or self._active_mountpoints:
+            log.error("Cannot start streaming until previous mounts have stopped")
+            return False
         self._ensure_parent_services()
 
         # Clean up any stale mount folders left behind from a crash
@@ -1028,6 +924,7 @@ class AOMount:
         self._active_mountpoints = []
         self.mount_workers = []
         self.mac_os_procs = []
+        self._worker_cpu_share_count = max(1, len(self.cfg.scenery_mounts))
         try:
             for scenery in self.cfg.scenery_mounts:
                 self._launch_scenery_worker(
@@ -1093,20 +990,53 @@ class AOMount:
                 if scenery.get('mount')
             ]
 
-        for mountpoint in mountpoints:
-            self.unmount(
-                mountpoint,
-                force=force,
-                wait_timeout=DEFAULT_WORKER_STOP_TIMEOUT,
-            )
+        if system_type == "darwin":
+            supervisor = getattr(self, "mount_worker_supervisor", None)
+            if supervisor is not None:
+                supervisor.prepare_shutdown()
+            # Each helper has a deadline; detach all regions concurrently so
+            # one stuck filesystem cannot hold up the remaining mounts.
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, min(8, len(mountpoints))),
+                thread_name_prefix="ao-unmount",
+            ) as executor:
+                results = list(executor.map(
+                    lambda path: self.unmount(
+                        path, force=force, wait_timeout=DEFAULT_WORKER_STOP_TIMEOUT
+                    ),
+                    mountpoints,
+                ))
+            if not all(results):
+                log.error("Unmount incomplete; keeping workers and shared services alive")
+                return False
+        else:
+            for mountpoint in mountpoints:
+                self.unmount(
+                    mountpoint, force=force,
+                    wait_timeout=DEFAULT_WORKER_STOP_TIMEOUT,
+                )
 
-        self.stop_mount_workers(timeout=DEFAULT_WORKER_STOP_TIMEOUT)
+        stopped = self.stop_mount_workers(timeout=DEFAULT_WORKER_STOP_TIMEOUT)
+        if stopped is False:
+            log.error("Workers still alive; keeping shared services for a shutdown retry")
+            return False
         self.stop_download_broker()
 
         remaining_mounts = [
             mountpoint for mountpoint in mountpoints
             if safe_ismount(mountpoint)
         ]
+
+        if remaining_mounts:
+            log.error("Unmount incomplete; mountpoints still active: %s", remaining_mounts)
+            return False
+
+        if system_type == "darwin":
+            for mountpoint in mountpoints:
+                try:
+                    cleanup_mountpoint(mountpoint)
+                except OSError as exc:
+                    log.warning("Could not restore mount placeholder %s: %s", mountpoint, exc)
 
         self._finish_performance_diagnostics()
 
@@ -1117,12 +1047,6 @@ class AOMount:
         self.stop_log_server()
 
         self._active_mountpoints = []
-        if remaining_mounts:
-            log.error(
-                "Unmount incomplete; mountpoints still active: %s",
-                remaining_mounts,
-            )
-            return False
         log.info("Unmount complete")
         return True
 
@@ -1131,6 +1055,8 @@ class AOMount:
 
     def unmount(self, mountpoint, force=False, wait_timeout=10.0):
         log.info(f"Shutting down {mountpoint}")
+        if system_type == "darwin":
+            return macsetup.unmount_macfuse(mountpoint, force=force, timeout=wait_timeout)
         poison_path = os.path.join(mountpoint, ".poison")
 
         try:
@@ -1150,11 +1076,7 @@ class AOMount:
         if safe_ismount(mountpoint):
             try:
                 import subprocess
-                if system_type == 'darwin':
-                    log.info(f"Force unmounting {mountpoint} via diskutil")
-                    subprocess.run(["diskutil", "unmount", "force", mountpoint],
-                                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                elif system_type == 'linux':
+                if system_type == 'linux':
                     log.info(f"Force unmounting {mountpoint} via fusermount -u -z")
                     if shutil.which("fusermount"):
                         subprocess.run(["fusermount", "-u", "-z", mountpoint],

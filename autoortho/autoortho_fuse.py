@@ -1194,13 +1194,18 @@ class AutoOrtho(Operations):
 
     def _getattr_poison(self, now):
         """Handle poison pill for shutdown."""
-        log.info("Poison pill.  Exiting!")
-        try:
-            getortho.begin_shutdown("poison pill")
-        except Exception:
-            pass
-        fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
-        do_fuse_exit(fuse_ptr=fuse_ptr)
+        if system_type == "darwin":
+            # Stopping the request loop inside getattr strands the kernel's
+            # pending requests. macOS must detach before the loop exits.
+            log.warning("Ignoring legacy poison probe on macOS; use OS unmount")
+        else:
+            log.info("Poison pill.  Exiting!")
+            try:
+                getortho.begin_shutdown("poison pill")
+            except Exception:
+                pass
+            fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
+            do_fuse_exit(fuse_ptr=fuse_ptr)
         
         attrs = {
             'st_atime': now, 

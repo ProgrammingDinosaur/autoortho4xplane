@@ -27,6 +27,14 @@ def safe_ismount(path) -> bool:
         return False
     
     try:
+        if sys.platform == "darwin":
+            from .macos_mounts import find_mount
+            try:
+                return find_mount(path) is not None
+            except OSError as exc:
+                # Fail closed: never inspect/clean a possibly live mount.
+                log.warning("Cannot read cached mount table: %s", exc)
+                return True
         return os.path.ismount(path)
     except (OSError, TypeError, ValueError) as e:
         # OSError: WinError 123 "The filename, directory name, or volume label syntax is incorrect"
@@ -41,16 +49,21 @@ _IGNORE_FILES = {".DS_Store", ".metadata_never_index"}
 _AO_PLACEHOLDER_ITEMS = {"Earth nav data", "terrain", "textures", ".AO_PLACEHOLDER"}
 
 def cleanup_mountpoint(mountpoint):
-    placeholder_path = os.path.join(mountpoint, ".AO_PLACEHOLDER")
-    if os.path.lexists(mountpoint):
-        log.info(f"Cleaning up mountpoint: {mountpoint}")
-        os.rmdir(mountpoint)
+    # Checking lexists/rmdir first can deadlock against a stopped FUSE server.
     if safe_ismount(mountpoint):
-        log.debug(f"Skipping cleanup: still mounted: {mountpoint}")
-    else:
-        for d in ('Earth nav data', 'terrain', 'textures'):
-            os.makedirs(os.path.join(mountpoint, d), exist_ok=True)
-        Path(placeholder_path).touch()
+        log.debug("Skipping cleanup: still mounted: %s", mountpoint)
+        return False
+    if os.path.islink(mountpoint) or not is_only_ao_placeholder(mountpoint):
+        # Never label unrelated scenery as disposable placeholder content.
+        log.warning("Skipping cleanup of non-placeholder directory: %s", mountpoint)
+        return False
+    placeholder_path = os.path.join(mountpoint, ".AO_PLACEHOLDER")
+    log.info("Cleaning up mountpoint: %s", mountpoint)
+    # Reusing the directory is idempotent and preserves filesystem metadata.
+    for d in ('Earth nav data', 'terrain', 'textures'):
+        os.makedirs(os.path.join(mountpoint, d), exist_ok=True)
+    Path(placeholder_path).touch()
+    return True
 
 
 def _is_frozen() -> bool:
@@ -129,13 +142,12 @@ def cleanup_stale_mount_folders(custom_scenery_path: str) -> int:
         
         folder_path = os.path.join(custom_scenery_path, entry)
         
-        # Skip if not a directory
-        if not os.path.isdir(folder_path):
-            continue
-        
         # Skip if currently mounted
         if safe_ismount(folder_path):
             log.debug(f"cleanup_stale_mount_folders: skipping mounted folder: {folder_path}")
+            continue
+
+        if not os.path.isdir(folder_path) or os.path.islink(folder_path):
             continue
         
         # Check if folder is empty or contains only placeholder content

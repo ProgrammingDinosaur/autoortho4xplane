@@ -16,10 +16,12 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-try:
-    import winreg as reg
-except ImportError:
-    log.error("Failed to import winreg")
+reg = None
+if sys.platform == "win32":
+    try:
+        import winreg as reg
+    except ImportError:
+        log.error("Failed to import winreg")
 
 _PLACEHOLDER = ".AO_PLACEHOLDER"
 _ALLOWED_PLACEHOLDER = {"Earth nav data", "terrain", "textures", _PLACEHOLDER, "desktop.ini"}

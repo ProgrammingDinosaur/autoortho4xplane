@@ -32,8 +32,10 @@ Usage:
 import logging
 import math
 import os
+import threading
 import time
-from typing import Optional, Dict, Any, TYPE_CHECKING
+from collections import OrderedDict
+from typing import Optional, Dict, Any, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from autoortho.aoimage.AoImage import AoImage
@@ -44,6 +46,43 @@ log = logging.getLogger(__name__)
 CHUNK_WIDTH = 256
 CHUNK_HEIGHT = 256
 CHUNK_BUFFER_SIZE = CHUNK_WIDTH * CHUNK_HEIGHT * 4
+
+# Deepest lower zoom searched for a substitute: 256 >> 8 is one source pixel,
+# still closer to the real terrain colour than missing_color.
+MAX_FALLBACK_ZOOM_LEVELS = 8
+# Decoded parent chunks kept per resolver. Neighbouring missing chunks share
+# parents (2x2 one level down, 4x4 two levels down), so a row decodes each
+# parent once.
+_PARENT_CACHE_ENTRIES = 32
+
+# (col, row, zoom) -> JPEG bytes or None
+ChunkReader = Callable[[int, int, int], Optional[bytes]]
+
+
+def _load_aoimage():
+    try:
+        from autoortho.aoimage import AoImage
+    except ImportError:
+        from aoimage import AoImage
+    return AoImage
+
+
+def _is_jpeg(data) -> bool:
+    return bool(data) and len(data) >= 100 and data[:3] == b"\xff\xd8\xff"
+
+
+def upscale_from_parent(parent_img, col: int, row: int, diff: int):
+    """Crop child ``(col, row)`` out of a chunk ``diff`` zooms lower and
+    scale it back to 256x256. Returns a new AoImage (caller closes it)."""
+    scale = 1 << diff
+    size = CHUNK_WIDTH >> diff
+    return parent_img.crop_and_upscale(
+        (col & (scale - 1)) * size,
+        (row & (scale - 1)) * size,
+        size,
+        size,
+        scale,
+    )
 
 
 class TimeBudget:
@@ -91,7 +130,10 @@ class FallbackResolver:
                  tile_col: int, tile_row: int, tile_zoom: int,
                  fallback_level: int = 2,
                  max_mipmap: int = 3,
-                 downloader = None):
+                 downloader = None,
+                 memory_reader: Optional[ChunkReader] = None,
+                 secondary_reader: Optional[ChunkReader] = None,
+                 grid_origin: Optional[tuple] = None):
         """
         Initialize fallback resolver.
         
@@ -104,6 +146,12 @@ class FallbackResolver:
             fallback_level: 0-2, controls which fallbacks are enabled
             max_mipmap: Maximum mipmap level for this tile
             downloader: Optional chunk downloader for network fallback
+            memory_reader: Returns JPEG bytes of a chunk already downloaded
+                and held in memory (checked before the disk cache)
+            secondary_reader: Returns JPEG bytes from slower storage such as
+                the long-term cache (checked after the local disk cache)
+            grid_origin: ``(col, row)`` of the tile's first chunk at
+                ``tile_zoom``; enables upscaling lower-detail mipmap images
         """
         self.cache_dir = cache_dir
         self.maptype = maptype
@@ -113,9 +161,16 @@ class FallbackResolver:
         self.fallback_level = fallback_level
         self.max_mipmap = max_mipmap
         self.downloader = downloader
+        self.memory_reader = memory_reader
+        self.secondary_reader = secondary_reader
+        self.grid_origin = grid_origin
         
         # Reference to mipmap images for scaling fallback
         self._mipmap_images: Dict[int, Any] = {}
+        # (col, row, zoom) -> decoded AoImage, or None for a known miss.
+        # The lock also covers crops so eviction never frees an image in use.
+        self._parents: "OrderedDict[tuple, Any]" = OrderedDict()
+        self._parents_lock = threading.Lock()
         
         # Statistics
         self.stats = {
@@ -182,7 +237,9 @@ class FallbackResolver:
         
         # Fallback 1: Disk cache search
         if self.fallback_level >= 1:
-            result = self._try_disk_cache_fallback(chunk_col, chunk_row, chunk_zoom, target_mipmap)
+            result = self._try_disk_cache_fallback(
+                chunk_col, chunk_row, chunk_zoom, target_mipmap, time_budget
+            )
             if result:
                 self.stats['disk_cache_hits'] += 1
                 self.stats['total_resolved'] += 1
@@ -221,117 +278,173 @@ class FallbackResolver:
         self.stats['total_failed'] += 1
         return None
     
+    def forget_misses(self) -> None:
+        """Drop cached lookups that found nothing, so chunks downloaded since
+        are seen."""
+        with self._parents_lock:
+            for key in [k for k, img in self._parents.items() if img is None]:
+                del self._parents[key]
+
+    def close(self) -> None:
+        """Free decoded parent chunks."""
+        with self._parents_lock:
+            images = [img for img in self._parents.values() if img is not None]
+            self._parents.clear()
+        for img in images:
+            try:
+                img.close()
+            except Exception:
+                pass
+
     def _try_disk_cache_fallback(self, col: int, row: int, zoom: int,
-                                  target_mipmap: int) -> Optional[bytes]:
+                                  target_mipmap: int,
+                                  time_budget: Optional[TimeBudget] = None
+                                  ) -> Optional[bytes]:
+        """RGBA bytes for the chunk upscaled from the closest lower zoom."""
+        img = self.lower_zoom_image(col, row, zoom, target_mipmap, time_budget)
+        if img is None:
+            return None
+        try:
+            return img.tobytes()
+        finally:
+            img.close()
+
+    def lower_zoom_image(self, col: int, row: int, zoom: int,
+                         target_mipmap: int = 0,
+                         time_budget: Optional[TimeBudget] = None):
         """
-        Search disk cache for lower-zoom JPEG and upscale.
-        
-        Looks for cached chunks at lower zoom levels that cover the
-        target chunk position, then crops and upscales.
+        Upscale the closest available lower-zoom imagery covering a chunk.
+
+        ``zoom`` is the chunk's own zoom. Each lower zoom is tried in order
+        of quality; at every level an already built lower-detail mipmap
+        image, the in-memory chunk, the local disk cache and the secondary
+        reader are checked, cheapest first. The closest level always gets a
+        full search; deeper levels stop once ``time_budget`` is exhausted.
+
+        Returns a new 256x256 AoImage owned by the caller, or None.
         """
         try:
-            # Import AoImage here to avoid circular imports
-            from autoortho.aoimage import AoImage
+            AoImage = _load_aoimage()
         except ImportError:
-            try:
-                from aoimage import AoImage
-            except ImportError:
-                log.warning("FallbackResolver: Could not import AoImage for disk cache fallback")
+            log.warning("FallbackResolver: Could not import AoImage for disk cache fallback")
+            return None
+        if 0 <= self.tile_zoom - zoom:
+            # The chunk's zoom fixes its mipmap level; mipmap images and
+            # their tile-local offsets are keyed by it.
+            target_mipmap = self.tile_zoom - zoom
+
+        levels = min(MAX_FALLBACK_ZOOM_LEVELS, zoom)
+        for diff in range(1, levels + 1):
+            if diff > 1 and time_budget is not None and time_budget.exhausted:
                 return None
-        
-        max_search_zoom = self.tile_zoom
-        
-        for mipmap_diff in range(target_mipmap + 1, self.max_mipmap + 1):
-            # Calculate equivalent position at lower zoom
-            diff = mipmap_diff - target_mipmap
-            col_p = col >> diff
-            row_p = row >> diff
-            zoom_p = zoom - mipmap_diff
-            
-            if zoom_p > max_search_zoom:
-                continue
-            
-            scale_factor = min(1 << diff, 16)
-            
-            # Build cache path
-            chunk_id = f"{col_p}_{row_p}_{zoom_p}_{self.maptype}"
-            cache_path = os.path.join(self.cache_dir, f"{chunk_id}.jpg")
-            
-            if not os.path.isfile(cache_path):
-                continue
-            
-            # Cache hit - read and upscale
-            log.debug(f"FallbackResolver: disk cache hit at {cache_path}")
-            
-            try:
-                data = None
-                max_attempts = 3
-                for attempt in range(1, max_attempts + 1):
+            upscaled = self._upscale_lower_mipmap(
+                col, row, target_mipmap, target_mipmap + diff
+            )
+            if upscaled is not None:
+                return upscaled
+            with self._parents_lock:
+                parent = self._parent_image(
+                    AoImage, col >> diff, row >> diff, zoom - diff
+                )
+                if parent is not None:
                     try:
-                        with open(cache_path, 'rb') as f:
-                            data = f.read()
-                        break
-                    except (IOError, OSError) as e:
-                        if attempt < max_attempts:
-                            time.sleep(0.01 * attempt)
-                        else:
-                            log.warning(f"FallbackResolver: failed to read cache {cache_path}: {e}")
-                            continue
-                
-                if not data or len(data) < 100:
-                    continue
-                
-                # Decode JPEG using AoImage (loads from memory bytes)
-                parent_img = AoImage.load_from_memory(data)
-                if not parent_img:
-                    continue
-                
-                cropped = None
-                try:
-                    # Calculate crop region for this chunk within parent
-                    crop_offset_x = (col % scale_factor) * (256 // scale_factor)
-                    crop_offset_y = (row % scale_factor) * (256 // scale_factor)
-                    crop_size = 256 // scale_factor
-                    
-                    # Use crop_and_upscale for atomic crop+scale operation
-                    # This is the proper AoImage API (not PIL-style crop/resize)
-                    if crop_size != 256:
-                        # Need to scale up - calculate scale factor to reach 256x256
-                        upscale_factor = 256 // crop_size
-                        cropped = parent_img.crop_and_upscale(
-                            crop_offset_x, crop_offset_y,
-                            crop_size, crop_size,
-                            upscale_factor
-                        )
-                    else:
-                        # No scaling needed - just crop
-                        # Create destination image for crop
-                        cropped = AoImage.new('RGBA', (256, 256), (0, 0, 0, 255))
-                        parent_img.crop(cropped, (crop_offset_x, crop_offset_y))
-                    
-                    if not cropped:
-                        continue
-                    
-                    # Return raw bytes (AoImage is always RGBA)
-                    result = cropped.tobytes()
-                    return result
-                finally:
-                    # Clean up images to free native memory
-                    try:
-                        parent_img.close()
-                    except Exception:
-                        pass
-                    try:
-                        if cropped is not None:
-                            cropped.close()
-                    except Exception:
-                        pass
-                
-            except Exception as e:
-                log.debug(f"FallbackResolver: disk cache fallback failed: {e}")
-                continue
-        
+                        return upscale_from_parent(parent, col, row, diff)
+                    except Exception as e:
+                        log.debug(f"FallbackResolver: upscale failed: {e}")
         return None
+
+    def _parent_image(self, AoImage, col: int, row: int, zoom: int):
+        """Decoded chunk ``(col, row, zoom)``, or None. Caller holds the lock."""
+        key = (col, row, zoom)
+        if key in self._parents:
+            self._parents.move_to_end(key)
+            return self._parents[key]
+
+        img = None
+        for read in (
+            self.memory_reader,
+            self._read_local_cache,
+            self.secondary_reader,
+        ):
+            if read is None:
+                continue
+            try:
+                data = read(col, row, zoom)
+            except Exception as e:
+                log.debug(f"FallbackResolver: chunk read failed: {e}")
+                data = None
+            if not _is_jpeg(data):
+                continue
+            try:
+                img = AoImage.load_from_memory(data)
+            except Exception as e:
+                log.debug(f"FallbackResolver: decode failed for {key}: {e}")
+                img = None
+            if img is not None:
+                if img.size == (CHUNK_WIDTH, CHUNK_HEIGHT):
+                    break
+                img.close()
+                img = None
+
+        self._parents[key] = img
+        while len(self._parents) > _PARENT_CACHE_ENTRIES:
+            _old_key, old_img = self._parents.popitem(last=False)
+            if old_img is not None:
+                old_img.close()
+        return img
+
+    def _read_local_cache(self, col: int, row: int, zoom: int) -> Optional[bytes]:
+        cache_path = os.path.join(
+            self.cache_dir, f"{col}_{row}_{zoom}_{self.maptype}.jpg"
+        )
+        for attempt in range(1, 4):
+            try:
+                with open(cache_path, 'rb') as f:
+                    data = f.read()
+                try:
+                    os.utime(cache_path, None)  # keep it fresh for cache LRU
+                except OSError:
+                    pass
+                return data
+            except FileNotFoundError:
+                return None
+            except OSError as e:
+                # Windows: the cache writer may hold the file briefly.
+                if attempt == 3:
+                    log.debug(f"FallbackResolver: failed to read cache {cache_path}: {e}")
+                    return None
+                time.sleep(0.01 * attempt)
+        return None
+
+    def _upscale_lower_mipmap(self, col: int, row: int,
+                              target_mipmap: int, source_mipmap: int):
+        """Upscale the chunk's region out of a complete lower-detail mipmap
+        image held in memory."""
+        if self.grid_origin is None or not self._mipmap_images:
+            return None
+        entry = self._mipmap_images.get(source_mipmap)
+        img = entry[0] if isinstance(entry, tuple) else entry
+        if img is None or getattr(img, "_freed", False):
+            return None
+        if isinstance(entry, tuple) and len(entry) >= 4:
+            if entry[3] != self.tile_zoom - source_mipmap:
+                return None
+        diff = source_mipmap - target_mipmap
+        local_col = col - (self.grid_origin[0] >> target_mipmap)
+        local_row = row - (self.grid_origin[1] >> target_mipmap)
+        if local_col < 0 or local_row < 0:
+            return None
+        size = CHUNK_WIDTH >> diff
+        x = (local_col * CHUNK_WIDTH) >> diff
+        y = (local_row * CHUNK_HEIGHT) >> diff
+        try:
+            width, height = img.size
+            if size < 1 or x + size > width or y + size > height:
+                return None
+            return img.crop_and_upscale(x, y, size, size, 1 << diff)
+        except Exception as e:
+            log.debug(f"FallbackResolver: mipmap upscale failed: {e}")
+            return None
     
     def _try_mipmap_scale_fallback(self, col: int, row: int, zoom: int,
                                     target_mipmap: int) -> Optional[bytes]:
@@ -341,16 +454,16 @@ class FallbackResolver:
         Looks at higher-detail mipmaps that have already been built
         and extracts/scales the region corresponding to this chunk.
         """
-        if not self._mipmap_images:
+        if not self._mipmap_images or self.grid_origin is None:
             return None
         
         try:
-            from autoortho.aoimage import AoImage
+            AoImage = _load_aoimage()
         except ImportError:
-            try:
-                from aoimage import AoImage
-            except ImportError:
-                return None
+            return None
+        # Mipmap images cover the whole tile, so offsets are tile-local.
+        local_col = col - (self.grid_origin[0] >> target_mipmap)
+        local_row = row - (self.grid_origin[1] >> target_mipmap)
 
         # Check higher-detail mipmaps (lower mipmap numbers = higher detail)
         for higher_mipmap in range(target_mipmap):
@@ -373,8 +486,8 @@ class FallbackResolver:
             try:
                 scale_factor = 1 << (target_mipmap - higher_mipmap)
                 
-                chunk_offset_x = (col % scale_factor) * 256
-                chunk_offset_y = (row % scale_factor) * 256
+                chunk_offset_x = local_col * 256 * scale_factor
+                chunk_offset_y = local_row * 256 * scale_factor
                 
                 # Validate bounds
                 if chunk_offset_x < 0 or chunk_offset_y < 0:
