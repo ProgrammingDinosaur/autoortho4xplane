@@ -108,7 +108,29 @@ def test_mount_worker_command_frozen(monkeypatch, tmp_path):
     supervisor.stop_all(timeout=0)
 
 
-def test_posix_stop_escalates_from_sigterm_to_sigkill(monkeypatch):
+def test_worker_openmp_limit_respects_share_even_with_inherited_override(monkeypatch, tmp_path):
+    import process_supervisor as ps
+
+    monkeypatch.setattr(ps.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(ps.os, "cpu_count", lambda: 32)
+    monkeypatch.setenv("OMP_NUM_THREADS", "64")
+    monkeypatch.setenv("OMP_THREAD_LIMIT", "99")
+    captured = {}
+    def fake_popen(cmd, **kwargs):
+        captured.update(kwargs["env"])
+        return DummyProcess()
+    monkeypatch.setattr(ps.subprocess, "Popen", fake_popen)
+    supervisor = AOProcessSupervisor()
+    handle = supervisor.start_mount_worker(
+        "/ao/root", "/xp/z_ao_na", "z_ao_na", False,
+        extra_env={"AO_MOUNT_WORKER_COUNT": "6"},
+    )
+    assert captured["OMP_THREAD_LIMIT"] == "5"
+    handle.process.returncode = 0
+    supervisor.stop_all(timeout=0)
+
+
+def test_posix_stop_retains_worker_stuck_after_sigkill(monkeypatch):
     import process_supervisor as ps
 
     process = DummyProcess(pid=4321, wait_timeout=True)
@@ -120,10 +142,10 @@ def test_posix_stop_escalates_from_sigterm_to_sigkill(monkeypatch):
     monkeypatch.setattr(ps.os, "getpgid", lambda pid: 9876)
     monkeypatch.setattr(ps.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
 
-    supervisor.stop_worker(handle, timeout=0.01)
+    assert supervisor.stop_worker(handle, timeout=0.01) is False
 
     assert calls == [(9876, signal.SIGTERM), (9876, signal.SIGKILL)]
-    assert handle not in supervisor.handles
+    assert handle in supervisor.handles
 
 
 def test_windows_worker_uses_process_group_and_job_object(monkeypatch, tmp_path):
@@ -183,7 +205,8 @@ def test_windows_force_kill_falls_back_to_taskkill(monkeypatch):
     assert process.killed is True
 
 
-def test_worker_mode_aliases():
+def test_worker_mode_aliases(monkeypatch):
+    monkeypatch.delenv("AO_RUN_MODE", raising=False)
     assert is_mount_worker_mode("mount_worker")
     assert is_mount_worker_mode("macfuse_worker")
     assert not is_mount_worker_mode("gui")
@@ -319,9 +342,10 @@ def test_windows_runtime_selects_fuse_library_before_import(
     assert os.environ["FUSE_LIBRARY_PATH"] == str(libpath.resolve())
 
 
-def test_unmount_sceneries_unmounts_before_stopping_workers():
+def test_unmount_sceneries_unmounts_before_stopping_workers(monkeypatch):
     import importlib
     autoortho_mod = importlib.import_module("autoortho")
+    monkeypatch.setattr(autoortho_mod, "system_type", "linux")
 
     aom = autoortho_mod.AOMount.__new__(autoortho_mod.AOMount)
     aom.cfg = SimpleNamespace(scenery_mounts=[])
@@ -352,6 +376,7 @@ def test_unmount_sceneries_unmounts_before_stopping_workers():
 def test_unmount_success_is_checked_after_workers_stop(monkeypatch):
     import importlib
     autoortho_mod = importlib.import_module("autoortho")
+    monkeypatch.setattr(autoortho_mod, "system_type", "linux")
 
     aom = autoortho_mod.AOMount.__new__(autoortho_mod.AOMount)
     aom.cfg = SimpleNamespace(scenery_mounts=[])

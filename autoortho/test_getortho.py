@@ -2284,23 +2284,6 @@ def test_get_bytes_mid_mipmap_read_maps_clamped_source_rows(
     )
     calls = {}
 
-    class _Img:
-        def __init__(self, width, height):
-            self.size = (width, height)
-
-        def data_ptr(self):
-            return b"pixels"
-
-        def reduce_2(self, steps=1):
-            calls["reduction"] = (self.size, steps)
-            return _Img(
-                self.size[0] >> steps,
-                self.size[1] >> steps,
-            )
-
-        def close(self):
-            pass
-
     def fake_get_img(mipmap, startrow=0, endrow=None, **kwargs):
         requested_zoom = min(tile.max_zoom - mipmap, tile.max_zoom)
         _, _, width, height, _, _ = tile._get_quick_zoom(
@@ -2311,7 +2294,11 @@ def test_get_bytes_mid_mipmap_read_maps_clamped_source_rows(
             height if endrow is None else endrow - startrow + 1
         )
         calls["img"] = (mipmap, startrow, endrow)
-        return _Img(width * 256, requested_rows * 256)
+        # Use the real native reducer: a stub previously hid its square-only
+        # input restriction when clamped source rows formed a rectangle.
+        return getortho.AoImage.new(
+            'RGBA', (width * 256, requested_rows * 256), (20, 40, 60)
+        )
 
     def fake_compress(width, height, data):
         calls["compressed_size"] = (width, height)
@@ -2338,11 +2325,11 @@ def test_get_bytes_mid_mipmap_read_maps_clamped_source_rows(
     )
 
     expected = {
-        2: ((2, 3), 1, (512, 256)),
-        3: ((0, 3), 2, (256, 256)),
-        4: ((0, 3), 3, (128, 128)),
+        2: ((2, 3), (512, 256)),
+        3: ((0, 3), (256, 256)),
+        4: ((0, 3), (128, 128)),
     }
-    for mipmap, (source_rows, steps, compressed_size) in expected.items():
+    for mipmap, (source_rows, compressed_size) in expected.items():
         calls.clear()
         mm = tile.dds.mipmap_list[mipmap]
 
@@ -2352,5 +2339,4 @@ def test_get_bytes_mid_mipmap_read_maps_clamped_source_rows(
         )
 
         assert calls["img"][1:] == source_rows
-        assert calls["reduction"][1] == steps
         assert calls["compressed_size"] == compressed_size

@@ -288,10 +288,11 @@ def setuplogs():
     log.info(f"File log level: {file_log_level_str}, Console log level: {console_log_level_str}")
 
 
-# If SSL_CERT_DIR is not set, default to /etc/ssl/certs when available for Linux users.
+# Leave Linux CA discovery to the HTTP clients (certifi by default). HTTPX
+# treats SSL_CERT_DIR as an override, and /etc/ssl/certs is not a usable
+# OpenSSL hashed CA directory on every distribution, including Fedora.
+# Explicit user SSL_CERT_FILE / SSL_CERT_DIR settings are left untouched.
 try:
-    if system_type == 'linux' and "SSL_CERT_DIR" not in os.environ:
-            os.environ["SSL_CERT_DIR"] = "/etc/ssl/certs"
     if system_type == "darwin":
         # Try to find bundled certifi CA bundle for PyInstaller builds
         # Check multiple possible locations

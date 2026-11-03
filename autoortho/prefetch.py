@@ -204,7 +204,14 @@ class QualityDeadlinePolicy:
         )
         maxwait = max(0.0, float(maxwait))
         if is_mipmap_zero and mode == PrefetchQualityMode.STRICT_TARGET:
-            return min(remaining, max(0.0, float(strict_deadline)))
+            # Strict mode has no fallback, so a row that inherits a tile
+            # budget spent by earlier rows would be served missing color
+            # without waiting at all. Every row keeps the prefer_target wait.
+            row_floor = maxwait + max(0.0, float(quality_grace))
+            return min(
+                max(remaining, row_floor),
+                max(0.0, float(strict_deadline)),
+            )
         if is_mipmap_zero and mode == PrefetchQualityMode.PREFER_TARGET:
             return min(remaining, maxwait + max(0.0, float(quality_grace)))
         return min(remaining, maxwait)

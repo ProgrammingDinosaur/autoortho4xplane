@@ -13,9 +13,21 @@ The resulting executable will be in dist/autoortho/
 
 import sys
 import os
+import re
+import tomllib
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_all
 
 block_cipher = None
+
+# Release workflows set VERNAME. Local builds use project metadata, never a
+# hardcoded bundle version or the separately versioned scenery file.
+with open(os.path.join(SPECPATH, 'pyproject.toml'), 'rb') as project_file:
+    project_version = tomllib.load(project_file)['tool']['poetry']['version']
+release_version = os.environ.get('VERNAME') or project_version
+version_match = re.match(r'^v?(\d+\.\d+\.\d+)', release_version)
+if version_match is None:
+    raise ValueError(f'Invalid application release version: {release_version!r}')
+bundle_version = version_match.group(1)
 
 # =============================================================================
 # Collect modules with native extensions (required for Linux - have .so files)
@@ -207,14 +219,9 @@ else:
 if os.path.exists(license_path):
     datas.append((license_path, f'autoortho/lib/{platform_name}/7zip'))
 
-# SSL Certificates (required for macOS - system certs not accessible in bundled app)
-if sys.platform == 'darwin':
-    import certifi
-    cacert_path = certifi.where()
-    if os.path.exists(cacert_path):
-        # Bundle certifi's CA bundle for SSL verification
-        datas.append((cacert_path, 'certifi'))
-        print(f"Bundling SSL certificates from: {cacert_path}")
+# Both Requests and HTTPX use certifi by default on every platform. Bundle its
+# data explicitly so Linux builds do not depend on the build host's CA paths.
+datas += collect_data_files('certifi')
 
 # =============================================================================
 # Hidden imports (modules that PyInstaller might miss)
@@ -386,8 +393,8 @@ if sys.platform == 'darwin':
         info_plist={
             'CFBundleName': 'AutoOrtho',
             'CFBundleDisplayName': 'AutoOrtho',
-            'CFBundleVersion': '1.0.0',
-            'CFBundleShortVersionString': '1.0.0',
+            'CFBundleVersion': bundle_version,
+            'CFBundleShortVersionString': bundle_version,
             'NSHighResolutionCapable': True,
             'LSMinimumSystemVersion': '10.15',
         },

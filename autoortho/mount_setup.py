@@ -47,15 +47,9 @@ def setupmount(mountpoint, systemtype):
                 except Exception as exc:
                     log.debug("Windows force_unmount preflight failed: %s", exc)
             elif systemtype == "macOS":
-                try:
-                    subprocess.run(
-                        ["diskutil", "unmount", "force", mountpoint],
-                        check=False,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception as exc:
-                    log.debug("macOS preflight unmount failed: %s", exc)
+                # A worker must not take over an existing/stale mount. Let
+                # its owner detach it while that owner is still serving FUSE.
+                raise MountError(f"{mountpoint} is already mounted")
             elif systemtype == "Linux-FUSE":
                 try:
                     if shutil.which("fusermount"):
@@ -74,6 +68,8 @@ def setupmount(mountpoint, systemtype):
                         )
                 except Exception as exc:
                     log.debug("Linux preflight unmount failed: %s", exc)
+        except MountError:
+            raise
         except Exception as exc:
             log.debug("Preflight unmount exception ignored: %s", exc)
 
@@ -150,7 +146,10 @@ def setupmount(mountpoint, systemtype):
     try:
         yield mountpoint
     finally:
-        try:
-            cleanup_mountpoint(mountpoint)
-        except Exception as exc:
-            log.warning("Failed to cleanup mountpoint %s: %s", mountpoint, exc)
+        # macOS cleanup belongs to the parent after BOTH detach and worker exit.
+        # The FUSE loop returning alone does not prove the kernel detached it.
+        if systemtype != "macOS":
+            try:
+                cleanup_mountpoint(mountpoint)
+            except Exception as exc:
+                log.warning("Failed to cleanup mountpoint %s: %s", mountpoint, exc)

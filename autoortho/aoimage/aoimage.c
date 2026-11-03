@@ -209,10 +209,14 @@ AOIAPI int32_t aoimage_reduce_2(const aoimage_t *s_img, aoimage_t *d_img) {
         return FALSE;
     }
 
-    if ( (s_img->width < 4)
-           || (s_img->width != s_img->height)
-           || (0 != (s_img->width & 0x03)) ) {
-		sprintf(d_img->errmsg, "width error: %d", s_img->width);
+    // Partial mipmap reads compose rectangular row strips. A 2x reduction
+    // only requires complete 2x2 pixel blocks, not a square source image.
+    if ( (s_img->width < 2) || (s_img->height < 2)
+           || (0 != (s_img->width & 0x01))
+           || (0 != (s_img->height & 0x01)) ) {
+        snprintf(d_img->errmsg, sizeof(d_img->errmsg),
+                 "invalid reduce size: %dx%d (expected even dimensions >= 2)",
+                 s_img->width, s_img->height);
         d_img->ptr = NULL;
         return FALSE;
     }

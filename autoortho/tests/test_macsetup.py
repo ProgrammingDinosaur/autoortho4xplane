@@ -8,21 +8,30 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import macsetup
+from utils import macos_mounts, mount_utils
+from utils.macos_mounts import MountEntry
+
+
+def mount_output(monkeypatch, output):
+    entries = []
+    for line in output.splitlines():
+        location, _, options = line.rpartition(" (")
+        source, _, path = location.partition(" on ")
+        entries.append(MountEntry(path, source, options.split(",", 1)[0].rstrip(")")))
+    monkeypatch.setattr(macos_mounts, "read_mount_table", lambda: entries)
 
 
 @pytest.mark.parametrize("fstype", ["macfuse", "osxfuse", "fusefs", "fuse-t"])
 def test_native_fuse_mount(monkeypatch, tmp_path, fstype):
     mountpoint = tmp_path / "Custom Scenery" / "z_ao"
-    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw:
-                        f"autoortho on {mountpoint} ({fstype}, local, nodev)\n")
+    mount_output(monkeypatch, f"autoortho on {mountpoint} ({fstype}, local, nodev)\n")
     assert macsetup.is_macfuse_mount(str(mountpoint))
 
 
 @pytest.mark.parametrize("host", ["fuse-t", "localhost", "127.0.0.1", "[::1]"])
 def test_fuse_t_local_nfs(monkeypatch, tmp_path, host):
     mountpoint = tmp_path / "Custom Scenery" / "z_ao"
-    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw:
-                        f"{host}:/autoortho on {mountpoint} (nfs, nodev, nosuid, mounted by user)\n")
+    mount_output(monkeypatch, f"{host}:/autoortho on {mountpoint} (nfs, nodev, nosuid, mounted by user)\n")
     assert macsetup.is_macfuse_mount(str(mountpoint))
 
 
@@ -37,8 +46,7 @@ def test_fuse_t_local_nfs(monkeypatch, tmp_path, host):
 ])
 def test_unrelated_mounts_are_rejected(monkeypatch, tmp_path, source, fstype, suffix):
     mountpoint = tmp_path / "z_ao"
-    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw:
-                        f"{source} on {mountpoint}{suffix} ({fstype}, local)\n")
+    mount_output(monkeypatch, f"{source} on {mountpoint}{suffix} ({fstype}, local)\n")
     assert not macsetup.is_macfuse_mount(str(mountpoint))
 
 
@@ -47,15 +55,14 @@ def test_symlink_parent_and_trailing_slash(monkeypatch, tmp_path):
     real.mkdir()
     alias = tmp_path / "alias"
     alias.symlink_to(real, target_is_directory=True)
-    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw:
-                        f"localhost:/ao on {real}/z_ao (nfs, nodev)\n")
+    mount_output(monkeypatch, f"localhost:/ao on {real}/z_ao (nfs, nodev)\n")
     assert macsetup.is_macfuse_mount(str(alias / "z_ao") + os.sep)
 
 
 def test_mount_command_failure(monkeypatch, tmp_path):
     def fail(*args, **kwargs):
-        raise subprocess.CalledProcessError(1, "mount")
-    monkeypatch.setattr(subprocess, "check_output", fail)
+        raise OSError("mount table unavailable")
+    monkeypatch.setattr(macos_mounts, "read_mount_table", fail)
     assert not macsetup.is_macfuse_mount(str(tmp_path))
 
 
@@ -67,12 +74,12 @@ def test_multiple_mountpoints_are_checked_independently(monkeypatch, tmp_path):
         f"fuse-t:/z_ao_eur on {eur} (nfs, nodev, nosuid, mounted by user)\n"
         f"fuse-t:/z_ao_na on {na} (nfs, nodev, nosuid, mounted by user)\n"
     )
-    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: table)
+    mount_output(monkeypatch, table)
     assert macsetup.is_macfuse_mount(str(eur))
     assert macsetup.is_macfuse_mount(str(na))
     assert not macsetup.is_macfuse_mount(str(missing))
 
 
 def test_empty_mount_table(monkeypatch, tmp_path):
-    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: "")
+    mount_output(monkeypatch, "")
     assert not macsetup.is_macfuse_mount(str(tmp_path))

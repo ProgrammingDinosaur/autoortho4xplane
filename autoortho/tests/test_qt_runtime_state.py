@@ -604,22 +604,27 @@ def test_repeated_start_is_ignored_while_starting(config_ui, monkeypatch):
     assert calls == []
 
 
-def test_worker_exit_starts_error_cleanup(config_ui, monkeypatch):
-    process = SimpleNamespace(poll=lambda: 7)
+@pytest.mark.parametrize("exit_code", [7, 3221226505, -1073740791])
+def test_worker_exit_starts_error_cleanup(config_ui, monkeypatch, caplog, exit_code):
+    process = SimpleNamespace(pid=2860, poll=lambda: exit_code)
     config_ui.mount_workers = [
         SimpleNamespace(process=process, mountpoint="/tmp/failed-mount")
     ]
     calls = []
-    monkeypatch.setattr(
-        config_ui,
-        "_start_mount_control",
-        lambda *args, **kwargs: calls.append((args, kwargs)),
-    )
+    def start_cleanup(*args, **kwargs):
+        # The initiating exit must already be in the log when cleanup begins.
+        assert "failed before streaming cleanup" in caplog.text
+        assert "pid=2860" in caplog.text
+        assert f"exit_code={exit_code} (0x{exit_code & 0xFFFFFFFF:08X})" in caplog.text
+        calls.append((args, kwargs))
+    monkeypatch.setattr(config_ui, "_start_mount_control", start_cleanup)
     config_ui._set_runtime_state(RuntimeState.RUNNING)
 
     config_ui._check_mount_workers()
 
-    assert "exited with code 7" in config_ui._runtime_error_message
+    assert f"exited with code {exit_code}" in config_ui._runtime_error_message
+    assert "PID 2860" in config_ui._runtime_error_message
+    assert f"0x{exit_code & 0xFFFFFFFF:08X}" in config_ui._runtime_error_message
     assert calls == [
         (("stop",), {"stop_target": RuntimeState.ERROR})
     ]
