@@ -1,0 +1,1115 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../info/">
+      
+      
+        <link rel="next" href="../performance/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+    
+    
+      
+        <title>macOS shutdown and native pipeline stability - AutoOrtho Continued</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#macos-shutdown-and-native-pipeline-stability" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="AutoOrtho Continued" class="md-header__button md-logo" aria-label="AutoOrtho Continued" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AutoOrtho Continued
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              macOS shutdown and native pipeline stability
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/ProgrammingDinosaur/autoortho4xplane" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Instructions
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../config/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Configuration
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../details/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Approach
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../faq/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  FAQ and Troubleshooting
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../info/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Info Attributions and Other Projects
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    <li class="md-tabs__item md-tabs__item--active">
+      <a href="./" class="md-tabs__link">
+        
+  
+  
+    
+  
+  macOS shutdown and native pipeline stability
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../performance/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Performance Tuning Guide
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../scenery/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Scenery Setup
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="AutoOrtho Continued" class="md-nav__button md-logo" aria-label="AutoOrtho Continued" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    AutoOrtho Continued
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/ProgrammingDinosaur/autoortho4xplane" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Instructions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../details/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Approach
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../faq/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    FAQ and Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../info/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Info Attributions and Other Projects
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    macOS shutdown and native pipeline stability
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    macOS shutdown and native pipeline stability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#evidence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Evidence
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#changes-by-priority" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Changes by priority
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#native-warnings-and-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native warnings and limits
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#live-local-check-october-31-2026" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Live local check — October 31, 2026
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#validation-before-release" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Validation before release
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Tuning Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../scenery/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scenery Setup
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#evidence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Evidence
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#changes-by-priority" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Changes by priority
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#native-warnings-and-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native warnings and limits
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#live-local-check-october-31-2026" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Live local check — October 31, 2026
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#validation-before-release" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Validation before release
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="macos-shutdown-and-native-pipeline-stability">macOS shutdown and native pipeline stability</h1>
+<p>The shutdown report identifies a reproducible application shutdown defect, with
+possible additional macFUSE/kernel involvement. The changes in this checkout
+remove the unsafe shutdown sequence and add bounded failure handling. Local
+live-mount checks passed on macFUSE 5.0.6, as detailed below. Validation of the
+built app on the reported macOS 27/macFUSE 5.4.0 combination is still required
+before claiming the reboot-level failure is resolved.</p>
+<h2 id="evidence">Evidence</h2>
+<p>The attached <code>autoortho-ui-log.txt</code> describes a different session from the
+one-mount report: six scenery mounts on an external T7 volume, Darwin 25.6.0,
+and a performance session dated October 19. Keep those environment details
+separate from the reported internal APFS/macOS 27/macFUSE 5.4.0 case.</p>
+<p>In that log, streaming starts at 08:48:32 and stopping begins at 08:48:38.
+Africa's <code>fuse_exit</code> is followed by cleanup at 09:08:38, exactly 20 minutes
+later. South America also takes 20 minutes. Europe receives its poison probe
+at 09:28:39 and has not completed shutdown when logging ends around 11:08.
+The per-worker tile counts remain zero. This demonstrates that X-Plane,
+large tile populations, and flight-time network pressure are not prerequisites.
+Two mountpoint cleanup attempts also fail with <code>Resource busy</code>.</p>
+<p>The supplied sample establishes that the main thread was blocked in <code>lstat</code>.
+It does not identify the pathname or prove which Python generator issued the
+call. The implementation nevertheless contained several independent ways to
+produce that state:</p>
+<ol>
+<li>The parent synchronously <code>lstat</code>ed a <code>.poison</code> file inside the mount.</li>
+<li>Its FUSE <code>getattr</code> callback stopped the FUSE request loop with <code>fuse_exit</code>.</li>
+<li>Mount polling used <code>os.path.ismount</code>, which itself calls <code>lstat</code>.</li>
+<li>Worker cleanup called <code>lexists</code> and <code>rmdir</code> before checking mount status.</li>
+<li>macOS readiness detection resolved the mount pathname and invoked <code>mount</code>,
+   both of which can block against an unresponsive filesystem.</li>
+</ol>
+<p>The attachment does not contain the separate <code>row_offset</code> traceback, manager
+<code>EOFError</code>, or native oversubscription messages. Those were assessed from the
+written report and the corresponding source code.</p>
+<h2 id="changes-by-priority">Changes by priority</h2>
+<table>
+<thead>
+<tr>
+<th>Priority</th>
+<th>Problem</th>
+<th>Change</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P0</td>
+<td>FUSE stops serving before macOS has detached it</td>
+<td>macOS shutdown no longer probes <code>.poison</code> or calls <code>fuse_exit</code> from that callback. The OS unmounts while the worker continues serving requests.</td>
+</tr>
+<tr>
+<td>P0</td>
+<td>Parent or worker blocks while inspecting its mount</td>
+<td>Darwin detection uses <code>getfsstat64(MNT_NOWAIT)</code> and a private buffer. Path normalization resolves only parent aliases, never the mount leaf. Worker cleanup is deferred to the parent until detach and worker exit.</td>
+</tr>
+<tr>
+<td>P0</td>
+<td><code>diskutil</code>/<code>umount</code> timeout handling can still wait forever</td>
+<td>A dedicated <code>/sbin/umount</code> helper gets a deadline. Timeout signals the helper without an unbounded post-kill wait. A blocked helper is retained and prevents repeated helpers against the same path.</td>
+</tr>
+<tr>
+<td>P0</td>
+<td>Shutdown claims success after losing ownership of stuck workers</td>
+<td>Surviving worker handles are retained. Failed detach keeps the workers, broker, stats manager, and logging available; startup refuses to overwrite that unresolved session.</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>One mount prevents all others from stopping</td>
+<td>macOS mounts detach concurrently, with bounded helper waits, rather than accumulating minutes per region.</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>Long texture/download waits prevent timely unmount</td>
+<td>The parent sends a one-time quiesce command over a private inherited pipe. Workers cancel queued work and wake native admission waiters without exiting the FUSE loop. This works with GUI standard streams disabled.</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>Lost stats manager raises into worker threads</td>
+<td>Stats reads/writes/mapping operations fall back to local counters on EOF or broken connections. Missing shared flight state disables speculative work. Rebinding preserves existing imported <code>STATS</code> references.</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>Native budgets sum to more than CPU capacity</td>
+<td>Thread reservations enforce a total per-worker limit. CPU capacity is divided across launched scenery workers, with a minimum of one thread each. Explicit per-build settings are capped.</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>Partial builds/cache reads bypass native accounting</td>
+<td>Cache batch reads use reserved thread counts. Partial builds reserve their full OpenMP default because their native ABI has no thread-count argument. Worker environment limits are set before native libraries load.</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>OpenMP workers spin while idle</td>
+<td>Workers default to <code>OMP_WAIT_POLICY=PASSIVE</code> and <code>KMP_BLOCKTIME=0</code>. User-specified wait policies remain supported.</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>Periodic threads continue after shutdown</td>
+<td>Tile cleaners have a wakeable stop event and are joined before tile state is cleared. Worker reload polling stops on quiescence. Stats batchers join their background thread after flushing.</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>A read crossing an already-served row returns missing-color pixels for the next row</td>
+<td>Found during live DDS testing. Partial commits now atomically preserve sealed rows while installing new rows; only installed rows are queued for persistence. Both native and Python partial builders have regression coverage.</td>
+</tr>
+<tr>
+<td>P2</td>
+<td><code>row_offset</code> NameError in partial mipmap success path</td>
+<td>The current source already uses <code>startrow * bytes_per_chunk_row</code> instead of that undefined variable. Regression coverage now includes the first, intermediate, multiple, and last rows, checking actual DDS byte offsets.</td>
+</tr>
+<tr>
+<td>P2</td>
+<td><code>.app</code> metadata reports 1.0.0</td>
+<td>Bundle version fields derive from release <code>VERNAME</code>, or the project version for local builds.</td>
+</tr>
+</tbody>
+</table>
+<p>The old native allocator divided CPUs by the number of active builds without
+changing reservations already in flight. On 12 cores, four builds could receive
+12 + 6 + 4 + 3 = 25 threads. New admissions reserve remaining capacity under a
+condition variable and release it even when a build raises. Across six mounts
+on 12 cores, each worker gets a two-thread share. If mounts outnumber cores,
+each worker still needs one thread; that minimum can exceed the machine total.
+The budget concerns native compute, not the total number of sleeping I/O,
+network, and UI threads.</p>
+<p>Admission is FIFO so a partial build needing its full reservation cannot be
+starved by a stream of smaller builds. Static sharing favors predictable CPU
+use; it can leave capacity unused when only one of several mounted regions is
+active. Measure DDS latency and throughput during the release validation rather
+than assuming a performance improvement from lower thread counts alone.</p>
+<h2 id="native-warnings-and-limits">Native warnings and limits</h2>
+<p>The worker is already launched as a fresh executable, and the FUSE options
+already specify <code>foreground=True</code>. Regression coverage preserves that setting.
+The warning about forking a threaded process does not, by itself, establish
+that Python multiprocessing forked the worker. A native FUSE library may launch
+mount helpers internally. Do not suppress this warning or attribute it to a
+specific component without the full worker log and native stack.</p>
+<p>The original report's processes remaining in <code>U</code>/<code>?E</code> after SIGKILL are a kernel
+or filesystem-driver state, beyond what Python cancellation can repair. An
+absent mount-table entry is not sufficient proof of recovery. In particular,
+do not document worker SIGKILL as a reliable recovery procedure. These changes
+aim to avoid creating the bad shutdown state and to report failure honestly;
+they cannot recover an already wedged macFUSE kernel session.</p>
+<p>While running tests locally, loading the installed <code>/usr/local/lib/libfuse.2.dylib</code>
+without mounting also caused <code>CFRelease(NULL)</code> in a process-exit destructor.
+That is separate evidence about this machine's native library environment,
+not proof of the reported macFUSE kernel failure. Callback unit tests use a
+stub driver. The subsequent live checks exercised the normal source worker
+entrypoint, which exits without running that native destructor.</p>
+<h2 id="live-local-check-october-31-2026">Live local check — October 31, 2026</h2>
+<p>Environment: macOS 26.7.1, Apple Silicon, 10 logical CPUs, Python 3.14.6,
+macFUSE 5.0.6, <code>/usr/local/lib/libfuse.2.dylib</code>. The test used temporary backing
+directories and actual macFUSE mounts, production worker supervision, shared
+statistics and download-broker services, and the production parent shutdown
+method. It reused mountpoints across cycles without launching X-Plane.</p>
+<table>
+<thead>
+<tr>
+<th>Scenario</th>
+<th>Successful cycles</th>
+<th>Total shutdown time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One mount, verified file read</td>
+<td>20</td>
+<td>0.76–1.29 s</td>
+</tr>
+<tr>
+<td>Six mounts, verified file reads</td>
+<td>3</td>
+<td>1.17–1.24 s</td>
+</tr>
+<tr>
+<td>One mount, native partial DDS reads</td>
+<td>3</td>
+<td>1.18–1.40 s</td>
+</tr>
+<tr>
+<td>Six mounts, concurrent native partial DDS reads</td>
+<td>3</td>
+<td>0.96–1.16 s</td>
+</tr>
+</tbody>
+</table>
+<p>The DDS input consisted of 341 cached JPEG chunks across ZL12–16. Reads checked
+the DDS header, 4096×4096 dimensions, and mipmap-zero rows 0, 1, 7, and 15.
+Identical source rows had identical compressed checksums. No network imagery
+was needed. Each successful cycle verified worker exit code zero, reaped PIDs,
+and disappearance of every test mount. The final independent process check
+found no test workers, brokers, managers, or mounts remaining. No force-kill or
+reboot was required for successful cycles, and no oversubscription messages or
+native partial exceptions were recorded.</p>
+<p>The first DDS attempt exposed a real boundary defect: a 32 KiB kernel read at
+offset 507904 crosses the first 524288-byte data row, which begins after the
+128-byte DDS header. Row zero was already sealed by an earlier read, so the
+combined row-zero/row-one commit was rejected and row one was served missing.
+The fix preserves row zero while committing row one. The subsequent DDS cycles
+passed, and regression tests reproduce the same read sequence for both native
+and Python builders. A harmless <code>winreg</code> import error logged on macOS was also
+corrected by restricting that import to Windows.</p>
+<p>Detailed JSON results, logs, and the isolated test harness are saved locally
+under <code>logs/macos-smoke-20261031/</code>. These checks exercise source workers, cached
+imagery, and an older driver than the report. They do not cover a packaged-app
+bootloader, a 30-minute flight, or network stalls. The test used a three-second
+tile budget and disabled speculative prefetch during the DDS phase.</p>
+<h2 id="validation-before-release">Validation before release</h2>
+<p>Automated regression groups cover shutdown ordering, timed-out and busy helpers,
+retained worker handles, retry/restart guards, GUI-independent control pipes,
+cached mount-table reads, cleanup protection, manager disconnects, native CPU
+admission/cancellation, and exact partial DDS row placement. Run parent/UI
+tests separately from package-based texture tests: the existing suite mixes
+<code>autoortho.py</code> imports with namespace-package imports.</p>
+<p>The expanded local verification passed 311 focused tests in two cleanly exiting
+runs: 247 texture/runtime/download/queue/cache tests and 64
+mount/supervisor/UI lifecycle tests. Syntax checks passed for implementation/build files, and
+<code>git diff --check</code> passed. The Darwin mount-table ABI was checked against the
+local SDK (2,168 bytes), and the cached API returned the APFS root entry.
+The automated regression runs use stubbed mounts; the live checks above were
+run separately against the installed driver.</p>
+<p>The broader Qt runtime suite aborted inside native <code>QWizard</code> code while opening
+the setup wizard during settings rendering. The selected asynchronous
+start/stop, worker-exit, and failed-close lifecycle tests passed. This is a
+remaining validation limitation; the full UI suite is not claimed as passing.</p>
+<p>For local tests, load both applicable config modules in worker mode before
+starting pytest, then unset <code>AO_RUN_MODE</code>. This avoids rewriting the real user
+configuration during module import while allowing config-persistence tests to
+exercise writes to their temporary configuration files.</p>
+<p>On a disposable test session or machine, validate the built <code>.app</code> with macFUSE
+5.4.0 on Apple Silicon, and separately with FUSE-T if it is supported:</p>
+<ol>
+<li>Start and stop one mount without launching X-Plane. Repeat at least 20 times;
+   every cycle must allow a new streaming session without rebooting.</li>
+<li>Repeat with all six regions. Record total detach time and worker exit time;
+   a helper timeout must become a visible failure, never an indefinite UI wait
+   or a successful stop while workers remain alive.</li>
+<li>Stop during cached reads, active downloads, partial native builds, and after
+   a 30-minute flight. Verify cancellation, native CPU peaks, memory plateau,
+   and the absence of continuing worker statistics after successful shutdown.</li>
+<li>Inject a manager disconnect and an unmount-helper timeout. Confirm that
+   the application remains responsive, preserves ownership, and refuses restart
+   until the unresolved session has actually stopped.</li>
+<li>Verify no worker processes remain after a successful stop, and verify both
+   bundle version fields in the built <code>Info.plist</code> against the release version.</li>
+</ol>
+<p>If a reboot-level failure persists with this sequence removed, collect the
+worker and parent stacks, loaded FUSE library path/version, and a macOS
+sysdiagnose for the driver maintainers. Avoid diagnostic commands against the
+stuck mount; the report already demonstrates that those commands can wedge too.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
+      
+    
+  </body>
+</html>
