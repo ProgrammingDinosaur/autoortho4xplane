@@ -76,6 +76,7 @@ static DWORD parent_of(DWORD pid) {
 }
 
 #define MAX_DUMP_ATTEMPTS 5
+enum { EXCEPTION_NONE, EXCEPTION_LOCAL, EXCEPTION_REMOTE, EXCEPTION_MODES };
 #define VERSION_CHARS 600
 
 typedef BOOL (WINAPI *mitigation_fn)(HANDLE, int, PVOID, SIZE_T);
@@ -135,42 +136,72 @@ static void capture(HANDLE process, const DEBUG_EVENT *event, const wchar_t *pre
     BOOL have_context = thread && GetThreadContext(thread, &context);
     DWORD context_error = have_context ? 0 : GetLastError();
     EXCEPTION_POINTERS pointers = { &record, &context };
-    MINIDUMP_EXCEPTION_INFORMATION info;
-    info.ThreadId = event->dwThreadId;
-    info.ExceptionPointers = &pointers;
-    info.ClientPointers = FALSE;  /* Exception and context live in collector. */
+    MINIDUMP_EXCEPTION_INFORMATION info[EXCEPTION_MODES];
+    ZeroMemory(info, sizeof(info));
+    /* Local: exception and context live in the collector (ClientPointers=FALSE).
+     * Server 2022's DbgHelp rejects this with ERROR_INVALID_USER_BUFFER. */
+    info[EXCEPTION_LOCAL].ThreadId = event->dwThreadId;
+    info[EXCEPTION_LOCAL].ExceptionPointers = &pointers;
+    info[EXCEPTION_LOCAL].ClientPointers = FALSE;
+    /* Remote: copy them into the stopped worker and pass worker addresses,
+     * the same form an in-process handler would use (ClientPointers=TRUE). */
+    struct remote_exception { EXCEPTION_POINTERS pointers; EXCEPTION_RECORD record; CONTEXT context; };
+    struct remote_exception *remote = NULL;
+    DWORD remote_error = 0;
+    if (have_context) {
+        remote = VirtualAllocEx(process, NULL, sizeof(*remote), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        struct remote_exception copy;
+        ZeroMemory(&copy, sizeof(copy));
+        SIZE_T written = 0;
+        if (remote) {
+            copy.pointers.ExceptionRecord = &remote->record;
+            copy.pointers.ContextRecord = &remote->context;
+            copy.record = record;
+            copy.context = context;
+        }
+        if (!remote || !WriteProcessMemory(process, remote, &copy, sizeof(copy), &written) ||
+            written != sizeof(copy)) {
+            remote_error = GetLastError();
+            if (remote) VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+            remote = NULL;
+        } else {
+            info[EXCEPTION_REMOTE].ThreadId = event->dwThreadId;
+            info[EXCEPTION_REMOTE].ExceptionPointers = &remote->pointers;
+            info[EXCEPTION_REMOTE].ClientPointers = TRUE;
+        }
+    }
 
     DWORD dump_error = 0, dump_attempts = 0;
     DWORD dump_errors[MAX_DUMP_ATTEMPTS] = { 0 };
-    BOOL dumped = FALSE, dump_has_exception = FALSE;
+    int dump_exception = EXCEPTION_NONE;
+    BOOL dumped = FALSE;
     const wchar_t *path = with_suffix(prefix, L".dmp");
     HANDLE dump = path ? CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL)
                        : INVALID_HANDLE_VALUE;
     if (dump != INVALID_HANDLE_VALUE) {
-        /* DbgHelp has failed on CI (ERROR_INVALID_USER_BUFFER) for every dump
-         * type. Fall back to smaller dumps; the last attempt omits the
-         * exception stream, which crash.json still preserves. */
-        static const struct { MINIDUMP_TYPE type; BOOL with_exception; } attempts[MAX_DUMP_ATTEMPTS] = {
-            { (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules |
-                MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithProcessThreadData |
-                MiniDumpWithFullMemoryInfo), TRUE },
-            { (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules |
-                MiniDumpWithProcessThreadData | MiniDumpWithFullMemoryInfo), TRUE },
-            { (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules), TRUE },
-            { MiniDumpNormal, TRUE },
-            { MiniDumpNormal, FALSE },
+        /* Prefer the remote form, then the local one, then a smaller dump; the
+         * last attempt omits the exception stream, which crash.json preserves. */
+        static const MINIDUMP_TYPE full = (MINIDUMP_TYPE)(MiniDumpWithThreadInfo |
+            MiniDumpWithUnloadedModules | MiniDumpWithIndirectlyReferencedMemory |
+            MiniDumpWithProcessThreadData | MiniDumpWithFullMemoryInfo);
+        const struct { MINIDUMP_TYPE type; int mode; } attempts[MAX_DUMP_ATTEMPTS] = {
+            { full, EXCEPTION_REMOTE }, { full, EXCEPTION_LOCAL },
+            { MiniDumpNormal, EXCEPTION_REMOTE }, { MiniDumpNormal, EXCEPTION_LOCAL },
+            { MiniDumpNormal, EXCEPTION_NONE },
         };
         for (size_t i = 0; i < MAX_DUMP_ATTEMPTS && !dumped; ++i) {
-            BOOL with_exception = attempts[i].with_exception && have_context;
-            if (i) {  /* Discard any partial output from the failed attempt. */
+            int mode = attempts[i].mode;
+            if (mode != EXCEPTION_NONE && !have_context) continue;
+            if (mode == EXCEPTION_REMOTE && !remote) continue;
+            if (dump_attempts) {  /* Discard any partial output from the failed attempt. */
                 SetFilePointer(dump, 0, NULL, FILE_BEGIN);
                 SetEndOfFile(dump);
             }
-            ++dump_attempts;
             dumped = MiniDumpWriteDump(process, event->dwProcessId, dump, attempts[i].type,
-                                      with_exception ? &info : NULL, NULL, NULL);
-            if (dumped) dump_has_exception = with_exception;
-            else dump_error = dump_errors[i] = GetLastError();
+                                      mode == EXCEPTION_NONE ? NULL : &info[mode], NULL, NULL);
+            if (dumped) dump_exception = mode;
+            else dump_error = dump_errors[dump_attempts] = GetLastError();
+            ++dump_attempts;
         }
         if (dumped) dump_error = 0;
         CloseHandle(dump);
@@ -178,6 +209,7 @@ static void capture(HANDLE process, const DEBUG_EVENT *event, const wchar_t *pre
     } else {
         dump_error = GetLastError();
     }
+    if (remote) VirtualFreeEx(process, remote, 0, MEM_RELEASE);
     if (thread) CloseHandle(thread);
 
     /* Preserve the exception record even if disk space or DbgHelp prevents a dump. */
@@ -190,10 +222,12 @@ static void capture(HANDLE process, const DEBUG_EVENT *event, const wchar_t *pre
         for (DWORD i = 0; i < record.NumberParameters && i < EXCEPTION_MAXIMUM_PARAMETERS; ++i) {
             fprintf(report, "%s\"0x%llx\"", i ? "," : "", (unsigned long long)record.ExceptionInformation[i]);
         }
-        fprintf(report, "],\"dump_written\":%s,\"dump_has_exception\":%s,\"dump_error\":%lu,"
+        static const char *const modes[EXCEPTION_MODES] = { "none", "local", "remote" };
+        fprintf(report, "],\"dump_written\":%s,\"dump_exception\":\"%s\",\"dump_error\":%lu,"
+                "\"remote_exception_error\":%lu,\"context_flags\":\"0x%08lx\","
                 "\"dump_attempts\":%lu,\"dump_errors\":[",
-                dumped ? "true" : "false", dump_has_exception ? "true" : "false",
-                dump_error, dump_attempts);
+                dumped ? "true" : "false", modes[dump_exception], dump_error,
+                remote_error, (unsigned long)context.ContextFlags, dump_attempts);
         for (DWORD i = 0; i < dump_attempts; ++i) fprintf(report, "%s%lu", i ? "," : "", dump_errors[i]);
         wchar_t dbghelp[VERSION_CHARS];
         fputs("],\"dbghelp_version\":", report);
