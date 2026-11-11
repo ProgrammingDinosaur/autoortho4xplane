@@ -75,6 +75,56 @@ static DWORD parent_of(DWORD pid) {
     return parent;
 }
 
+#define MAX_DUMP_ATTEMPTS 5
+#define VERSION_CHARS 600
+
+typedef BOOL (WINAPI *mitigation_fn)(HANDLE, int, PVOID, SIZE_T);
+typedef DWORD (WINAPI *version_size_fn)(LPCWSTR, LPDWORD);
+typedef BOOL (WINAPI *version_info_fn)(LPCWSTR, DWORD, DWORD, LPVOID);
+typedef BOOL (WINAPI *version_query_fn)(LPCVOID, LPCWSTR, LPVOID *, PUINT);
+
+/* Resolve optional APIs at runtime: no extra import libraries or Win10 headers. */
+static void (*optional_proc(const wchar_t *module, const char *name))(void) {
+    HMODULE handle = GetModuleHandleW(module);
+    if (!handle) handle = LoadLibraryExW(module, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return handle ? (void (*)(void))GetProcAddress(handle, name) : NULL;
+}
+
+/* Raw PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY flags (bit 0: CET enabled). */
+static const char *shadow_stack_policy(HANDLE process) {
+    static char text[16];
+    mitigation_fn query = (mitigation_fn)optional_proc(L"kernel32.dll", "GetProcessMitigationPolicy");
+    DWORD flags = 0;
+    if (!process || !query || !query(process, 15 /* ProcessUserShadowStackPolicy */, &flags, sizeof(flags)))
+        return "unavailable";
+    snprintf(text, sizeof(text), "0x%08lx", flags);
+    return text;
+}
+
+/* Path and file version of the DbgHelp actually loaded, for CI diagnostics. */
+static void dbghelp_version(wchar_t *out, size_t chars) {
+    wchar_t path[MAX_PATH];
+    HMODULE dbghelp = GetModuleHandleW(L"dbghelp.dll");
+    if (!dbghelp || !GetModuleFileNameW(dbghelp, path, MAX_PATH)) {
+        swprintf(out, chars, L"unavailable");
+        return;
+    }
+    swprintf(out, chars, L"%ls", path);
+    version_size_fn size_of = (version_size_fn)optional_proc(L"version.dll", "GetFileVersionInfoSizeW");
+    version_info_fn info_of = (version_info_fn)optional_proc(L"version.dll", "GetFileVersionInfoW");
+    version_query_fn query = (version_query_fn)optional_proc(L"version.dll", "VerQueryValueW");
+    DWORD ignored = 0, size = size_of ? size_of(path, &ignored) : 0;
+    void *data = size && info_of && query ? malloc(size) : NULL;
+    VS_FIXEDFILEINFO *fixed = NULL;
+    UINT length = 0;
+    if (data && info_of(path, 0, size, data) && query(data, L"\\", (LPVOID *)&fixed, &length) && fixed) {
+        swprintf(out, chars, L"%ls %lu.%lu.%lu.%lu", path,
+                 HIWORD(fixed->dwFileVersionMS), LOWORD(fixed->dwFileVersionMS),
+                 HIWORD(fixed->dwFileVersionLS), LOWORD(fixed->dwFileVersionLS));
+    }
+    free(data);
+}
+
 static void capture(HANDLE process, const DEBUG_EVENT *event, const wchar_t *prefix) {
     EXCEPTION_RECORD record = event->u.Exception.ExceptionRecord;
     record.ExceptionRecord = NULL;  /* The linked record pointer is remote. */
@@ -91,32 +141,36 @@ static void capture(HANDLE process, const DEBUG_EVENT *event, const wchar_t *pre
     info.ClientPointers = FALSE;  /* Exception and context live in collector. */
 
     DWORD dump_error = 0, dump_attempts = 0;
-    BOOL dumped = FALSE;
+    DWORD dump_errors[MAX_DUMP_ATTEMPTS] = { 0 };
+    BOOL dumped = FALSE, dump_has_exception = FALSE;
     const wchar_t *path = with_suffix(prefix, L".dmp");
     HANDLE dump = path ? CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL)
                        : INVALID_HANDLE_VALUE;
     if (dump != INVALID_HANDLE_VALUE) {
-        /* DbgHelp intermittently fails (e.g. ERROR_INVALID_USER_BUFFER) while
-         * walking remote memory. Fall back to smaller dumps; every level still
-         * holds the thread, module and exception streams. */
-        static const MINIDUMP_TYPE types[] = {
-            (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules |
+        /* DbgHelp has failed on CI (ERROR_INVALID_USER_BUFFER) for every dump
+         * type. Fall back to smaller dumps; the last attempt omits the
+         * exception stream, which crash.json still preserves. */
+        static const struct { MINIDUMP_TYPE type; BOOL with_exception; } attempts[MAX_DUMP_ATTEMPTS] = {
+            { (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules |
                 MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithProcessThreadData |
-                MiniDumpWithFullMemoryInfo),
-            (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules |
-                MiniDumpWithProcessThreadData | MiniDumpWithFullMemoryInfo),
-            (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules),
-            MiniDumpNormal,
+                MiniDumpWithFullMemoryInfo), TRUE },
+            { (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules |
+                MiniDumpWithProcessThreadData | MiniDumpWithFullMemoryInfo), TRUE },
+            { (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules), TRUE },
+            { MiniDumpNormal, TRUE },
+            { MiniDumpNormal, FALSE },
         };
-        for (size_t i = 0; i < sizeof(types) / sizeof(types[0]) && !dumped; ++i) {
+        for (size_t i = 0; i < MAX_DUMP_ATTEMPTS && !dumped; ++i) {
+            BOOL with_exception = attempts[i].with_exception && have_context;
             if (i) {  /* Discard any partial output from the failed attempt. */
                 SetFilePointer(dump, 0, NULL, FILE_BEGIN);
                 SetEndOfFile(dump);
             }
             ++dump_attempts;
-            dumped = MiniDumpWriteDump(process, event->dwProcessId, dump, types[i],
-                                      have_context ? &info : NULL, NULL, NULL);
-            if (!dumped) dump_error = GetLastError();
+            dumped = MiniDumpWriteDump(process, event->dwProcessId, dump, attempts[i].type,
+                                      with_exception ? &info : NULL, NULL, NULL);
+            if (dumped) dump_has_exception = with_exception;
+            else dump_error = dump_errors[i] = GetLastError();
         }
         if (dumped) dump_error = 0;
         CloseHandle(dump);
@@ -136,9 +190,17 @@ static void capture(HANDLE process, const DEBUG_EVENT *event, const wchar_t *pre
         for (DWORD i = 0; i < record.NumberParameters && i < EXCEPTION_MAXIMUM_PARAMETERS; ++i) {
             fprintf(report, "%s\"0x%llx\"", i ? "," : "", (unsigned long long)record.ExceptionInformation[i]);
         }
-        fprintf(report, "],\"dump_written\":%s,\"dump_error\":%lu,\"dump_attempts\":%lu,"
-                "\"context_error\":%lu}\n",
-                dumped ? "true" : "false", dump_error, dump_attempts, context_error);
+        fprintf(report, "],\"dump_written\":%s,\"dump_has_exception\":%s,\"dump_error\":%lu,"
+                "\"dump_attempts\":%lu,\"dump_errors\":[",
+                dumped ? "true" : "false", dump_has_exception ? "true" : "false",
+                dump_error, dump_attempts);
+        for (DWORD i = 0; i < dump_attempts; ++i) fprintf(report, "%s%lu", i ? "," : "", dump_errors[i]);
+        wchar_t dbghelp[VERSION_CHARS];
+        fputs("],\"dbghelp_version\":", report);
+        dbghelp_version(dbghelp, VERSION_CHARS);
+        json_path(report, dbghelp);
+        fprintf(report, ",\"shadow_stack_policy\":\"%s\",\"context_error\":%lu}\n",
+                shadow_stack_policy(process), context_error);
         fclose(report);
     }
     fprintf(stderr, "Native crash captured: worker=%lu exception=0x%08lx dump=%s error=%lu\n",

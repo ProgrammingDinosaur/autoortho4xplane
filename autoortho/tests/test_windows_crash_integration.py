@@ -76,7 +76,7 @@ fail(ctypes.byref(record), None, 0)
         count, directory = struct.unpack_from("<II", dump, 8)
         streams = {struct.unpack_from("<III", dump, directory + i * 12)[0]:
                    struct.unpack_from("<III", dump, directory + i * 12)[2] for i in range(count)}
-        self.assertTrue({3, 4, 6}.issubset(streams), streams)  # threads, modules, exception
+        self.assertTrue({3, 4, 6}.issubset(streams), (streams, report))  # threads, modules, exception
         self.assertEqual(struct.unpack_from("<I", dump, streams[6] + 8)[0], 0xC0000409)
         self.assertTrue(list(self.directory.glob("*.modules.jsonl")))
         self.assertTrue(list(self.directory.glob("*.build.json")))
