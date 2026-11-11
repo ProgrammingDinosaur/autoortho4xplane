@@ -1,0 +1,8 @@
+# Native sources are hashed byte-for-byte by autoortho/native_build.py.
+# The DLL is compiled on Linux (LF) but verified on Windows runners, where
+# core.autocrlf would otherwise convert these to CRLF and break the hashes.
+autoortho/aopipeline/*.c        text eol=lf
+autoortho/aopipeline/*.h        text eol=lf
+autoortho/aopipeline/Makefile.* text eol=lf
+autoortho/native/*.c            text eol=lf
+autoortho/native/*.h            text eol=lf

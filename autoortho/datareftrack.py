@@ -245,6 +245,11 @@ class DatarefTracker(object):
          "Pressure altitude in standard atmosphere", 0),
         ("sim/graphics/scenery/sun_pitch_degrees", "°",
          "Sun elevation angle from horizontal (v9.40.0+)", 1),
+        # The paging model's first guess of k (see paging_model.py).
+        ("sim/graphics/view/window_width", "px",
+         "Width of X-Plane's window", 0),
+        ("sim/graphics/view/field_of_view_deg", "°",
+         "Horizontal field of view", 1),
     ]
     # fmt:on
 
@@ -269,6 +274,8 @@ class DatarefTracker(object):
         self.local_time_sec = -1.0  # Local time (seconds since midnight)
         self.pressure_alt = -1.0  # Pressure altitude in feet
         self.sun_pitch = -999.0  # Sun elevation angle (-90 to +90, -999 = invalid)
+        self.window_width = 0.0  # X-Plane window width in px (0 = unknown)
+        self.fov_deg = 0.0  # horizontal field of view (0 = unknown)
         self.connected = False
         self.data_valid = False
         self.has_ever_connected = False  # True once first connection established
@@ -615,6 +622,8 @@ class DatarefTracker(object):
                     pressure_alt = values[6] if len(values) >= 7 else None
                     # sun_pitch is optional (8th value)
                     sun_pitch = values[7] if len(values) >= 8 else None
+                    window_width = values[8] if len(values) >= 9 else None
+                    fov_deg = values[9] if len(values) >= 10 else None
 
                     # Validate position data
                     if self._validate_position(lat, lon, alt):
@@ -632,6 +641,10 @@ class DatarefTracker(object):
                         # Only update sun_pitch if we received it
                         if sun_pitch is not None:
                             self.sun_pitch = sun_pitch
+                        if window_width:
+                            self.window_width = window_width
+                        if fov_deg:
+                            self.fov_deg = fov_deg
                         self.data_valid = True
                         
                         # Feed the flight averager (alt is in meters, convert to feet)

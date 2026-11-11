@@ -7,6 +7,22 @@ import multiprocessing
 if getattr(sys, 'frozen', False):
     multiprocessing.freeze_support()
 
+# This gate precedes imports of mount setup, Qt and native libraries. The
+# collector attaches from another process and can observe Windows fast-fail.
+if sys.platform == "win32" and os.environ.get("AO_RUN_MODE") in ("mount_worker", "macfuse_worker"):
+    if __package__:
+        from .windows_crash import wait_for_collector, check_native_build
+    else:
+        from windows_crash import wait_for_collector, check_native_build
+    wait_for_collector()
+    check_native_build()
+elif os.environ.get("AO_RUN_MODE") in ("mount_worker", "macfuse_worker"):
+    if __package__:
+        from .posix_crash import enable_worker_fault_logging
+    else:
+        from posix_crash import enable_worker_fault_logging
+    enable_worker_fault_logging()
+
 try:
     from autoortho.worker_modes import is_mount_worker_mode
 except ImportError:

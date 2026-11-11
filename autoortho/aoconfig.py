@@ -378,6 +378,11 @@ tile_queue_enabled = True
 # Recommended: 100 (default)
 tile_queue_max_size = 100
 # Shared HTTP/2 transport. The parent owns one broker used by all mount workers.
+# Set to False to try plain HTTP/1.1, as OrthoStreamXP does: no broker, each
+# of the fetch_threads download workers makes one request at a time on its
+# own connection. Raise fetch_threads at the same time (to 64, its ceiling;
+# it is also capped at twice the CPU cores), since that is then the number
+# of downloads in flight.
 http2_enabled = True
 # Maximum broker requests that may be in flight (pending a reply) at once.
 # This is the real download-concurrency knob: it is not bounded by the number
@@ -428,6 +433,59 @@ simheaven_compat = False
 using_custom_tiles = False
 # Color used for missing textures. an
 missing_color = [66, 77, 55]
+
+[streaming]
+# Streaming techniques adopted from OrthoStreamXP. Each one can be turned off
+# on its own to compare with the previous behavior.
+#
+# Only the mipmap X-Plane actually wants triggers downloads. X-Plane reads the
+# start of every texture it loads (the "header chunk"), and the read for each
+# level starts with the tail of the finer level before it. Those incidental
+# bytes are answered from what is at hand instead of downloading max-zoom rows.
+read_classifier = True
+# Keep the low-zoom chunks (this zoom and coarser) on disk for good and never
+# evict them. One ZL12 chunk covers a whole ZL16 tile, so far scenery and
+# placeholders always have real imagery after the first visit.
+low_zoom_base = True
+low_zoom_base_max_zoom = 12
+# Prefetch each tile only to the mipmap X-Plane will want at its distance,
+# instead of every mipmap. Far tiles then cost one low-zoom chunk.
+paging_prefetch = True
+# Paging constant k: X-Plane wants mipmap n while the distance to the tile's
+# near edge, in the tile's own pixels, is below 2^n * k. 0 guesses it from
+# X-Plane's window and field of view, then measures it in flight.
+paging_k = 0
+# Fetch the level the aircraft will need this many seconds from now.
+paging_lead_seconds = 60
+# X-Plane opens all terrain (.ter) files of a scenery tile 20-45 s before it
+# reads their textures. Queue those textures as soon as their .ter is opened.
+ter_load_ahead = True
+# Wait policy by distance band. Near (mipmap 0-1) waits for real imagery,
+# middle waits briefly, far (the low-zoom base level) never waits: it gets the
+# best data at hand and the real data is fetched behind it.
+wait_bands = True
+# Seconds a near or middle read may wait while a flight starts or X-Plane
+# loads a new place (X-Plane will not read those textures again while parked).
+near_wait_seconds = 60.0
+# Seconds a near or middle read may wait in flight.
+band_max_wait_seconds = 6.0
+# Seconds a far read (the base level) may wait. OrthoStreamXP uses 0; a short
+# wait lets a base chunk that is already downloading arrive.
+far_wait_seconds = 0.5
+# Downloads are ordered by band (near reads first, then middle reads, then
+# work done ahead of X-Plane). A queued build X-Plane starts reading is raised
+# to the reader's priority instead of being started again.
+band_priorities = True
+# Keep prefetch running (at lower priority) while X-Plane reads tiles,
+# instead of pausing it. False restores the pause.
+prefetch_during_live_reads = True
+# Apply season colors when bytes are served, by recoloring the DXT block
+# endpoints, instead of baking them into built and cached textures. Changing
+# season settings then never invalidates the cache.
+read_time_colours = True
+# Track one number per tile: the finest mipmap with real imagery. Only real
+# imagery is persisted, and a level implies every coarser one.
+real_from_index = True
 
 [pydds]
 # ISPC or STB for dds file compression

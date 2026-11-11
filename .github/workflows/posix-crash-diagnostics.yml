@@ -1,0 +1,29 @@
+name: POSIX crash diagnostics
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'autoortho/posix_crash.py'
+      - 'autoortho/process_supervisor.py'
+      - 'autoortho/mount_worker.py'
+      - 'autoortho/__main__.py'
+      - 'autoortho/tests/test_posix_crash*'
+      - '.github/workflows/posix-crash-diagnostics.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Verify real fatal-signal capture and normal exit
+        run: python -m unittest discover -s autoortho/tests -p test_posix_crash_integration.py -v

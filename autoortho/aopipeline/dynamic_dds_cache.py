@@ -71,6 +71,11 @@ _ROW_RECORD_HEADER = struct.Struct(">4sBIQI32s")
 _MAX_ROW_RECORD_SIZE = 128 * 1024 * 1024
 
 
+# Predicate on a chunk JPEG file name: True for files kept for good (the
+# low-zoom base). Set by getortho from the [streaming] config.
+protect_jpeg = None
+
+
 def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
                          tilename_zoom: int, max_zoom: int, min_zoom: int,
                          width: int, height: int, maptype: str,
@@ -101,7 +106,10 @@ def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
 
         for r in range(scaled_row, scaled_row + scaled_height):
             for c in range(scaled_col, scaled_col + scaled_width):
-                jpeg_path = os.path.join(cache_dir, f"{c}_{r}_{zoom}_{maptype}.jpg")
+                jpeg_name = f"{c}_{r}_{zoom}_{maptype}.jpg"
+                if protect_jpeg is not None and protect_jpeg(jpeg_name):
+                    continue  # the low-zoom base is kept for good
+                jpeg_path = os.path.join(cache_dir, jpeg_name)
                 for attempt in range(3):
                     try:
                         file_size = os.path.getsize(jpeg_path)
@@ -169,6 +177,9 @@ class DynamicDDSCache:
         self._cleanup_source_jpegs_after_store = bool(
             cleanup_source_jpegs_after_store
         )
+        # Persist mipmap 0 only when every row is real target imagery
+        # (set from [streaming] real_from_index by getortho).
+        self.real_only = False
         self._maintenance = ThreadPoolExecutor(
             max_workers=max(1, min(8, int(maintenance_workers))),
             thread_name_prefix="dds-cache",
@@ -1469,6 +1480,16 @@ class DynamicDDSCache:
         ):
             log.debug("DDS cache store rejected a mismatched row manifest")
             return False
+        if self.real_only and not all(
+            getattr(manifest, "is_exact", False)
+            for manifest in dict(mm0_manifest).values()
+        ):
+            # Only real imagery is persisted: mipmap 0 with fallback or
+            # missing rows is rebuilt next time instead of cached and healed.
+            # Its coarser levels are real and are kept.
+            self._bump("dds_cache_store_rejected_not_real")
+            self._store_coarser_levels(tile, max_zoom, dds_bytes)
+            return False
 
         try:
             dds_path, ddm_path = self._paths_for(
@@ -1541,6 +1562,42 @@ class DynamicDDSCache:
             return False
 
     @profiled_stage("cache.dds_store_incremental", tile_arg=1)
+    def _store_coarser_levels(self, tile, max_zoom, dds_bytes):
+        """Persist mipmaps 1+ of a build whose mipmap 0 is not all real."""
+        try:
+            dds = tile.dds
+            green = set(getattr(tile, "_green_mipmaps", ()) or ())
+            data, offsets = {}, {}
+            for mm in dds.mipmap_list[1:]:
+                if mm.idx in green or mm.endpos > len(dds_bytes):
+                    continue
+                data[mm.idx] = bytes(dds_bytes[mm.startpos:mm.endpos])
+                offsets[mm.idx] = (mm.startpos, mm.length)
+            if not data:
+                return False
+            return self.store_incremental(
+                tile.id, max_zoom, tile.row, tile.col, tile.maptype,
+                tile.tilename_zoom, bytes(dds_bytes[:128]), dds.total_size,
+                dds.width, dds.height, dds.mipMapCount, data, offsets,
+            )
+        except Exception as exc:
+            log.debug(f"Could not keep the coarser levels of {getattr(tile, 'id', '?')}: {exc}")
+            return False
+
+    @staticmethod
+    def _bump(name):
+        try:
+            from autoortho.aostats import inc_stat
+        except ImportError:
+            try:
+                from aostats import inc_stat
+            except ImportError:
+                return
+        try:
+            inc_stat(name)
+        except Exception:
+            pass
+
     def store_incremental(self, tile_id: str, max_zoom: int,
                           row: int, col: int, maptype: str,
                           tilename_zoom: int,

@@ -14,7 +14,7 @@ ISPC_LIB    := ../lib/linux/libispc_texcomp.so
 CC          := gcc
 LD          := gcc
 
-CFLAGS      := -O3 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
+CFLAGS      := -O3 -g -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
                -I../aoimage \
                -fopenmp -pthread
 
@@ -24,7 +24,7 @@ LDFLAGS     := -shared -rdynamic -fopenmp -pthread
 SOURCES     := aocache.c aodecode.c aodds.c aopipeline.c
 OBJECTS     := $(SOURCES:.c=.o)
 
-.PHONY: all clean phase1 phase2 phase3
+.PHONY: all clean phase1 phase2 phase3 release-bundle
 
 # Default: build everything available
 all: libaopipeline.so
@@ -39,6 +39,10 @@ phase2: aocache.o aodecode.o
 
 # Phase 3: Add DDS building (complete pipeline)
 phase3: libaopipeline.so
+
+release-bundle: libaopipeline.so
+	mkdir -p lib/linux
+	cp libaopipeline.so lib/linux/libaopipeline.so
 
 # Pattern rules
 aocache.o: aocache.c aocache.h internal.h

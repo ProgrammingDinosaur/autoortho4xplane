@@ -124,7 +124,7 @@ def _install_crash_handler():
         except ImportError:
             from crash_handler import install_crash_handler
         install_crash_handler(skip_signal_handlers=True)
-        log.debug("Crash handler installed in mount worker with signal handlers skipped")
+        log.debug("Python crash hook installed; Python fatal-signal callbacks skipped")
     except Exception as exc:
         print(f"Warning: mount worker could not install crash handler: {exc}", file=sys.stderr)
 
@@ -335,6 +335,12 @@ def main():
     log.info("MOUNT: %s", args.mountpoint)
     _clear_root_poison(args.root)
     FUSE, AutoOrtho, fuse_option_profiles_by_os, mount_systemtype = _runtime_for_platform()
+    if sys.platform != "win32":
+        if __package__:
+            from .posix_crash import capture_worker_images
+        else:
+            from posix_crash import capture_worker_images
+        capture_worker_images()
     additional_args = fuse_option_profiles_by_os(args.nothreads, mount_name)
 
     log.info("Starting FUSE mount")

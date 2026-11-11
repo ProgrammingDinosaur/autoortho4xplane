@@ -205,6 +205,71 @@ def test_windows_force_kill_falls_back_to_taskkill(monkeypatch):
     assert process.killed is True
 
 
+def test_windows_collector_gates_worker_and_closes_after_exit(monkeypatch, tmp_path):
+    import process_supervisor as ps
+    import windows_crash as wc
+
+    calls = []
+    worker = DummyProcess()
+
+    class Collector:
+        event_name = "Local\\AutoOrthoCrash-test"
+
+        def __init__(self, directory):
+            assert directory == tmp_path / ".autoortho-data" / "crashes"
+
+        def start(self, pid, stderr):
+            calls.append(("start", pid))
+
+        def close(self):
+            assert worker.poll() is not None
+            calls.append(("close", worker.pid))
+
+    def popen(cmd, **kwargs):
+        assert kwargs["env"][wc.READY_ENV] == Collector.event_name
+        return worker
+
+    monkeypatch.setattr(wc, "WindowsCrashCollector", Collector)
+    monkeypatch.setattr(ps.os, "name", "nt")
+    monkeypatch.setattr(ps.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(ps.subprocess, "Popen", popen)
+    supervisor = AOProcessSupervisor()
+    monkeypatch.setattr(supervisor, "_attach_windows_job", lambda process: None)
+    handle = supervisor.start_mount_worker("/root", "C:/mount", "mount", False)
+    assert calls == [("start", worker.pid)]
+    worker.returncode = 0xC0000409
+    supervisor.stop_worker(handle)
+    assert calls == [("start", worker.pid), ("close", worker.pid)]
+
+
+def test_posix_worker_fault_is_collected_before_handle_cleanup(monkeypatch, tmp_path):
+    import json
+    import process_supervisor as ps
+    import posix_crash as pc
+
+    worker = DummyProcess()
+    original_collector = pc.PosixCrashCollector
+    monkeypatch.setattr(pc, "PosixCrashCollector", lambda directory: original_collector(directory, collect_system=False))
+    monkeypatch.setattr(ps.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(ps.os, "name", "posix")
+    captured = {}
+    def popen(cmd, **kwargs):
+        captured.update(kwargs["env"])
+        return worker
+    monkeypatch.setattr(ps.subprocess, "Popen", popen)
+    supervisor = AOProcessSupervisor()
+    handle = supervisor.start_mount_worker("/root", "/mount", "mount", False)
+    collector = handle.crash_collector
+    assert captured[pc.PREFIX_ENV] == str(collector.prefix)
+    assert collector.pid == worker.pid
+    worker.returncode = -signal.SIGSEGV
+    supervisor.stop_worker(handle)
+    report = json.loads(pc.Path(str(collector.prefix) + ".crash.json").read_text())
+    assert report["signal"] == "SIGSEGV"
+    assert not report["shutdown_requested"]
+    assert not supervisor.handles
+
+
 def test_worker_mode_aliases(monkeypatch):
     monkeypatch.delenv("AO_RUN_MODE", raising=False)
     assert is_mount_worker_mode("mount_worker")

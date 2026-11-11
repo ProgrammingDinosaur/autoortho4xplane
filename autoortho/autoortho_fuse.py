@@ -776,6 +776,11 @@ class AutoOrtho(Operations):
         self.ktx2_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\D*)(\d+).ktx2")
         self.dsf_re = re.compile(r".*/[-+]\d+[-+]\d+.dsf")
         self.ter_re = re.compile(r".*/\d+[-_]\d+[-_](\D*)(\d+).ter")
+        # Row, column, map type and zoom of a tile's terrain definition, for
+        # load-ahead (X-Plane opens these 20-45 s before their textures).
+        self.ter_tile_re = re.compile(
+            r".*/(\d+)[-_](\d+)[-_](\S*?)(\d{2})(?:_(?:sea|water)_overlay)?\.ter$"
+        )
         self.root = os.path.abspath(root)
         self.cache_dir = cache_dir
 
@@ -1454,6 +1459,7 @@ class AutoOrtho(Operations):
                 getortho.register_discovered_maptype(maptype)
 
             tile_id = f"{row}_{col}_{maptype}_{zoom}"
+            getortho.note_texture_requested(row, col, zoom)
             with profile_span(
                 "fuse.dds_open",
                 tile_id=tile_id,
@@ -1469,6 +1475,16 @@ class AutoOrtho(Operations):
 
         if path.endswith('AOISWORKING'):
             return 0
+
+        ter_match = self.ter_tile_re.match(path)
+        if ter_match:
+            try:
+                row, col, maptype, zoom = ter_match.groups()
+                getortho.note_terrain_opened(
+                    int(row), int(col), self._resolve_dds_maptype(maptype), int(zoom)
+                )
+            except Exception as exc:  # load-ahead is best effort
+                log.debug(f"Load-ahead could not note {path}: {exc}")
 
         if system_type == 'windows':
             return os.open(full_path, flags | os.O_BINARY)
