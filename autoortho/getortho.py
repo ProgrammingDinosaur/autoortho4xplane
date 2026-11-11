@@ -69,6 +69,21 @@ except ImportError:
     from dxt_upscale import painted_missing_chunks
 
 try:
+    from autoortho import load_ahead, low_zoom_base, paging_model, read_pattern, streaming_options
+except ImportError:
+    import load_ahead
+    import low_zoom_base
+    import paging_model
+    import read_pattern
+    import streaming_options
+
+try:
+    from autoortho import colour_table, wait_bands
+except ImportError:
+    import colour_table
+    import wait_bands
+
+try:
     from autoortho.dds_manifest import (
         ComposedImageResult,
         CompressedRowResult,
@@ -1265,7 +1280,13 @@ class LivePressureController:
                 pass
 
     def _update_locked(self):
-        network = self._live_reads > 0 or self._download_live_pressure
+        if streaming_options.flag("prefetch_during_live_reads"):
+            # Prefetch already waits in a lower-priority queue: only live
+            # downloads actually queued or in flight hold it back, not every
+            # read (most are answered from memory or disk).
+            network = self._download_live_pressure
+        else:
+            network = self._live_reads > 0 or self._download_live_pressure
         build = self._live_reads >= self._build_threshold
         if (network, build) == (
             self._network_pressure,
@@ -1904,6 +1925,22 @@ if seasons_enabled:
         lock = _get_season_lock(key)
         with lock:
             return ao_seasons.saturation(row, col, zoom, day)
+
+
+def _seasons_at_build():
+    """Seasons are baked into built images only when not applied at read time."""
+    return seasons_enabled and not streaming_options.flag("read_time_colours")
+
+
+def season_colour_table(row, col, zoom):
+    """The RGB565 table that applies this tile's season as it is read, or None."""
+    if not seasons_enabled or not streaming_options.flag("read_time_colours"):
+        return None
+    saturation = 0.01 * season_saturation_locked(row, col, zoom)
+    if saturation >= 1.0:
+        return None
+    # Rounded so nearby days share one cached table.
+    return colour_table.saturation_table(round(saturation, 3))
 
 
 def _is_jpeg(dataheader):
@@ -5169,6 +5206,98 @@ def _active_mount_worker_count():
     except Exception:
         return 1
 
+# ============================================================================
+# PAGING MODEL: which mipmap X-Plane will want of a tile (see paging_model.py)
+# ============================================================================
+_paging_model_instance = None
+_paging_model_lock = threading.Lock()
+
+
+def get_paging_model():
+    """The session's paging model, its first guess refreshed from X-Plane."""
+    global _paging_model_instance
+    with _paging_model_lock:
+        if _paging_model_instance is None:
+            k = streaming_options.number("paging_k")
+            _paging_model_instance = paging_model.PagingModel(k if k > 0 else None)
+        model = _paging_model_instance
+    width = getattr(datareftracker, "window_width", 0) or 0
+    fov = getattr(datareftracker, "fov_deg", 0) or 0
+    if width and fov:
+        model.use_screen(width, fov)
+    return model
+
+
+def current_camera():
+    """(lat, lon, height_agl_m, track_deg, speed_mps), or None without a fresh position."""
+    if not getattr(datareftracker, "data_valid", False) or not getattr(
+        datareftracker, "connected", False
+    ):
+        return None
+    return (
+        datareftracker.lat,
+        datareftracker.lon,
+        max(0.0, float(datareftracker.alt or 0.0)),
+        datareftracker.hdg,
+        datareftracker.spd,
+    )
+
+
+_flight_start = wait_bands.StartTracker()
+_flight_start_lock = threading.Lock()
+
+
+def flight_is_starting(near_read=False):
+    """Whether X-Plane is starting a flight or loading another place."""
+    connected = bool(
+        getattr(datareftracker, "data_valid", False)
+        and getattr(datareftracker, "connected", False)
+    )
+    with _flight_start_lock:
+        return _flight_start.update(
+            connected,
+            getattr(datareftracker, "lat", 0.0),
+            getattr(datareftracker, "lon", 0.0),
+            getattr(datareftracker, "spd", 0.0),
+            time.monotonic(),
+            near_read=near_read,
+        )
+
+
+def dds_pixels(tilename_zoom, target_zoom):
+    """Width in pixels of the DDS of a tile named at ``tilename_zoom``."""
+    diff = int(tilename_zoom) - int(target_zoom)
+    chunks = Tile.width >> diff if diff >= 0 else Tile.width << -diff
+    return max(1, chunks) * 256
+
+
+def tile_distance_m(row, col, tilename_zoom, camera):
+    """(camera distance, tile centre lat, lon, ground size) of a tile."""
+    lat, lon = paging_model.tile_centre(row, col, tilename_zoom, Tile.width)
+    size_m = paging_model.tile_size_m(lat, tilename_zoom, Tile.width)
+    distance = paging_model.camera_distance_m(camera[0], camera[1], camera[2], lat, lon)
+    return distance, lat, lon, size_m
+
+
+def paging_target_mip(row, col, tilename_zoom, target_zoom, camera=None, lead_s=None):
+    """The mipmap X-Plane will want of a tile ``lead_s`` from now, or None.
+
+    None when there is no fresh aircraft position.
+    """
+    camera = camera if camera is not None else current_camera()
+    if camera is None:
+        return None
+    distance, lat, lon, size_m = tile_distance_m(row, col, tilename_zoom, camera)
+    if lead_s is None:
+        lead_s = streaming_options.number("paging_lead_seconds")
+    soon = paging_model.soon_distance_m(
+        distance, camera[0], camera[1], lat, lon, camera[3], camera[4], lead_s
+    )
+    return get_paging_model().mip_for(
+        soon, size_m, dds_pixels(tilename_zoom, target_zoom)
+    )
+
+
 class SpatialPrefetcher:
     """
     Background prefetcher that anticipates tile needs based on aircraft movement.
@@ -5491,6 +5620,17 @@ class SpatialPrefetcher:
 
         # Sort tiles by time-to-encounter (earliest first = nearest in time)
         sorted_tiles = sorted(tile_times.items(), key=lambda x: x[1][0])
+        if streaming_options.flag("paging_prefetch"):
+            near = {
+                (row, col, zoom)
+                for (row, col, _maptype, zoom), _eta in self.paging_split(
+                    [
+                        ((row, col, default_maptype, zoom), eta)
+                        for (row, col, zoom), (eta, _alt) in sorted_tiles
+                    ]
+                )
+            }
+            sorted_tiles = [item for item in sorted_tiles if item[0] in near]
 
         if self._coordinator is not None:
             evidence = []
@@ -6039,6 +6179,7 @@ class SpatialPrefetcher:
 
         # Sort tiles by distance (nearest first - gradient from player outward)
         sorted_tiles = sorted(tile_distances.items(), key=lambda x: x[1])
+        sorted_tiles = self.paging_split(sorted_tiles)
 
         if self._coordinator is not None:
             evidence = []
@@ -6127,6 +6268,69 @@ class SpatialPrefetcher:
                 return override
         return None  # Accept any maptype from terrain index
     
+    def paging_split(self, tiles, budget=None):
+        """Fetch far tiles only to the level X-Plane will want; return the near ones.
+
+        ``tiles`` is a list of ``((row, col, maptype, zoom), distance)``.
+        Tiles the paging model puts at full detail (mipmap 0) are returned
+        for the normal full-quality prefetch. Every other tile gets only the
+        chunks of its predicted level and coarser here: a far tile costs one
+        low-zoom chunk instead of every chunk of every level.
+        """
+        if not streaming_options.flag("paging_prefetch") or self._tile_cacher is None:
+            return list(tiles)
+        camera = current_camera()
+        if camera is None:
+            return list(tiles)
+        warmed = getattr(self, "_paging_warmed", None)
+        if warmed is None:
+            warmed = self._paging_warmed = OrderedDict()
+        budget = self.max_chunks if budget is None else max(0, int(budget))
+        # Plans are renewed only after the aircraft moves a quarter of the
+        # prefetch radius: the lead must cover that gap, or a tile can reach
+        # full detail between two plans without being fetched for it.
+        speed = max(1.0, float(camera[4] or 0.0))
+        lead_s = max(
+            streaming_options.number("paging_lead_seconds"),
+            self.prefetch_radius_nm * 1852 * 0.25 / speed + 30.0,
+        )
+        near = []
+        submitted = 0
+        coarse_tiles = 0
+        for (row, col, maptype, zoom), distance in tiles:
+            target_zoom = self._tile_cacher._get_target_zoom_level(
+                zoom, row=row, col=col
+            )
+            mip = paging_target_mip(row, col, zoom, target_zoom, camera, lead_s)
+            if mip is None or mip <= 0:
+                near.append(((row, col, maptype, zoom), distance))
+                continue
+            coarse_tiles += 1
+            key = (row, col, maptype, zoom, min(mip, 5))
+            if key in warmed or submitted >= budget:
+                continue
+            if self._tile_cacher.is_tile_opened_by_xplane(row, col, maptype, zoom):
+                continue
+            count, complete = self._prefetch_tile(
+                row,
+                col,
+                zoom,
+                maptype,
+                max_chunks=budget - submitted,
+                first_mip=mip,
+            )
+            submitted += count
+            if complete:
+                warmed[key] = True
+                while len(warmed) > 20000:
+                    warmed.popitem(last=False)
+        if coarse_tiles:
+            bump("paging_prefetch_coarse_tiles", coarse_tiles)
+        if submitted:
+            bump("paging_prefetch_coarse_chunks", submitted)
+            self._prefetch_count += submitted
+        return near
+
     def _prefetch_tile(
         self,
         row,
@@ -6134,9 +6338,13 @@ class SpatialPrefetcher:
         zoom,
         maptype: Optional[str] = None,
         max_chunks: Optional[int] = None,
+        first_mip: int = 0,
     ):
         """
         Submit prefetch requests for a tile's chunks at ALL mipmap levels.
+
+        With ``first_mip`` > 0 only that level and the coarser ones are
+        fetched: the paging model says X-Plane will not want finer ones yet.
 
         Args:
             row: Tile row coordinate
@@ -6197,7 +6405,10 @@ class SpatialPrefetcher:
             #   mipmap 4 → max_zoom-4 (ZL12) → 1 chunk (lowest detail)
             # =========================================================================
 
-            for mipmap in range(tile.max_mipmap + 1):
+            for mipmap in range(
+                min(max(0, int(first_mip)), tile.max_mipmap),
+                tile.max_mipmap + 1,
+            ):
                 mipmap_zoom = tile.max_zoom - mipmap
 
                 # Don't go below minimum zoom
@@ -6339,6 +6550,7 @@ def start_prefetcher(tile_cacher, scenery_id="default"):
     else:
         spatial_prefetcher.set_coordinator(None)
     spatial_prefetcher.start()
+    _start_terrain_load_ahead()
 
 
 def prefetch_dsf(
@@ -6368,16 +6580,35 @@ def prefetch_dsf(
         next_cursor = start
         pressure = False
         generation = os.path.normcase(os.path.abspath(dsf_path))
+        camera = (
+            current_camera()
+            if streaming_options.flag("paging_prefetch")
+            else None
+        )
         for row, col, maptype, zoom in tiles[start:end]:
+            target_zoom = spatial_prefetcher._tile_cacher._get_target_zoom_level(
+                zoom, row=row, col=col
+            )
+            if camera is not None:
+                # Paging prefetch: a tile X-Plane will not want at full
+                # detail gets only its level and coarser, wherever it is.
+                mip = paging_target_mip(row, col, zoom, target_zoom, camera)
+                if mip is not None and mip > 0:
+                    if not spatial_prefetcher._tile_cacher.is_tile_opened_by_xplane(
+                        row, col, maptype, zoom
+                    ):
+                        count, _complete = spatial_prefetcher._prefetch_tile(
+                            row, col, zoom, maptype, first_mip=mip
+                        )
+                        bump("dsf_paging_coarse_chunks", count)
+                    next_cursor += 1
+                    continue
             if not spatial_prefetcher.tile_in_projected_corridor(
                 row, col, zoom
             ):
                 bump("dsf_candidates_outside_corridor")
                 next_cursor += 1
                 continue
-            target_zoom = spatial_prefetcher._tile_cacher._get_target_zoom_level(
-                zoom, row=row, col=col
-            )
             key = prefetch_coordinator.make_key(
                 row,
                 col,
@@ -6409,9 +6640,75 @@ def prefetch_dsf(
     )
 
 
+# ============================================================================
+# TERRAIN LOAD-AHEAD: warm textures as X-Plane opens their .ter files
+# ============================================================================
+terrain_load_ahead = None
+
+
+def load_ahead_warm(row, col, maptype, zoom):
+    """Fetch what a texture X-Plane is about to load needs.
+
+    Its paging level with a known aircraft position, else its base level
+    (one low-zoom chunk). Returns False when nothing could be queued now.
+    """
+    if not is_prefetch_runtime_allowed():
+        return False
+    cacher = spatial_prefetcher._tile_cacher
+    if cacher is None:
+        return True
+    if cacher.is_tile_opened_by_xplane(row, col, maptype, zoom):
+        return True  # X-Plane is reading it: the live path owns it
+    target_zoom = cacher._get_target_zoom_level(zoom, row=row, col=col)
+    mip = paging_target_mip(row, col, zoom, target_zoom)
+    if mip is None:
+        mip = 4  # no position yet: the base level of every texture
+    submitted, complete = spatial_prefetcher._prefetch_tile(
+        row, col, zoom, maptype, first_mip=mip
+    )
+    bump("ter_load_ahead_chunks", submitted)
+    return complete or submitted > 0
+
+
+def _load_ahead_aircraft():
+    camera = current_camera()
+    return None if camera is None else (camera[0], camera[1])
+
+
+def note_terrain_opened(row, col, maptype, zoom):
+    """FUSE hook: X-Plane opened the .ter of a texture."""
+    if terrain_load_ahead is not None:
+        terrain_load_ahead.note_terrain(row, col, maptype, zoom)
+
+
+def note_texture_requested(row, col, zoom):
+    """FUSE hook: X-Plane opened a texture."""
+    if terrain_load_ahead is not None:
+        terrain_load_ahead.note_texture_request(row, col, zoom)
+
+
+def _start_terrain_load_ahead():
+    global terrain_load_ahead
+    if not streaming_options.flag("ter_load_ahead") or not spatial_prefetcher.enabled:
+        return
+    if terrain_load_ahead is None:
+        terrain_load_ahead = load_ahead.LoadAhead(
+            load_ahead_warm, aircraft=_load_ahead_aircraft
+        )
+    terrain_load_ahead.start()
+
+
+def _stop_terrain_load_ahead():
+    global terrain_load_ahead
+    if terrain_load_ahead is not None:
+        terrain_load_ahead.stop()
+        terrain_load_ahead = None
+
+
 def stop_prefetcher():
     """Stop the spatial prefetcher."""
     global prefetch_coordinator
+    _stop_terrain_load_ahead()
     spatial_prefetcher.stop()
     spatial_prefetcher.set_coordinator(None)
     if prefetch_coordinator is not None:
@@ -8489,6 +8786,15 @@ def start_predictive_dds(tile_cacher=None) -> None:
 
         # Wire network healing callback so cache can trigger downloads
         dynamic_dds_cache._network_heal_callback = _dispatch_network_healing
+        dynamic_dds_cache.real_only = streaming_options.flag("real_from_index")
+        try:
+            from autoortho.aopipeline import dynamic_dds_cache as _ddc_module
+        except ImportError:
+            from aopipeline import dynamic_dds_cache as _ddc_module
+        _ddc_module.protect_jpeg = low_zoom_base.protector(
+            streaming_options.flag("low_zoom_base"),
+            streaming_options.number("low_zoom_base_max_zoom"),
+        )
 
         if persistent_dds_mb > 0:
             size_desc = f"max={persistent_dds_mb}MB"
@@ -8540,6 +8846,11 @@ def start_predictive_dds(tile_cacher=None) -> None:
                 dds_cache=dynamic_dds_cache
             )
             
+            disk_budget_manager.protect_jpeg = low_zoom_base.protector(
+                streaming_options.flag("low_zoom_base"),
+                streaming_options.number("low_zoom_base_max_zoom"),
+            )
+
             if dynamic_dds_cache is not None:
                 dynamic_dds_cache._budget_manager = disk_budget_manager
             log.info(f"Disk budget manager initialized (total={total_budget_gb}GB, dds_pct={dds_pct}%)")
@@ -9197,6 +9508,12 @@ class Chunk(object):
         elif target_dir == self.cache_dir and disk_budget_manager is not None:
             disk_budget_manager.account_jpeg(len(data))
 
+    def _is_base_chunk(self):
+        """Part of the low-zoom base: kept for good, outside the JPEG budget."""
+        return streaming_options.flag("low_zoom_base") and int(self.zoom) <= int(
+            streaming_options.number("low_zoom_base_max_zoom")
+        )
+
     def save_cache(self, data=None):
         data = self.data if data is None else data
         if not data:
@@ -9211,7 +9528,7 @@ class Chunk(object):
         if not _atomic_write(self.cache_path, data):
             return
 
-        if disk_budget_manager is not None:
+        if disk_budget_manager is not None and not self._is_base_chunk():
             disk_budget_manager.account_jpeg(len(data))
         if self.lt_cache_dir:
             if not _submit_bounded_cache_write(
@@ -9987,7 +10304,14 @@ class Tile(object):
 
         self.bytes_read = 0
         self.lowest_offset = 99999999
-        
+        # Where X-Plane's reads of this open ended, to tell the level a read
+        # wants from bytes it only reads in passing (see read_pattern).
+        self._read_cursor = read_pattern.ReadCursor()
+        # The level X-Plane last showed it wants (None before any such read).
+        self._last_wanted_mip = None
+        # Band of the latest read (wait_bands), for download priorities.
+        self._read_band = None
+
         # Track if tile was pre-populated by aopipeline (all mipmaps built at once)
         # When True, the "bytes_read" warning is not applicable because X-Plane
         # may only need small mipmaps even though we populated everything
@@ -10531,6 +10855,8 @@ class Tile(object):
         """
         if self._closed or self.dds is None:
             return 0
+        with self._lock:
+            self._read_cursor.reset()
         green_levels = self._unseal_green_mipmaps()
         rows = self._mm0_rows.unseal_for_reopen()
         if not rows:
@@ -12101,9 +12427,13 @@ class Tile(object):
         
         self._is_live = True
         
-        # Store time budget for streaming builder (which runs in separate context)
+        # Store time budget for streaming builder (which runs in separate context).
+        # A per-read band budget (wait_bands) must not replace the tile's own:
+        # later reads take their band wait from what the tile has left.
         if time_budget is not None:
-            self._tile_time_budget = time_budget
+            with self._time_budget_lock:
+                if self._tile_time_budget is None:
+                    self._tile_time_budget = time_budget
         
         # Boost priority of any queued/in-flight background downloads at every
         # zoom: lower-mipmap chunks feed the mipmaps X-Plane reads first and
@@ -12112,12 +12442,21 @@ class Tile(object):
         with self._lock:
             grids = tuple(self.chunks.values())
         reprioritize = False
+        raised_to = PRIORITY_LIVE
+        if self._read_band is not None and streaming_options.flag("band_priorities"):
+            # Raised to the reader's band, never lowered: a far read must not
+            # jump ahead of near ones.
+            raised_to = wait_bands.chunk_priority(self._read_band, 0)
         for grid in grids:
             for chunk in grid:
                 if not hasattr(chunk, 'priority'):
                     continue
                 if getattr(chunk, 'in_flight', False) or getattr(chunk, 'in_queue', False):
-                    chunk.priority = PRIORITY_LIVE
+                    try:
+                        current = float(chunk.priority)
+                    except (TypeError, ValueError):
+                        current = float(PRIORITY_PREFETCH)
+                    chunk.priority = min(current, raised_to)
                     chunk.prefetch = False
                     reprioritize = True
 
@@ -12989,7 +13328,36 @@ class Tile(object):
             self.lowest_offset = offset
 
         request_end = offset + length
+        header_chunk = False
+        first_needed = 0
+        wanted = None
+        if streaming_options.flag("read_classifier"):
+            with self._lock:
+                header_chunk, wanted, first_needed = read_pattern.classify(
+                    self.dds.mipmap_list,
+                    self._read_cursor,
+                    offset,
+                    length,
+                )
+            if wanted is not None:
+                self._note_wanted_level(wanted)
+            if header_chunk:
+                bump("read_header_chunks")
+                # The header chunk's piece of mipmap 0 is shown from the
+                # base level (one low-zoom chunk) instead of downloading
+                # max-zoom rows for every texture X-Plane loads.
+                self._ensure_base_mipmap()
+            elif first_needed > 0 and first_needed < len(self.dds.mipmap_list):
+                bump("read_incidental_tails")
+        if streaming_options.flag("wait_bands") and not header_chunk:
+            level = wanted if wanted is not None else self._last_wanted_mip
+            if level is None:
+                level = max(first_needed, self.find_mipmap_pos(offset))
+            level = min(level, len(self.dds.mipmap_list) - 1)
+            request_budget = self._band_budget(level, request_budget)
         for mipmap in self.dds.mipmap_list:
+            if mipmap.idx < first_needed:
+                continue
             overlap_start = max(offset, mipmap.startpos)
             overlap_end = min(request_end, mipmap.endpos)
             if overlap_start >= overlap_end:
@@ -13011,9 +13379,204 @@ class Tile(object):
                 )
         
         self.bytes_read += length
-        data = self._read_with_mm0_sealing(offset, length)
-        self._record_mipmap_provenance(offset, len(data))
-        return data
+        if first_needed > 0:
+            # Incidental bytes of mipmap 0 are a display substitute for this
+            # read only: sealing them would fix that substitute as level 0's
+            # version, and the real read that follows would replay it.
+            data = self._read_unsealed(offset, length)
+        else:
+            data = self._read_with_mm0_sealing(offset, length)
+        needed_start = offset
+        if 0 < first_needed < len(self.dds.mipmap_list):
+            needed_start = max(
+                offset, self.dds.mipmap_list[first_needed].startpos
+            )
+        if first_needed < len(self.dds.mipmap_list) and needed_start < offset + len(data):
+            self._record_mipmap_provenance(
+                needed_start, offset + len(data) - needed_start
+            )
+        if wanted is not None:
+            # OrthoStreamXP's quality measure: the share of X-Plane's reads
+            # answered with real imagery at the level it wanted.
+            bump(
+                "reads_wanted_real"
+                if self.real_from() <= wanted
+                else "reads_wanted_standin"
+            )
+        return self._recolour(data, offset)
+
+    def _recolour(self, data, offset):
+        """The season's colours applied to served bytes (see colour_table.py)."""
+        try:
+            table = season_colour_table(self.row, self.col, self.tilename_zoom)
+        except Exception as exc:
+            log.debug(f"Season lookup for {self.id} failed: {exc}")
+            return data
+        if table is None:
+            return data
+        return colour_table.apply(
+            data,
+            offset,
+            colour_table.block_bytes(self.dds.dxt_format),
+            table,
+        )
+
+    def _band_budget(self, mip, tile_budget):
+        """The budget of one read by its band (see wait_bands.py).
+
+        Never longer than what is left of the tile's own budget.
+        """
+        band = wait_bands.band_of(mip, self.max_mipmap)
+        camera = current_camera()
+        if camera is not None:
+            try:
+                distance, _lat, _lon, size_m = tile_distance_m(
+                    self.row, self.col, self.tilename_zoom, camera
+                )
+                by_distance = wait_bands.band_of(
+                    get_paging_model().mip_for(distance, size_m, int(self.dds.width)),
+                    self.max_mipmap,
+                )
+                band = wait_bands.nearer(band, by_distance)
+            except Exception:
+                pass
+        self._read_band = band
+        starting = flight_is_starting(near_read=band == wait_bands.NEAR)
+        wait = wait_bands.wait_seconds(band, starting)
+        bump(f"read_band_{band}")
+        if tile_budget is not None:
+            wait = min(wait, tile_budget.remaining)
+        return TimeBudget(wait)
+
+    def _mm0_all_exact(self):
+        """Mipmap 0 is complete and every row of it is real target imagery."""
+        dds = self.dds
+        if dds is None or not dds.mipmap_list or not dds.mipmap_list[0].retrieved:
+            return False
+        rows = self._mm0_manifest_rows()
+        return len(rows) == self.chunks_per_col and all(
+            manifest.is_exact for manifest in rows.values()
+        )
+
+    def real_from(self):
+        """The finest level k with real imagery at k and every coarser level.
+
+        The tile's one-number index (OrthoStreamXP's ``RealFrom``): the level
+        count when it has none. A level counts when it is built and has no
+        missing color; mipmap 0 only when every row is target imagery.
+        """
+        dds = self.dds
+        if dds is None or not dds.mipmap_list:
+            return 0
+        with self._lock:
+            green = set(self._green_mipmaps)
+        k = len(dds.mipmap_list)
+        for mm in reversed(dds.mipmap_list):
+            if not mm.retrieved or mm.idx in green:
+                break
+            if mm.idx == 0 and not self._mm0_all_exact():
+                break
+            k = mm.idx
+        return k
+
+    def _derive_levels_from_mm0(self, mipmap, native_dds):
+        """Build ``mipmap`` and coarser from mipmap 0's chunks, without downloads.
+
+        Real imagery at a level gives every coarser level by halving, so when
+        mipmap 0 is complete and exact, the coarser levels X-Plane reads next
+        need none of their own zoom's chunks.
+        """
+        if not hasattr(native_dds, "build_mipmap_chain") or not self._mm0_all_exact():
+            return False
+        jpegs = self._collect_chunks_for_zoom(self.max_zoom)
+        if not jpegs or any(data is None for data in jpegs):
+            return False
+        missing_color = tuple(CFG.autoortho.missing_color[:3])
+        try:
+            with self._source_lease(jpegs):
+                with _native_build_context() as threads:
+                    result = native_dds.build_mipmap_chain(
+                        jpegs,
+                        format=CFG.pydds.format.upper(),
+                        missing_color=missing_color,
+                        max_threads=threads,
+                    )
+        except Exception as exc:
+            log.debug(f"Deriving levels of {self.id} from mipmap 0 failed: {exc}")
+            return False
+        if not result.success or self.dds is None:
+            return False
+        written = []
+        with self._dds_write_lock:
+            self.ready.clear()
+            try:
+                last = None
+                for i in range(result.mipmap_count):
+                    data = result.get_mipmap_data(i)
+                    if data:
+                        last = data
+                    if i < mipmap or i >= len(self.dds.mipmap_list) or not data:
+                        continue
+                    if not self.dds.mipmap_list[i].retrieved:
+                        self.dds.replace_mipmap_dense(i, data)
+                        written.append(i)
+                for mm in self.dds.mipmap_list[result.mipmap_count:]:
+                    if last and not mm.retrieved:
+                        self.dds.replace_mipmap_dense(mm.idx, last)
+                        written.append(mm.idx)
+            finally:
+                self.ready.set()
+        if not written:
+            return False
+        self._note_mipmaps_built(written, set())
+        bump("mipmaps_derived_from_mm0", len(written))
+        self._try_incremental_dds_store(mipmap)
+        self._maybe_persist_complete_dds()
+        return True
+
+    def _note_wanted_level(self, mip):
+        """X-Plane wants ``mip`` of this tile now: evidence for the paging model."""
+        self._last_wanted_mip = mip
+        camera = current_camera()
+        if camera is None:
+            return
+        try:
+            distance, _lat, _lon, size_m = tile_distance_m(
+                self.row, self.col, self.tilename_zoom, camera
+            )
+            get_paging_model().note_read(
+                mip, distance, size_m, int(self.dds.width)
+            )
+        except Exception as exc:  # statistics only
+            log.debug(f"Paging sample for {self.id} failed: {exc}")
+
+    def _read_unsealed(self, offset, length):
+        """Bytes served as they are now, without sealing any mipmap-0 row."""
+        with self._lock:
+            green_sources = frozenset(self._green_mipmaps)
+        return self.dds.read_served(offset, length, green_sources)
+
+    def _ensure_base_mipmap(self):
+        """Build the base level (one low-zoom chunk) if it is not there yet.
+
+        The base level is what every placeholder is stretched from. Waiting
+        for it is bounded by ``maxwait``: it is one chunk, usually on disk.
+        """
+        dds = self.dds
+        if dds is None or not dds.mipmap_list:
+            return
+        base = min(self.max_mipmap, len(dds.mipmap_list) - 1)
+        if dds.mipmap_list[base].retrieved or self.real_from() <= base:
+            return
+        wait = self.get_maxwait()
+        if streaming_options.flag("wait_bands"):
+            wait = wait_bands.wait_seconds(wait_bands.FAR, False)
+            if self._read_band is None:
+                self._read_band = wait_bands.FAR
+        try:
+            self.get_mipmap(base, time_budget=TimeBudget(wait))
+        except Exception as exc:  # a placeholder still gets served
+            log.debug(f"Base mipmap {base} for {self.id} failed: {exc}")
 
     def _read_with_mm0_sealing(self, offset, length):
         mm0 = self.dds.mipmap_list[0]
@@ -13458,9 +14021,19 @@ class Tile(object):
                 
                 # Apply spatial + predictive priority system
                 # This considers distance from player and movement direction
-                chunk.priority = _calculate_spatial_priority(
-                    chunk.row, chunk.col, chunk.zoom, base_priority
-                )
+                band = self._read_band
+                if band is not None and streaming_options.flag("band_priorities"):
+                    # Near reads first, then middle, then far; distance and
+                    # direction only break ties within a band.
+                    chunk.priority = wait_bands.chunk_priority(
+                        band, mipmap
+                    ) + _calculate_spatial_priority(
+                        chunk.row, chunk.col, chunk.zoom, 0
+                    ) / 20.0
+                else:
+                    chunk.priority = _calculate_spatial_priority(
+                        chunk.row, chunk.col, chunk.zoom, base_priority
+                    )
                 
                 chunk_getter.submit(chunk)
                 data_updated = True
@@ -13989,7 +14562,7 @@ class Tile(object):
 
         # OPTIMIZATION: In-place desaturation when image isn't cached
         # Only copy when image was saved to cache AND needs desaturation
-        if seasons_enabled:
+        if _seasons_at_build():
             saturation = 0.01 * season_saturation_locked(self.row, self.col, self.tilename_zoom)
             if saturation < 1.0:    # desaturation is expensive
                 if should_cache:
@@ -14061,7 +14634,7 @@ class Tile(object):
             bump("cached_image_partial_crop")
             img = cropped
 
-        if seasons_enabled:
+        if _seasons_at_build():
             saturation = 0.01 * season_saturation_locked(
                 self.row,
                 self.col,
@@ -14973,6 +15546,17 @@ class Tile(object):
         if zoom < self.min_zoom:
             return False
         
+        # Real imagery at mipmap 0 gives every coarser level by halving: no
+        # downloads of this level's own chunks (item 5, real_from_index).
+        if (
+            mipmap > 0
+            and streaming_options.flag("real_from_index")
+            and not self.dds.mipmap_list[mipmap].retrieved
+            and self._probe_chunk_cache_ratio(zoom) < 1.0
+            and self._derive_levels_from_mm0(mipmap, native_dds)
+        ):
+            return True
+
         # Always require all chunks for native build — if any are missing,
         # fall through to the Python path which handles per-chunk fallbacks.
         min_ratio = 1.0

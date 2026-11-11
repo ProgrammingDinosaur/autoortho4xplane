@@ -73,6 +73,37 @@ def _wait_for_state(app, ui, state, timeout=2.0):
     )
 
 
+@pytest.mark.parametrize("busy", [False, True])
+def test_add_seasons_from_library_without_legacy_button(config_ui, monkeypatch, busy):
+    from downloader import SeasonsApplyStatus
+    from ui.task_models import TaskState
+
+    ui = config_ui
+    assert ui.findChild(QPushButton, "scenery-options-na") is None
+    ui.add_seasons_current = "eu" if busy else None
+    started = []
+    monkeypatch.setattr(
+        "config_ui_qt.AddSeasonsWorker.start",
+        lambda worker: started.append(worker),
+    )
+
+    ui.on_add_seasons("na", SeasonsApplyStatus.NOT_APPLIED)
+
+    if busy:
+        assert ui.add_seasons_queue == ["na"]
+        assert ui.task_manager.task("seasons:na").state == TaskState.RUNNING
+        ui.on_add_seasons("na", SeasonsApplyStatus.NOT_APPLIED)
+        assert ui.add_seasons_queue == ["na"]
+        ui.add_seasons_current = None
+        ui._dequeue_and_start_next_seasons_job()
+    assert len(started) == 1
+    assert started[0].package_name == "z_ao_na"
+    assert ui.add_seasons_current == "na"
+    assert ui.task_manager.task("seasons:na").state == TaskState.RUNNING
+    ui.on_add_seasons_finished("na", True)
+    assert ui.task_manager.task("seasons:na").state == TaskState.COMPLETED
+
+
 def test_runtime_state_controls(config_ui):
     config_ui._set_runtime_state(RuntimeState.RUNNING)
     assert config_ui.run_button.text() == "Stop Streaming"

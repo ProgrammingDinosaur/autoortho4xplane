@@ -1,0 +1,66 @@
+name: Windows native diagnostics
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'autoortho/aopipeline/**'
+      - 'autoortho/native/**'
+      - 'autoortho/native_build.py'
+      - 'autoortho/windows_crash.py'
+      - 'autoortho/process_supervisor.py'
+      - 'autoortho/__main__.py'
+      - 'autoortho.spec'
+      - 'autoortho/tests/test_windows_crash*'
+      - 'autoortho/tests/test_native_build.py'
+      - 'autoortho/tests/test_mount_worker_supervisor.py'
+      - '.github/workflows/windows-native.yml'
+      - '.github/workflows/build_release.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Windows cross compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64-posix make
+      - name: Compile DLL and crash collector from this checkout
+        working-directory: autoortho/aopipeline
+        run: make -B -f Makefile.mingw64 windows-bundle CC=x86_64-w64-mingw32-gcc-posix LD=x86_64-w64-mingw32-gcc-posix
+      - name: Record source and binary hashes
+        run: python3 autoortho/native_build.py record --source-root . --directory autoortho/aopipeline/lib/windows --revision "${{ github.sha }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-native
+          path: |
+            autoortho/aopipeline/lib/windows/*.dll
+            autoortho/aopipeline/lib/windows/ao-crash-collector.exe
+            autoortho/aopipeline/lib/windows/native-build.json
+          if-no-files-found: error
+
+  verify:
+    needs: compile
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-native
+          path: autoortho/aopipeline/lib/windows
+      - name: Verify exact sources, runtime versions and crash capture
+        run: |
+          python autoortho/native_build.py verify --source-root . --directory autoortho/aopipeline/lib/windows
+          python -m unittest discover -s autoortho/tests -p test_windows_crash_integration.py -v
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-crash-smoke-evidence
+          path: crash-smoke-evidence/
+          if-no-files-found: ignore

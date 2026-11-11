@@ -27,6 +27,11 @@ else:
 log = logging.getLogger(__name__)
 
 
+def _scenery_package_name(region_id: str) -> str:
+    """Map catalog IDs to installed folders; accept legacy package names too."""
+    return region_id if region_id.startswith("z_ao_") else f"z_ao_{region_id}"
+
+
 class SceneryDownloadWorker(QThread):
     progress = Signal(str, dict)
     finished = Signal(str, bool)
@@ -106,18 +111,20 @@ class AddSeasonsWorker(QThread):
 
     def __init__(self, scenery_name: str, scenery_path: str):
         super().__init__()
+        # Keep the caller's ID in signals so task progress uses the same key.
         self.scenery_name = scenery_name
+        self.package_name = _scenery_package_name(scenery_name)
         self.scenery_path = os.path.join(
             scenery_path,
             "z_autoortho",
             "scenery",
-            scenery_name,
+            self.package_name,
         )
 
     def run(self):
         try:
             success = dsf_utils.add_seasons_to_package(
-                self.scenery_name,
+                self.package_name,
                 progress_callback=lambda payload: self.progress.emit(
                     self.scenery_name,
                     payload,
@@ -139,11 +146,12 @@ class RestoreDefaultDsfsWorker(QThread):
         super().__init__()
         self.dl_manager = dl_manager
         self.region_id = region_id
+        self.package_name = _scenery_package_name(region_id)
 
     def run(self):
         try:
             success = dsf_utils.restore_default_dsfs(
-                self.region_id,
+                self.package_name,
                 progress_callback=lambda payload: self.progress.emit(
                     self.region_id,
                     payload,
@@ -163,6 +171,7 @@ class AddRoughnessWorker(QThread):
     def __init__(self, scenery_name: str, scenery_path: str, roughness_value):
         super().__init__()
         self.scenery_name = scenery_name
+        self.package_name = _scenery_package_name(scenery_name)
         self.scenery_path = scenery_path
         self.roughness_value = roughness_value
 
@@ -174,7 +183,7 @@ class AddRoughnessWorker(QThread):
                 from utils.ter_utils import ter_utils
             self.progress.emit(self.scenery_name, {"stage": "scanning"})
             success = ter_utils.patch_terrain_to_package(
-                self.scenery_name,
+                self.package_name,
                 self.roughness_value,
                 progress_callback=lambda payload: self.progress.emit(
                     self.scenery_name,
@@ -196,6 +205,7 @@ class RestoreRoughnessWorker(QThread):
     def __init__(self, scenery_name: str, scenery_path: str):
         super().__init__()
         self.scenery_name = scenery_name
+        self.package_name = _scenery_package_name(scenery_name)
         self.scenery_path = scenery_path
 
     def run(self):
@@ -205,7 +215,7 @@ class RestoreRoughnessWorker(QThread):
             else:
                 from utils.ter_utils import ter_utils
             success = ter_utils.restore_ter_files(
-                self.scenery_name,
+                self.package_name,
                 progress_callback=lambda payload: self.progress.emit(
                     self.scenery_name,
                     payload,

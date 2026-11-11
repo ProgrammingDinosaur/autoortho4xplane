@@ -1,0 +1,53 @@
+name: Windows diagnostic build
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-diagnostic-build.yml'
+      - '.github/workflows/windows-native.yml'
+      - 'autoortho/native/**'
+      - 'autoortho/native_build.py'
+      - 'autoortho/windows_crash.py'
+      - 'autoortho/process_supervisor.py'
+      - 'autoortho/__main__.py'
+      - 'autoortho.spec'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    uses: ./.github/workflows/windows-native.yml
+
+  portable-build:
+    needs: native
+    runs-on: windows-2022
+    env:
+      VERNAME: 3.0.3-native-diagnostics
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-native
+          path: autoortho/aopipeline/lib/windows
+      - name: Install build requirements
+        run: python -m pip install -r requirements.txt -r requirements-build.txt
+      - name: Build portable application
+        run: |
+          Set-Content -Path autoortho/.version -Value $env:VERNAME
+          python -m PyInstaller --noconfirm --clean autoortho.spec
+      - name: Verify packaged native artifacts and create zip
+        run: |
+          python autoortho/native_build.py verify --source-root . --directory dist/autoortho/ao_files/autoortho/aopipeline/lib/windows
+          Copy-Item docs/windows-native-diagnostics.md dist/autoortho/windows-native-diagnostics.md
+          Copy-Item docs/native-crash-diagnostics.md dist/autoortho/native-crash-diagnostics.md
+          python -c "import shutil; shutil.make_archive('AutoOrtho_windows_native_diagnostics', 'zip', 'dist', 'autoortho')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoOrtho-windows-native-diagnostics
+          path: AutoOrtho_windows_native_diagnostics.zip
+          if-no-files-found: error

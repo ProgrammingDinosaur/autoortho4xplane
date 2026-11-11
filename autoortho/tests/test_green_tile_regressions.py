@@ -261,8 +261,18 @@ def test_kernel_read_crossing_served_row_builds_new_row(
     no_dynamic_cache, tmp_path, monkeypatch, native
 ):
     """macFUSE reads 32 KiB across the 128-byte-offset DDS row boundary."""
+    from autoortho import streaming_options
     from autoortho.dds_manifest import ComposedImageResult, MipmapSource, RowState
 
+    # This pins row sealing across kernel reads. Its first read is a header
+    # chunk, which the read classifier (test_read_classifier) answers without
+    # building row zero, so the classifier is off here.
+    original_flag = streaming_options.flag
+    monkeypatch.setattr(
+        streaming_options,
+        "flag",
+        lambda name: False if name == "read_classifier" else original_flag(name),
+    )
     tile = _tile(tmp_path, 16, 16)
     mm = tile.dds.mipmap_list[0]
     row_bytes = mm.length // tile.chunks_per_col

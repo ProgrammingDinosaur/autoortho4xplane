@@ -93,3 +93,43 @@ def test_update_uses_installed_patch_status_and_hides_patch_action(qt_app):
     assert item.seasons_status == "Applied"
     assert item.roughness_status == "Partial"
     assert item.update_available is True
+
+
+def test_open_details_refresh_after_patch_and_reinstallation(qt_app):
+    page = SceneryLibraryPage()
+    region = _region("na", "1.0", installed="1.0")
+    region.local_rel.seasons_apply_status.value = "not_applied"
+    region.local_rel.roughness_apply_status.value = "not_applied"
+    page.set_regions([region])
+    page.list_view.setCurrentIndex(page.proxy_model.index(0, 0))
+    assert "Terrain reflectivity: Not applied" in page.details_label.text()
+
+    region.local_rel.seasons_apply_status.value = "applied"
+    region.local_rel.roughness_apply_status.value = "applied"
+    page.set_regions([region])
+
+    assert "Seasons: Applied" in page.details_label.text()
+    assert "Terrain reflectivity: Applied (0.8)" in page.details_label.text()
+    assert page.list_view.currentIndex().data(SceneryListModel.RegionIdRole) == "na"
+
+    # A fresh installation resets the patches without requiring reselection.
+    region.local_rel.seasons_apply_status.value = "not_applied"
+    region.local_rel.roughness_apply_status.value = "not_applied"
+    region.local_rel.roughness_value = None
+    page.set_regions([region])
+
+    assert "Seasons: Not applied" in page.details_label.text()
+    assert "Terrain reflectivity: Not applied" in page.details_label.text()
+
+
+def test_removed_region_clears_open_details(qt_app):
+    page = SceneryLibraryPage()
+    page.set_regions([_region("na", "1.0", installed="1.0")])
+    page.show_details("na")
+
+    page.set_regions([])
+
+    assert "Select a scenery package" in page.details_label.text()
+    assert page.options_button.isHidden()
+    assert page.uninstall_button.isHidden()
+    assert not page.options_button.property("regionId")

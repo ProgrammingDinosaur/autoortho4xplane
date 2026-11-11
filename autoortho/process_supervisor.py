@@ -32,6 +32,7 @@ class WorkerHandle:
     job_handle: Optional[int] = None
     shutdown_requested: bool = False
     control_stream: Optional[BinaryIO] = None
+    crash_collector: Optional[object] = None
 
     @property
     def pid(self) -> int:
@@ -117,6 +118,28 @@ class AOProcessSupervisor:
         safe_name = _safe_worker_log_name(volname or Path(mountpoint).name or "mount")
         std_file = open(log_dir / f"worker-{safe_name}.log", "ab", buffering=0)
 
+        collector = None
+        if os.name == "nt":
+            try:
+                if __package__:
+                    from .windows_crash import WindowsCrashCollector, READY_ENV
+                else:
+                    from windows_crash import WindowsCrashCollector, READY_ENV
+                collector = WindowsCrashCollector(log_dir.parent / "crashes")
+                env[READY_ENV] = collector.event_name
+            except Exception as exc:
+                log.warning("Native crash collection unavailable: %s", exc)
+        else:
+            try:
+                if __package__:
+                    from .posix_crash import PosixCrashCollector
+                else:
+                    from posix_crash import PosixCrashCollector
+                collector = PosixCrashCollector(log_dir.parent / "crashes")
+                collector.prepare_environment(env)
+            except Exception as exc:
+                log.warning("POSIX crash collection unavailable: %s", exc)
+
         popen_kwargs = {
             "env": env,
             "stdin": subprocess.PIPE,
@@ -154,6 +177,8 @@ class AOProcessSupervisor:
         except Exception:
             _close_quietly(std_file)
             _close_quietly(control_stream)
+            if collector is not None:
+                collector.close()
             raise
         finally:
             if control_read is not None:
@@ -166,10 +191,13 @@ class AOProcessSupervisor:
             volname=str(volname or ""),
             stdout_file=std_file,
             control_stream=control_stream,
+            crash_collector=collector,
         )
 
         if os.name == "nt":
             handle.job_handle = self._attach_windows_job(process)
+        if collector is not None:
+            collector.start(process.pid, std_file)
 
         self.handles.append(handle)
         log.info("Mount worker for %s started with pid: %s", volname, process.pid)
@@ -217,6 +245,7 @@ class AOProcessSupervisor:
     def kill_worker_tree(self, handle: WorkerHandle):
         if handle.process.poll() is not None:
             return
+        handle.shutdown_requested = True
 
         if os.name == "nt":
             self._kill_windows_tree(handle)
@@ -282,6 +311,7 @@ class AOProcessSupervisor:
     def _request_worker_stop(self, handle: WorkerHandle):
         if handle.process.poll() is not None:
             return
+        handle.shutdown_requested = True
 
         if os.name == "nt":
             try:
@@ -303,6 +333,15 @@ class AOProcessSupervisor:
                 pass
 
     def _cleanup_handle(self, handle: WorkerHandle):
+        if handle.crash_collector is not None:
+            try:
+                record_exit = getattr(handle.crash_collector, "record_exit", None)
+                if record_exit is not None:
+                    record_exit(handle.process.poll(), expected=handle.shutdown_requested)
+                handle.crash_collector.close()
+            except Exception as exc:
+                log.warning("Could not close native crash collector for pid %s: %s", handle.pid, exc)
+            handle.crash_collector = None
         if handle in self.handles:
             try:
                 self.handles.remove(handle)

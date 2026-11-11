@@ -37,6 +37,9 @@ on:
         default: ''
 
 jobs:
+  windows-native:
+    uses: ./.github/workflows/windows-native.yml
+
   build-linux:
     strategy:
       matrix:
@@ -48,11 +51,22 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
    
     - name: Setup 
       run: |
-        sudo apt-get update && sudo apt-get install -y make ca-certificates
+        sudo apt-get update && sudo apt-get install -y gcc make ca-certificates libturbojpeg0-dev
         sudo update-ca-certificates
+
+    - name: Rebuild and verify Linux native pipeline
+      run: |
+        make -B -C autoortho/aopipeline -f Makefile.linux release-bundle
+        python3 autoortho/native_build.py record --platform linux --source-root . --directory autoortho/aopipeline/lib/linux --revision "${{ github.sha }}"
+        python3 autoortho/native_build.py verify --source-root . --directory autoortho/aopipeline/lib/linux
+        python3 autoortho/native_build.py versions --platform linux --source-root . --directory autoortho/aopipeline/lib/linux
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
@@ -93,12 +107,20 @@ jobs:
 
     - name: Setup 
       run: |
+          brew install libomp jpeg-turbo
           python3 -m pip install -U -r requirements.txt
           python3 -m pip install -U -r requirements-build.txt
           xattr -rc .
           chmod -RN . || true
           chflags -R nouchg,noschg . || true
           chmod  -R u+rwX .
+
+    - name: Rebuild and verify macOS native pipeline
+      run: |
+        make -B -C autoortho/aopipeline -f Makefile.macos release-bundle
+        python3 autoortho/native_build.py record --platform macos --source-root . --directory autoortho/aopipeline/lib/macos --revision "${{ github.sha }}"
+        python3 autoortho/native_build.py verify --source-root . --directory autoortho/aopipeline/lib/macos
+        python3 autoortho/native_build.py versions --platform macos --source-root . --directory autoortho/aopipeline/lib/macos
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
@@ -126,6 +148,7 @@ jobs:
 
 
   build-windows:
+    needs: windows-native
     runs-on: windows-latest
 
     env:
@@ -149,10 +172,21 @@ jobs:
       run: |
         echo "${{ inputs.internalver }}" > autoortho/.version
 
+    - uses: actions/download-artifact@v4
+      with:
+        name: windows-native
+        path: autoortho/aopipeline/lib/windows
+
+    - name: Verify Windows native artifacts match this checkout
+      run: python autoortho/native_build.py verify --source-root . --directory autoortho/aopipeline/lib/windows
+
     - name: Build
       run: |
         make win_exe VERSION=${{ env.VERNAME }}
         make win_zip ZIP="7z a" VERSION=${{ env.VERNAME }}
+
+    - name: Verify packaged native DLL and collector were preserved
+      run: python autoortho/native_build.py verify --source-root . --directory autoortho_release/ao_files/autoortho/aopipeline/lib/windows
 
     - name: Save artifact
       uses: actions/upload-artifact@v4

@@ -15,6 +15,7 @@ import sys
 import os
 import re
 import tomllib
+import runpy
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_all
 
 block_cipher = None
@@ -109,6 +110,11 @@ aoimage_path = os.path.join(autoortho_path, 'aoimage')
 aopipeline_path = os.path.join(autoortho_path, 'aopipeline')
 aopipeline_lib_path = os.path.join(aopipeline_path, 'lib', platform_name)
 
+# Fail packaging instead of silently shipping an old checked-in native library.
+# run_path avoids importing the application's same-named top-level module.
+native_provenance = runpy.run_path(os.path.join(autoortho_path, 'native_build.py'))
+native_provenance['verify_bundle'](aopipeline_lib_path, SPECPATH, expected_platform=platform_name)
+
 # =============================================================================
 # Binary files (DLLs, shared libraries, executables)
 # =============================================================================
@@ -129,6 +135,7 @@ if sys.platform == 'win32':
     binaries.append((os.path.join(aopipeline_lib_path, 'libgomp-1.dll'), 'autoortho/aopipeline/lib/windows'))
     binaries.append((os.path.join(aopipeline_lib_path, 'libturbojpeg.dll'), 'autoortho/aopipeline/lib/windows'))
     binaries.append((os.path.join(aopipeline_lib_path, 'libwinpthread-1.dll'), 'autoortho/aopipeline/lib/windows'))
+    binaries.append((os.path.join(aopipeline_lib_path, 'ao-crash-collector.exe'), 'autoortho/aopipeline/lib/windows'))
 elif sys.platform == 'darwin':
     binaries.append((os.path.join(aopipeline_lib_path, 'libaopipeline.dylib'), 'autoortho/aopipeline/lib/macos'))
 else:
@@ -174,6 +181,8 @@ else:  # Linux
 # Data files
 # =============================================================================
 datas = []
+datas.append((os.path.join(aopipeline_lib_path, 'native-build.json'),
+              'autoortho/aopipeline/lib/' + platform_name))
 
 # Version file - auto-generate from git if not present
 version_file = os.path.join(autoortho_path, '.version')
@@ -377,7 +386,9 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    # Compression would change the native artifact hashes in its manifest.
+    upx_exclude=['aopipeline.dll', 'ao-crash-collector.exe', 'libgomp-1.dll',
+                 'libgcc_s_seh-1.dll', 'libwinpthread-1.dll', 'libturbojpeg.dll'],
     name='autoortho',
 )
 
