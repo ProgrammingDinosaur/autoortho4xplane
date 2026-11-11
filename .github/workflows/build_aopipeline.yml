@@ -1,15 +1,19 @@
 name: Build aopipeline libraries
 
-# Triggered by any PR to develop that touches aopipeline C/H sources.
+# Triggered by any PR to develop that touches aopipeline C/H sources (or this
+# workflow), or manually from the Actions tab on any branch ("Run workflow").
 # Builds the shared library for Linux, macOS (arm64), and Windows (MinGW
-# cross-compile on Linux), then commits the updated binaries back to the PR branch.
+# cross-compile on Linux), then commits the updated binaries back to that branch.
+# Manual runs need this file on the default branch for GitHub to offer them.
 
 on:
+  workflow_dispatch:
   pull_request:
     branches: [develop]
     paths:
       - 'autoortho/aopipeline/*.c'
       - 'autoortho/aopipeline/*.h'
+      - '.github/workflows/build_aopipeline.yml'
 
 jobs:
 
@@ -80,7 +84,9 @@ jobs:
     runs-on: ubuntu-latest
 
     # Skip for fork PRs: GITHUB_TOKEN cannot push to a fork branch
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
 
     permissions:
       contents: write
@@ -88,7 +94,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref }}
+          # head_ref is only set for pull_request; manual runs use the chosen branch.
+          ref: ${{ github.head_ref || github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download Linux lib
