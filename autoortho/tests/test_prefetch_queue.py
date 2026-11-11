@@ -367,7 +367,19 @@ def test_predictive_builder_parks_once_during_live_pressure():
             getortho.live_pressure_controller.live_read_end()
 
 
-def test_imminent_background_share_is_bounded_and_refilled():
+def _live_reads_pause_prefetch(monkeypatch):
+    """These tests pin the controller's mechanics with live reads counting as
+    network pressure, the behavior of ``prefetch_during_live_reads = False``."""
+    original = getortho.streaming_options.flag
+    monkeypatch.setattr(
+        getortho.streaming_options,
+        "flag",
+        lambda name: False if name == "prefetch_during_live_reads" else original(name),
+    )
+
+
+def test_imminent_background_share_is_bounded_and_refilled(monkeypatch):
+    _live_reads_pause_prefetch(monkeypatch)
     controller = getortho.LivePressureController(
         imminent_share=0.10,
         token_capacity=2,
@@ -386,7 +398,8 @@ def test_imminent_background_share_is_bounded_and_refilled():
         controller.live_read_end()
 
 
-def test_build_pressure_hysteresis_clears_while_network_remains_live():
+def test_build_pressure_hysteresis_clears_while_network_remains_live(monkeypatch):
+    _live_reads_pause_prefetch(monkeypatch)
     controller = getortho.LivePressureController(
         build_threshold=2,
         clearance_hysteresis=0.25,

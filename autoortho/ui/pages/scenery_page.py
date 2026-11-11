@@ -463,6 +463,10 @@ class SceneryLibraryPage(QWidget):
         )
 
     def set_regions(self, regions: Iterable, tasks=()) -> None:
+        selected_id = self.list_view.currentIndex().data(
+            SceneryListModel.RegionIdRole
+        )
+        details_id = self.options_button.property("regionId")
         self.items = [
             item for item in (item_from_region(region) for region in regions)
             if item is not None
@@ -479,6 +483,17 @@ class SceneryLibraryPage(QWidget):
         self.region_filter.setCurrentIndex(max(0, index))
         self.region_filter.blockSignals(False)
         self.refresh()
+        # Model resets clear Qt's selection; keep the current package and its
+        # details in sync with refreshed patch status and task activity.
+        if selected_id:
+            for row, item in enumerate(self.items):
+                if item.region_id == selected_id:
+                    self.list_view.setCurrentIndex(
+                        self.proxy_model.mapFromSource(self.model.index(row, 0))
+                    )
+                    break
+        if details_id:
+            self.show_details(details_id)
 
     def set_runtime_locked(self, locked: bool) -> None:
         locked = bool(locked)
@@ -552,6 +567,13 @@ class SceneryLibraryPage(QWidget):
             None,
         )
         if item is None:
+            self.details_label.setText(
+                "Select a scenery package to view installation details and "
+                "recent activity."
+            )
+            for button in (self.options_button, self.uninstall_button):
+                button.setProperty("regionId", None)
+                button.hide()
             return
         task_lines = [
             f"• {task.title}: {task.state.value}"

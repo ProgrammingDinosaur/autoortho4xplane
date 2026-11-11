@@ -28,6 +28,9 @@ on:
         default: ''
 
 jobs:
+  windows-native:
+    uses: ./.github/workflows/windows-native.yml
+
   build-linux:
     strategy:
       matrix:
@@ -41,16 +44,22 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
    
     - name: Setup 
       run: |
-        sudo apt-get update && sudo apt-get install -y make ca-certificates libomp-dev libcurl4-openssl-dev
+        sudo apt-get update && sudo apt-get install -y gcc make ca-certificates libomp-dev libturbojpeg0-dev libcurl4-openssl-dev
         sudo update-ca-certificates
     
     - name: Build native pipeline (aopipeline)
       run: |
-        cd autoortho/aopipeline
-        make -f Makefile.linux phase3 || echo "Native pipeline build skipped (optional)"
+        make -B -C autoortho/aopipeline -f Makefile.linux release-bundle
+        python3 autoortho/native_build.py record --platform linux --source-root . --directory autoortho/aopipeline/lib/linux --revision "${{ github.sha }}"
+        python3 autoortho/native_build.py verify --source-root . --directory autoortho/aopipeline/lib/linux
+        python3 autoortho/native_build.py versions --platform linux --source-root . --directory autoortho/aopipeline/lib/linux
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
@@ -94,14 +103,16 @@ jobs:
 
     - name: Setup
       run: |
-        brew install libomp jpeg-turbo curl || true
+        brew install libomp jpeg-turbo curl
         python3 -m pip install -U -r requirements.txt
         python3 -m pip install -U -r requirements-build.txt
 
     - name: Build native pipeline (aopipeline)
       run: |
-        cd autoortho/aopipeline
-        make -f Makefile.macos phase3 || echo "Native pipeline build skipped (optional)"
+        make -B -C autoortho/aopipeline -f Makefile.macos release-bundle
+        python3 autoortho/native_build.py record --platform macos --source-root . --directory autoortho/aopipeline/lib/macos --revision "${{ github.sha }}"
+        python3 autoortho/native_build.py verify --source-root . --directory autoortho/aopipeline/lib/macos
+        python3 autoortho/native_build.py versions --platform macos --source-root . --directory autoortho/aopipeline/lib/macos
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
@@ -130,6 +141,7 @@ jobs:
 
 
   build-windows:
+    needs: windows-native
     runs-on: windows-2022
     permissions:
       contents: write
@@ -150,9 +162,13 @@ jobs:
           python -m pip install -U -r requirements.txt
           python -m pip install -U -r requirements-build.txt
 
-    # Note: Native pipeline for Windows requires MinGW cross-compile or MSVC
-    # The pre-built libraries in autoortho/aopipeline/ are included if available
-    # For now, skip native build on Windows CI (can be added with proper toolchain)
+    - uses: actions/download-artifact@v4
+      with:
+        name: windows-native
+        path: autoortho/aopipeline/lib/windows
+
+    - name: Verify Windows native artifacts match this checkout
+      run: python autoortho/native_build.py verify --source-root . --directory autoortho/aopipeline/lib/windows
 
     - name: Optionally set internal version separately
       if: ${{ inputs.internalver != '' }}
@@ -163,6 +179,9 @@ jobs:
       run: |
         make win_exe VERSION=${{ env.VERNAME }}
         make win_zip ZIP="7z a" VERSION=${{ env.VERNAME }}
+
+    - name: Verify packaged native DLL and collector were preserved
+      run: python autoortho/native_build.py verify --source-root . --directory autoortho_release/ao_files/autoortho/aopipeline/lib/windows
 
     - name: Save artifact
       uses: actions/upload-artifact@v4

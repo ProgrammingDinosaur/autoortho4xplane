@@ -22,7 +22,7 @@ MIN_MACOS   := 11.0
 # OpenMP support via Homebrew libomp (for headers only at compile time)
 OMP_INC     ?= /opt/homebrew/opt/libomp/include
 
-CFLAGS      := -O3 -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
+CFLAGS      := -O3 -g -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
                -arch $(ARCH) -mmacosx-version-min=$(MIN_MACOS) \
                -I$(TJ_INC) -I$(OMP_INC) -I../aoimage \
                -Xpreprocessor -fopenmp -pthread
@@ -38,7 +38,7 @@ SOURCES     := aocache.c aodecode.c aodds.c aopipeline.c
 OBJECTS     := $(SOURCES:.c=.o)
 HEADERS     := aocache.h aodecode.h aodds.h aopipeline.h internal.h
 
-.PHONY: all clean phase1 phase2 phase3
+.PHONY: all clean phase1 phase2 phase3 release-bundle
 
 # Default: build everything available
 all: libaopipeline.dylib
@@ -53,6 +53,10 @@ phase2: aocache.o aodecode.o
 
 # Phase 3: Add DDS building (complete pipeline)
 phase3: libaopipeline.dylib
+
+release-bundle: libaopipeline.dylib
+	mkdir -p lib/macos
+	cp libaopipeline.dylib lib/macos/libaopipeline.dylib
 
 # Pattern rules
 aocache.o: aocache.c aocache.h internal.h

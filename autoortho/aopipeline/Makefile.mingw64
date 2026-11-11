@@ -14,7 +14,7 @@ ISPC_LIB    := ../lib/windows/ispc_texcomp.dll
 CC          := x86_64-w64-mingw32-gcc
 LD          := x86_64-w64-mingw32-gcc
 
-CFLAGS      := -O3 -Wall -fdiagnostics-color \
+CFLAGS      := -O3 -g -Wall -fdiagnostics-color \
                -DWIN32 -DAOPIPELINE_EXPORTS \
                -I$(JPGT)/include -I../aoimage \
                -fopenmp
@@ -28,7 +28,7 @@ LIBS        := -L$(JPGT)/lib -lturbojpeg
 SOURCES     := aocache.c aodecode.c aodds.c aopipeline.c
 OBJECTS     := $(SOURCES:.c=.o)
 
-.PHONY: all clean phase1 phase2 phase3 libjpeg-turbo-gcc64
+.PHONY: all clean phase1 phase2 phase3 libjpeg-turbo-gcc64 windows-bundle
 
 # Default: build everything available
 all: aopipeline.dll
@@ -67,6 +67,18 @@ aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h internal.h
 aopipeline.dll: $(OBJECTS) libjpeg-turbo-gcc64
 	$(LD) -o $@ $(LDFLAGS) $(OBJECTS) $(LIBS)
 
+ao-crash-collector.exe: ../native/crash_collector.c
+	$(CC) -O2 -g -Wall -Wextra -Werror -municode -static-libgcc $< -o $@ -ldbghelp
+
+# Releases compile from the same checkout that supplies the Python code.
+# Keep debug information in the DLL/collector for native crash analysis.
+windows-bundle: aopipeline.dll ao-crash-collector.exe
+	mkdir -p lib/windows
+	cp aopipeline.dll ao-crash-collector.exe lib/windows/
+	cp "$(shell $(CC) -print-file-name=libgomp-1.dll)" lib/windows/
+	cp "$(shell $(CC) -print-file-name=libgcc_s_seh-1.dll)" lib/windows/
+	cp "$(shell $(CC) -print-file-name=libwinpthread-1.dll)" lib/windows/
+
 clean:
-	rm -f $(OBJECTS) aopipeline.dll aocache.dll
+	rm -f $(OBJECTS) aopipeline.dll aocache.dll ao-crash-collector.exe
 

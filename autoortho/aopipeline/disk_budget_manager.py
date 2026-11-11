@@ -96,6 +96,9 @@ class DiskBudgetManager:
         self._jpeg_usage = 0
 
         self._dds_cache = dds_cache  # Reference to DynamicDDSCache for eviction
+        # Predicate on a JPEG file name: True for files kept for good (the
+        # low-zoom base). They are neither counted nor evicted.
+        self.protect_jpeg = None
 
         self._lock = threading.Lock()
         self._scan_complete = threading.Event()
@@ -291,6 +294,8 @@ class DiskBudgetManager:
                     continue
                 for fname in filenames:
                     if fname.endswith((".jpg", ".jpeg")):
+                        if self.protect_jpeg is not None and self.protect_jpeg(fname):
+                            continue
                         try:
                             total += os.path.getsize(os.path.join(dirpath, fname))
                         except OSError:
@@ -307,6 +312,8 @@ class DiskBudgetManager:
                     continue
                 for filename in filenames:
                     if not filename.lower().endswith((".jpg", ".jpeg")):
+                        continue
+                    if self.protect_jpeg is not None and self.protect_jpeg(filename):
                         continue
                     path = os.path.join(dirpath, filename)
                     try:

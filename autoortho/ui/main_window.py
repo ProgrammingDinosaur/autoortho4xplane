@@ -7971,10 +7971,8 @@ class ConfigUI(QMainWindow):
             )
             return
 
-        # Button no longer exists directly; use scenery-options for state changes
+        # Legacy per-package buttons are optional in the scenery library.
         button = self.findChild(QPushButton, f"scenery-options-{region_id}")
-        if button is None:
-            return
 
         # If something is already processing, enqueue this request
         if self.add_seasons_current is not None:
@@ -7991,11 +7989,9 @@ class ConfigUI(QMainWindow):
                         self.on_add_seasons(rid, status)
                     ),
                 )
-                try:
+                if button is not None:
                     button.setEnabled(False)
                     button.setText("Queued for seasons…")
-                except Exception:
-                    pass
             return
 
         # Nothing processing; start immediately
