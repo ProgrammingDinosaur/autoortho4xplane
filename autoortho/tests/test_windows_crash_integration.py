@@ -112,7 +112,7 @@ except OSError:
         with os.add_dll_directory(str(directory)):
             library = ctypes.CDLL(str(directory / "aopipeline.dll"))
             for name in ("aocache", "aodecode", "aodds"):
-                source = (APP / "aopipeline" / (name + ".c")).read_text()
+                source = (APP / "aopipeline" / (name + ".c")).read_text(encoding="utf-8")
                 expected = re.search(r'#define ' + name.upper() + r'_VERSION "([^"]+)"', source).group(1)
                 version = getattr(library, name + "_version")
                 version.restype = ctypes.c_char_p

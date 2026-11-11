@@ -96,7 +96,7 @@ def verify_versions(directory, root, platform_name):
         library = ctypes.CDLL(str(directory / PLATFORM_FILES[platform_name][0]))
         versions = {}
         for name in ("aocache", "aodecode", "aodds"):
-            source = (Path(root) / "autoortho/aopipeline" / (name + ".c")).read_text()
+            source = (Path(root) / "autoortho/aopipeline" / (name + ".c")).read_text(encoding="utf-8")
             match = re.search(r'#define\s+' + name.upper() + r'_VERSION\s+"([^"]+)"', source)
             if match is None:
                 raise ValueError(f"Missing source version: {name}")
