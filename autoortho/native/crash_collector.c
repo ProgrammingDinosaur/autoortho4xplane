@@ -90,17 +90,35 @@ static void capture(HANDLE process, const DEBUG_EVENT *event, const wchar_t *pre
     info.ExceptionPointers = &pointers;
     info.ClientPointers = FALSE;  /* Exception and context live in collector. */
 
-    DWORD dump_error = 0;
+    DWORD dump_error = 0, dump_attempts = 0;
     BOOL dumped = FALSE;
     const wchar_t *path = with_suffix(prefix, L".dmp");
     HANDLE dump = path ? CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL)
                        : INVALID_HANDLE_VALUE;
     if (dump != INVALID_HANDLE_VALUE) {
-        MINIDUMP_TYPE type = (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules |
-            MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithProcessThreadData | MiniDumpWithFullMemoryInfo);
-        dumped = MiniDumpWriteDump(process, event->dwProcessId, dump, type,
-                                  have_context ? &info : NULL, NULL, NULL);
-        if (!dumped) dump_error = GetLastError();
+        /* DbgHelp intermittently fails (e.g. ERROR_INVALID_USER_BUFFER) while
+         * walking remote memory. Fall back to smaller dumps; every level still
+         * holds the thread, module and exception streams. */
+        static const MINIDUMP_TYPE types[] = {
+            (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules |
+                MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithProcessThreadData |
+                MiniDumpWithFullMemoryInfo),
+            (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules |
+                MiniDumpWithProcessThreadData | MiniDumpWithFullMemoryInfo),
+            (MINIDUMP_TYPE)(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules),
+            MiniDumpNormal,
+        };
+        for (size_t i = 0; i < sizeof(types) / sizeof(types[0]) && !dumped; ++i) {
+            if (i) {  /* Discard any partial output from the failed attempt. */
+                SetFilePointer(dump, 0, NULL, FILE_BEGIN);
+                SetEndOfFile(dump);
+            }
+            ++dump_attempts;
+            dumped = MiniDumpWriteDump(process, event->dwProcessId, dump, types[i],
+                                      have_context ? &info : NULL, NULL, NULL);
+            if (!dumped) dump_error = GetLastError();
+        }
+        if (dumped) dump_error = 0;
         CloseHandle(dump);
         if (!dumped && path) DeleteFileW(path);
     } else {
@@ -118,8 +136,9 @@ static void capture(HANDLE process, const DEBUG_EVENT *event, const wchar_t *pre
         for (DWORD i = 0; i < record.NumberParameters && i < EXCEPTION_MAXIMUM_PARAMETERS; ++i) {
             fprintf(report, "%s\"0x%llx\"", i ? "," : "", (unsigned long long)record.ExceptionInformation[i]);
         }
-        fprintf(report, "],\"dump_written\":%s,\"dump_error\":%lu,\"context_error\":%lu}\n",
-                dumped ? "true" : "false", dump_error, context_error);
+        fprintf(report, "],\"dump_written\":%s,\"dump_error\":%lu,\"dump_attempts\":%lu,"
+                "\"context_error\":%lu}\n",
+                dumped ? "true" : "false", dump_error, dump_attempts, context_error);
         fclose(report);
     }
     fprintf(stderr, "Native crash captured: worker=%lu exception=0x%08lx dump=%s error=%lu\n",
