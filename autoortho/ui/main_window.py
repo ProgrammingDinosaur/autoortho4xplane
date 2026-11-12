@@ -54,6 +54,7 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.shell import ApplicationShell
     from autoortho.ui.pages.scenery_page import SceneryLibraryPage
     from autoortho.ui.pages.settings_page import SettingsPage
+    from autoortho.ui.pages.expert_settings_page import ExpertSettingsPage
     from autoortho.ui.pages.flight_plan_page import FlightPlanPage
     from autoortho.ui.pages.diagnostics_page import DiagnosticsPage
     from autoortho.ui.dynamic_zoom_editor import DynamicZoomEditor, PRESETS
@@ -111,6 +112,7 @@ else:
     from ui.shell import ApplicationShell
     from ui.pages.scenery_page import SceneryLibraryPage
     from ui.pages.settings_page import SettingsPage
+    from ui.pages.expert_settings_page import ExpertSettingsPage
     from ui.pages.flight_plan_page import FlightPlanPage
     from ui.pages.diagnostics_page import DiagnosticsPage
     from ui.dynamic_zoom_editor import DynamicZoomEditor, PRESETS
@@ -303,6 +305,7 @@ class ConfigUI(QMainWindow):
         "sun_day_threshold_spin",
     )
     RESTART_REQUIRED_SETTINGS = {
+        "expert_settings",
         "scenery_path_edit",
         "xplane_path_edit",
         "cache_dir_edit",
@@ -377,6 +380,98 @@ class ConfigUI(QMainWindow):
         "dynamic_zoom_steps",
         "missing_color",
     }
+    # Settings a dedicated control already edits. The Expert settings table
+    # shows them read-only so two controls never disagree about one value.
+    # tests/test_expert_settings_page.py checks this against every
+    # "self.cfg.<section>.<key> =" assignment in this module.
+    WIDGET_BOUND_SETTINGS = frozenset({
+        "autoortho.background_builder_workers",
+        "autoortho.buffer_pool_size",
+        "autoortho.download_dispatch_workers",
+        "autoortho.dynamic_zoom_steps",
+        "autoortho.fallback_extends_budget",
+        "autoortho.fallback_level",
+        "autoortho.fallback_timeout",
+        "autoortho.fetch_threads",
+        "autoortho.live_builder_concurrency",
+        "autoortho.live_tile_admission",
+        "autoortho.maptype_override",
+        "autoortho.max_zoom",
+        "autoortho.max_zoom_mode",
+        "autoortho.max_zoom_near_airports",
+        "autoortho.maxwait",
+        "autoortho.min_zoom",
+        "autoortho.missing_color",
+        "autoortho.native_partial_allow_incomplete",
+        "autoortho.persist_partial_dds_cache",
+        "autoortho.pipeline_mode",
+        "autoortho.predictive_dds_build_interval_ms",
+        "autoortho.predictive_dds_enabled",
+        "autoortho.predictive_dds_use_fallbacks",
+        "autoortho.prefetch_admission_burst",
+        "autoortho.prefetch_enabled",
+        "autoortho.prefetch_interval",
+        "autoortho.prefetch_lookahead",
+        "autoortho.prefetch_max_chunks",
+        "autoortho.prefetch_quality_grace_sec",
+        "autoortho.prefetch_quality_mode",
+        "autoortho.prefetch_radius_nm",
+        "autoortho.provider_adaptive_concurrency",
+        "autoortho.provider_adaptive_controller_v2",
+        "autoortho.provider_max_connections",
+        "autoortho.provider_max_in_flight",
+        "autoortho.provider_origin_cooldown_seconds",
+        "autoortho.provider_origin_decrease_factor",
+        "autoortho.provider_origin_initial_concurrency",
+        "autoortho.provider_queue_timeout",
+        "autoortho.simheaven_compat",
+        "autoortho.strict_target_deadline_sec",
+        "autoortho.suspend_maxwait",
+        "autoortho.tile_image_cache_mb",
+        "autoortho.tile_time_budget",
+        "autoortho.use_time_budget",
+        "autoortho.using_custom_tiles",
+        "cache.auto_clean_cache",
+        "cache.cache_mem_limit",
+        "cache.file_cache_size",
+        "diagnostics.checkpoint_interval_seconds",
+        "diagnostics.performance_profiling",
+        "diagnostics.python_allocation_tracing",
+        "diagnostics.sample_interval_seconds",
+        "flightdata.webui_port",
+        "flightdata.xplane_udp_port",
+        "fuse.threading",
+        "general.console_log_level",
+        "general.file_log_level",
+        "general.hide",
+        "paths.cache_dir",
+        "paths.download_dir",
+        "paths.long_term_cache_dir",
+        "paths.scenery_path",
+        "paths.xplane_path",
+        "pydds.compressor",
+        "pydds.format",
+        "scenery.max_download_workers",
+        "scenery.noclean",
+        "scenery.storage_safety_margin_gb",
+        "seasons.compress_dsf",
+        "seasons.enabled",
+        "seasons.fal_saturation",
+        "seasons.seasons_convert_workers",
+        "seasons.spr_saturation",
+        "seasons.sum_saturation",
+        "seasons.win_saturation",
+        "simbrief.prefetch_while_parked",
+        "simbrief.route_consideration_radius_nm",
+        "simbrief.route_deviation_threshold_nm",
+        "simbrief.use_flight_data",
+        "simbrief.userid",
+        "time_exclusion.default_to_exclusion",
+        "time_exclusion.enabled",
+        "time_exclusion.sun_day_threshold",
+        "time_exclusion.sun_night_threshold",
+        "windows.prefer_winfsp",
+    })
 
     @staticmethod
     def _publish_simbrief_to_workers(data, enabled=None):
@@ -1095,6 +1190,23 @@ class ConfigUI(QMainWindow):
                 ),
             ),
         )
+        self.expert_settings_page = ExpertSettingsPage(
+            self.cfg,
+            locked_names=self.WIDGET_BOUND_SETTINGS,
+        )
+        self.expert_settings_page.changed.connect(
+            self._on_settings_control_changed
+        )
+        self.categorized_settings_page.add_category(
+            "All Settings (Expert)",
+            [self.expert_settings_page],
+            recommendation=(
+                "Every AutoOrtho setting with its default and whether you "
+                "changed it. Only changed settings are stored in your config "
+                "file; the rest follow AutoOrtho's defaults."
+            ),
+            restore_defaults=False,
+        )
         self.categorized_settings_page.preset_requested.connect(
             self._apply_settings_preset
         )
@@ -1651,6 +1763,8 @@ class ConfigUI(QMainWindow):
             snapshot["dynamic_zoom_steps"] = (
                 self._dynamic_zoom_manager.save_to_config()
             )
+        if hasattr(self, "expert_settings_page"):
+            snapshot["expert_settings"] = self.expert_settings_page.snapshot()
         return snapshot
 
     def _initialize_settings_session(self):
@@ -1756,6 +1870,11 @@ class ConfigUI(QMainWindow):
                     self.dynamic_zoom_editor.set_manager(
                         self._dynamic_zoom_manager
                     )
+            if "expert_settings" in snapshot and hasattr(
+                self,
+                "expert_settings_page",
+            ):
+                self.expert_settings_page.restore(snapshot["expert_settings"])
 
             for method_name in (
                 "_update_zoom_mode_visibility",
@@ -8661,9 +8780,16 @@ class ConfigUI(QMainWindow):
                 self.cfg.simbrief.use_flight_data = self.simbrief_use_flight_data_check.isChecked()
 
         if persist:
+            # Expert-table edits apply last: the keys it may edit have no
+            # other control, so nothing above overwrites them.
+            expert_page = getattr(self, "expert_settings_page", None)
+            if expert_page is not None:
+                expert_page.apply_to(self.cfg)
             if not self._persist_configuration(notify=True):
                 self.ready.set()
                 return False
+            if expert_page is not None:
+                expert_page.mark_saved()
         else:
             self.cfg.set_config()
             self.cfg.refresh_derived_paths(create_missing=False)

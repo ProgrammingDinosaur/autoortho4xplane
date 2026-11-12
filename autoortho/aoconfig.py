@@ -10,9 +10,15 @@ from types import SimpleNamespace
 if __package__:
     from autoortho.utils.constants import system_type
     from autoortho.worker_modes import is_mount_worker_mode
+    from autoortho.settings_registry import (
+        Tier,
+        build_registry,
+        parse_value,
+    )
 else:
     from utils.constants import system_type
     from worker_modes import is_mount_worker_mode
+    from settings_registry import Tier, build_registry, parse_value
 
 import logging
 log = logging.getLogger(__name__)
@@ -24,57 +30,10 @@ class SectionParser(object):
     false = ['false', 'no', 'off']
 
     def __init__(self, /, **kwargs):
+        # Lists first, then booleans (text only), integers and floats; see
+        # settings_registry.parse_value.
         for k, v in kwargs.items():
-            # Normalize to string for parsing while tolerating None
-            sv = '' if v is None else str(v)
-            s = sv.strip()
-
-            # Detect list first (before other parsing)
-            if s.startswith('[') and s.endswith(']'):
-                try:
-                    parsed_val = ast.literal_eval(s)
-                except Exception:
-                    parsed_val = s
-            # Detect booleans (text-only, not '0'/'1' to avoid corrupting numbers)
-            elif s.lower() in self.true:
-                parsed_val = True
-            elif s.lower() in self.false:
-                parsed_val = False
-            # Try to parse as integer
-            elif s.lstrip('-').isdigit():
-                try:
-                    parsed_val = int(s)
-                except ValueError:
-                    parsed_val = s
-            # Try to parse as float
-            elif self._is_float(s):
-                try:
-                    parsed_val = float(s)
-                except ValueError:
-                    parsed_val = s
-            else:
-                parsed_val = s
-
-            self.__dict__.update({k: parsed_val})
-    
-    @staticmethod
-    def _is_float(s):
-        """Check if string looks like a float (contains decimal point or scientific notation)."""
-        if not s:
-            return False
-        # Remove leading minus sign for checking
-        s_check = s.lstrip('-')
-        # Must contain at least one digit
-        if not any(c.isdigit() for c in s_check):
-            return False
-        # Check for float patterns: decimal point or scientific notation
-        if '.' in s_check or 'e' in s_check.lower():
-            try:
-                float(s)
-                return True
-            except ValueError:
-                return False
-        return False
+            self.__dict__[k] = parse_value(v)
 
     def __repr__(self):
         items = (f"{k}={v!r}" for k, v in self.__dict__.items())
@@ -88,7 +47,80 @@ class SectionParser(object):
 
 # Bump when a release changes a default that existing configs must pick up,
 # and add the step to _migrate_config_revision.
-CONFIG_REVISION = 1
+CONFIG_REVISION = 2
+
+# From this revision the file holds only the settings the user changed; every
+# other setting is a commented "# key = default" line. Active lines in such a
+# file are the user's explicit choices, even when equal to the default.
+SPARSE_REVISION = 2
+
+# Shown at the top of [general] in the written file. Comment lines are read as
+# option keys (comment_prefixes='/') and dropped on load, so text before the
+# first section header would break parsing.
+_FILE_NOTE = (
+    "# Only the settings you changed are active. A line such as",
+    "# \"# max_zoom = 16\" is a default in use: delete the \"# \" and change",
+    "# the value to override it.",
+)
+
+_MISSING = object()
+
+
+def _normalized(section, value):
+    """A value in comparable form: parsed, and paths in canonical form."""
+    parsed = parse_value(value)
+    if section == "paths" and isinstance(parsed, str) and parsed:
+        return os.path.normcase(os.path.normpath(os.path.expanduser(parsed)))
+    return parsed
+
+
+def _same(a, b):
+    """Equal values of the same kind (True is not the integer 1 here)."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    return a == b
+
+
+def _new_parser():
+    return configparser.ConfigParser(
+        strict=False,
+        allow_no_value=True,
+        comment_prefixes='/',
+    )
+
+
+def _read_config_file(path):
+    """Read a config file as UTF-8, falling back to the locale encoding.
+
+    Releases before the sparse format wrote the file in the locale encoding
+    (cp1252 on Windows), which UTF-8 cannot read when a comment holds a dash.
+    Latin-1 is the last resort: it decodes any byte, and only comments hold
+    non-ASCII text in practice.
+    """
+    for encoding in ("utf-8", None, "latin-1"):
+        parser = _new_parser()
+        try:
+            parser.read(path, encoding=encoding)
+            return parser
+        except UnicodeDecodeError:
+            continue
+    return parser
+
+
+_REGISTRY = None
+
+
+def settings_registry():
+    """The registry of every packaged setting (built once)."""
+    global _REGISTRY
+    if _REGISTRY is None:
+        ranges = {
+            f"autoortho.{name}": spec["range"]
+            for name, spec in PROVIDER_SETTINGS.items()
+            if "range" in spec
+        }
+        _REGISTRY = build_registry(AOConfig._defaults, ranges)
+    return _REGISTRY
 
 
 class AOConfig(object):
@@ -630,29 +662,117 @@ route_prefetch_radius_nm = 40
             self.save()
 
 
+    @staticmethod
+    def registry():
+        return settings_registry()
+
     def load(self):
         self.config.read_string(self._defaults)
-        user_config = configparser.ConfigParser(
-            strict=False,
-            allow_no_value=True,
-            comment_prefixes='/',
-        )
-        if os.path.isfile(self.conf_file):
+        file_exists = os.path.isfile(self.conf_file)
+        if file_exists:
             log.info(f"Config file found {self.conf_file} reading...")
-            user_config.read(self.conf_file)
-            self.config.read(self.conf_file)
+            user_config = _read_config_file(self.conf_file)
         else:
             log.info("No config file found. Using defaults...")
+            user_config = _new_parser()
+
+        # Comment lines are parsed as option keys; the commented defaults of a
+        # sparse file ("# key = value") must not reach the live config.
+        for section in user_config.sections():
+            if not self.config.has_section(section):
+                self.config.add_section(section)
+            for key, value in user_config.items(section, raw=True):
+                if not key.startswith('#'):
+                    self.config.set(section, key, value)
 
         self._explicit_options = {
-            section: set(user_config.options(section))
+            section: {
+                option for option in user_config.options(section)
+                if not option.startswith('#')
+            }
             for section in user_config.sections()
         }
+        self._loaded_explicit = {}
+        if file_exists and _file_revision(user_config) >= SPARSE_REVISION:
+            self._loaded_explicit = self._explicit_values(user_config)
         _migrate_legacy_provider_options(self, user_config)
-        if os.path.isfile(self.conf_file):
+        if file_exists:
             _migrate_config_revision(self, user_config)
         self.get_config()
         return True
+
+    def _explicit_values(self, user_config):
+        """The registered settings a sparse file sets, in comparable form."""
+        registry = self.registry()
+        values = {}
+        for section in user_config.sections():
+            for key, value in user_config.items(section, raw=True):
+                spec = registry.get(section, key)
+                if spec is None or spec.tier is Tier.RETIRED:
+                    continue
+                values[(section, spec.key)] = _normalized(section, value)
+        return values
+
+    # -- Value sources -----------------------------------------------------
+
+    def _current_value(self, section, key):
+        namespace = self.__dict__.get(section)
+        if namespace is not None and key in namespace.__dict__:
+            return namespace.__dict__[key]
+        return self.config.get(section, key, raw=True, fallback=None)
+
+    def value(self, section, key):
+        """The live value of a setting (None when unknown)."""
+        return self._current_value(section, key)
+
+    def is_custom(self, section, key):
+        """Whether a setting holds the user's own value rather than the default.
+
+        A value differing from the default is custom. In a sparse file, an
+        active line equal to the default stays custom until the value changes,
+        so a deliberate choice is not dropped. Settings the registry does not
+        know (plugins, hand-added keys) are always custom; retired ones never.
+        """
+        spec = self.registry().get(section, key)
+        if spec is None:
+            return True
+        if spec.tier is Tier.RETIRED:
+            return False
+        current = _normalized(section, self._current_value(section, spec.key))
+        if not _same(current, _normalized(section, spec.default_text)):
+            return True
+        loaded = self._loaded_explicit.get((section, spec.key), _MISSING)
+        return loaded is not _MISSING and _same(loaded, current)
+
+    def source(self, section, key):
+        """'custom' or 'default', for the settings UI."""
+        return "custom" if self.is_custom(section, key) else "default"
+
+    def _should_write(self, section, key):
+        spec = self.registry().get(section, key)
+        if spec is not None and spec.persist_always:
+            return True
+        return self.is_custom(section, key)
+
+    def set_value(self, section, key, value):
+        """Set one setting from its text form (as the config file holds it)."""
+        text = '' if value is None else str(value)
+        if not self.config.has_section(section):
+            self.config.add_section(section)
+        self.config.set(section, key, text)
+        namespace = self.__dict__.get(section)
+        if namespace is None:
+            namespace = SectionParser()
+            self.__dict__[section] = namespace
+        namespace.__dict__[key] = parse_value(text)
+
+    def reset_to_default(self, section, key):
+        """Return a registered setting to its default; it is then not written."""
+        spec = self.registry().get(section, key)
+        if spec is None:
+            raise KeyError(f"{section}.{key} is not a known setting")
+        self.set_value(section, spec.key, spec.default_text)
+        self._loaded_explicit.pop((section, spec.key), None)
 
 
     def _load_defaults_parser(self):
@@ -813,8 +933,18 @@ route_prefetch_radius_nm = 40
         self.set_config()
 
         text = self.render_config_text()
-        with open(self.conf_file, 'w') as h:
+        with open(self.conf_file, 'w', encoding='utf-8') as h:
             h.write(text)
+        # What was written is now the user's explicit choice.
+        self._loaded_explicit = {
+            (spec.section, spec.key): _normalized(
+                spec.section,
+                self._current_value(spec.section, spec.key),
+            )
+            for spec in self.registry()
+            if spec.tier is not Tier.RETIRED
+            and self.is_custom(spec.section, spec.key)
+        }
         log.info(f"Wrote config file: {self.conf_file}")
 
     def render_config_text(self):
@@ -824,13 +954,23 @@ route_prefetch_radius_nm = 40
         comment containing ``:`` or ``=`` collapses into one shared key per
         section and old comments survive forever in their original position.
         Writing from the template keeps every comment verbatim next to the
-        setting it describes and drops stale ones. Values come from the live
-        config; settings the template does not know are kept at the end of
-        their section.
+        setting it describes and drops stale ones.
+
+        Only custom settings (see :meth:`is_custom`) are active lines; every
+        other setting is written as ``# key = default`` so the file still
+        documents it. Retired settings and their comments are left out.
+        Settings the template does not know are kept at the end of their
+        section.
         """
+        registry = self.registry()
         lines = []
         written = {}
         section = None
+        pending_comments = []
+
+        def flush_comments():
+            lines.extend(pending_comments)
+            pending_comments.clear()
 
         def flush_extras(sect):
             if sect is None or not self.config.has_section(sect):
@@ -845,28 +985,42 @@ route_prefetch_radius_nm = 40
         for raw_line in self._defaults.splitlines():
             stripped = raw_line.strip()
             if stripped.startswith('[') and stripped.endswith(']'):
+                flush_comments()
                 flush_extras(section)
                 if lines and lines[-1] != '':
                     lines.append('')
+                first_section = section is None
                 section = stripped[1:-1].strip()
                 written.setdefault(section, set())
                 lines.append(stripped)
+                if first_section:
+                    lines.extend(_FILE_NOTE)
                 continue
-            if not stripped or stripped.startswith('#') or section is None:
-                if stripped:
-                    lines.append(stripped)
+            if not stripped:
+                flush_comments()
+                continue
+            if stripped.startswith('#') or section is None:
+                pending_comments.append(stripped)
                 continue
             key = self.config.optionxform(
                 stripped.split('=', 1)[0].split(':', 1)[0].strip()
             )
-            if (
+            written[section].add(key)
+            spec = registry.get(section, key)
+            if spec is not None and spec.tier is Tier.RETIRED:
+                pending_comments.clear()
+                continue
+            flush_comments()
+            if not (
                 self.config.has_section(section)
                 and self.config.has_option(section, key)
             ):
+                lines.append(stripped)
+            elif spec is None or self._should_write(section, key):
                 lines.append(self._format_option(section, key))
             else:
-                lines.append(stripped)
-            written[section].add(key)
+                lines.append(f"# {key} = {spec.default_text}")
+        flush_comments()
         flush_extras(section)
 
         for sect in self.config.sections():
@@ -1079,10 +1233,12 @@ def resolve_provider_setting(name, cfg=None):
 def _migrate_config_revision(cfg, user_config):
     """Apply one-time default changes to configs saved by older releases.
 
-    Every save writes every setting, so a saved value cannot tell a user's
-    choice from an old default. The revision marks which changes a file has
-    already seen; each step runs once and the next save records the new
-    revision.
+    Before revision 2 every save wrote every setting, so a saved value cannot
+    tell a user's choice from an old default. The revision marks which changes
+    a file has already seen; each step runs once and the next save records the
+    new revision. From revision 2 the file is sparse (only custom settings are
+    active), so a changed default reaches every user who never set it and new
+    steps are rarely needed.
     """
     try:
         revision = int(
@@ -1111,7 +1267,23 @@ def _migrate_config_revision(cfg, user_config):
                 "(new default; rows that miss their deadline now use "
                 "lower-resolution imagery instead of the missing color)"
             )
+    if revision < 2:
+        # Sparse format: settings equal to their default become commented
+        # "# key = default" lines at the next save (the loaded file had no
+        # explicit choices recorded, see AOConfig.load), and retired settings
+        # are dropped.
+        log.info(
+            "Config will now store only changed settings; values equal to "
+            "their defaults follow future default changes"
+        )
     cfg.config.set("general", "config_revision", str(CONFIG_REVISION))
+
+
+def _file_revision(user_config):
+    try:
+        return int(user_config.get("general", "config_revision", fallback="0"))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _migrate_legacy_provider_options(cfg, user_config):

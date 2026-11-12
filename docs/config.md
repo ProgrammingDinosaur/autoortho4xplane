@@ -90,7 +90,40 @@ This folder can be set to any convenient location with enough space for scenery 
 
 ## User config file location
 
-The configuration file `.autoortho` is located in the user's home directory.  
+The configuration file `.autoortho` is located in the user's home directory.
+
+### Only changed settings are stored
+
+The file keeps every setting with its comment, but only the settings you
+changed are active lines. Every other setting is written as a commented
+default:
+
+```ini
+# Maximum zoom level to allow. ...
+# max_zoom = 16
+maxwait = 4.0
+```
+
+Here `max_zoom` follows AutoOrtho's default, so it picks up any future change
+to that default, while `maxwait` keeps your own value. To override a default
+by hand, delete the `# ` and change the value. A line you write yourself stays
+active even when it equals the default, until you change it in the app.
+
+The file is written as UTF-8. Older files written in another encoding are
+still read, and the first save converts them: values equal to the defaults
+become commented lines, and retired settings (`live_aopipeline_min_chunk_ratio`,
+`ephemeral_dds_cache_mb`, `max_concurrent_downloads`, `http2_max_connections`)
+are removed after their values are migrated.
+
+### All Settings (Expert)
+
+**Settings → All Settings (Expert)** lists every setting with its value, its
+default and whether you changed it. Search by name or description, filter by
+group (Essential, Tuning, Expert), or show only changed settings. Double-click
+a value to edit it, or select rows and choose **Reset Selected to Default**.
+Settings that already have a control on another settings page are shown
+greyed and are changed there. Edits are applied with **Apply** and discarded
+with **Revert**, like any other setting.
 
 ## Performance Tuning
 

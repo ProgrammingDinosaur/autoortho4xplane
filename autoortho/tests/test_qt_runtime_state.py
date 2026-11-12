@@ -282,8 +282,10 @@ def test_settings_schema_renders_and_each_category_is_navigable(
         "Connections & Integrations",
         "Logging & Reports",
         "Advanced",
+        "All Settings (Expert)",
     ]
     expected_groups = {
+        "All Settings (Expert)": set(),
         "General": {"Startup and Window", "Application Window"},
         "Setup & Storage": {"Paths Configuration", "Cache Settings"},
         "Scenery": {
