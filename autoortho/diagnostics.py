@@ -1764,6 +1764,50 @@ _PHASE_NAMES = {
 }
 
 
+# Blurry near reads in flight by what prefetch had done for the tile
+# (prefetch_ledger.MISS_KINDS), in the report's words.
+_MISS_NAMES = {
+    "never_wide": "Never queued, outside the corridor",
+    "never_inside": "Never queued, inside the corridor",
+    "never_paused": "Never queued, prefetch paused",
+    "never_turn": "Never queued, in a turn",
+    "coarse": "Queued at a coarser level only",
+    "late": "Queued, not ready in time",
+    "evicted": "Ready, then dropped from memory",
+    "done": "Ready (blurry for another reason)",
+}
+
+
+def _render_miss_causes(flight: dict) -> list:
+    """*Blurry moments by cause*: the share of each miss kind, by phase."""
+    by_phase = {
+        phase: kinds for phase, kinds in (flight.get("misses_by_phase") or {}).items()
+        if sum(kinds.values())
+    }
+    if not by_phase:
+        return []
+    phases = list(by_phase)
+    lines = [
+        "",
+        "### Blurry moments by cause",
+        "",
+        "| Cause | " + " | ".join(_PHASE_NAMES.get(p, p) for p in phases) + " |",
+        "|---|" + "---:|" * len(phases),
+    ]
+    totals = {phase: sum(kinds.values()) for phase, kinds in by_phase.items()}
+    for kind, name in _MISS_NAMES.items():
+        if not any(by_phase[p].get(kind) for p in phases):
+            continue
+        cells = [
+            f"{100.0 * by_phase[p].get(kind, 0) / totals[p]:.0f} %" for p in phases
+        ]
+        lines.append(f"| {name} | " + " | ".join(cells) + " |")
+    lines.append(
+        "| Blurry tiles counted | " + " | ".join(f"{totals[p]:,}" for p in phases) + " |"
+    )
+    return lines
+
+
 def _render_flight(flight: dict) -> list:
     """The governor's verdict: fidelity by phase, guards, what was learned."""
     if not flight:
@@ -1778,6 +1822,7 @@ def _render_flight(flight: dict) -> list:
         lines.extend(["", "| Phase | Sharp at target |", "|---|---:|"])
         for phase, value in phases.items():
             lines.append(f"| {_PHASE_NAMES.get(phase, phase)} | {float(value) * 100:.0f} % |")
+    lines.extend(_render_miss_causes(flight))
     lines.append("")
     lines.append(
         f"- Auto-tuning: {flight.get('mode', 'off')}, "

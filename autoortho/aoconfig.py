@@ -479,6 +479,8 @@ paging_prefetch = True
 # X-Plane's window and field of view, then measures it in flight.
 paging_k = 0
 # Fetch the level the aircraft will need this many seconds from now.
+# Auto-tuning may raise it (30-180 s) when blurry tiles were prefetched only
+# at a coarser level or too late; a value set here is never changed.
 paging_lead_seconds = 60
 # X-Plane opens all terrain (.ter) files of a scenery tile 20-45 s before it
 # reads their textures. Queue those textures as soon as their .ter is opened.

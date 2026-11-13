@@ -78,15 +78,64 @@ except ImportError:
     import streaming_options
 
 try:
-    from autoortho import colour_table, texture_plan, wait_bands
+    from autoortho import colour_table, prefetch_ledger, texture_plan, wait_bands
 except ImportError:
     import colour_table
+    import prefetch_ledger
     import texture_plan
     import wait_bands
 
 # Photo textures X-Plane holds (finest level read in the last 20 minutes):
 # the graphics memory estimate auto-tuning watches for the texture cap.
 held_textures = texture_plan.HeldTextures()
+
+# What prefetch queued and finished per tile, to explain blurry near reads
+# (prefetch_ledger.py). One per worker: each worker prefetches and reads its
+# own scenery.
+tile_ledger = prefetch_ledger.PrefetchLedger()
+
+
+def _ledger_queued(row, col, zoom, mip, source):
+    try:
+        tile_ledger.note_queued(
+            prefetch_ledger.ledger_key(row, col, zoom), mip, source, time.monotonic()
+        )
+    except Exception as exc:  # statistics only
+        log.debug(f"Prefetch ledger queue note failed: {exc}")
+
+
+def _ledger_done(row, col, zoom, mip):
+    try:
+        tile_ledger.note_done(
+            prefetch_ledger.ledger_key(row, col, zoom), mip, time.monotonic()
+        )
+    except Exception as exc:  # statistics only
+        log.debug(f"Prefetch ledger done note failed: {exc}")
+
+
+def _ledger_evicted(tile):
+    """A tile left memory: tell the ledger, with its finest real level then."""
+    try:
+        key = prefetch_ledger.ledger_key(tile.row, tile.col, tile.tilename_zoom)
+        if key not in tile_ledger:
+            return
+        done_mip = None
+        dds = getattr(tile, "dds", None)
+        if dds is not None and dds.mipmap_list:
+            real = tile.real_from()
+            if real < len(dds.mipmap_list):
+                done_mip = real
+        tile_ledger.note_evicted(key, time.monotonic(), done_mip=done_mip)
+    except Exception as exc:  # statistics only
+        log.debug(f"Prefetch ledger eviction note failed: {exc}")
+
+
+def _ledger_coordinator_published(key, source):
+    _ledger_queued(key.tile_row, key.tile_col, key.terrain_zoom, 0, source)
+
+
+def _ledger_coordinator_complete(key):
+    _ledger_done(key.tile_row, key.tile_col, key.terrain_zoom, 0)
 
 try:
     from autoortho.ram_brake import DiskBrake, RamBrake
@@ -5636,7 +5685,8 @@ class SpatialPrefetcher:
         self._last_velocity_signature = None
         self._last_simbrief_signature = None
         self._shared_simbrief_generation = None
-        
+        self._last_skip_at = None   # last skipped cycle (prefetch ledger)
+
         # Track recently prefetched to avoid duplicates
         # Use an LRU-like structure with max size
         self._recently_prefetched = set()
@@ -5736,14 +5786,27 @@ class SpatialPrefetcher:
 
         Falls back to velocity-based prefetching if aircraft deviates from route.
         """
+        camera = current_camera()
+        if camera is not None:
+            tile_ledger.note_track(time.monotonic(), camera[3])
+
         # Legacy submission has no admission coordinator and must fully yield.
         if is_live_building() and self._coordinator is None:
+            self._note_pause("live")
             return
 
         # Very low free RAM: prefetch would only add to the pressure.
         if ram_brake.engaged:
             bump("prefetch_cycles_ram_brake")
+            self._note_pause("ram")
             return
+
+        # The runtime gate (X-Plane not in the flight yet) or live pressure
+        # refuses every queue this cycle; the cycle still runs, as before.
+        if not is_flight_runtime_allowed():
+            self._note_pause("gate")
+        elif not is_prefetch_runtime_allowed():
+            self._note_pause("live")
 
         # Check if tile_cacher is available
         if self._tile_cacher is None:
@@ -5773,6 +5836,15 @@ class SpatialPrefetcher:
         
         # Fall back to velocity-based prefetching
         self._do_velocity_prefetch_cycle(lat, lon)
+
+    def _note_pause(self, reason):
+        """A cycle was skipped: blurry tiles never queued may be why."""
+        now = time.monotonic()
+        self._last_skip_at = now
+        try:
+            tile_ledger.note_paused(now, reason)
+        except Exception:  # statistics only
+            pass
 
     def _sync_shared_simbrief(self):
         generation = get_stat("simbrief_route_generation")
@@ -6007,7 +6079,9 @@ class SpatialPrefetcher:
                 continue
             
             # Prefetch this tile
-            submitted, complete = self._prefetch_tile(row, col, zoom)
+            submitted, complete = self._prefetch_tile(
+                row, col, zoom, source="simbrief"
+            )
             chunks_submitted += submitted
 
             if submitted > 0:
@@ -6265,7 +6339,9 @@ class SpatialPrefetcher:
                 continue
 
             # Prefetch this tile
-            submitted, complete = self._prefetch_tile(row, col, zoom)
+            submitted, complete = self._prefetch_tile(
+                row, col, zoom, source="simbrief"
+            )
             chunks_submitted += submitted
 
             # Only mark as recently prefetched if ALL chunks were submitted
@@ -6677,6 +6753,7 @@ class SpatialPrefetcher:
                 maptype,
                 max_chunks=budget - submitted,
                 first_mip=mip,
+                source="paging",
             )
             submitted += count
             if complete:
@@ -6698,12 +6775,16 @@ class SpatialPrefetcher:
         maptype: Optional[str] = None,
         max_chunks: Optional[int] = None,
         first_mip: int = 0,
+        source: str = "velocity",
     ):
         """
         Submit prefetch requests for a tile's chunks at ALL mipmap levels.
 
         With ``first_mip`` > 0 only that level and the coarser ones are
         fetched: the paging model says X-Plane will not want finer ones yet.
+
+        ``source`` names the prefetch path for the prefetch ledger
+        (velocity, simbrief, paging, ter or dsf).
 
         Args:
             row: Tile row coordinate
@@ -6751,6 +6832,9 @@ class SpatialPrefetcher:
             
             submitted = 0
             total_submittable = 0
+            truncated = False
+            all_ready = True
+            start_mip = min(max(0, int(first_mip)), tile.max_mipmap)
             # =========================================================================
             # Download chunks for ALL mipmap levels (not just mipmap 0)
             # This ensures prebuilt DDS matches on-demand behavior where X-Plane
@@ -6764,10 +6848,9 @@ class SpatialPrefetcher:
             #   mipmap 4 → max_zoom-4 (ZL12) → 1 chunk (lowest detail)
             # =========================================================================
 
-            for mipmap in range(
-                min(max(0, int(first_mip)), tile.max_mipmap),
-                tile.max_mipmap + 1,
-            ):
+            for mipmap in range(start_mip, tile.max_mipmap + 1):
+                if truncated:
+                    break
                 mipmap_zoom = tile.max_zoom - mipmap
 
                 # Don't go below minimum zoom
@@ -6786,10 +6869,12 @@ class SpatialPrefetcher:
 
                 for chunk in mipmap_chunks:
                     if max_chunks is not None and submitted >= max_chunks:
-                        return submitted, False
+                        truncated = True
+                        break
                     # Skip if already ready, in flight, or failed
                     if chunk.ready.is_set():
                         continue
+                    all_ready = False
                     if chunk.in_queue or chunk.in_flight:
                         continue
                     if chunk.permanent_failure:
@@ -6808,7 +6893,13 @@ class SpatialPrefetcher:
                     if chunk_getter.submit(chunk, timeout=(5, 10), max_attempts=8):
                         submitted += 1
 
-            complete = (total_submittable == 0) or (submitted == total_submittable)
+            complete = not truncated and (
+                (total_submittable == 0) or (submitted == total_submittable)
+            )
+            if submitted > 0 or (not truncated and total_submittable == 0):
+                _ledger_queued(row, col, zoom, start_mip, source)
+                if all_ready and not truncated:
+                    _ledger_done(row, col, zoom, start_mip)
             return submitted, complete
             
         except Exception as e:
@@ -6828,6 +6919,7 @@ class SpatialPrefetcher:
         self,
         tiles: List[Tuple[int, int, str, int]],
         max_chunks: Optional[int] = None,
+        source: str = "dsf",
     ) -> int:
         """Queue an explicit ordered set of terrain tiles."""
         if not is_prefetch_runtime_allowed():
@@ -6846,6 +6938,7 @@ class SpatialPrefetcher:
                 zoom,
                 maptype,
                 max_chunks=limit - submitted_total,
+                source=source,
             )
             submitted_total += submitted
             if complete:
@@ -6903,6 +6996,8 @@ def start_prefetcher(tile_cacher, scenery_id="default"):
                 ),
                 metric=bump,
                 gauge=profile_gauge,
+                on_publish=_ledger_coordinator_published,
+                on_complete=_ledger_coordinator_complete,
             )
             prefetch_coordinator.start()
         spatial_prefetcher.set_coordinator(prefetch_coordinator)
@@ -6958,7 +7053,7 @@ def prefetch_dsf(
                         row, col, maptype, zoom
                     ):
                         count, _complete = spatial_prefetcher._prefetch_tile(
-                            row, col, zoom, maptype, first_mip=mip
+                            row, col, zoom, maptype, first_mip=mip, source="dsf"
                         )
                         bump("dsf_paging_coarse_chunks", count)
                     next_cursor += 1
@@ -7024,7 +7119,7 @@ def load_ahead_warm(row, col, maptype, zoom):
     if mip is None:
         mip = 4  # no position yet: the base level of every texture
     submitted, complete = spatial_prefetcher._prefetch_tile(
-        row, col, zoom, maptype, first_mip=mip
+        row, col, zoom, maptype, first_mip=mip, source="ter"
     )
     bump("ter_load_ahead_chunks", submitted)
     return complete or submitted > 0
@@ -7070,6 +7165,7 @@ def stop_prefetcher():
     global prefetch_coordinator
     _stop_terrain_load_ahead()
     spatial_prefetcher.stop()
+    tile_ledger.clear()
     spatial_prefetcher.set_coordinator(None)
     if prefetch_coordinator is not None:
         prefetch_coordinator.stop()
@@ -9056,6 +9152,10 @@ def _on_tile_complete_callback(tile_id: str, tile,
         partial: True when threshold reached but not 100% — build with available chunks
         healing: True when remaining chunks arrived after a partial build — patch the DDS
     """
+    if not partial and tile is not None:
+        # Every native (mipmap 0) chunk is in: the prefetch ledger counts the
+        # tile as complete at full detail.
+        _ledger_done(tile.row, tile.col, tile.tilename_zoom, 0)
     if healing:
         # Remaining chunks arrived after partial build — dispatch healing
         _dispatch_healing(tile)
@@ -13758,6 +13858,8 @@ class Tile(object):
                 # Target fidelity (the governor's goal): near reads answered
                 # with real imagery at the target zoom.
                 bump("near_reads_real" if real else "near_reads_standin")
+                if not real:
+                    self._note_near_miss(wanted)
                 if (
                     real
                     and not getattr(self, "_sharp_noted", False)
@@ -13902,6 +14004,41 @@ class Tile(object):
         self._try_incremental_dds_store(mipmap)
         self._maybe_persist_complete_dds()
         return True
+
+    def _note_near_miss(self, wanted):
+        """A near read was blurry in flight: count what prefetch had done for it.
+
+        Bumps one ``near_miss_<kind>`` counter (prefetch_ledger.MISS_KINDS)
+        for the governor. Skipped while a flight starts or X-Plane jumped
+        (prefetch can't know where a flight begins), without a position, and
+        below the prefetcher's own minimum speed (it does not run there).
+        """
+        if getattr(self, "_read_starting", False):
+            return
+        camera = current_camera()
+        if camera is None:
+            return
+        try:
+            if float(camera[4] or 0.0) < SpatialPrefetcher.MIN_SPEED_MPS:
+                return
+            now = time.monotonic()
+            tile_ledger.note_track(now, camera[3])
+            key = prefetch_ledger.ledger_key(self.row, self.col, self.tilename_zoom)
+            kind = tile_ledger.classify_miss(key, wanted, now)
+            if kind == "never":
+                _distance, lat, lon, _size = tile_distance_m(
+                    self.row, self.col, self.tilename_zoom, camera
+                )
+                ground = paging_model.ground_distance_m(camera[0], camera[1], lat, lon)
+                bearing = paging_model.bearing_deg(camera[0], camera[1], lat, lon)
+                cross = prefetch_ledger.cross_track_m(ground, bearing, camera[3] or 0.0)
+                radius = float(spatial_prefetcher.prefetch_radius_nm) * 1852.0
+                kind = tile_ledger.never_kind(now, cross_track_m=cross, radius_m=radius)
+                if kind == "never_paused":
+                    bump(f"near_miss_paused_{tile_ledger.paused_reason(now)}")
+            bump(f"near_miss_{kind}")
+        except Exception as exc:  # statistics only
+            log.debug(f"Near miss note for {self.id} failed: {exc}")
 
     def _note_late(self, wanted, read_started):
         """A near or middle read stopped waiting: time its imagery's arrival."""
@@ -17974,6 +18111,7 @@ class TileCacher(object):
                             )
                         except Exception:
                             pass
+                    _ledger_evicted(t)
                     t.close()
                 except Exception:
                     pass

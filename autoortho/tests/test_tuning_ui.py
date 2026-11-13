@@ -45,7 +45,29 @@ def test_report_renders_flight_verdict():
     assert "| Cruise | 99 % |" in text
     assert "7 decisions (5 kept, 2 undone)" in text
     assert "provider_origin_max_concurrency 144" in text
+    assert "Blurry moments by cause" not in text
     assert diagnostics._render_flight({}) == []
+
+
+def test_report_renders_blurry_moments_by_cause():
+    import diagnostics
+
+    lines = diagnostics._render_flight({
+        "verdict": "A few blurry moments", "fidelity": 0.93,
+        "misses_by_phase": {
+            "cruise": {"never_wide": 6, "late": 2},
+            "departure_arrival": {"late": 3, "evicted": 1},
+            "taxi": {},
+        },
+    })
+    text = "\n".join(lines)
+    assert "### Blurry moments by cause" in text
+    assert "| Cause | Cruise | Departure and arrival |" in text   # taxi had none
+    assert "| Never queued, outside the corridor | 75 % | 0 % |" in text
+    assert "| Queued, not ready in time | 25 % | 75 % |" in text
+    assert "| Ready, then dropped from memory | 0 % | 25 % |" in text
+    assert "| Blurry tiles counted | 8 | 4 |" in text
+    assert "Queued at a coarser level only" not in text
 
 
 def test_mount_lifecycle_runs_and_summarises(tmp_path, monkeypatch):

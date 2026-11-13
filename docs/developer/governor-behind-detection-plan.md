@@ -1,6 +1,6 @@
 # Plan: detecting "behind the aircraft" from prefetch misses
 
-Status: planned, not implemented
+Status: implemented (steps 1-5); thresholds are the starting values below until flight reports set them. See the proposal's implementation notes for where the code differs from this plan.
 Related: [settings-refactor-proposal.md](settings-refactor-proposal.md) §4.4 (the *Behind the aircraft* row of the bottleneck classifier) and its phases 5-6 notes
 
 ---

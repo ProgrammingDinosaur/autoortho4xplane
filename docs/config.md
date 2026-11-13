@@ -338,6 +338,29 @@ arrived within the longest wait allowed, and never beyond what it needed.
 When most of it took longer, waiting would only hold X-Plane up, so the
 state is *Imagery arrives late* and prefetch looks further ahead instead.
 
+It tunes prefetch only on evidence too. AutoOrtho remembers, per tile, what
+prefetch did for it: when it was queued, to which detail level, when its
+imagery was in, and whether it later left the memory cache. When X-Plane
+reads a nearby tile blurry in flight (not while a flight loads or after a
+jump), AutoOrtho records why:
+
+| What prefetch had done | State | What auto-tuning moves |
+|---|---|---|
+| Never queued it, and the tile lay off to the side | *Prefetch corridor too narrow* | Prefetch radius |
+| Never queued it, though it lay ahead | *Prefetch corridor too short* | Prefetch lookahead |
+| Never queued it, while prefetch was paused | *Prefetch paused* | Nothing; Home names the pause (low memory, X-Plane's own downloads) when it keeps happening |
+| Never queued it, in a turn | — | Nothing (SimBrief routes cover planned turns) |
+| Queued only a coarser level than X-Plane wanted | *Prefetch asks for too little detail* | Prefetch lead time (`[streaming] paging_lead_seconds`, 30-180 s) |
+| Queued it, but it was not ready in time | *Prefetch starts too late* | Prefetch lead time, then prefetch chunks per cycle (not while the line is full) |
+| It was ready, then left memory | *Memory cache too small* | Memory cache (only while AutoOrtho uses under 80 % of its RAM limit) |
+| It was ready and in memory | — | Nothing (a failed download, for example) |
+
+A setting moves only with at least 10 such blurry tiles in the last 30
+seconds and one cause behind at least half of them; the change is kept when
+that cause's share of nearby reads falls. When the scenery stays blurry with
+no clear cause, the state is *Blurry, cause unclear*: nothing moves, and
+after five minutes Home says so and points to the flight report.
+
 The rules that keep it steady: one change at a time, a 30-second wait per
 setting (two minutes after an undo), bigger steps only while a flight is
 loading, and nothing above your limits. Settings you set yourself are
@@ -384,7 +407,9 @@ learned settings** clears both.
 *Smooth flight*, *A few blurry moments* or *Often blurry*, sharpness by
 phase (loading, taxi, departure and arrival, cruise), the number of changes
 kept and undone, peak download speed, brake activations, and what was
-learned for next time.
+learned for next time. Its *Blurry moments by cause* table gives, per phase,
+the share of blurry nearby tiles by what prefetch had done for them (the
+causes in the table above).
 
 With `[governor] record_samples = True` (the default) each session's
 samples are written to `~/.autoortho-data/governor/samples-*.jsonl`

@@ -43,6 +43,15 @@ from typing import Callable, Deque, Dict, Iterable, List, Optional
 log = logging.getLogger(__name__)
 
 
+# Chosen by __package__, not try/except: with the autoortho folder on
+# sys.path, "autoortho" can resolve to autoortho.py (see _wait_bands below).
+# prefetch_ledger itself imports nothing of the app.
+if __package__:
+    from autoortho.prefetch_ledger import MISS_KINDS, PAUSE_REASONS
+else:
+    from prefetch_ledger import MISS_KINDS, PAUSE_REASONS
+
+
 def _wait_bands():
     """wait_bands, imported on first use.
 
@@ -90,6 +99,37 @@ MIN_LATE_FLIGHT = 20
 MIN_LATE_START = 5
 NEAR_WAIT_LEVER = "streaming.near_wait_seconds"
 BAND_WAIT_LEVER = "streaming.band_max_wait_seconds"
+PAGING_LEAD_LEVER = "streaming.paging_lead_seconds"
+PREFETCH_CHUNKS_LEVER = "autoortho.prefetch_max_chunks"
+# Behind the aircraft, by evidence (governor-behind-detection-plan.md): each
+# blurry near read in flight is classified by what prefetch had done for the
+# tile (prefetch_ledger.py). A prefetch lever moves only with at least
+# MIN_MISSES classified misses in the window and one cause behind at least
+# MISS_DOMINANT_SHARE of them. Starting values, to be set from flight reports.
+MIN_MISSES = 10
+MISS_DOMINANT_SHARE = 0.5
+# A bigger memory cache only while AutoOrtho uses under this share of its RAM limit.
+EVICTED_RAM_SHARE = 0.8
+# Dominant miss cause -> state. Turns and tiles that were complete have
+# nothing to tune.
+MISS_STATE = {
+    "never_wide": "behind_wide",
+    "never_inside": "behind_short",
+    "never_paused": "prefetch_paused",
+    "never_turn": "ok",
+    "coarse": "paging_coarse",
+    "late": "prefetch_late",
+    "evicted": "memory_evicted",
+    "done": "ok",
+}
+STATE_MISS = {state: kind for kind, state in MISS_STATE.items() if state != "ok"}
+# States without moves that tell the user once they persist.
+NOTICE_STATES = ("prefetch_paused", "unexplained")
+PAUSE_WORDS = {
+    "ram": "low memory",
+    "live": "X-Plane's own downloads",
+    "gate": "the wait for X-Plane to enter the flight",
+}
 DATA_DIR = os.path.join(os.path.expanduser("~"), ".autoortho-data", "governor")
 
 
@@ -164,6 +204,12 @@ def levers_for(cfg, limits=None) -> Dict[str, LeverSpec]:
                   2, 4, 30, unit="min", group="prefetch"),
         LeverSpec("autoortho.prefetch_radius_nm", "Prefetch radius",
                   10, 10, 80, unit="nm", group="prefetch"),
+        # Read at call time (streaming_options), so live with no hook.
+        LeverSpec(PAGING_LEAD_LEVER, "Prefetch lead time",
+                  15, 30, 180, unit="s", group="prefetch"),
+        # The template's 64 is the floor: never lowered below the default.
+        LeverSpec(PREFETCH_CHUNKS_LEVER, "Prefetch chunks per cycle",
+                  64, 64, 2048, group="prefetch"),
     ]
     if texture_cap_allowed(cfg):
         try:
@@ -222,6 +268,33 @@ class Sample:
     # how long imagery took after a near or middle read stopped waiting.
     late_flight: tuple = ()
     late_start: tuple = ()
+    # Cumulative blurry near reads in flight by what prefetch had done for
+    # the tile (prefetch_ledger.MISS_KINDS), and the never-queued ones missed
+    # during a prefetch pause by its reason.
+    near_miss_never_wide: int = 0
+    near_miss_never_inside: int = 0
+    near_miss_never_paused: int = 0
+    near_miss_never_turn: int = 0
+    near_miss_coarse: int = 0
+    near_miss_late: int = 0
+    near_miss_evicted: int = 0
+    near_miss_done: int = 0
+    near_miss_paused_ram: int = 0
+    near_miss_paused_live: int = 0
+    near_miss_paused_gate: int = 0
+    # Whether the flight was starting (the service's view), so a replay
+    # judges each sample as the live governor did. None in old recordings.
+    starting: Optional[bool] = None
+
+    def misses(self) -> Dict[str, int]:
+        return {kind: int(getattr(self, f"near_miss_{kind}", 0) or 0) for kind in MISS_KINDS}
+
+    def pauses(self) -> Dict[str, int]:
+        return {r: int(getattr(self, f"near_miss_paused_{r}", 0) or 0) for r in PAUSE_REASONS}
+
+
+def _delta(after: Dict[str, int], before: Dict[str, int]) -> Dict[str, int]:
+    return {k: max(0, after.get(k, 0) - before.get(k, 0)) for k in after}
 
 
 @dataclass(frozen=True)
@@ -242,6 +315,12 @@ class Window:
     graphics_memory_bytes: int = 0
     late_flight: tuple = ()
     late_start: tuple = ()
+    miss_counts: Dict[str, int] = field(default_factory=dict)
+    pause_counts: Dict[str, int] = field(default_factory=dict)
+
+    @property
+    def misses_total(self) -> int:
+        return sum(self.miss_counts.values())
 
 
 def window_of(samples: List[Sample]) -> Optional[Window]:
@@ -281,6 +360,8 @@ def window_of(samples: List[Sample]) -> Optional[Window]:
         graphics_memory_bytes=last.graphics_memory_bytes,
         late_flight=tuple(last.late_flight or ()),
         late_start=tuple(last.late_start or ()),
+        miss_counts=_delta(last.misses(), first.misses()),
+        pause_counts=_delta(last.pauses(), first.pauses()),
     )
 
 
@@ -345,7 +426,13 @@ STATE_TEXT = {
     "compute_limit": "Compute-bound at the CPU limit",
     "wait": "Waiting too briefly",
     "slow_imagery": "Imagery arrives late",
-    "behind": "Behind the aircraft",
+    "behind_wide": "Prefetch corridor too narrow",
+    "behind_short": "Prefetch corridor too short",
+    "paging_coarse": "Prefetch asks for too little detail",
+    "prefetch_late": "Prefetch starts too late",
+    "prefetch_paused": "Prefetch paused",
+    "memory_evicted": "Memory cache too small",
+    "unexplained": "Blurry, cause unclear",
     "sim_fps": "X-Plane's frame rate dropped",
     "vram": "Graphics memory nearly full",
     "unreachable": "Target out of reach",
@@ -398,11 +485,15 @@ class Governor:
         self.degraded: List[str] = []
         self.notice: Optional[str] = None
         self.phase_fidelity: Dict[str, List[int]] = {}   # phase -> [real, total]
+        self.phase_misses: Dict[str, Dict[str, int]] = {}  # phase -> kind -> count
+        self._persist: Dict[str, tuple] = {}     # notice state -> (first, last seen)
         self.peak_mbps = 0.0
 
     # -- feeding ---------------------------------------------------------
 
     def observe(self, sample: Sample, starting: Optional[bool] = None) -> Optional[Decision]:
+        if starting is None:
+            starting = sample.starting
         if starting is not None:
             self.starting = bool(starting)
         previous = self.samples[-1] if self.samples else None
@@ -416,6 +507,12 @@ class Governor:
             bucket = self.phase_fidelity.setdefault(phase, [0, 0])
             bucket[0] += max(0, real)
             bucket[1] += max(0, real + stand)
+            misses = _delta(sample.misses(), previous.misses())
+            if any(misses.values()):
+                by_kind = self.phase_misses.setdefault(phase, {})
+                for kind, count in misses.items():
+                    if count:
+                        by_kind[kind] = by_kind.get(kind, 0) + count
         self.window = window_of(list(self.samples))
         if self.window is not None:
             self.peak_mbps = max(self.peak_mbps, self.window.mbps)
@@ -439,6 +536,7 @@ class Governor:
         if outcome is not None:
             return outcome
         self.state = self.classify(self.window)
+        self._note_persistent(sample.t)
         if self._pending is not None:
             # One change at a time: wait for the last one's verdict.
             return None
@@ -486,8 +584,38 @@ class Governor:
                 return "wait"
             if verdict == "too_slow":
                 return "slow_imagery"
-            return "behind"
+            return self.miss_state(w)
         return "ok"
+
+    def miss_cause(self, w: Optional[Window] = None):
+        """The dominant miss kind as ``(kind, count, total)``, or None.
+
+        None with fewer than MIN_MISSES classified misses in the window or no
+        kind behind MISS_DOMINANT_SHARE of them.
+        """
+        w = w if w is not None else self.window
+        if w is None:
+            return None
+        total = w.misses_total
+        if total < MIN_MISSES:
+            return None
+        kind, count = max(w.miss_counts.items(), key=lambda kv: kv[1])
+        if count < MISS_DOMINANT_SHARE * total:
+            return None
+        return kind, count, total
+
+    def miss_state(self, w: Window) -> str:
+        """Low fidelity with no network, compute or wait cause: ask the ledger.
+
+        Without evidence nothing moves (``unexplained``). Misses are not
+        counted while a flight starts (prefetch can't know where it begins).
+        """
+        if self.starting:
+            return "ok"
+        cause = self.miss_cause(w)
+        if cause is None:
+            return "unexplained"
+        return MISS_STATE.get(cause[0], "ok")
 
     def wait_evidence(self, w: Optional[Window] = None):
         """Whether a longer wait would bring real imagery, from the samples.
@@ -591,10 +719,12 @@ class Governor:
         ],
         # The line has room but each picture comes late: ask for it earlier.
         "slow_imagery": [("autoortho.prefetch_lookahead", +1)],
-        "behind": [
-            ("autoortho.prefetch_lookahead", +1),
-            ("autoortho.prefetch_radius_nm", +1),
-        ],
+        # Behind the aircraft, by the dominant miss cause.
+        "behind_wide": [("autoortho.prefetch_radius_nm", +1)],
+        "behind_short": [("autoortho.prefetch_lookahead", +1)],
+        "paging_coarse": [(PAGING_LEAD_LEVER, +1)],
+        "prefetch_late": [(PAGING_LEAD_LEVER, +1), (PREFETCH_CHUNKS_LEVER, +1)],
+        "memory_evicted": [("cache.cache_mem_limit", +1)],
     }
 
     def _candidates(self, state):
@@ -610,6 +740,13 @@ class Governor:
                     continue
                 moves.append((name, +1 if base > value else -1))
             return moves
+        w = self.window
+        if state == "prefetch_late" and w is not None and w.broker_saturated:
+            return []     # more prefetch would only queue behind a full line
+        if state == "memory_evicted" and w is not None and self.ram_limit_bytes and (
+            w.ao_memory_bytes >= EVICTED_RAM_SHARE * self.ram_limit_bytes
+        ):
+            return []     # no RAM to give the cache
         return list(self._PLAN.get(state, ()))
 
     def _decide(self, now: float) -> Optional[Decision]:
@@ -646,9 +783,41 @@ class Governor:
                 self._pending = (decision, w)
             self.history.append(decision)
             return decision
-        if state not in ("ok", "headroom", "warming_up", "paused") and moves:
+        if state not in ("ok", "headroom", "warming_up", "paused") and (
+            moves or state in STATE_MISS
+        ) and state not in NOTICE_STATES:
             self._note_limited(now, state)
         return None
+
+    def _note_persistent(self, now) -> None:
+        """A state without moves that keeps coming back reaches the user once."""
+        state = self.state
+        if state not in NOTICE_STATES:
+            return
+        first, last = self._persist.get(state, (now, now))
+        if now - last > 2 * WINDOW_S:
+            first = now           # it went away for a while: start again
+        self._persist[state] = (first, now)
+        if self.notice or now - first < UNREACHABLE_AFTER_S:
+            return
+        if state == "prefetch_paused":
+            w = self.window
+            pauses = w.pause_counts if w is not None else {}
+            reason = max(pauses.items(), key=lambda kv: kv[1])[0] if any(
+                pauses.values()) else "gate"
+            self.notice = (
+                "Scenery was often blurry because prefetch was paused by "
+                f"{PAUSE_WORDS.get(reason, reason)}. "
+                + {
+                    "ram": "Close other programs or raise the RAM limit.",
+                    "live": "A faster connection or a lower zoom target helps.",
+                }.get(reason, "")
+            ).strip()
+        else:
+            self.notice = (
+                "Scenery was often blurry and AutoOrtho could not tell why; "
+                "the flight report lists the blurry tiles by cause."
+            )
 
     def _note_limited(self, now, state):
         """Every lever for this bottleneck is at its limit."""
@@ -682,7 +851,11 @@ class Governor:
             "memory": "memory",
             "wait": "waiting time",
             "slow_imagery": "how fast the imagery server answers",
-            "behind": "prefetching",
+            "behind_wide": "prefetching",
+            "behind_short": "prefetching",
+            "paging_coarse": "how much detail prefetch asks for",
+            "prefetch_late": "how early prefetch starts",
+            "memory_evicted": "memory",
             "sim_fps": "X-Plane's frame rate",
             "vram": "graphics memory",
         }.get(state, "this PC")
@@ -713,7 +886,13 @@ class Governor:
             parts.append(f"{1000 / w.frame_time_ms:.0f} fps")
             if self.frame_best_ms:
                 parts.append(f"was {1000 / self.frame_best_ms:.0f}")
-        elif state in ("wait", "slow_imagery", "behind") and w.fidelity is not None:
+        elif state in STATE_MISS or state == "unexplained":
+            evidence = self._miss_evidence(state, w)
+            if evidence:
+                parts.append(evidence)
+            if w.fidelity is not None:
+                parts.append(f"{w.fidelity * 100:.0f} % sharp")
+        elif state in ("wait", "slow_imagery") and w.fidelity is not None:
             parts.append(f"{w.fidelity * 100:.0f} % sharp")
             if state in ("wait", "slow_imagery"):
                 _verdict, need = self.wait_evidence()
@@ -724,10 +903,33 @@ class Governor:
                     )
         return ": ".join([parts[0], ", ".join(parts[1:])]) if len(parts) > 1 else parts[0]
 
+    _MISS_TEXT = {
+        "never_wide": "lay outside the prefetch corridor",
+        "never_inside": "were never queued, inside the corridor",
+        "never_paused": "were missed while prefetch was paused",
+        "coarse": "were queued only at a coarser level",
+        "late": "were queued but not ready",
+        "evicted": "had left the memory cache",
+    }
+
+    def _miss_evidence(self, state, w: Window) -> str:
+        total = w.misses_total
+        kind = STATE_MISS.get(state)
+        if kind is None:
+            return f"{total} blurry tiles, no single cause" if total else ""
+        count = w.miss_counts.get(kind, 0)
+        return f"{count} of {total} blurry tiles {self._MISS_TEXT.get(kind, kind)}"
+
     # -- keep or revert --------------------------------------------------
 
     def _metric(self, state, w: Window) -> float:
         """Bigger is better: the bottleneck's own measure."""
+        kind = STATE_MISS.get(state)
+        if kind is not None:
+            # The share of near reads blurry for this cause (lower is better).
+            # Per near read rather than per miss, so a change that cut every
+            # cause is not judged worse.
+            return -(w.miss_counts.get(kind, 0) / max(1, w.near_reads))
         if state.startswith("network"):
             return w.mbps * (1 - w.error_share)
         if state.startswith("compute"):
@@ -834,6 +1036,13 @@ class Governor:
             },
             "notice": self.notice,
             "degraded": list(self.degraded),
+            "misses": {
+                kind: sum(phase.get(kind, 0) for phase in self.phase_misses.values())
+                for kind in MISS_KINDS
+            },
+            "misses_by_phase": {
+                phase: dict(kinds) for phase, kinds in self.phase_misses.items()
+            },
         }
 
 
@@ -1158,6 +1367,11 @@ class GovernorService:
             graphics_memory_bytes=self._summed("graphics_memory_bytes"),
             late_flight=self._late_counts(starting=False),
             late_start=self._late_counts(starting=True),
+            **{f"near_miss_{kind}": self._counter(f"near_miss_{kind}")
+               for kind in MISS_KINDS},
+            **{f"near_miss_paused_{reason}": self._counter(f"near_miss_paused_{reason}")
+               for reason in PAUSE_REASONS},
+            starting=self._starting,
         )
 
     def _late_counts(self, starting) -> tuple:
@@ -1295,6 +1509,7 @@ class GovernorService:
                 "mbps": window.mbps if window else 0.0,
                 "cpu": sample.cpu_percent,
                 "ram_gb": sample.ao_memory_bytes / 1024 ** 3,
+                "misses": dict(window.miss_counts) if window else {},
                 "decision": decision.text() if decision else "",
             })
             if decision is not None:

@@ -134,6 +134,7 @@ def test_registry_owners():
         "cache.file_cache_size": "limit",
         "cache.cache_mem_limit": "governed",
         "streaming.paging_k": "measured",
+        "streaming.paging_lead_seconds": "governed",
         "paths.cache_dir": "user",
         "seasons.enabled": "user",
         "general.window_x": "internal",
@@ -142,6 +143,7 @@ def test_registry_owners():
     for name, owner in owners.items():
         assert registry.get(*name.split(".", 1)).owner == owner, name
     assert registry.get("streaming", "paging_k").live is True
+    assert registry.get("streaming", "paging_lead_seconds").live is True
     assert registry.get("autoortho", "prefetch_pipeline_v2").retire_after
     assert all(s.tier.value == "tuning" for s in registry.by_owner("governed"))
 

@@ -49,7 +49,10 @@ BOTTLENECK_GAUGE = {
     "compute_limit": "computer",
     "sim_fps": "computer",
     "memory": "computer",
+    "memory_evicted": "computer",
     "vram": "graphics",
+    # behind_wide, behind_short, paging_coarse, prefetch_late and
+    # prefetch_paused are prefetch, not a resource: no gauge.
 }
 
 

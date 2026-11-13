@@ -76,9 +76,13 @@ class Flight:
     def step(self, *, real=50, standin=0, ok=100, err=0, mbps=50.0, waits=0,
              admissions=20, cpu=40.0, free=16 * GB, ao=3 * GB, active=10, limit=128,
              backlog=0, connected=True, speed=250, alt=10000, paused=False,
-             frame=None, late_flight=(), late_start=()):
+             frame=None, late_flight=(), late_start=(), misses=None, pauses=None):
         self.t += 2.0
         c = self.c
+        for kind, count in (misses or {}).items():
+            c[f"near_miss_{kind}"] = c.get(f"near_miss_{kind}", 0) + count
+        for reason, count in (pauses or {}).items():
+            c[f"near_miss_paused_{reason}"] = c.get(f"near_miss_paused_{reason}", 0) + count
         c["near_real"] += real
         c["near_standin"] += standin
         c["req_ok"] += ok
@@ -141,8 +145,8 @@ def test_classifier_states():
         (dict(real=40, standin=10, late_flight=_late(8, 30)), "wait"),
         # Blurry, but most of it took longer than any wait allows.
         (dict(real=40, standin=10, late_flight=_late(30, 30)), "slow_imagery"),
-        # Blurry with no evidence that waiting helps: no wait raise.
-        (dict(real=40, standin=10), "behind"),
+        # Blurry with no evidence at all: nothing to tune, but say so.
+        (dict(real=40, standin=10), "unexplained"),
     ]
     for step, expected in cases:
         samples = [flight.step(**step) for _ in range(6)]
@@ -432,7 +436,7 @@ def test_too_few_late_reads_raise_no_wait():
     flight = Flight()
     samples = [flight.step(real=40, standin=10, late_flight=_late(8, 5)) for _ in range(6)]
     assert gov.wait_evidence(gv.window_of(samples)) == ("unknown", 8.0)
-    assert gov.classify(gv.window_of(samples)) == "behind"
+    assert gov.classify(gv.window_of(samples)) == "unexplained"
 
 
 def test_wait_already_long_enough_is_not_raised():
@@ -441,7 +445,7 @@ def test_wait_already_long_enough_is_not_raised():
     flight = Flight()
     samples = [flight.step(real=40, standin=10, late_flight=_late(5, 40)) for _ in range(6)]
     assert gov.wait_evidence(gv.window_of(samples)) == ("enough", 5.0)
-    assert gov.classify(gv.window_of(samples)) == "behind"
+    assert gov.classify(gv.window_of(samples)) == "unexplained"
 
 
 def test_slow_imagery_asks_for_it_earlier_and_never_raises_the_wait():
@@ -476,3 +480,225 @@ def test_accepted_suggestions_are_kept_beside_learned_levers(tmp_path):
     assert store.warm_start("k", "auto")["autoortho.live_tile_admission"] == 24
     store.clear()
     assert store.warm_start("k", "auto") == {}
+
+
+# ------------------------------------------- behind the aircraft, by evidence
+
+
+def _prefetch_levers():
+    levers = _levers()
+    levers[gv.PAGING_LEAD_LEVER] = LeverSpec(
+        gv.PAGING_LEAD_LEVER, "Prefetch lead time", 15, 30, 180, unit="s", group="prefetch")
+    levers[gv.PREFETCH_CHUNKS_LEVER] = LeverSpec(
+        gv.PREFETCH_CHUNKS_LEVER, "Prefetch chunks per cycle", 64, 64, 2048,
+        group="prefetch")
+    return levers
+
+
+PREFETCH_VALUES = dict(VALUES, **{gv.PAGING_LEAD_LEVER: 60, gv.PREFETCH_CHUNKS_LEVER: 64})
+
+
+def _flying(**kwargs):
+    gov = Governor(_prefetch_levers(), PREFETCH_VALUES, **kwargs)
+    gov.starting = False
+    return gov
+
+
+def _blurry(misses, pauses=None, **step):
+    return dict(real=40, standin=10, misses=misses, pauses=pauses, **step)
+
+
+@pytest.mark.parametrize("kind, state", [
+    ("never_wide", "behind_wide"),
+    ("never_inside", "behind_short"),
+    ("never_paused", "prefetch_paused"),
+    ("never_turn", "ok"),
+    ("coarse", "paging_coarse"),
+    ("late", "prefetch_late"),
+    ("evicted", "memory_evicted"),
+    ("done", "ok"),
+])
+def test_dominant_miss_cause_picks_the_state(kind, state):
+    gov = _flying()
+    flight = Flight()
+    other = "coarse" if kind == "late" else "late"
+    samples = [flight.step(**_blurry({kind: 4, other: 1})) for _ in range(6)]
+    assert gov.classify(gv.window_of(samples)) == state
+
+
+def test_too_few_misses_move_nothing():
+    gov = _flying(mode="auto")
+    decisions = _run(gov, Flight(), 6, **_blurry({"never_wide": 1}))
+    assert gov.window.misses_total < gv.MIN_MISSES
+    assert gov.state == "unexplained"
+    assert decisions == []
+    assert gov.values == {k: float(v) for k, v in PREFETCH_VALUES.items()}
+
+
+def test_no_single_cause_moves_nothing():
+    gov = _flying(mode="auto")
+    decisions = _run(gov, Flight(), 6, **_blurry(
+        {"never_wide": 2, "late": 2, "evicted": 2}))
+    assert gov.state == "unexplained"
+    assert decisions == []
+
+
+def test_misses_while_starting_are_not_evidence():
+    gov = Governor(_prefetch_levers(), PREFETCH_VALUES)
+    flight = Flight()
+    samples = [flight.step(**_blurry({"never_wide": 4})) for _ in range(6)]
+    gov.starting = True
+    assert gov.classify(gv.window_of(samples)) == "ok"
+
+
+@pytest.mark.parametrize("kind, lever", [
+    ("never_wide", "autoortho.prefetch_radius_nm"),
+    ("never_inside", "autoortho.prefetch_lookahead"),
+    ("coarse", gv.PAGING_LEAD_LEVER),
+    ("late", gv.PAGING_LEAD_LEVER),
+    ("evicted", "cache.cache_mem_limit"),
+])
+def test_each_cause_moves_its_own_lever(kind, lever):
+    gov = _flying(mode="advise")
+    decisions = _run(gov, Flight(), 6, **_blurry({kind: 4}))
+    assert decisions and decisions[0].lever == lever
+    assert decisions[0].new > decisions[0].old
+
+
+def test_late_prefetch_then_does_more_per_cycle():
+    gov = _flying(mode="advise", pinned={gv.PAGING_LEAD_LEVER})
+    decisions = _run(gov, Flight(), 6, **_blurry({"late": 4}))
+    assert decisions[0].lever == gv.PREFETCH_CHUNKS_LEVER
+    assert (decisions[0].old, decisions[0].new) == (64, 128)
+
+
+def test_late_prefetch_on_a_full_line_moves_nothing():
+    gov = _flying(mode="advise")
+    flight = Flight()
+    samples = [flight.step(**_blurry({"late": 4})) for _ in range(6)]
+    gov.window = replace(gv.window_of(samples), broker_saturated=True)
+    assert gov._candidates("prefetch_late") == []
+
+
+def test_evicted_needs_ram_to_spare():
+    gov = _flying(mode="advise", ram_limit_bytes=8 * GB)
+    decisions = _run(gov, Flight(), 6, **_blurry({"evicted": 4}, ao=int(6.6 * GB)))
+    assert gov.state == "memory_evicted"
+    assert decisions == []
+    decisions = _run(_flying(mode="advise", ram_limit_bytes=8 * GB), Flight(), 6,
+                     **_blurry({"evicted": 4}, ao=4 * GB))
+    assert decisions and decisions[0].lever == "cache.cache_mem_limit"
+
+
+def test_reason_cites_the_evidence():
+    gov = _flying(mode="advise")
+    flight = Flight()
+    for _ in range(6):
+        gov.observe(flight.step(**_blurry({"never_wide": 3, "late": 1})), starting=False)
+    decision = gov.history[0]
+    assert decision.state == "behind_wide"
+    assert decision.reason.startswith("prefetch corridor too narrow: ")
+    assert "blurry tiles lay outside the prefetch corridor" in decision.reason
+
+
+def test_kept_when_the_cause_fades():
+    gov = _flying(mode="auto")
+    flight = Flight()
+    first = _run(gov, flight, 6, **_blurry({"never_wide": 8}))
+    assert first and first[0].lever == "autoortho.prefetch_radius_nm"
+    _run(gov, flight, 12, real=50, standin=0)
+    assert gov.history[0].outcome == "kept"
+    assert gov.values["autoortho.prefetch_radius_nm"] == 40
+
+
+def test_reverted_when_the_cause_grows():
+    gov = _flying(mode="auto")
+    flight = Flight()
+    _run(gov, flight, 6, **_blurry({"never_wide": 8}))
+    later = _run(gov, flight, 12, **_blurry({"never_wide": 12}))
+    assert later and later[0].outcome == "reverted"
+    assert gov.values["autoortho.prefetch_radius_nm"] == 30
+
+
+def test_paused_prefetch_moves_nothing_and_tells_the_user_when_it_repeats():
+    gov = _flying(mode="auto")
+    decisions = _run(gov, Flight(), 200, **_blurry({"never_paused": 4}, pauses={"ram": 4}))
+    assert decisions == []
+    assert gov.state == "prefetch_paused"
+    assert gov.notice and "paused by low memory" in gov.notice
+
+
+def test_unexplained_tells_the_user_after_a_while():
+    gov = _flying(mode="auto")
+    flight = Flight()
+    _run(gov, flight, 100, real=40, standin=10)
+    assert gov.notice is None            # 200 s: not yet
+    _run(gov, flight, 60, real=40, standin=10)
+    assert "could not tell why" in gov.notice
+
+
+def test_unexplained_timer_restarts_after_a_long_break():
+    gov = _flying(mode="auto")
+    flight = Flight()
+    _run(gov, flight, 100, real=40, standin=10)
+    _run(gov, flight, 40, real=50, standin=0)      # 80 s sharp
+    _run(gov, flight, 100, real=40, standin=10)
+    assert gov.notice is None
+
+
+def test_summary_counts_misses_by_phase():
+    gov = _flying(mode="advise")
+    flight = Flight()
+    _run(gov, flight, 5, **_blurry({"late": 2}))
+    _run(gov, flight, 5, alt=1000, **_blurry({"never_wide": 1}))
+    summary = gov.summary()
+    # The first sample has no previous one to count from.
+    assert summary["misses"]["late"] == 8
+    assert summary["misses_by_phase"]["cruise"] == {"late": 8}
+    assert summary["misses_by_phase"]["departure_arrival"] == {"never_wide": 5}
+
+
+def test_headroom_eases_the_new_levers_back():
+    values = dict(PREFETCH_VALUES, **{gv.PAGING_LEAD_LEVER: 90})
+    gov = Governor(_prefetch_levers(), values, baseline=PREFETCH_VALUES, mode="auto")
+    decisions = _run(gov, Flight(), 4, cpu=20)
+    assert decisions and decisions[0].lever == gv.PAGING_LEAD_LEVER
+    assert decisions[0].new == 75
+
+
+def test_levers_for_includes_the_prefetch_levers():
+    levers = gv.levers_for(SimpleNamespace())
+    assert levers[gv.PAGING_LEAD_LEVER].minimum == 30
+    assert levers[gv.PAGING_LEAD_LEVER].maximum == 180
+    assert levers[gv.PREFETCH_CHUNKS_LEVER].step == 64
+
+
+def test_service_samples_the_miss_counters():
+    stats = {"near_miss_never_wide": 7, "near_miss_late": 3, "near_miss_paused_ram": 2}
+    service = gv.GovernorService(_flying(), read_stat=stats.get)
+    sample = service.sample()
+    assert sample.near_miss_never_wide == 7 and sample.near_miss_late == 3
+    assert sample.near_miss_paused_ram == 2 and sample.near_miss_done == 0
+
+
+def test_replay_reproduces_miss_decisions_from_a_recording(tmp_path):
+    flight = Flight()
+    samples = [replace(flight.step(**_blurry({"never_wide": 3, "late": 1})), starting=False)
+               for _ in range(8)]
+    path = tmp_path / "samples-flight.jsonl"
+    path.write_text("\n".join(json.dumps(asdict(s)) for s in samples), encoding="utf-8")
+    loaded = gv.load_samples(path)
+    assert loaded == samples
+    live = _flying(mode="advise")
+    expected = [d for d in (live.observe(s) for s in samples) if d]
+    replayed = gv.replay(loaded, _prefetch_levers(), PREFETCH_VALUES, mode="advise")
+    assert expected and expected[0].state == "behind_wide"
+    assert [(d.lever, d.new, d.state) for d in replayed] == \
+        [(d.lever, d.new, d.state) for d in expected]
+
+
+def test_old_recordings_without_miss_counters_still_load(tmp_path):
+    path = tmp_path / "samples-old.jsonl"
+    path.write_text(json.dumps({"t": 2.0, "near_real": 5, "near_standin": 1}), encoding="utf-8")
+    sample = gv.load_samples(path)[0]
+    assert sample.near_miss_late == 0 and sample.misses()["never_wide"] == 0

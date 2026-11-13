@@ -226,6 +226,7 @@ _TUNING = {
     "streaming.near_wait_seconds",
     "streaming.band_max_wait_seconds",
     "streaming.paging_k",
+    "streaming.paging_lead_seconds",
     "guards.xplane_vram_reserve_gb",
     "governor.allow_texture_cap",
     "governor.texture_cap_px",
@@ -280,6 +281,7 @@ _GOVERNED = {
     "autoortho.prefetch_max_chunks",
     "streaming.near_wait_seconds",
     "streaming.band_max_wait_seconds",
+    "streaming.paging_lead_seconds",
     "governor.texture_cap_px",
 }
 _MEASURED = {"streaming.paging_k"}
@@ -298,6 +300,7 @@ _LIVE = {
     "streaming.near_wait_seconds",
     "streaming.band_max_wait_seconds",
     "streaming.paging_k",
+    "streaming.paging_lead_seconds",
     "autoortho.live_tile_admission",
     "autoortho.background_builder_workers",
     "autoortho.predictive_dds_build_interval_ms",
