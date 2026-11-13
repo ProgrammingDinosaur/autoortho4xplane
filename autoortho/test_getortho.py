@@ -299,7 +299,7 @@ def _test_tile_close(tmpdir):
 #     files = os.listdir(tmpdir)
 #     assert len(m.tiles) == len(files)
 
-def test_get_bytes_mm4_mm0(tmpdir):
+def test_get_bytes_mm4_mm0(tmpdir, monkeypatch):
     tile = getortho.Tile(17408, 25856, 'BI', 16, cache_dir=tmpdir)
     #tile = getortho.Tile(21760, 32320, 'BI', 16, cache_dir=tmpdir)
     #tile = getortho.Tile(2176, 3232, 'BI', 13, cache_dir=tmpdir)
@@ -308,7 +308,10 @@ def test_get_bytes_mm4_mm0(tmpdir):
     ret = tile.read_dds_bytes(mmstart, 1024)
     assert ret
    
-    tile.maxchunk_wait = 0.05
+    # Short waits for the mipmap 0 read (the wait bands are the only
+    # wait policy).
+    monkeypatch.setattr(getortho.CFG.streaming, "near_wait_seconds", 0.05, raising=False)
+    monkeypatch.setattr(getortho.CFG.streaming, "band_max_wait_seconds", 0.05, raising=False)
     mmstart = tile.dds.mipmap_list[0].startpos
     ret = tile.read_dds_bytes(mmstart, 8388608)
     assert ret
@@ -1854,12 +1857,12 @@ class TestTimeBudget:
         tile._tile_time_budget = None
         tile._fallback_time_budget = None
         tile._time_budget_lock = getortho.threading.Lock()
-        monkeypatch.setattr(getortho.CFG.autoortho, "use_time_budget", True)
+        # The tile budget is the longest band wait (tile_time_budget is
+        # retired).
+        monkeypatch.setattr(getortho.CFG.streaming, "near_wait_seconds", "12", raising=False)
+        monkeypatch.setattr(getortho.CFG.streaming, "band_max_wait_seconds", "6", raising=False)
         monkeypatch.setattr(
-            getortho.CFG.autoortho, "tile_time_budget", "12"
-        )
-        monkeypatch.setattr(
-            getortho.CFG.autoortho, "suspend_maxwait", False
+            getortho.datareftracker, "has_ever_connected", True, raising=False
         )
 
         first = tile._get_or_create_tile_time_budget()
@@ -1868,7 +1871,7 @@ class TestTimeBudget:
         assert first is second
         assert first.max_seconds == 12
 
-    def test_tile_honors_legacy_budget_mode(self, monkeypatch):
+    def test_retired_budget_switch_is_ignored(self, monkeypatch):
         tile = getortho.Tile.__new__(getortho.Tile)
         tile._tile_time_budget = None
         tile._fallback_time_budget = None
@@ -1876,8 +1879,25 @@ class TestTimeBudget:
         monkeypatch.setattr(
             getortho.CFG.autoortho, "use_time_budget", False
         )
+        monkeypatch.setattr(
+            getortho.datareftracker, "has_ever_connected", True, raising=False
+        )
 
-        assert tile._get_or_create_tile_time_budget() is None
+        budget = tile._get_or_create_tile_time_budget()
+        assert budget is not None
+        assert budget.max_seconds == getortho.wait_bands.tile_budget_seconds()
+
+    def test_first_load_extends_the_tile_budget(self, monkeypatch):
+        tile = getortho.Tile.__new__(getortho.Tile)
+        tile._tile_time_budget = None
+        tile._fallback_time_budget = None
+        tile._time_budget_lock = getortho.threading.Lock()
+        monkeypatch.setattr(getortho.CFG.streaming, "near_wait_seconds", "60", raising=False)
+        monkeypatch.setattr(
+            getortho.datareftracker, "has_ever_connected", False, raising=False
+        )
+
+        assert tile._get_or_create_tile_time_budget().max_seconds == 600
 
 
 class TestFallbackLevel:
@@ -2041,15 +2061,15 @@ class TestPerformanceConfig:
         cfg = aoconfig.AOConfig(os.path.join(str(tmpdir), '.aocfg'))
         
         # Modify values
-        cfg.autoortho.use_time_budget = False
-        cfg.autoortho.tile_time_budget = "3.5"
+        cfg.streaming.band_max_wait_seconds = "8.0"
+        cfg.autoortho.use_time_budget = False      # retired: not saved
         cfg.autoortho.fallback_level = "full"  # Use string value
         cfg.save()
         
         # Reload and verify
         cfg.load()
-        assert cfg.autoortho.use_time_budget == False
-        assert float(cfg.autoortho.tile_time_budget) == 3.5
+        assert float(cfg.streaming.band_max_wait_seconds) == 8.0
+        assert cfg.autoortho.use_time_budget == True
         assert cfg.autoortho.fallback_level == 'full', f"Expected 'full', got {cfg.autoortho.fallback_level}"
 
 

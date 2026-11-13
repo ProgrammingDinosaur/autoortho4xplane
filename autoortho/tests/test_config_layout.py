@@ -31,7 +31,7 @@ def test_save_restores_template_comments_and_keeps_values(tmp_path):
         "[autoortho]\n"
         "# this prevents a single slow chunk from consuming the entire tile budget.\n"
         "# recommended = 250 (fast CPU), 500 (balanced), 1000 (low-end CPU)\n"
-        "maxwait = 4.0\n"
+        "prefetch_interval = 4.0\n"
         "custom_user_key = 7\n"
         "# stale comment from an old release\n"
         "[my_plugin]\n"
@@ -42,8 +42,8 @@ def test_save_restores_template_comments_and_keeps_values(tmp_path):
     aoconfig.AOConfig(str(path))
     text = path.read_text()
 
-    assert _lines_before(text, "maxwait").startswith(
-        "# Recommended: 2.0 (fast networks)"
+    assert _lines_before(text, "prefetch_interval").startswith(
+        "# How often to check for prefetch opportunities"
     )
     assert text.count("250 (fast CPU)") == 1
     assert _lines_before(text, "predictive_dds_build_interval_ms") == (
@@ -55,7 +55,7 @@ def test_save_restores_template_comments_and_keeps_values(tmp_path):
     assert "[my_plugin]" in text and "enabled = True" in text
 
     reloaded = aoconfig.AOConfig(str(path))
-    assert float(reloaded.autoortho.maxwait) == 4.0
+    assert float(reloaded.autoortho.prefetch_interval) == 4.0
     assert reloaded.autoortho.custom_user_key == 7
     assert path.read_text() == text
 
@@ -98,6 +98,7 @@ def test_full_file_from_older_release_becomes_sparse(tmp_path):
         "gui = True\n"
         "[autoortho]\n"
         "max_zoom = 16\n"
+        "prefetch_interval = 4.0\n"
         "maxwait = 4.0\n"
         "max_concurrent_downloads = 256\n"
         "ephemeral_dds_cache_mb = 4096\n",
@@ -109,11 +110,15 @@ def test_full_file_from_older_release_becomes_sparse(tmp_path):
 
     assert _active_lines(text) == [
         f"config_revision = {aoconfig.CONFIG_REVISION}",
-        "maxwait = 4.0",
+        # Engine values set by hand are kept, and Home offers to review them.
+        "kept_values = autoortho.prefetch_interval",
+        "prefetch_interval = 4.0",
     ]
     assert "max_concurrent_downloads" not in text
     assert "ephemeral_dds_cache_mb" not in text
-    assert cfg.source("autoortho", "maxwait") == "custom"
+    # Wait consolidation retired maxwait: dropped, not kept.
+    assert "maxwait" not in text
+    assert cfg.source("autoortho", "prefetch_interval") == "custom"
     assert cfg.source("autoortho", "max_zoom") == "default"
     # Retired keys are still readable for code that has not moved on.
     assert cfg.autoortho.max_concurrent_downloads == 256
@@ -183,9 +188,9 @@ def test_file_is_utf8_and_older_locale_files_still_load(tmp_path):
     path.read_text(encoding="utf-8")
 
     path.write_bytes(
-        b"[autoortho]\n# an old dash \x97 in cp1252\nmaxwait = 3.0\n"
+        b"[autoortho]\n# an old dash \x97 in cp1252\nprefetch_interval = 3.0\n"
     )
-    assert float(aoconfig.AOConfig(str(path)).autoortho.maxwait) == 3.0
+    assert float(aoconfig.AOConfig(str(path)).autoortho.prefetch_interval) == 3.0
 
 
 def test_old_config_gets_new_partial_build_default_once(tmp_path):

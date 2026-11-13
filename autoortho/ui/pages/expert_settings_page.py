@@ -47,6 +47,14 @@ _TIER_LABELS = {
 }
 
 COLUMNS = ("Setting", "Value", "Default", "Source")
+
+# Sources of values AutoOrtho picked itself (not the user's own).
+_AUTOMATIC_SOURCES = {
+    "hardware": "This PC",
+    "limit": "Your limits",
+    "measured": "Measured",
+}
+_NOT_CHANGED = ("Default",) + tuple(_AUTOMATIC_SOURCES.values())
 COL_SETTING, COL_VALUE, COL_DEFAULT, COL_SOURCE = range(4)
 
 
@@ -101,12 +109,14 @@ class ExpertSettingsModel(QAbstractTableModel):
             if column == COL_VALUE:
                 return self.value_text(spec)
             if column == COL_DEFAULT:
-                return spec.default_text
+                return self.default_text(spec)
             if column == COL_SOURCE:
                 return self.source_text(spec)
         if role == Qt.ItemDataRole.ToolTipRole:
             return self.tooltip(spec)
-        if role == Qt.ItemDataRole.FontRole and self.source_text(spec) != "Default":
+        if role == Qt.ItemDataRole.FontRole and self.source_text(spec) not in (
+            _NOT_CHANGED
+        ):
             font = QFont()
             font.setBold(True)
             return font
@@ -151,10 +161,15 @@ class ExpertSettingsModel(QAbstractTableModel):
     def _saved_text(self, spec):
         return _text(self._config.value(spec.section, spec.key))
 
+    def default_text(self, spec):
+        """What Reset gives: this PC's value where AutoOrtho scales it."""
+        automatic = self._config.automatic_text(spec.section, spec.key)
+        return spec.default_text if automatic is None else automatic
+
     def value_text(self, spec):
         pending = self._pending.get(spec.name)
         if pending == RESET:
-            return spec.default_text
+            return self.default_text(spec)
         if pending is not None:
             return pending
         return self._saved_text(spec)
@@ -165,14 +180,28 @@ class ExpertSettingsModel(QAbstractTableModel):
             return "Reset (pending)"
         if pending is not None:
             return "Edited (pending)"
-        if self._config.source(spec.section, spec.key) == "custom":
+        source = self._config.source(spec.section, spec.key)
+        if source == "custom":
             return "Custom"
+        if source in _AUTOMATIC_SOURCES:
+            return _AUTOMATIC_SOURCES[source]
         return "Default"
 
     def tooltip(self, spec):
         parts = [spec.name, f"Group: {_TIER_LABELS[spec.tier]}"]
         if spec.range is not None:
             parts.append(f"Range: {spec.range[0]} to {spec.range[1]}")
+        if self.default_text(spec) != spec.default_text:
+            reason = {
+                "limit": "Lowered to fit your limits",
+                "measured": "From the connection test",
+            }.get(
+                self._config.source(spec.section, spec.key),
+                "Scaled to this PC",
+            )
+            parts.append(
+                f"{reason}; the packaged default is {spec.default_text}."
+            )
         if not self.is_editable(spec):
             parts.append("Change this one on its own settings page.")
         if spec.help:
@@ -249,7 +278,7 @@ class _ExpertFilter(QSortFilterProxyModel):
         spec = model.spec(source_row)
         if self._tier and spec.tier.value != self._tier:
             return False
-        if self._only_custom and model.source_text(spec) == "Default":
+        if self._only_custom and model.source_text(spec) in _NOT_CHANGED:
             return False
         text = model.search_text(source_row)
         return all(word in text for word in self._words)

@@ -1369,6 +1369,28 @@ class _AdaptiveConcurrencyController:
                 state.successes = 0
                 self._report(origin, state, "protocol_cap")
 
+    def set_maximum(self, maximum: int) -> int:
+        """Move the ceiling every origin works under (the governor's lever).
+
+        Never below the controller's floor. Origins over the new ceiling are
+        cut at once; a raised ceiling only lets them climb, response by
+        response. Returns the maximum in effect.
+        """
+        self._maximum = max(self._minimum, int(maximum))
+        for origin, state in self._origins.items():
+            if state.http_version.startswith("HTTP/1"):
+                state.ceiling = max(
+                    self._minimum,
+                    min(self._maximum, self._connection_limit),
+                )
+            else:
+                state.ceiling = self._http2_ceiling()
+            if state.limit > state.ceiling:
+                state.limit = state.ceiling
+                state.successes = 0
+                self._report(origin, state, "governor_cap")
+        return self._maximum
+
     def limit_for(self, origin: str) -> int:
         state = self._state(origin)
         configured = state.limit if self.enabled else self._maximum
@@ -2069,6 +2091,44 @@ def _is_stream_capacity_error(exc: BaseException) -> bool:
     return False
 
 
+class _ByteRateLimiter:
+    """Token bucket for downloaded bytes, shared by every request.
+
+    Holds at most a quarter second of bytes, so bursts stay short; a body
+    chunk larger than the bucket waits for the tokens it lacks.
+    """
+
+    def __init__(self, bytes_per_second: float, *, clock=time.monotonic, sleep=None):
+        self.rate = float(bytes_per_second)
+        self.capacity = max(64 * 1024.0, self.rate * 0.25)
+        self._tokens = self.capacity
+        self._clock = clock
+        self._stamp = clock()
+        self._sleep = sleep or asyncio.sleep
+        self._lock = asyncio.Lock()
+
+    def set_rate(self, bytes_per_second: float) -> None:
+        self._refill()
+        self.rate = float(bytes_per_second)
+        self.capacity = max(64 * 1024.0, self.rate * 0.25)
+        self._tokens = min(self._tokens, self.capacity)
+
+    def _refill(self) -> None:
+        now = self._clock()
+        self._tokens = min(
+            self.capacity, self._tokens + (now - self._stamp) * self.rate
+        )
+        self._stamp = now
+
+    async def consume(self, size: int) -> None:
+        async with self._lock:
+            self._refill()
+            self._tokens -= size
+            if self._tokens < 0:
+                await self._sleep(-self._tokens / self.rate)
+                self._refill()
+
+
 class _BrokerCore:
     """Owns the httpx client, priority queue and coalescing/cancellation state."""
 
@@ -2082,6 +2142,7 @@ class _BrokerCore:
         transport: Any = None,
         adaptive: Optional[Dict[str, Any]] = None,
         transport_trace: bool = False,
+        max_bytes_per_second: float = 0.0,
     ):
         _require_dependencies(require_http2=transport is None)
         if transport is None and not _install_httpcore_stream_reset():
@@ -2115,6 +2176,13 @@ class _BrokerCore:
         self._transport_metrics = _TransportLifecycleMetrics(
             transport_trace
         )
+        # [limits] bandwidth_mbps: bodies are read no faster than this, so
+        # TCP flow control slows the servers down too.
+        self._rate = (
+            _ByteRateLimiter(max_bytes_per_second)
+            if max_bytes_per_second and max_bytes_per_second > 0
+            else None
+        )
 
         adaptive_kwargs = dict(adaptive or {})
         adaptive_kwargs.setdefault("maximum", self._max_concurrency)
@@ -2143,6 +2211,36 @@ class _BrokerCore:
 
     async def start(self) -> None:
         self._workers = [asyncio.create_task(self._worker_loop()) for _ in range(self._max_concurrency)]
+
+    def configure(
+        self,
+        *,
+        origin_max_concurrency: Optional[int] = None,
+        max_bytes_per_second: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Change the live levers: the per-origin ceiling and the rate.
+
+        The ceiling cannot exceed the worker count the broker started with.
+        A rate of 0 removes the bandwidth limit.
+        """
+        applied: Dict[str, Any] = {}
+        if origin_max_concurrency is not None:
+            ceiling = max(1, min(self._max_concurrency, int(origin_max_concurrency)))
+            applied["origin_max_concurrency"] = self._limiter.set_maximum(ceiling)
+            for origin in list(self._backlog):
+                self._resume_waiting_origins(origin)
+        if max_bytes_per_second is not None:
+            rate = max(0.0, float(max_bytes_per_second))
+            if rate <= 0:
+                self._rate = None
+            elif self._rate is None:
+                self._rate = _ByteRateLimiter(rate)
+            else:
+                self._rate.set_rate(rate)
+            applied["max_bytes_per_second"] = rate
+        if applied:
+            log.info("Broker levers: %s", applied)
+        return applied
 
     async def stop(self) -> None:
         self._stopping = True
@@ -2597,6 +2695,8 @@ class _BrokerCore:
                     total = 0
                     body_started = time.monotonic()
                     async for chunk in resp.aiter_bytes():
+                        if self._rate is not None:
+                            await self._rate.consume(len(chunk))
                         total += len(chunk)
                         if total > self._max_response_bytes:
                             raise ResponseTooLargeError(
@@ -2760,6 +2860,7 @@ class _RouterServer:
             transport=transport,
             adaptive=config.get("adaptive"),
             transport_trace=bool(config.get("transport_trace", False)),
+            max_bytes_per_second=float(config.get("max_bytes_per_second", 0) or 0),
         )
 
     async def _send(
@@ -2835,6 +2936,11 @@ class _RouterServer:
             await self._handle_stats(identity, msg)
         elif mtype == "CANCEL":
             await self._core.cancel(msg.get("id"))
+        elif mtype == "CONFIG":
+            self._core.configure(
+                origin_max_concurrency=msg.get("origin_max_concurrency"),
+                max_bytes_per_second=msg.get("max_bytes_per_second"),
+            )
         elif mtype == "REPRIORITIZE":
             await self._core.reprioritize(
                 msg.get("id"), int(msg.get("priority", DEFAULT_PRIORITY))
@@ -2930,6 +3036,7 @@ def _server_config(
     profile_environment=None,
     adaptive=None,
     transport_trace=False,
+    max_bytes_per_second=0.0,
 ) -> Dict[str, Any]:
     return {
         "max_concurrency": max_concurrency,
@@ -2939,6 +3046,7 @@ def _server_config(
         "profile_environment": dict(profile_environment or {}),
         "adaptive": dict(adaptive or {}),
         "transport_trace": bool(transport_trace),
+        "max_bytes_per_second": float(max_bytes_per_second or 0),
     }
 
 
@@ -3245,6 +3353,7 @@ class HTTP2Broker:
         origin_cooldown_seconds: float = DEFAULT_ORIGIN_COOLDOWN_SECONDS,
         queue_timeout: float = 60.0,
         transport_trace: bool = False,
+        max_bytes_per_second: float = 0.0,
     ):
         if transport is not None and not in_process:
             raise ValueError("transport injection is only supported with in_process=True")
@@ -3269,6 +3378,7 @@ class HTTP2Broker:
         self._live_priority_threshold = int(live_priority_threshold)
         self._profile_environment = dict(profile_environment or {})
         self._transport_trace = bool(transport_trace)
+        self._max_bytes_per_second = max(0.0, float(max_bytes_per_second or 0))
         self._adaptive = _adaptive_config(
             enabled=adaptive_concurrency,
             initial=min(
@@ -3328,6 +3438,7 @@ class HTTP2Broker:
             profile_environment=self._profile_environment,
             adaptive=self._adaptive,
             transport_trace=self._transport_trace,
+            max_bytes_per_second=self._max_bytes_per_second,
         )
 
         if self._in_process:
@@ -3588,6 +3699,30 @@ class HTTP2Broker:
                 "priority": int(priority),
             }
         )
+        return True
+
+    def configure(
+        self,
+        *,
+        origin_max_concurrency: Optional[int] = None,
+        max_bytes_per_second: Optional[float] = None,
+    ) -> bool:
+        """Change the per-origin ceiling and/or the bandwidth limit live.
+
+        Best effort, like ``reprioritize``: returns False when the broker is
+        not running.
+        """
+        if not self._started or self._stopped:
+            return False
+        dispatcher = self._dispatcher
+        if dispatcher is None:
+            return False
+        message: Dict[str, Any] = {"type": "CONFIG", "token": self._token}
+        if origin_max_concurrency is not None:
+            message["origin_max_concurrency"] = int(origin_max_concurrency)
+        if max_bytes_per_second is not None:
+            message["max_bytes_per_second"] = float(max_bytes_per_second)
+        dispatcher.send_control(message)
         return True
 
     def server_stats(self, *, timeout: float = 5.0) -> Dict[str, Any]:

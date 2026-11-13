@@ -78,10 +78,34 @@ except ImportError:
     import streaming_options
 
 try:
-    from autoortho import colour_table, wait_bands
+    from autoortho import colour_table, texture_plan, wait_bands
 except ImportError:
     import colour_table
+    import texture_plan
     import wait_bands
+
+# Photo textures X-Plane holds (finest level read in the last 20 minutes):
+# the graphics memory estimate auto-tuning watches for the texture cap.
+held_textures = texture_plan.HeldTextures()
+
+try:
+    from autoortho.ram_brake import DiskBrake, RamBrake
+except ImportError:
+    from ram_brake import DiskBrake, RamBrake
+
+try:
+    from autoortho import provider_urls
+except ImportError:
+    import provider_urls
+
+try:
+    from autoortho import hardware
+    from autoortho import limits as limits_module
+    from autoortho.live_settings import LiveSettings, ResizableGate
+except ImportError:
+    import hardware
+    import limits as limits_module
+    from live_settings import LiveSettings, ResizableGate
 
 try:
     from autoortho.dds_manifest import (
@@ -1200,13 +1224,30 @@ _native_build_condition = threading.Condition(_active_native_builds_lock)
 _native_build_waiters = deque()
 
 
+_live_cpu_threads = 0   # set live from limits.cpu_threads
+
+
+def _cpu_thread_total():
+    """Threads AutoOrtho may build on: [limits] cpu_cores, else every CPU."""
+    if _live_cpu_threads > 0:
+        return min(CURRENT_CPU_COUNT, _live_cpu_threads)
+    try:
+        limit = int(os.getenv("AO_CPU_THREAD_LIMIT") or 0)
+    except ValueError:
+        limit = 0
+    if limit <= 0:
+        active = globals().get("_limits")
+        limit = (active.cpu_threads if active is not None else 0) or 0
+    return min(CURRENT_CPU_COUNT, limit) if limit > 0 else CURRENT_CPU_COUNT
+
+
 def _native_cpu_budget():
     """Divide CPU capacity between the independently spawned scenery workers."""
     try:
         workers = max(1, int(os.getenv("AO_MOUNT_WORKER_COUNT", "1")))
     except ValueError:
         workers = 1
-    return max(1, CURRENT_CPU_COUNT // workers)
+    return max(1, _cpu_thread_total() // workers)
 
 
 def _native_thread_load() -> tuple:
@@ -1424,7 +1465,9 @@ try:
     )
 except (TypeError, ValueError):
     _live_tile_admission_limit = 16
-_live_tile_admission = threading.BoundedSemaphore(
+# Resizable so the governor can widen or narrow live admission while
+# streaming (live_settings.py).
+_live_tile_admission = ResizableGate(
     _live_tile_admission_limit
 )
 
@@ -1487,13 +1530,19 @@ def _live_read_end():
 def acquire_live_tile_slot(timeout: float) -> bool:
     """Bound complete live tile work before expensive tile state is created."""
     started = time.monotonic()
-    acquired = _live_tile_admission.acquire(timeout=max(0.0, timeout))
+    acquired = _live_tile_admission.acquire(blocking=False)
+    if not acquired:
+        # The governor's compute signal: live tiles queueing for admission.
+        bump("live_admission_waits")
+        acquired = _live_tile_admission.acquire(timeout=max(0.0, timeout))
+    waited_ms = (time.monotonic() - started) * 1000.0
     record_stage(
         "tile.admission_wait",
-        (time.monotonic() - started) * 1000.0,
+        waited_ms,
         outcome="ok" if acquired else "timeout",
-        details={"limit": _live_tile_admission_limit},
+        details={"limit": _live_tile_admission.limit},
     )
+    bump("live_admissions")
     return acquired
 
 
@@ -1843,6 +1892,142 @@ def bump_many(d: dict):
         stats_batcher.add_many(d)
     else:
         inc_many(d)
+
+
+def _on_ram_brake_change(engaged, _free, _total):
+    if engaged:
+        bump("ram_brake_activations")
+
+
+def _ram_brake_enabled():
+    value = getattr(getattr(CFG, "guards", None), "ram_brake", True)
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+# Pauses prefetch and background builds and shrinks the memory cache while
+# the system is very low on free RAM (see ram_brake.py).
+ram_brake = RamBrake(enabled=_ram_brake_enabled(), on_change=_on_ram_brake_change)
+
+
+def _resolve_limits():
+    try:
+        return limits_module.from_config(CFG, hardware.basic())
+    except Exception as exc:
+        log.debug(f"Limits unavailable: {exc}")
+        return None
+
+
+_limits = _resolve_limits()
+
+
+def _on_disk_brake_change(engaged, _free):
+    if engaged:
+        bump("disk_brake_activations")
+
+
+def _disk_margin_bytes():
+    try:
+        margin_gb = float(getattr(CFG.scenery, "storage_safety_margin_gb", 2))
+    except (TypeError, ValueError):
+        margin_gb = 2.0
+    return int(max(2.0, margin_gb) * 1024 ** 3)
+
+
+# Lever values the parent publishes while streaming (live_settings.py).
+live_settings = LiveSettings(CFG)
+
+
+def _live_int(value, low, high):
+    try:
+        return max(low, min(high, int(float(value))))
+    except (TypeError, ValueError):
+        return None
+
+
+def _on_live_admission(value):
+    limit = _live_int(value, 1, 256)
+    if limit is not None:
+        _live_tile_admission.resize(limit)
+
+
+def _on_live_background_workers(value):
+    workers = _live_int(value, 1, 16)
+    if workers is not None and background_dds_builder is not None:
+        background_dds_builder.set_max_workers(workers)
+
+
+def _on_live_build_interval(value):
+    interval = _live_int(value, 50, 2000)
+    if interval is not None and background_dds_builder is not None:
+        background_dds_builder.set_build_interval(interval / 1000.0)
+
+
+def _on_live_predictive_memory(value):
+    megabytes = _live_int(value, 64, 65536)
+    if megabytes is not None and background_dds_builder is not None:
+        background_dds_builder.set_byte_budget_mb(megabytes)
+
+
+def _on_live_cache_limit(value):
+    try:
+        TileCacher.cache_mem_lim = int(float(value) * 1024 ** 3)
+    except (TypeError, ValueError):
+        pass
+
+
+def _on_live_prefetch(_value):
+    spatial_prefetcher._load_config()
+
+
+def _on_live_cpu_threads(value):
+    global _live_cpu_threads
+    threads = _live_int(value, 0, 4096)
+    if threads is not None:
+        _live_cpu_threads = threads
+
+
+def _on_live_ram_gb(value):
+    global _ram_limit_bytes
+    try:
+        gb = float(value)
+    except (TypeError, ValueError):
+        return
+    _ram_limit_bytes = (
+        int((gb - limits_module.APP_OVERHEAD_GB) * 1024 ** 3) if gb > 0 else None
+    )
+
+
+for _name, _hook in (
+    ("autoortho.live_tile_admission", _on_live_admission),
+    ("autoortho.background_builder_workers", _on_live_background_workers),
+    ("autoortho.predictive_dds_build_interval_ms", _on_live_build_interval),
+    ("autoortho.predictive_dds_memory_mb", _on_live_predictive_memory),
+    ("cache.cache_mem_limit", _on_live_cache_limit),
+    ("autoortho.prefetch_lookahead", _on_live_prefetch),
+    ("autoortho.prefetch_radius_nm", _on_live_prefetch),
+    ("autoortho.prefetch_max_chunks", _on_live_prefetch),
+    ("autoortho.prefetch_interval", _on_live_prefetch),
+    ("limits.cpu_threads", _on_live_cpu_threads),
+    ("limits.ram_gb", _on_live_ram_gb),
+):
+    live_settings.on_change(_name, _hook)
+
+
+# Stops new cache writes while the cache drive is nearly full (ram_brake.py).
+disk_brake = DiskBrake(
+    getattr(getattr(CFG, "paths", None), "cache_dir", ""),
+    _disk_margin_bytes(),
+    enabled=_ram_brake_enabled(),
+    on_change=_on_disk_brake_change,
+)
+# AutoOrtho's workers may use the RAM limit minus the app's own share.
+_ram_limit_bytes = (
+    int((_limits.ram_gb - limits_module.APP_OVERHEAD_GB) * 1024 ** 3)
+    if _limits is not None and _limits.ram_gb
+    else None
+)
 
 
 def get_tile_creation_stats():
@@ -4192,6 +4377,9 @@ def _submit_bounded_cache_write(
 ) -> bool:
     global _cache_write_pending_bytes, _lt_cache_write_pending_bytes
     byte_count = max(0, int(byte_count))
+    if not disk_brake.writes_allowed():
+        bump(f"{kind}_cache_write_disk_brake")
+        return False
     if kind == "local":
         lock = _cache_write_pending_lock
         limit = _cache_write_limit_bytes()
@@ -5207,6 +5395,111 @@ def _active_mount_worker_count():
         return 1
 
 # ============================================================================
+# LATE ARRIVALS: how long imagery took after a read stopped waiting for it
+# ============================================================================
+
+
+class LateArrivals:
+    """Counts how long a level's chunks took after a read gave up on them.
+
+    When a near or middle read is answered without real imagery while some
+    of the level's chunks are still downloading, those chunks are watched
+    until they arrive. The time from the start of the read is counted in
+    ``wait_bands.LATE_BUCKETS_S`` (separately while a flight starts). The
+    governor raises a wait only when most of them came soon after the wait
+    ended; otherwise waiting longer would only hold X-Plane up.
+    """
+
+    MAX_WATCHED = 512
+    POLL_S = 0.5
+
+    def __init__(self, clock=time.monotonic, count=None, auto_start=True):
+        self._clock = clock
+        self._count = count or bump
+        self._auto_start = auto_start
+        self._lock = threading.Lock()
+        self._watched = {}   # (tile id, level) -> (chunks, started, starting)
+        self._thread = None
+        self._stop = threading.Event()
+
+    def note(self, tile_id, level, chunks, started, starting):
+        """Watch ``chunks`` (those not yet arrived). Returns whether it does."""
+        pending = tuple(c for c in chunks if not c.ready.is_set())
+        if not pending:
+            return False
+        key = (tile_id, int(level))
+        with self._lock:
+            if key in self._watched or len(self._watched) >= self.MAX_WATCHED:
+                return False
+            self._watched[key] = (pending, float(started), bool(starting))
+            start = self._auto_start and (
+                self._thread is None or not self._thread.is_alive()
+            )
+        if start:
+            self._start()
+        return True
+
+    def watched(self):
+        with self._lock:
+            return len(self._watched)
+
+    def check(self):
+        """Count the levels that arrived or ran out of time. Returns how many."""
+        now = self._clock()
+        with self._lock:
+            items = list(self._watched.items())
+        finished = []
+        for key, (chunks, started, starting) in items:
+            elapsed = max(0.0, now - started)
+            if all(c.ready.is_set() for c in chunks):
+                finished.append(key)
+                if any(getattr(c, "permanent_failure", False) for c in chunks):
+                    continue   # failed, not late: no wait would have helped
+                index = wait_bands.late_bucket(elapsed)
+            elif elapsed > wait_bands.LATE_GIVE_UP_S:
+                finished.append(key)
+                index = len(wait_bands.LATE_BUCKETS_S)
+            else:
+                continue
+            try:
+                self._count(wait_bands.late_stat_key(starting, index))
+            except Exception:
+                pass
+        if finished:
+            with self._lock:
+                for key in finished:
+                    self._watched.pop(key, None)
+        return len(finished)
+
+    def _start(self):
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run, name="late-arrivals", daemon=True
+            )
+            self._thread.start()
+
+    def _run(self):
+        while not self._stop.wait(self.POLL_S):
+            try:
+                self.check()
+            except Exception as exc:  # statistics only
+                log.debug(f"Late arrival check failed: {exc}")
+            with self._lock:
+                if not self._watched:
+                    self._thread = None
+                    return
+
+    def stop(self):
+        self._stop.set()
+
+
+late_arrivals = LateArrivals()
+
+
+# ============================================================================
 # PAGING MODEL: which mipmap X-Plane will want of a tile (see paging_model.py)
 # ============================================================================
 _paging_model_instance = None
@@ -5245,6 +5538,22 @@ def current_camera():
 
 _flight_start = wait_bands.StartTracker()
 _flight_start_lock = threading.Lock()
+
+
+def _publish_graphics_memory():
+    """This worker's gauges for Home: photo textures' graphics memory, builds."""
+    pid = os.getpid()
+    try:
+        fmt = str(getattr(CFG.pydds, "format", "BC1"))
+        set_stat(f"graphics_memory_bytes:{pid}", held_textures.bytes(fmt))
+        set_stat(f"building_now:{pid}", int(_live_tile_admission.held))
+    except Exception as exc:  # statistics only
+        log.debug(f"Home gauges failed: {exc}")
+
+
+def _initial_load():
+    """X-Plane is loading the first flight: it has never connected yet."""
+    return not getattr(datareftracker, "has_ever_connected", False)
 
 
 def flight_is_starting(near_read=False):
@@ -5429,6 +5738,11 @@ class SpatialPrefetcher:
         """
         # Legacy submission has no admission coordinator and must fully yield.
         if is_live_building() and self._coordinator is None:
+            return
+
+        # Very low free RAM: prefetch would only add to the pressure.
+        if ram_brake.engaged:
+            bump("prefetch_cycles_ram_brake")
             return
 
         # Check if tile_cacher is available
@@ -6031,6 +6345,50 @@ class SpatialPrefetcher:
         # Clamp to reasonable values
         return max(0, int(predicted_alt))
     
+    HORIZON_EVERY_S = 10.0
+    HORIZON_MAX_TILES = 80
+    _horizon_at = 0.0
+
+    def _tile_ready(self, row, col, maptype, zoom):
+        """The tile is sharp at its target already (in memory or cached)."""
+        cacher = self._tile_cacher
+        target = cacher._get_target_zoom_level(zoom, row=row, col=col)
+        tile_id = cacher._to_tile_id(row, col, maptype, zoom)
+        tile = cacher.tiles.get(tile_id)
+        if tile is not None and getattr(tile, "dds", None) is not None:
+            try:
+                if tile.max_zoom == target and tile.real_from() == 0:
+                    return True
+            except Exception:
+                pass
+        if dynamic_dds_cache is None:
+            return False
+        from types import SimpleNamespace
+
+        probe = SimpleNamespace(row=row, col=col, maptype=maptype, tilename_zoom=zoom)
+        return dynamic_dds_cache.contains(tile_id, target, probe)
+
+    def _note_horizon(self, sorted_tiles):
+        """Prefetch horizon for Home: how far ahead everything is already sharp.
+
+        Walks the predicted path's tiles nearest first (at most every 10 s,
+        at most 80 tiles) and publishes the distance of the last ready one
+        before the first that is not.
+        """
+        now = time.monotonic()
+        if now - self._horizon_at < self.HORIZON_EVERY_S:
+            return
+        self._horizon_at = now
+        horizon = 0.0
+        try:
+            for (row, col, maptype, zoom), distance in sorted_tiles[: self.HORIZON_MAX_TILES]:
+                if not self._tile_ready(row, col, maptype, zoom):
+                    break
+                horizon = max(horizon, float(distance))
+            set_stat(f"prefetch_horizon_m:{os.getpid()}", int(horizon))
+        except Exception as exc:  # statistics only
+            log.debug(f"Prefetch horizon failed: {exc}")
+
     def _do_velocity_prefetch_cycle(self, lat: float, lon: float):
         """
         Execute velocity-based prefetch cycle using radius-based sampling.
@@ -6179,6 +6537,7 @@ class SpatialPrefetcher:
 
         # Sort tiles by distance (nearest first - gradient from player outward)
         sorted_tiles = sorted(tile_distances.items(), key=lambda x: x[1])
+        self._note_horizon(sorted_tiles)
         sorted_tiles = self.paging_split(sorted_tiles)
 
         if self._coordinator is not None:
@@ -6550,6 +6909,7 @@ def start_prefetcher(tile_cacher, scenery_id="default"):
     else:
         spatial_prefetcher.set_coordinator(None)
     spatial_prefetcher.start()
+    live_settings.start()
     _start_terrain_load_ahead()
 
 
@@ -7035,6 +7395,23 @@ class BackgroundDDSBuilder:
         self._active_builds = 0
         self._active_lock = threading.Lock()
     
+    # The pool is created at this ceiling; _max_workers (live) gates how many
+    # builds the coordinator dispatches.
+    MAX_WORKERS_CEILING = 16
+
+    def set_max_workers(self, workers: int) -> None:
+        self._max_workers = max(1, min(self.MAX_WORKERS_CEILING, int(workers)))
+        self._work_event.set()
+
+    def set_build_interval(self, seconds: float) -> None:
+        self._build_interval = max(0.05, min(2.0, float(seconds)))
+        self._work_event.set()
+
+    def set_byte_budget_mb(self, megabytes: int) -> None:
+        per_worker = max(64, int(megabytes) // _active_mount_worker_count())
+        self._byte_budget = per_worker * 1024 * 1024
+        self._work_event.set()
+
     def start(self) -> None:
         """Start the background builder."""
         if self._coordinator_thread is not None and self._coordinator_thread.is_alive():
@@ -7044,8 +7421,9 @@ class BackgroundDDSBuilder:
         self._stop_event.clear()
         
         # Create worker pool
+        # Threads start on demand, up to the ceiling; see set_max_workers.
         self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self._max_workers,
+            max_workers=max(self.MAX_WORKERS_CEILING, self._max_workers),
             thread_name_prefix="BackgroundDDS"
         )
         
@@ -7362,6 +7740,9 @@ class BackgroundDDSBuilder:
 
             if self._stop_event.is_set() or is_shutdown_requested():
                 break
+            # Very low free RAM: hold queued builds until it recovers.
+            if ram_brake.engaged:
+                continue
             self._resume_waiting_requests()
 
             # Fill all available worker slots
@@ -8542,7 +8923,7 @@ def _do_network_healing(tile, indices_to_heal):
             return
 
         # Background healing uses a generous timeout — no frame deadline
-        healing_timeout = max(10.0, float(getattr(CFG.autoortho, 'maxwait', 2.0)) * 3)
+        healing_timeout = 10.0
 
         # ── Step 1: Create Chunk objects and submit for download ──
         heal_chunks = {}  # idx -> Chunk
@@ -8772,6 +9153,11 @@ def start_predictive_dds(tile_cacher=None) -> None:
             from aopipeline.dynamic_dds_cache import DynamicDDSCache
 
         cache_dir = str(CFG.paths.cache_dir)
+        try:
+            from autoortho.aopipeline import dynamic_dds_cache as _ddc_module
+        except ImportError:
+            from aopipeline import dynamic_dds_cache as _ddc_module
+        _ddc_module.writes_allowed = disk_brake.writes_allowed
         dynamic_dds_cache = DynamicDDSCache(
             cache_dir=cache_dir,
             max_size_mb=persistent_dds_mb,
@@ -9558,10 +9944,7 @@ class Chunk(object):
 
         server_num = idx % (len(self.serverlist))
         server = self.serverlist[server_num]
-        quadkey = _gtile_to_quadkey(self.col, self.row, self.zoom)
 
-        MAPID = "s2cloudless-2024_3857"
-        MATRIXSET = "g"
         if self.maptype.upper() == "APPLE":
             (
                 apple_token,
@@ -9573,26 +9956,15 @@ class Chunk(object):
             apple_token = apple_token_service.apple_token
             apple_version = apple_token_service.version
             apple_token_generation = apple_token_service.generation
-        MAPTYPES = {
-            "EOX": f"https://s2maps-tiles.eu/wmts?layer={MAPID}&style=default&tilematrixset={MATRIXSET}&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image%2Fjpeg&TileMatrix={self.zoom}&TileCol={self.col}&TileRow={self.row}",
-            "BI": f"https://t.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=15312",
-            "GO2": f"http://mts{server_num}.google.com/vt/lyrs=s&x={self.col}&y={self.row}&z={self.zoom}",
-            # The http:// endpoint answers every tile with a 301 to https://.
-            "ARC": f"https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "NAIP": f"http://naip.maptiles.arcgis.com/arcgis/rest/services/NAIP/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "USGS": f"https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "FIREFLY": f"https://fly.maptiles.arcgis.com/arcgis/rest/services/World_Imagery_Firefly/MapServer/tile/{self.zoom}/{self.row}/{self.col}",
-            "YNDX": f"https://sat{server_num+1:02d}.maps.yandex.net/tiles?l=sat&v=3.1814.0&x={self.col}&y={self.row}&z={self.zoom}",
-            "APPLE": f"https://sat-cdn.apple-mapkit.com/tile?style=7&size=1&scale=1&z={self.zoom}&x={self.col}&y={self.row}&v={apple_version}&accessKey={apple_token}"
-        }
-
-        url = MAPTYPES[self.maptype.upper()]
-        header = {
-                "user-agent": "curl/7.68.0"
-        }
-        if self.maptype.upper() == "EOX":
-            log.debug("EOX DETECTED")
-            header.update({'referer': 'https://s2maps.eu/'})
+        url, header = provider_urls.tile_url(
+            self.maptype,
+            self.col,
+            self.row,
+            self.zoom,
+            server_num=server_num,
+            apple_token=apple_token,
+            apple_version=apple_version,
+        )
         return url, header, server, apple_token_generation
 
     def begin_network_attempt(self, idx=0, timeout=None, max_attempts=None):
@@ -9656,13 +10028,9 @@ class Chunk(object):
         backoff_sleep = min(2.0, self.attempt / 10.0)
         self.attempt += 1
 
-        # Read timeout = maxwait + 1s safety margin. No point keeping a
+        # Read timeout = an in-flight read's wait + 1 s. No point keeping a
         # download alive longer than the caller is willing to wait.
-        try:
-            _maxwait = float(CFG.autoortho.maxwait)
-        except Exception:
-            _maxwait = 2.0
-        _http_timeout = timeout or (5, _maxwait + 1.0)
+        _http_timeout = timeout or (5, wait_bands.http_read_timeout_seconds())
 
         log.debug(f"Requesting {self.url} ..")
 
@@ -10254,7 +10622,6 @@ class Tile(object):
 
     refs = None
 
-    maxchunk_wait = float(CFG.autoortho.maxwait)
     imgs = None
     
     # Maximum fallback chunks per tile to prevent unbounded memory growth
@@ -12773,15 +13140,7 @@ class Tile(object):
 
         transition_budget = time_budget
         if not self._is_live and transition_budget is None:
-            transition_budget = TimeBudget(
-                float(
-                    getattr(
-                        CFG.autoortho,
-                        'tile_time_budget',
-                        30.0,
-                    )
-                )
-            )
+            transition_budget = TimeBudget(wait_bands.tile_budget_seconds())
         self.mark_live(transition_budget)
 
         requested_mipmap = self.find_mipmap_pos(offset)
@@ -12856,15 +13215,7 @@ class Tile(object):
                 self._tile_time_budget or time_budget
             )
             if transition_budget is None:
-                transition_budget = TimeBudget(
-                    float(
-                        getattr(
-                            CFG.autoortho,
-                            'tile_time_budget',
-                            30.0,
-                        )
-                    )
-                )
+                transition_budget = TimeBudget(wait_bands.tile_budget_seconds())
             # Wait briefly for prefetch to complete with boosted priority
             if self._live_transition_event is not None:
                 wait_time = min(transition_budget.remaining, 2.0)
@@ -13318,6 +13669,7 @@ class Tile(object):
             request_budget.end_read()
 
     def _read_dds_bytes_budgeted(self, offset, length, request_budget):
+        read_started = time.monotonic()
 
         # Track when this tile was first requested (for stats only)
         if self.first_request_time is None:
@@ -13398,11 +13750,27 @@ class Tile(object):
         if wanted is not None:
             # OrthoStreamXP's quality measure: the share of X-Plane's reads
             # answered with real imagery at the level it wanted.
-            bump(
-                "reads_wanted_real"
-                if self.real_from() <= wanted
-                else "reads_wanted_standin"
-            )
+            real = self.real_from() <= wanted
+            bump("reads_wanted_real" if real else "reads_wanted_standin")
+            if not real and streaming_options.flag("wait_bands"):
+                self._note_late(wanted, read_started)
+            if getattr(self, "_read_band", None) == wait_bands.NEAR:
+                # Target fidelity (the governor's goal): near reads answered
+                # with real imagery at the target zoom.
+                bump("near_reads_real" if real else "near_reads_standin")
+                if (
+                    real
+                    and not getattr(self, "_sharp_noted", False)
+                    and self.first_request_time is not None
+                ):
+                    # Time to sharp: first read of the texture until its
+                    # first near read is answered with real imagery.
+                    self._sharp_noted = True
+                    bump(
+                        "time_to_sharp_ms_total",
+                        int((time.monotonic() - self.first_request_time) * 1000),
+                    )
+                    bump("time_to_sharp_count")
         return self._recolour(data, offset)
 
     def _recolour(self, data, offset):
@@ -13442,6 +13810,7 @@ class Tile(object):
                 pass
         self._read_band = band
         starting = flight_is_starting(near_read=band == wait_bands.NEAR)
+        self._read_starting = starting
         wait = wait_bands.wait_seconds(band, starting)
         bump(f"read_band_{band}")
         if tile_budget is not None:
@@ -13534,9 +13903,57 @@ class Tile(object):
         self._maybe_persist_complete_dds()
         return True
 
+    def _note_late(self, wanted, read_started):
+        """A near or middle read stopped waiting: time its imagery's arrival."""
+        if getattr(self, "_read_band", None) not in (wait_bands.NEAR, wait_bands.MIDDLE):
+            return
+        try:
+            level = min(int(wanted), int(self.max_mipmap))
+            with self._lock:
+                grid = self.chunks.get(self.max_zoom - level)
+            if grid is None:
+                return
+            late_arrivals.note(
+                self.id,
+                level,
+                grid.materialized(),
+                read_started,
+                bool(getattr(self, "_read_starting", False)),
+            )
+        except Exception as exc:  # statistics only
+            log.debug(f"Late arrival note for {self.id} failed: {exc}")
+
+    def needs_live_slot(self, offset, length):
+        """Whether this read must pass live tile admission.
+
+        Admission bounds the memory of detailed builds. Header chunks and
+        base-level reads use none of it, so they skip the gate instead of
+        queueing behind near reads that hold every slot while they wait.
+        """
+        if not streaming_options.flag("read_classifier"):
+            return True
+        dds = self.dds
+        if dds is None or not dds.mipmap_list:
+            return True
+        try:
+            base = min(int(self.max_mipmap), len(dds.mipmap_list) - 1)
+            needed = read_pattern.needs_build_slot(
+                dds.mipmap_list, int(offset), int(length), base
+            )
+        except Exception as exc:
+            log.debug(f"Admission check for {self.id} failed: {exc}")
+            return True
+        if not needed:
+            bump("live_admission_skipped")
+        return needed
+
     def _note_wanted_level(self, mip):
         """X-Plane wants ``mip`` of this tile now: evidence for the paging model."""
         self._last_wanted_mip = mip
+        try:
+            held_textures.note(self.id, max(1, int(self.dds.width) >> int(mip)))
+        except Exception:  # statistics only
+            pass
         camera = current_camera()
         if camera is None:
             return
@@ -13560,7 +13977,8 @@ class Tile(object):
         """Build the base level (one low-zoom chunk) if it is not there yet.
 
         The base level is what every placeholder is stretched from. Waiting
-        for it is bounded by ``maxwait``: it is one chunk, usually on disk.
+        for it is bounded by the far band's wait: it is one chunk, usually on
+        disk.
         """
         dds = self.dds
         if dds is None or not dds.mipmap_list:
@@ -13734,32 +14152,11 @@ class Tile(object):
         bump_many(counters)
 
     def _get_or_create_tile_time_budget(self):
-        use_time_budget = getattr(CFG.autoortho, "use_time_budget", True)
-        if isinstance(use_time_budget, str):
-            use_time_budget = use_time_budget.lower().strip() in (
-                "true", "1", "yes", "on"
-            )
-        if not use_time_budget:
-            return None
-
+        """The tile's budget across its reads (wait_bands.tile_budget_seconds)."""
         with self._time_budget_lock:
             if self._tile_time_budget is None:
-                budget_seconds = max(
-                    0.1,
-                    float(getattr(CFG.autoortho, "tile_time_budget", 60.0)),
-                )
-                suspend_maxwait = getattr(
-                    CFG.autoortho, "suspend_maxwait", False
-                )
-                if isinstance(suspend_maxwait, str):
-                    suspend_maxwait = suspend_maxwait.lower().strip() in (
-                        "true", "1", "yes", "on"
-                    )
-                initial_load = suspend_maxwait and not getattr(
-                    datareftracker, "has_ever_connected", False
-                )
-                if initial_load:
-                    budget_seconds = min(budget_seconds * 10.0, 1800.0)
+                initial_load = _initial_load()
+                budget_seconds = wait_bands.tile_budget_seconds(initial_load)
                 quality_mode = _prefetch_quality_mode()
                 if quality_mode == PrefetchQualityMode.PREFER_TARGET:
                     budget_seconds += max(
@@ -13784,7 +14181,10 @@ class Tile(object):
                         ),
                     )
                     if initial_load:
-                        budget_seconds = min(budget_seconds * 10.0, 1800.0)
+                        budget_seconds = min(
+                            budget_seconds * wait_bands.INITIAL_LOAD_FACTOR,
+                            wait_bands.INITIAL_LOAD_CAP_S,
+                        )
                 self._tile_time_budget = ReadActiveTimeBudget(budget_seconds)
             return self._tile_time_budget
 
@@ -13864,34 +14264,13 @@ class Tile(object):
             # Use the provided per-request budget
             log.debug(f"GET_IMG: Using provided budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
         else:
-            # Fallback: create budget if caller didn't provide one (internal calls, tests)
-            use_time_budget = getattr(CFG.autoortho, 'use_time_budget', True)
-            if isinstance(use_time_budget, str):
-                use_time_budget = use_time_budget.lower() in ('true', '1', 'yes', 'on')
-            
-            if use_time_budget:
-                base_budget = float(getattr(CFG.autoortho, 'tile_time_budget', 5.0))
-                # Use has_ever_connected to distinguish true startup from temporary disconnects.
-                # During stutters, X-Plane may briefly stop sending UDP packets, causing
-                # connected=False. We don't want longer timeouts during stutters - only
-                # during the actual initial scenery load (before first connection).
-                if CFG.autoortho.suspend_maxwait and not datareftracker.has_ever_connected:
-                    # Startup mode: increase budget but cap to reasonable maximum
-                    # 10x multiplier for initial loading to allow more tiles to complete.
-                    startup_multiplier = 10.0
-                    max_startup_budget = 1800.0  # 30 minute absolute cap
-                    effective_budget = min(base_budget * startup_multiplier, max_startup_budget)
-                    log.debug(f"GET_IMG: Startup mode - creating fallback budget {effective_budget:.1f}s "
-                              f"(base={base_budget:.1f}s × {startup_multiplier})")
-                else:
-                    effective_budget = base_budget
-                    log.debug(f"GET_IMG: Creating fallback budget {effective_budget:.1f}s (no budget passed)")
-                time_budget = TimeBudget(effective_budget)
-            else:
-                # Legacy mode: create budget from maxwait parameter
-                effective_maxwait = self.get_maxwait() if maxwait == 5 else maxwait
-                time_budget = TimeBudget(effective_maxwait)
-                log.debug(f"GET_IMG: Legacy mode - fallback budget {effective_maxwait:.1f}s")
+            # Fallback: create budget if caller didn't provide one (internal
+            # calls, tests). The tile budget from the wait bands, longer only
+            # during the first load (before X-Plane ever connected; stutters
+            # that briefly drop the connection do not count).
+            effective_budget = wait_bands.tile_budget_seconds(_initial_load())
+            log.debug(f"GET_IMG: Creating fallback budget {effective_budget:.1f}s (no budget passed)")
+            time_budget = TimeBudget(effective_budget)
 
         # === FALLBACK CONFIGURATION ===
         # Get fallback settings for use by the fallback chain in process_chunk().
@@ -14013,7 +14392,7 @@ class Tile(object):
                 # During initial load (before first connection), further deprioritize high-detail
                 # to ensure lower mipmaps load completely first.
                 # Uses has_ever_connected to avoid applying during temporary stutters.
-                if CFG.autoortho.suspend_maxwait and not datareftracker.has_ever_connected:
+                if _initial_load():
                     # Add penalty to high-detail mipmaps during initial load
                     # Mipmap 0 gets +20, mipmap 4 gets +0
                     initial_load_penalty = (self.max_mipmap - mipmap) * 5
@@ -15388,11 +15767,12 @@ class Tile(object):
         )
 
     def get_maxwait(self):
-        effective_maxwait = self.maxchunk_wait
-        # Only extend maxwait during true initial loading, not during temporary disconnects
-        if CFG.autoortho.suspend_maxwait and not datareftracker.has_ever_connected:
-            effective_maxwait = 20
-        return effective_maxwait
+        """Longest wait for one row of chunks: a near read's band wait.
+
+        Callers pass the read's own budget too (the band budget from
+        ``_band_budget``), which bounds this.
+        """
+        return wait_bands.chunk_wait_seconds(flight_is_starting())
 
     def get_fallback_level(self):
         """Get the fallback level as an integer.
@@ -17103,6 +17483,52 @@ class TileCacher(object):
         if self.clean_t is not threading.current_thread():
             self.clean_t.join(timeout=1.0)
 
+    RADAR_EVERY_S = 10.0
+    RADAR_RADIUS_NM = 60.0
+    RADAR_MAX_TILES = 300
+    _radar_at = 0.0
+
+    def _publish_radar(self):
+        """Home's tile radar: open tiles near the aircraft and their state.
+
+        Codes: 0 sharp at target, 1 being read now, 2 below target, 3 nothing
+        yet. At most every 10 s, the 300 nearest within 60 nm.
+        """
+        now = time.monotonic()
+        if now - self._radar_at < self.RADAR_EVERY_S:
+            return
+        self._radar_at = now
+        try:
+            if not (datareftracker.data_valid and datareftracker.connected):
+                set_stat(f"tile_radar:{os.getpid()}", [])
+                return
+            lat0, lon0 = float(datareftracker.lat), float(datareftracker.lon)
+            with self.tc_lock:
+                tiles = list(self.tiles.values())
+            rows = []
+            cos0 = math.cos(math.radians(lat0))
+            for tile in tiles:
+                half = max(1, int(getattr(tile, "chunks_per_row", 16) or 16)) / 2 - 0.5
+                lat, lon = _chunk_to_latlon(tile.row + half, tile.col + half,
+                                            tile.tilename_zoom)
+                dy = (lat - lat0) * 60.0
+                dx = (lon - lon0) * 60.0 * cos0
+                distance = math.hypot(dx, dy)
+                if distance > self.RADAR_RADIUS_NM:
+                    continue
+                try:
+                    sharp = tile.dds is not None and tile.real_from() == 0
+                    some = tile.dds is not None and tile.real_from() < len(tile.dds.mipmap_list)
+                except Exception:
+                    sharp = some = False
+                code = 0 if sharp else 1 if tile.refs > 0 else 2 if some else 3
+                rows.append((distance, [round(dx, 2), round(dy, 2), code]))
+            rows.sort(key=lambda item: item[0])
+            set_stat(f"tile_radar:{os.getpid()}",
+                     [row for _d, row in rows[: self.RADAR_MAX_TILES]])
+        except Exception as exc:  # statistics only
+            log.debug(f"Tile radar failed: {exc}")
+
     def _compute_dynamic_zoom(self, row: int, col: int, tile_zoom: int) -> int:
         """
         Compute dynamic zoom level based on predicted altitude at tile.
@@ -17290,7 +17716,24 @@ class TileCacher(object):
         log.debug(f"Dynamic zoom (predicted): {predicted_alt:.0f}ft AGL -> ZL{zoom}")
         return zoom
 
-    def _get_target_zoom_level(self, default_zoom: int, row: int = None, col: int = None) -> int:
+    def _get_target_zoom_level(self, default_zoom: int, row: int = None,
+                               col: int = None, count: bool = False) -> int:
+        """The build zoom for a tile: the target's, within the texture cap.
+
+        The cap (``[governor] texture_cap_px``, set by auto-tuning when the
+        user allowed it) lowers a zoom whose texture would be larger; see
+        texture_plan.py. ``count`` records a capped tile (once, when opened).
+        """
+        zoom = self._uncapped_target_zoom_level(default_zoom, row=row, col=col)
+        cap = texture_plan.cap_from_config(CFG)
+        if not cap:
+            return zoom
+        capped = texture_plan.capped_zoom(default_zoom, zoom, cap)
+        if count and capped < zoom:
+            bump("texture_capped_tiles")
+        return capped
+
+    def _uncapped_target_zoom_level(self, default_zoom: int, row: int = None, col: int = None) -> int:
         """
         Get target zoom level for a tile.
 
@@ -17580,6 +18023,8 @@ class TileCacher(object):
                     cur_mem = stat_mem  # prefer the full-featured metric
             except Exception:
                 pass
+            _publish_graphics_memory()
+            self._publish_radar()
 
             self.show_stats()
 
@@ -17619,16 +18064,23 @@ class TileCacher(object):
                 global_mem_bytes = 0
             
             # Determine effective memory and limit based on aggregation availability
+            # Half the limit while the system is very low on free RAM, or
+            # AutoOrtho is over its RAM limit ([limits] ram_gb).
+            if _ram_limit_bytes:
+                ram_brake.note_own_memory(
+                    max(global_mem_bytes, cur_mem), _ram_limit_bytes
+                )
+            braked_limit = ram_brake.cache_limit(self.cache_mem_lim)
             if global_mem_bytes > 0:
                 # Global aggregation working - use global memory vs global limit
                 # Floor at local cur_mem so we never under-count if the global
                 # stat hasn't caught up with this worker's recent growth.
                 effective_mem = max(global_mem_bytes, cur_mem)
-                effective_limit = self.cache_mem_lim
+                effective_limit = braked_limit
             else:
                 # Fallback: use local memory vs cache limit
                 effective_mem = cur_mem
-                effective_limit = self.cache_mem_lim
+                effective_limit = braked_limit
                 if cur_mem > self.cache_mem_lim:
                     log.warning(
                         "Global memory stats unavailable/stale. "
@@ -17724,12 +18176,13 @@ class TileCacher(object):
                     pass
                 
                 # Update effective_mem and effective_limit consistently
+                braked_limit = ram_brake.cache_limit(self.cache_mem_lim)
                 if global_mem_bytes > 0:
                     effective_mem = max(global_mem_bytes, cur_mem)
-                    effective_limit = self.cache_mem_lim
+                    effective_limit = braked_limit
                 else:
                     effective_mem = cur_mem
-                    effective_limit = self.cache_mem_lim
+                    effective_limit = braked_limit
                 
                 # Recalculate global target and proportional target
                 headroom = max(int(effective_limit * self.evict_hysteresis_frac), self.evict_headroom_min_bytes)
@@ -17775,7 +18228,7 @@ class TileCacher(object):
             mem_pressure = (
                 effective_mem / max(1, effective_limit)
             )
-            if mem_pressure > 0.7:
+            if mem_pressure > 0.7 or effective_limit < self.cache_mem_lim:
                 poll_interval = poll_interval_fast
             else:
                 poll_interval = poll_interval_normal
@@ -17814,7 +18267,9 @@ class TileCacher(object):
                     col, row, map_type, zoom, 
                     cache_dir=self.cache_dir,
                     min_zoom=self.min_zoom,
-                    max_zoom=self._get_target_zoom_level(zoom, row=row, col=col),
+                    max_zoom=self._get_target_zoom_level(
+                        zoom, row=row, col=col, count=True
+                    ),
                 )
                 self.tiles[idx] = tile
                 # New tile becomes MRU
@@ -18033,6 +18488,16 @@ def shutdown():
     # 8. Clear process memory stats
     try:
         clear_process_memory_stat()
+    except Exception:
+        pass
+    try:
+        try:
+            from autoortho.aostats import delete_stat
+        except ImportError:
+            from aostats import delete_stat
+        for gauge in ("graphics_memory_bytes", "building_now", "prefetch_horizon_m",
+                      "tile_radar"):
+            delete_stat(f"{gauge}:{os.getpid()}")
     except Exception:
         pass
 

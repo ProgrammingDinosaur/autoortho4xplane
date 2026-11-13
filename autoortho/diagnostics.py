@@ -1502,6 +1502,8 @@ def _build_session_summary(
         "metadata": parent_metadata,
         "diagnostic_flags": diagnostics,
         "delivery": delivery,
+        # The governor's verdict for the flight (governor.Governor.summary).
+        "flight": _sanitize_json((stats_snapshot or {}).get("governor/summary") or {}),
         "process_profiles": process_profiles,
     }
 
@@ -1753,6 +1755,51 @@ def _markdown_escape(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
+_PHASE_NAMES = {
+    "starting": "Starting",
+    "taxi": "Taxi",
+    "departure_arrival": "Departure and arrival",
+    "cruise": "Cruise",
+    "idle": "Not connected",
+}
+
+
+def _render_flight(flight: dict) -> list:
+    """The governor's verdict: fidelity by phase, guards, what was learned."""
+    if not flight:
+        return []
+    lines = ["", "## Flight verdict", "", f"**{flight.get('verdict', '')}**"]
+    if flight.get("fidelity") is not None:
+        lines.append(
+            f"- Sharp at target: {float(flight['fidelity']) * 100:.0f} % of nearby reads"
+        )
+    phases = flight.get("fidelity_by_phase") or {}
+    if phases:
+        lines.extend(["", "| Phase | Sharp at target |", "|---|---:|"])
+        for phase, value in phases.items():
+            lines.append(f"| {_PHASE_NAMES.get(phase, phase)} | {float(value) * 100:.0f} % |")
+    lines.append("")
+    lines.append(
+        f"- Auto-tuning: {flight.get('mode', 'off')}, "
+        f"{flight.get('decisions', 0)} decisions "
+        f"({flight.get('kept', 0)} kept, {flight.get('reverted', 0)} undone)"
+    )
+    lines.append(f"- Peak download: {flight.get('peak_mbps', 0)} Mbit/s")
+    lines.append(
+        f"- Memory brake: {flight.get('ram_brake_activations', 0)} times; "
+        f"disk brake: {flight.get('disk_brake_activations', 0)} times"
+    )
+    learned = flight.get("learned") or {}
+    if learned:
+        lines.append(
+            "- Learned for next time: "
+            + ", ".join(f"{k.split('.', 1)[1]} {v:g}" for k, v in learned.items())
+        )
+    if flight.get("notice"):
+        lines.append(f"- {flight['notice']}")
+    return lines
+
+
 def _render_markdown(summary: dict) -> str:
     lines = [
         "# AutoOrtho Flight Performance Report",
@@ -1768,6 +1815,7 @@ def _render_markdown(summary: dict) -> str:
         "",
     ]
     lines.extend(f"- {flag}" for flag in summary["diagnostic_flags"])
+    lines.extend(_render_flight(summary.get("flight") or {}))
 
     delivery = summary.get("delivery", {})
     lines.extend(

@@ -1,6 +1,6 @@
 # Settings refactor proposal: Target, Limits, Governor
 
-Status: proposal / draft for discussion (revision 2)
+Status: phases 1 to 9 implemented (see "Implementation notes" at the end); the governor ships in Advise mode until real flights confirm its decisions (revision 2)
 Scope: user-facing settings, how settings are stored and resolved, the setup wizard, and a live auto-tuning engine
 Reference studied: OrthoStreamXP (OSXP), shared with permission. This proposal borrows its measurement ideas but keeps AutoOrtho's own model.
 
@@ -496,3 +496,157 @@ If one of these explains a problem, it reaches Home **as a notice in plain words
 | Tuned store, Reset | `Tuning/TunedSettings.cs` | Learned profile store |
 | Texture size cap | `Textures/TextureQuality.cs` | Optional lever (phase 8) |
 | Paging model | `Scenery/Paging/PagingModel.cs` | Already ported as `autoortho/paging_model.py` |
+
+---
+
+## Implementation notes
+
+### Phase 1 (registry, sparse file, Expert table)
+
+- The registry is `autoortho/settings_registry.py`, built from the existing `_defaults` template, so there is still one place to change a default.
+- `AOConfig.is_custom()` / `source()` / `reset_to_default()` / `set_value()`; the file stores only custom settings as active lines (`CONFIG_REVISION = 2`).
+- The Expert table is `autoortho/ui/pages/expert_settings_page.py`; settings with a control elsewhere are read-only there.
+
+### Phase 2 (hardware baseline, guards, RAM brake)
+
+- `autoortho/hardware.py`: cores and RAM (psutil) and graphics memory (Windows registry as in OSXP, `nvidia-smi` / sysfs on Linux, unified memory on Apple silicon). `baseline_values()` holds the scaling rules.
+- Resolution layer: `AOConfig._apply_hardware_baseline()` sets non-custom keys to the baseline; `automatic_text()` is what reset gives; `source()` returns `"hardware"`. Baseline values are not written to the file. `[tuning] hardware_baseline` turns it off (fixed at load, so turning it off never pins the scaled values).
+- `autoortho/target_cost.py`: the cost model. Per flight phase it flies a straight 20-minute path and sums, per texture, the detail wanted at closest approach from `paging_model.mip_for_k` (graphics memory, imagery bytes at 16 KB a chunk, download rate). Departure phases add the ZL18 airport textures wanted on the ground. About 2 ms per target.
+- `autoortho/guards.py`: VRAM / RAM / disk / download checks and `suggest_target()`, a greedy one-level-at-a-time search for the nearest target within 90 % of the card. The disk guard uses free space only; the bandwidth guard waits for the phase 3 connection test.
+- UI: `autoortho/ui/widgets/target_cost_panel.py` under the zoom controls, fed from the controls before Apply; a "PC resources" readiness check (graphics memory and RAM only) shows on Home and in Diagnostics and is refreshed after each save.
+- `autoortho/ram_brake.py`: each worker samples free RAM at most once a second; engaged, it skips prefetch cycles, holds background builds and halves the memory cache limit in the tile clean loop. Counted as `ram_brake_activations`.
+- Not done in phase 2: the mount-time notice uses the readiness check rather than a separate Home banner (phase 9 revisits Home).
+
+### Phase 3 (limits, connection test, wizard steps)
+
+- `autoortho/limits.py`: `[limits]` `ram_gb`, `vram_gb`, `bandwidth_mbps`, `cpu_cores`, each `auto` or a number (registry kind `auto`). `resolve()` gives the effective limits; `clamp_automatic()` lowers the automatic values of `cache_mem_limit`, `predictive_dds_memory_mb` and the two builder counts. Auto limits never lower the hardware baseline (tested). `protect_sim_fps` is left for the governor phases, and `disk_cache_gb` stays `cache.file_cache_size`.
+- Resolution order in `AOConfig._apply_hardware_baseline()`: packaged default, hardware baseline, connection-test warm start (`provider_origin_initial_concurrency`), limits; user values are never clamped. `source()` adds `"limit"` and `"measured"`.
+- Engine: the RAM brake also engages when AutoOrtho's aggregated worker memory exceeds `ram_gb` minus the app's share; `AO_CPU_THREAD_LIMIT` (set by the parent) sizes `_native_cpu_budget()` and each worker's OpenMP variables (`process_supervisor.apply_openmp_budget`); the broker gets `max_bytes_per_second` and throttles body reads with a token bucket (`_ByteRateLimiter`).
+- `autoortho/connection_test.py`: OSXP's method (rounds of 16 to 256, steady middle 10-90 %, fewest at once reaching 90 % with under 1 % failed) over an httpx HTTP/2 client like the broker's. Provider URLs moved to `autoortho/provider_urls.py`, shared with `getortho.Chunk` (identical URLs, checked against the old templates). A live run against Bing took 3.3 s: 90 Mbit/s, 64 at once, 15-19 KB a chunk.
+- Guards: the graphics memory budget is the custom `vram_gb` when set; the download check compares the need with the connection test and the bandwidth limit; the RAM check warns above the RAM limit; `suggest_target_for_pc()` picks the sharpest fixed target both allow.
+- UI: Settings > Limits (`LimitsEditor`, `ConnectionTestPanel`), "Suggest a target for this PC" in the cost panel, and two wizard steps (Quality target, Limits) before Review.
+
+### Phases 1-3 completed (Essentials and the remaining gaps)
+
+- Essentials tier (§6.3): `ui/pages/essentials_page.py`, the first settings category. Its controls mirror the full controls (`ui/widgets/mirror.py`), so saving, Revert and change tracking are unchanged. `SettingsPage` shows only essential categories (Essentials, Limits) until **Show all settings** (`general.show_all_settings`); search covers everything. The governor mode row is in place for phases 5-6.
+- The performance profiles are removed (§10). `min_zoom` is no longer on the Imagery page (§6.3, §9); its hidden slider still bounds the maximum zoom.
+- Migration notice (§10): converting a pre-sparse file records hand-set engine values in `general.kept_values`; Home shows them (`ui/widgets/notice_bar.py`, the notice area phase 9 builds on) with **Review** and **Use automatic values** (controls found by object name, scaled sliders handled; settings without a control are reset in the Expert table).
+- Registry (§6.1): `SettingSpec.owner` (target / limit / user / governed / measured / internal / fixed, as §9) and `live` (true for the call-time streaming options). Per-lever step and cooldown live with the governor (phase 5). `prefetch_pipeline_v2` is marked `retire_after`; `fetch_threads` is already labelled as the HTTP/1.1 fallback.
+- Wizard (§7): six steps (checks on Welcome, X-Plane, Scenery with its folder, Image cache with a suggested limit and More folders, Quality, Limits and ready with "Start AutoOrtho when setup finishes").
+- Guards: the disk check counts what the cache may still take; fixes can return a custom graphics memory limit to Auto, raise a custom download limit, or lower the disk cache. Low-disk brake (`ram_brake.DiskBrake`) on JPEG cache writes and DDS cache stores.
+- Limits: the connection warm start applies only to the provider tested; a bandwidth limit sets `provider_origin_max_concurrency` from the measured per-request rate.
+- Not done here: `protect_sim_fps` and measured graphics memory belong to the governor sampler (phases 5 and 9); `disk_cache_gb` remains `cache.file_cache_size` (owner "limit"); `prefetch_pipeline_v2` retires one release later.
+
+### Phase 4 (live levers)
+
+- `autoortho/live_settings.py`: `LiveSettings` publishes lever values from the parent into the stats store (`governor/levers` plus a generation key); each worker polls every 1.5 s (a daemon thread started with the prefetcher), writes changed values into its `CFG` and runs registered hooks. `ResizableGate` is a resizable bounded semaphore.
+- getortho hooks: `live_tile_admission` (now a `ResizableGate`), `background_builder_workers` (the pool is created at its ceiling of 16; the coordinator dispatches up to the live value), `predictive_dds_build_interval_ms`, `predictive_dds_memory_mb`, `cache_mem_limit` (the clean loop evicts down to a lowered value), prefetch lookahead / radius / chunks / interval (the prefetcher reloads), `limits.cpu_threads` (native thread budget) and `limits.ram_gb` (the brake's limit). `tile_image_cache_mb` and `cache_write_buffer_mb` are read at use, so a published value applies to new tiles and writes.
+- `live_builder_concurrency`, `buffer_pool_size`, `streaming_builder_pool_size`, `provider_max_in_flight` and `provider_origin_initial_concurrency` size pools at start and stay start-only; live builds are bounded live through `live_tile_admission` and the thread budget. OpenMP's per-worker `OMP_THREAD_LIMIT` is fixed at spawn, so a raised CPU limit takes full effect at the next start.
+- Broker: a `CONFIG` control message (`HTTP2Broker.configure()`) moves the adaptive controller's ceiling (`set_maximum`, never under its floor, at most the worker count) and the token bucket's rate (0 removes it).
+- Parent: `AOMount.publish_levers()` and `apply_live_levers()` (recomputes automatic values with `AOConfig.recompute_automatic()` and publishes what changed); levers are cleared at unmount. The UI applies limits and live Expert edits at once while streaming; `SettingSpec.live` marks what is live, and only non-live Expert edits raise the restart notice.
+
+### Phases 5-6 (governor: Advise and Auto)
+
+- `autoortho/governor.py`. `GovernorService` runs in the parent while streaming (started after the mounts, stopped first at unmount) and samples every 2 s:
+  - worker counters from the stats store: `near_reads_real` / `near_reads_standin` (the fidelity metric, counted in `getortho._read_dds_bytes_budgeted`), `req_ok` / `req_err`, `bytes_dl`, `live_admission_waits` / `live_admissions`, `time_to_sharp_ms_*` and the brake counts;
+  - the broker's `server_stats()` (origin limit and active count, backlog);
+  - psutil CPU and RAM;
+  - `datareftrack` (AGL, ground speed, and now `sim/operation/misc/frame_rate_period` and `sim/time/paused`).
+- `Governor` is pure (no I/O or clocks of its own):
+  - a 30 s `Window`, a classifier with the states of §4.4 plus `sim_fps`, and a move plan per state;
+  - one decision at a time, at most every 6 s; per-lever cooldown 30 s (half while starting, four times after a revert); double steps while starting;
+  - keep/revert judged 20 s after a change on the samples since the change, against fidelity (−2 points) and the state's own metric (−5 %);
+  - degradation shortens prefetch and sets a notice after 5 minutes with every lever for the bottleneck at its limit;
+  - eleven levers (`levers_for()`), bounded by the limits: the provider ceiling, live tile admission, background builders and their pause, three memory budgets, two waits, and prefetch lookahead and radius.
+- **Advise** is the default for now, until real flights confirm the decisions (§11). The proposal's default is Auto; switching is a one-line change to `[governor] mode` in the template.
+- Learned profiles: `LearnedProfiles` in `~/.autoortho-data/governor/learned.json`, keyed by `profile_key()` (target hash, provider, `network_fingerprint()`, a salted hash of the local /24 networks). Applied as a warm start in Auto only; saved at unmount in Auto.
+- `protect_sim_fps` (`[limits]`, default on). The best 30 s frame-time average after starting is the reference. Frames more than 20 % slower than it, and under 40 fps, classify as `sim_fps`, which lowers background builders, lengthens the build pause and shortens prefetch. The change is kept while fidelity stays ≥ 95 %.
+- Transparency:
+  - Settings > Auto-Tuning (`ui/pages/tuning_page.py`): the table, timeline and buttons of §5.2, refreshed each second;
+  - Home notices for Advise suggestions (**Apply** pins the value) and for an unreachable target;
+  - a log line per decision;
+  - `governor/summary` in the stats store becomes the report's *Flight verdict* section (`diagnostics._render_flight`).
+- Replay: `[governor] record_samples` writes `samples-*.jsonl`. `load_samples()` + `replay()` run the same rules offline (`tests/test_governor.py`).
+- Not done here:
+  - the fitted paging `k` is not stored in the learned profile (it is fitted in each worker); the measured graphics memory peak is (since phase 8);
+  - the far/middle "one level below target" step of §4.4 degradation is left to the existing low-zoom base and wait bands;
+  - texture capping is phase 8.
+
+### Phase 7 (wait consolidation)
+
+- The wait bands are the only wait policy. `wait_bands.py` derives what the retired keys did:
+  - `chunk_wait_seconds(starting)` replaces `maxwait`: a near read's band wait, so a row may use what is left of the read's band budget;
+  - `tile_budget_seconds(initial_load)` replaces `tile_time_budget`: the longest band wait (60 s by default, as before), ×10 up to 30 minutes before X-Plane first connects;
+  - `http_read_timeout_seconds()` replaces `maxwait + 1` for the HTTP/1.1 read timeout.
+  - `suspend_maxwait` and `use_time_budget` are always on.
+- Callers moved:
+  - `Tile.get_maxwait()` (every live row wait goes through it and `QualityDeadlinePolicy`), `_get_or_create_tile_time_budget()`, the `get_img()` fallback budget, the two live-transition budgets, the initial-load priority penalty and the healing timeout (a fixed 10 s, its old default);
+  - in `autoortho_fuse.py`, the macFUSE `daemon_timeout` and `_calculate_build_timeout()`.
+- `maxwait`, `suspend_maxwait`, `use_time_budget` and `tile_time_budget` are `RETIRED` in the registry: kept in the template for old files, ignored, and never written.
+- UI: the four legacy controls on the Streaming page became two sliders bound to `[streaming] band_max_wait_seconds` ("Wait for nearby imagery in flight") and `near_wait_seconds` ("Wait while a flight loads"). They are live: a changed value is published to the workers on Apply; an unchanged one is not republished, so the governor's value stands.
+- Behaviour change to watch in flight reports: a near row may now wait up to the band wait (6 s in flight, 60 s while starting) instead of `maxwait` (2 s) plus grace.
+- Docs: `performance.md` (wait policy, startup loading, recommended configurations, the stale profile presets section), `faq.md` and `config.md`.
+
+### Phase 8 (texture-size lever)
+
+- `autoortho/texture_plan.py`:
+  - texture sizes (4096 px at the file zoom, doubling per level);
+  - `capped_zoom()`, which lowers a build zoom until the texture fits the cap;
+  - `texture_bytes()` (BC1 half a byte a pixel, BC3 one, a third more for the levels);
+  - `HeldTextures`, OSXP's graphics memory meter: each texture at the finest level X-Plane read in the last 20 minutes.
+- Engine:
+  - the cap is a clamp in `TileCacher._get_target_zoom_level()`, so live tiles and the prefetcher agree. It applies to tiles opened after `[governor] texture_cap_px` changes (a live setting), since X-Plane keeps a texture's size while it holds it;
+  - the DDS caches are keyed by the build zoom (`{tile}_z{zoom}`), so a capped texture is plan-keyed without a new key;
+  - `texture_capped_tiles` counts capped opens;
+  - each worker's `_note_wanted_level()` feeds `held_textures`; the clean loop publishes `graphics_memory_bytes:<pid>`, and the governor sums them.
+- Downscale before encode is left out. A capped texture is built at the zoom that fits, not downloaded one level finer and shrunk as OSXP does: that costs four times the downloads and decodes for a small sharpness gain, and the 8K buffer pool stays sized for uncapped textures.
+- Governor:
+  - `allow_texture_cap` adds the `governor.texture_cap_px` lever (0 or 4096);
+  - the `vram` state (the estimate at 95 % of `guards.vram_budget()`) caps textures once. That decision is kept without judging (the estimate falls over 20 minutes) and never eased off in headroom;
+  - without the permission, the governor sets a notice instead;
+  - the summary records `peak_graphics_memory_gb` and `texture_cap_px`.
+- UI: "Allow smaller textures when graphics memory is short" on the Auto-Tuning page. It is live: allowing it adds the lever to a running governor; withdrawing it lifts a cap (publishes 0). The status line shows the estimate against the budget.
+
+### Phase 9 (Home revamp)
+
+- `autoortho/home_snapshot.py`: `build()` turns the governor snapshot and the app's state into a `HomeSnapshot`. It is pure, no Qt:
+  - state: stopped / starting / flying / paused / after flight;
+  - the status strip, the hero and its 5 s trend buckets;
+  - the gauges with a level and a bottleneck chip mapped from the governor state;
+  - activity, the auto-tuning lines, the radar and the tray/taskbar summary.
+  The main window builds it once a second (with the Auto-Tuning refresh) and sends it through one signal (`home_snapshot_ready`).
+- Sampler additions (`GovernorService`):
+  - session totals since streaming started: textures served (`tile_mem_*`), cache share (`chunk_hit` / `chunk_miss`), bytes downloaded, distance and duration;
+  - climbing/descending from the last minute of altitude;
+  - heading;
+  - workers' gauges summed (`building_now`), maxed (`prefetch_horizon_m`) or joined (`tile_radar`);
+  - `flight_summary()` for the last-flight card, saved to `governor/last_flight.json` at unmount.
+- New metrics:
+  - prefetch horizon: `SpatialPrefetcher._note_horizon()`, every 10 s, the distance along the predicted path before the first tile that is neither in memory at target nor in the DDS cache; velocity mode only;
+  - builds in progress (live tile admission held);
+  - graphics memory (phase 8's `HeldTextures`);
+  - loading progress (the governor's near-read fidelity while X-Plane is not yet connected);
+  - the tile radar (`TileCacher._publish_radar()`: the 300 nearest open tiles within 60 nm and their state, every 10 s).
+- `ui/pages/home_page.py`:
+  - status strip; notices (`NoticeBar`); stopped blocks (one-line readiness, target with guard lights, storage, scenery); starting block; flying block (clickable hero with `SparkLine`, three `GaugeCard`s, activity with `TileRadar`, auto-tuning); last-flight card; footer;
+  - paused dims (opacity effect) and freezes the numbers;
+  - the old setters stay as the compatibility API: the task and failure cards became a badge on Scenery library and a `scenery_task_failed` notice.
+- Optional extras:
+  - tray summary: `general.hide` was a setting without an implementation; it now minimizes to a tray icon while streaming, with the summary as its tooltip ("!" in front while a warning notice waits), and the window title carries the summary too;
+  - compact mode, which also hides the navigation rail;
+  - the tile radar.
+- Accessibility: every gauge, the hero, the radar and the last-flight card have a full sentence as their accessible description; state is shown by symbol and text as well as colour (●, ◐, ❚❚, ■, ◆, ✓, !); blocks are added in reading order.
+- Not done:
+  - "Open map with blurry spots" (the map has no layer for them yet; the card opens the map);
+  - the horizon on SimBrief routes;
+  - the tray icon's colour by state (the tooltip carries it).
+
+### Follow-ups from the OrthoStreamXP comparison
+
+A review against OSXP's streaming and tuning code found three gaps, now closed:
+
+- **Live tile admission only for detailed builds.** Every DDS read used to take one of the `live_tile_admission` slots for the whole read, waits included. While a flight loads, near reads may wait 60 s, so 16 of them could hold every slot and leave header chunks and far reads to time out into the fallback texture. `read_pattern.needs_build_slot()` (called through `Tile.needs_live_slot()` in `autoortho_fuse.read`) lets the DDS header, the header chunk and its FUSE pieces, and base-level reads skip the gate; `live_admission_skipped` counts them. With `read_classifier` off every read is admitted, as before. This is AutoOrtho's version of OSXP's weighted build gate: the slots still bound detailed builds, and reads that take no build memory don't queue for them.
+- **Waits raised on evidence.** `getortho.LateArrivals` watches the chunks a near or middle read gave up on and counts how long they took from the start of the read, in `wait_bands.LATE_BUCKETS_S` (`late_flight_b*`, `late_start_b*`). `Governor.wait_evidence()` raises `band_max_wait_seconds` (or `near_wait_seconds` while starting) only when at least 20 (5 while starting) such reads were seen and 80 % (90 %) of them arrived within the lever's maximum, and never beyond that time (OSXP's `Tuner` rules). When most took longer, the new state `slow_imagery` lengthens prefetch lookahead instead. Without evidence the state falls through to `behind`.
+- **Applied Advise suggestions are learned, not pinned.** **Apply** publishes the value, records it in `LearnedProfiles.put_applied()` (the `applied` part of the profile entry, kept when Auto saves its levers) and leaves the setting unpinned, so the governor may move it again and **Reset learned settings** clears it (OSXP's tuned store). `LearnedProfiles.warm_start()` gives Advise flights the applied values and Auto flights the applied values overlaid with what Auto settled on. The Tuning page marks these values *Learned*.
+
+Still open: the evidence-based *behind the aircraft* state, planned in [governor-behind-detection-plan.md](governor-behind-detection-plan.md), and persisting the fitted paging `k` (low value: it is refitted after 200 reads).

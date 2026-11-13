@@ -10,10 +10,19 @@ Setup and configuration for most use cases should be pretty simple. The importan
 
 On a new installation, AutoOrtho opens a guided setup wizard that:
 
-1. Detects or asks for the X-Plane installation.
-2. Validates scenery, cache, archive, and temporary-download folders.
-3. Checks the required FUSE backend for the current platform.
-4. Lets you select scenery regions and reviews disk-space requirements.
+1. **Welcome and checks:** the required FUSE backend for this platform.
+2. **X-Plane:** detected, or browse for it.
+3. **Scenery:** the scenery folder, and regions to install (or use scenery
+   you already have).
+4. **Image cache:** one folder, its free space, and a disk cache limit
+   (with a suggestion for that drive). The long-term cache and download
+   folders are under **More folders…**.
+5. **Quality target:** one zoom level everywhere, or an altitude profile
+   (Airliner, General Aviation, Low VRAM). It shows what the target needs on
+   this PC, can test your connection, and can suggest a target.
+6. **Limits and ready:** **Use what's available (recommended)** or your own
+   limits, a last readiness check, and **Start AutoOrtho when setup
+   finishes** (it waits if scenery is still being installed).
 
 Existing installations with valid paths and dependencies are detected
 automatically and are not forced through the wizard. The wizard remains
@@ -25,13 +34,13 @@ changes are discarded and the last applied configuration remains active.
 
 The application is organized around five primary destinations:
 
-- **Home** — runtime, readiness, X-Plane, cache, task, and failure summaries.
+- **Home** — what AutoOrtho is doing now (see [Home](#home) below).
 - **Scenery Library** — scenery search, filters, installation, updates, and
   package details.
 - **Flight Plan & Map** — SimBrief controls, loaded-flight details, and the
   local Custom Map Editor.
-- **Settings** — searchable categories, presets, exact numeric
-  inputs, and Apply/Revert.
+- **Settings** — Essentials first, every setting with **Show all settings**,
+  search, exact numeric inputs, and Apply/Revert.
 - **Diagnostics** — health checks, searchable logs, export actions, and
   performance-report history.
 
@@ -48,6 +57,57 @@ remain understandable without color perception.
 AutoOrtho follows the operating system UI font and supports Qt display scaling,
 including 200% scaling. Search fields, tables, task actions, settings controls,
 and custom editors expose accessible names for assistive technologies.
+
+## Home
+
+Home answers four questions in order: is it working, are you getting the
+quality you asked for, what is AutoOrtho using, and do you need to do
+anything. What it shows follows the state:
+
+- **Stopped:** the status strip with **Start streaming**, *Ready to fly*
+  (the checklist appears only when something is wrong), the quality target
+  with the lights from the cost preview and an **Edit** link, the last
+  flight, storage, and scenery.
+- **Starting:** mounting, waiting for X-Plane, and how much of the nearby
+  scenery is already sharp while X-Plane loads.
+- **Flying:**
+  - **Scenery quality:** % sharp at target over the last 30 seconds, the target, the time to sharp scenery after an area loads, and a ten-minute trend with blurry moments in red. Click it for the Auto-Tuning timeline.
+  - **Network, Computer and Graphics memory** gauges: use against the capacity or your limit, coloured by headroom. The one auto-tuning finds is holding the scenery back gets a ◆ chip.
+  - **Activity:** textures served, the share from cache, data downloaded, builds in progress, and how far ahead of the aircraft everything is already sharp (in minutes and nm). It also has a small radar of the tiles around the aircraft (green sharp, blue being read, amber below target, grey not loaded) with the prefetch corridor; click it for the map.
+  - **Auto-tuning:** the last change and why, the number of changes and pinned values.
+- **Paused:** the same, dimmed, and the numbers stop.
+- **After a flight:** the last flight in full: the verdict, sharpness by
+  phase, distance, duration, data and cache share, guard activations and what
+  auto-tuning learned. **Dismiss** returns to the stopped view.
+
+Notices (at most three, the most serious first) appear between the strip and
+the rest only when there is something to do: a target out of reach,
+auto-tuning advice, values kept from an older config, or a failed scenery
+install. Scenery installs show as a badge on **Scenery library**. **Compact**
+keeps only the strip, quality and gauges (and hides the navigation) for a
+second monitor. While streaming, the window title reads like Home's headline,
+for example `AutoOrtho · 96 % sharp · 142 Mbit/s · Flying`. With **Minimize
+to the system tray when streaming starts**, the window goes to a tray icon
+with the same text as its tooltip, and comes back when streaming stops.
+
+## Essentials and all settings
+
+**Settings** opens on **Essentials**: the quality target with what it needs
+on this PC, the limits, the folders and disk cache, the imagery source,
+seasons, night exclusion, SimBrief and whether the window hides while
+streaming. AutoOrtho sizes everything else for this PC. **Show all settings**
+(top right) shows every category; searching always looks through all of
+them, and opening a category from elsewhere in the app shows them too.
+
+The four performance profiles are gone: the quality target (with its
+altitude profiles), the limits and the automatic sizing cover what they
+did. The minimum zoom level is now an Expert setting (All Settings), since
+the low-zoom base covers far scenery.
+
+When an older config is converted and it set engine settings by hand,
+those values are kept, and Home says so: **Review** opens them in the
+Expert table, and **Use automatic values** puts AutoOrtho's own values back
+(press **Apply** to keep them).
 
 ## Applying and reverting settings
 
@@ -101,19 +161,22 @@ default:
 ```ini
 # Maximum zoom level to allow. ...
 # max_zoom = 16
-maxwait = 4.0
+fallback_timeout = 45.0
 ```
 
 Here `max_zoom` follows AutoOrtho's default, so it picks up any future change
-to that default, while `maxwait` keeps your own value. To override a default
+to that default, while `fallback_timeout` keeps your own value. To override a default
 by hand, delete the `# ` and change the value. A line you write yourself stays
 active even when it equals the default, until you change it in the app.
 
 The file is written as UTF-8. Older files written in another encoding are
 still read, and the first save converts them: values equal to the defaults
 become commented lines, and retired settings (`live_aopipeline_min_chunk_ratio`,
-`ephemeral_dds_cache_mb`, `max_concurrent_downloads`, `http2_max_connections`)
-are removed after their values are migrated.
+`ephemeral_dds_cache_mb`, `max_concurrent_downloads`, `http2_max_connections`,
+and the old waits `maxwait`, `suspend_maxwait`, `tile_time_budget` and
+`use_time_budget`) are removed after their values are migrated. The old waits
+have nothing to migrate to: the wait bands replaced them (see the
+[Performance Tuning Guide](performance.md#wait-policy-wait-bands)).
 
 ### All Settings (Expert)
 
@@ -123,14 +186,218 @@ group (Essential, Tuning, Expert), or show only changed settings. Double-click
 a value to edit it, or select rows and choose **Reset Selected to Default**.
 Settings that already have a control on another settings page are shown
 greyed and are changed there. Edits are applied with **Apply** and discarded
-with **Revert**, like any other setting.
+with **Revert**, like any other setting. The Source column shows **This PC**
+for values scaled to your computer (below); **Reset** returns a setting to
+that value.
+
+### Defaults scaled to this PC
+
+A few defaults suit a mid-range PC but are wrong at either end, so AutoOrtho
+scales them to your cores and RAM when you have not set them yourself:
+
+| Setting | Rule | 8 GB, 4 cores | 16 GB, 8 cores | 32 GB, 12 cores |
+|---|---|---|---|---|
+| `cache_mem_limit` | a quarter of RAM, 2 to 8 GB | 2 | 4 | 8 |
+| `predictive_dds_memory_mb` | by RAM, 256 to 1024 | 256 | 512 | 768 |
+| `live_builder_concurrency` | one per physical core, 4 to 12 | 4 | 8 | 12 |
+| `background_builder_workers` | one per three cores beyond two, 1 to 4 | 1 | 2 | 3 |
+
+These values are not written to the config file, which shows them as
+`# (set for this PC; the packaged default is 4)`, so the file still suits
+another PC. A value you set yourself always wins. Set
+`[tuning] hardware_baseline = False` to use the packaged defaults instead.
+
+After a connection test, AutoOrtho also starts each flight's download
+concurrency (`provider_origin_initial_concurrency`) at the number the test
+suggested, when the test measured the imagery source in use; the adaptive
+controller still moves from there. The Expert table shows that value as
+**Measured**. A download limit also caps how many downloads run at once
+(`provider_origin_max_concurrency`): about what the limit needs, with half
+again to spare.
+
+## Resource limits
+
+**Settings → Limits** sets what AutoOrtho may use of this PC. Each limit is
+**Auto** (worked out from the hardware) or your own ceiling:
+
+| Limit | Auto | What it holds back |
+|---|---|---|
+| RAM (`ram_gb`) | a quarter of RAM plus 0.5 GB, leaving X-Plane at least 4 GB or 20 % | the memory cache and predictive build memory AutoOrtho picks; the low-memory brake engages when AutoOrtho goes over it |
+| Graphics memory (`vram_gb`) | the card's memory minus `xplane_vram_reserve_gb` | the budget the graphics memory guard checks the target against |
+| Download speed (`bandwidth_mbps`) | no limit | every download: the broker reads no faster than this, so other apps keep the rest |
+| CPU cores (`cpu_cores`) | all physical cores but two (all but one on four cores or fewer) | native texture-build threads, and the builder counts AutoOrtho picks |
+| Protect X-Plane's frame rate (`protect_sim_fps`) | on | in Auto mode, auto-tuning eases off background builds and prefetch when X-Plane's frames get clearly slower (see below) |
+
+Limits lower only the values AutoOrtho picks itself. A value you set by hand
+elsewhere is kept, and the guards warn when it is over a limit. The Expert
+table shows a lowered value as **Your limits**. Changing a limit while
+streaming takes effect at once: AutoOrtho resizes its memory cache, build
+workers, download rate and download concurrency without remounting. (Raising
+the CPU limit above what streaming started with takes full effect at the
+next start.)
+
+Edits in the Expert table to settings a running mount can pick up (prefetch
+distance, live admission, background builders, memory budgets and the like)
+also apply at once; only the others ask for a restart.
+
+### Connection test
+
+**Test my connection** on the Limits page (and in the setup wizard)
+downloads about 30 MB of real imagery from your imagery source, in rounds of
+16 to 256 downloads at once, and reports the speed and the fewest downloads
+at once that reach 90 % of it. A typical run takes a few seconds. The result
+is kept in `~/.autoortho-data/connection.json`; the download guard compares
+it with what the zoom target needs, and **Suggest a target for this PC** uses
+it. The test is disabled while streaming, because it would share the
+connection. Apple Maps and custom maps are tested with Bing, since they need
+a session.
+
+## Guards: what your settings need from this PC
+
+Under the zoom controls in **Settings → Imagery**, a panel shows what the
+zoom target needs on this PC, with a light for each resource:
+
+- **Graphics memory:** the photo textures X-Plane holds for the target,
+  against the card's memory minus what X-Plane needs for itself
+  (`[guards] xplane_vram_reserve_gb`, 5 GB), or against your graphics memory
+  limit when you set one. Red when it does not fit, amber when close.
+- **RAM:** the memory cache plus about 1 GB for the app, against your RAM.
+  Red when less than 6 GB is left for X-Plane, amber above 35 % of RAM or
+  above the RAM limit.
+- **Disk:** free space on the cache drive against what the cache may still
+  take (its limit minus what it holds now, plus the safety margin), and how
+  much new imagery an hour of flying adds.
+- **Download:** the speed the target needs to keep up, against the last
+  connection test and your download limit. Amber when it needs more than
+  80 % of the slower of the two.
+
+**Suggest a target for this PC** fills in the sharpest fixed zoom level that
+both the graphics memory budget and the connection carry.
+
+The estimate follows X-Plane's texture paging: full detail only near the
+aircraft, less further away, and textures stay loaded for about 20 minutes.
+It works out each flight phase (on the ground, departure, climb, cruise, or
+each altitude step in Dynamic mode) and shows the busiest one. For example,
+from cruise altitude ZL17 needs no more graphics memory than ZL16, because
+X-Plane never asks for the extra detail from that height. Treat the figures
+as estimates: wide screens, a wide field of view and turning flight hold
+more.
+
+When a light is amber or red, **Apply suggestion** fills in the nearest
+setting that fits: one zoom level lower, a smaller memory or disk cache, or
+the automatic graphics memory or a higher download limit when your own
+limit is the only problem. Nothing changes until you press **Apply**. Guards never block
+anything. When the saved settings do not fit, Home's Readiness card lists
+**PC resources** with the reason. Set `[guards] warnings = False` to turn the
+panel and that check off.
+
+Graphics memory is read from Windows' display driver information, from
+`nvidia-smi` or the AMD driver on Linux, and on Macs with Apple silicon is
+taken as about two thirds of RAM. When it cannot be read, the panel says so
+and does not warn.
+
+### Low-disk brake
+
+When the cache drive has less free space than the safety margin
+(`[scenery] storage_safety_margin_gb`, at least 2 GB), AutoOrtho stops
+writing new cache entries until 1 GB more is free. Scenery keeps
+streaming; only caching pauses. Counted as `disk_brake_activations`.
+`[guards] ram_brake = False` turns this brake off too.
+
+### Low-memory brake
+
+While the system has very little free RAM (below 1.5 GB or 8 % of RAM), or
+AutoOrtho uses more than its RAM limit, AutoOrtho pauses prefetch and
+background builds and holds its memory cache to half its limit. X-Plane's
+own requests are always served. The brake releases once free RAM has stayed
+above 2.5 GB (or 12 %), and AutoOrtho under 90 % of its limit, for 20
+seconds. Each activation is logged and counted in the performance report
+(`ram_brake_activations`). Set `[guards] ram_brake = False` to turn it off.
+
+## Auto-tuning
+
+While streaming, AutoOrtho measures every 2 seconds how much of the nearby
+scenery X-Plane gets at the zoom you asked for (**% sharp at target**),
+along with download speed, errors, CPU, RAM and the flight phase. Every few
+seconds it looks at the last 30 seconds, works out what holds the
+sharpness back (the connection, the imagery server, the CPU, memory, too
+short a wait, or prefetch falling behind) and can move one setting one
+step. **Settings → Auto-Tuning** (`[governor] mode`, also on Essentials)
+picks what it does with that:
+
+| Mode | What happens |
+|---|---|
+| **Auto** | Changes the setting while streaming, checks the next 20 seconds, and undoes the change if sharpness or the bottleneck got worse. |
+| **Advise** *(default for now)* | Works out the same changes but applies none. Home shows the latest suggestion with **Apply**, which uses it at once and keeps it for the next flights as a learned value (not a pinned one): auto-tuning may suggest moving it again, and **Reset learned settings** clears it. |
+| **Off** | Uses the configured values. Sharpness is still measured. |
+
+It waits longer only on evidence. When a nearby read stops waiting,
+AutoOrtho times how long that imagery still took to arrive. The wait is
+raised only when most of it (80 % in flight, 90 % while a flight loads)
+arrived within the longest wait allowed, and never beyond what it needed.
+When most of it took longer, waiting would only hold X-Plane up, so the
+state is *Imagery arrives late* and prefetch looks further ahead instead.
+
+The rules that keep it steady: one change at a time, a 30-second wait per
+setting (two minutes after an undo), bigger steps only while a flight is
+loading, and nothing above your limits. Settings you set yourself are
+**pinned** and never moved. It never lowers your zoom target: when every
+setting it may move is at its limit for five minutes and sharpness stays
+under 95 %, it shortens prefetch and tells you what limits it (for example
+"the limit is your connection"), with links to the target and the limits.
+
+The Auto-Tuning page lists the settings it may move, with the current
+value, the range your limits allow, where the value comes from (*Baseline*,
+*Learned*, *Governor* or *Pinned*), the last change and its reason, and a
+**Pin** button. A timeline shows sharpness, Mbit/s, CPU and RAM for the
+session; click a red marker to read that decision. **Export tuning report**
+writes the same as JSON to `~/.autoortho-data/governor/`.
+
+**Protect X-Plane's frame rate** (`[limits] protect_sim_fps`, on the
+Limits page): when X-Plane's frames take 20 % longer than the best
+30-second average of this flight and it runs under 40 fps, Auto mode
+lowers background builders, lengthens the pause between background builds
+and shortens prefetch. Such a change is kept as long as the scenery stays
+at least 95 % sharp. The frame time comes from X-Plane's UDP data output,
+like the flight data; without it the option does nothing.
+
+**Smaller textures when graphics memory is short** (`[governor]
+allow_texture_cap`, off by default, on the Auto-Tuning page). AutoOrtho
+estimates the graphics memory of the photo textures X-Plane holds: each
+texture at the finest detail X-Plane read in the last 20 minutes. The page's
+status line shows it against the graphics memory budget (your limit, or the
+card minus `xplane_vram_reserve_gb`). When it reaches 95 % of the budget and
+you allowed it, Auto mode builds textures above 4096 px (ZL17 on ZL16
+scenery, ZL19 near airports) at 4096 px for the rest of the session: a
+quarter of the memory, with the detail of one zoom level lower. Your zoom
+target is not changed, and textures X-Plane already holds keep their size.
+Without the permission, Home tells you instead.
+
+**Learning across flights.** In Auto mode, where the settings ended up is
+saved at unmount in `~/.autoortho-data/governor/learned.json`, keyed by the
+zoom target, the imagery source and a salted hash of your local network, so
+the next flight with the same key starts there. Suggestions you applied in
+Advise mode are kept in the same file and used in Advise and Auto. **Reset
+learned settings** clears both.
+
+**Flight verdict.** The performance report gains a *Flight verdict* section:
+*Smooth flight*, *A few blurry moments* or *Often blurry*, sharpness by
+phase (loading, taxi, departure and arrival, cruise), the number of changes
+kept and undone, peak download speed, brake activations, and what was
+learned for next time.
+
+With `[governor] record_samples = True` (the default) each session's
+samples are written to `~/.autoortho-data/governor/samples-*.jsonl`
+(counters only, no positions). Developers can replay them offline with
+`governor.load_samples()` and `governor.replay()` to check a change to the
+rules against real flights.
 
 ## Performance Tuning
 
 AutoOrtho includes advanced performance settings that allow you to balance image quality against loading times and stuttering. These settings are available under **Settings → Streaming**.
 
 Key settings include:
-- **Tile Time Budget** - Maximum time to wait for a tile before returning results
+- **Wait for nearby imagery / Wait while a flight loads** - How long X-Plane's reads of nearby textures wait for real imagery (the wait bands; distant textures never wait)
 - **Fallback Level** - How aggressively to find replacement imagery for failed chunks
 - **Spatial Prefetching** - Proactively download tiles ahead of your aircraft
 - **Dynamic Zoom Levels** - Automatically adjust imagery quality based on altitude
@@ -171,7 +438,10 @@ partial_cache_promote_startup_max_tiles = 0
   reduces it after overload responses or timeouts. Windowed v2 additionally
   requires utilized, backlogged windows before latency-based adjustments.
 - `live_tile_admission` bounds expensive concurrent tile construction while
-  allowing JPEG retrieval to continue independently.
+  allowing JPEG retrieval to continue independently. Only reads that may
+  build a detailed level take a slot: X-Plane's header chunk (read for every
+  texture it loads) and reads of the base level skip it, so they are never
+  stuck behind nearby reads that wait for imagery.
 - `tile_image_cache_mb` is a per-tile byte budget for temporary fallback RGBA
   images. Oversized ZL17 mipmap-zero images are compressed and released.
 - Cache-write byte budgets prevent slow storage from retaining an unbounded

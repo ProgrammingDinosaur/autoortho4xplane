@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QLabel, QDoubleSpinBox
+from PySide6.QtWidgets import QApplication, QLabel, QSpinBox
 
 from aoconfig import AOConfig
 from config_ui_qt import ConfigUI
@@ -89,22 +89,18 @@ def test_advanced_adaptive_tuning_is_collapsed_and_explained(config_ui):
     assert not config_ui.advanced_adaptive_toggle.isEnabled()
 
 
-def test_per_chunk_exact_value_enables_apply(config_ui, qt_app):
+def test_wait_exact_value_enables_apply(config_ui, qt_app):
     exact_control = next(
         spin
-        for spin in config_ui.categorized_settings_page.findChildren(
-            QDoubleSpinBox
-        )
-        if spin.property("boundSliderObjectName") == "maxwait"
+        for spin in config_ui.categorized_settings_page.findChildren(QSpinBox)
+        if spin.property("boundSliderObjectName") == "band_max_wait_seconds"
     )
     assert not config_ui.apply_button.isEnabled()
 
-    exact_control.setValue(exact_control.value() + 0.1)
+    exact_control.setValue(exact_control.value() + 1)
     qt_app.processEvents()
 
-    assert config_ui.maxwait_slider.value() == round(
-        exact_control.value() * 10
-    )
+    assert config_ui.band_wait_slider.value() == round(exact_control.value())
     assert config_ui.settings_session.dirty is True
     assert config_ui.apply_button.isEnabled()
 
