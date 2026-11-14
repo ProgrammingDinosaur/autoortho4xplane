@@ -409,6 +409,7 @@ class ConfigUI(QMainWindow):
     # tests/test_expert_settings_page.py checks this against every
     # "self.cfg.<section>.<key> =" assignment in this module.
     WIDGET_BOUND_SETTINGS = frozenset({
+        "autoortho.streaming_backend",
         "autoortho.background_builder_workers",
         "autoortho.buffer_pool_size",
         "autoortho.download_dispatch_workers",
@@ -1702,6 +1703,10 @@ class ConfigUI(QMainWindow):
             mirror(self.hide_check, page.hide_check),
         ]
         page.update_mode_rows()
+        page.set_backend(str(getattr(self.cfg.autoortho, "streaming_backend", "fuse")
+                             or "fuse").strip().lower())
+        page.backend_changed.connect(self._on_backend_changed)
+        page.defender_requested.connect(self._request_defender_exclusion)
 
         sliders = (
             self.spr_sat_slider,
@@ -1740,6 +1745,60 @@ class ConfigUI(QMainWindow):
         self.hardware_detected.connect(self._refresh_essentials_limits)
         self._refresh_essentials_limits()
         self._refresh_essentials_profile()
+
+    def _refresh_files_card(self, runtime):
+        """Home's files-mode card (hidden in FUSE mode)."""
+        home = getattr(self, "home_page", None)
+        if home is None or not hasattr(home, "set_files_mode"):
+            return
+        active = bool(getattr(self, "_files_mode_active", False))
+        if self._selected_backend() != "files" and not active:
+            home.set_files_mode(None)
+            return
+        try:
+            try:
+                from autoortho.files_mode.status import files_mode_status
+            except ImportError:
+                from files_mode.status import files_mode_status
+            stats = self.files_mode_stats() if active and hasattr(self, "files_mode_stats") else {}
+            home.set_files_mode(files_mode_status(
+                stats, error=getattr(self, "files_mode_error", None),
+                running=active and runtime == "running",
+            ))
+        except Exception as exc:
+            log.debug("Files-mode card: %s", exc)
+
+    def _request_defender_exclusion(self):
+        """Essentials' Defender button: Windows' elevation prompt decides."""
+        try:
+            try:
+                from autoortho.files_mode import windows_integration
+            except ImportError:
+                from files_mode import windows_integration
+            root = self._files_root() if hasattr(self, "_files_root") else None
+            if not root:
+                return
+            os.makedirs(root, exist_ok=True)
+            if windows_integration.request_defender_exclusion(root):
+                QMessageBox.information(
+                    self, "Microsoft Defender",
+                    "Windows is adding the exclusion for:\n" + str(root),
+                )
+        except Exception as exc:
+            log.warning("Defender exclusion request failed: %s", exc)
+
+    def _on_backend_changed(self, value):
+        """Essentials' backend choice: saved with the other settings."""
+        try:
+            self._on_settings_control_changed()
+        except Exception:
+            pass
+
+    def _selected_backend(self):
+        page = getattr(self, "essentials_page", None)
+        if page is not None:
+            return page.backend()
+        return str(getattr(self.cfg.autoortho, "streaming_backend", "fuse") or "fuse")
 
     def _sync_essentials(self):
         """Bring the Essentials mirrors up to date (after a Revert, which
@@ -1963,6 +2022,7 @@ class ConfigUI(QMainWindow):
             now=time.monotonic(),
         )
         self.home_snapshot_ready.emit(snapshot)
+        self._refresh_files_card(runtime)
         self._update_tray_summary(snapshot)
         # Taskbar summary while streaming (the window may be hidden).
         base = getattr(self, "_base_window_title", None)
@@ -9578,6 +9638,7 @@ class ConfigUI(QMainWindow):
         # Save options
         self.cfg.general.showconfig = self.showconfig_check.isChecked()
         self.cfg.autoortho.maptype_override = self.maptype_combo.currentText()
+        self.cfg.autoortho.streaming_backend = self._selected_backend()
         if self.cfg.autoortho.simheaven_compat != self.simheaven_compat_check.isChecked():
             self.cfg.autoortho.simheaven_compat = self.simheaven_compat_check.isChecked()
             self.simheaven_config_changed_session = True

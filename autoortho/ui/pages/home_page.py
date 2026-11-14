@@ -452,6 +452,21 @@ class HomePage(QWidget):
         stopped.addLayout(row)
         outer.addWidget(self.stopped_block)
 
+        # -- files mode (streaming without FUSE) -------------------------------
+        self.files_card = QFrame()
+        self.files_card.setObjectName("statusCard")
+        self.files_card.setAccessibleName("Files mode")
+        files = QVBoxLayout(self.files_card)
+        files.setContentsMargins(10, 8, 10, 8)
+        files.addWidget(_caption("FILES MODE"))
+        self.files_label = QLabel("")
+        self.files_label.setWordWrap(True)
+        files.addWidget(self.files_label)
+        self.files_detail_label = _secondary("")
+        files.addWidget(self.files_detail_label)
+        self.files_card.setVisible(False)
+        outer.addWidget(self.files_card)
+
         # -- starting ----------------------------------------------------------
         self.loading_card = QFrame()
         self.loading_card.setObjectName("statusCard")
@@ -694,6 +709,22 @@ class HomePage(QWidget):
         self.last_flight_card.setAccessibleDescription(
             f"{summary.get('verdict', '')}. " + ". ".join(lines)
         )
+
+    def set_files_mode(self, status: Optional[Mapping[str, Any]]) -> None:
+        """Files mode's card: ``None`` hides it (FUSE mode).
+
+        ``status`` has ``headline``, ``detail`` and ``state`` (ok, info,
+        warning, error), from :func:`files_mode_status`.
+        """
+        if not status:
+            self.files_card.setVisible(False)
+            return
+        self.files_label.setText(str(status.get("headline", "")))
+        self.files_detail_label.setText(str(status.get("detail", "")))
+        self.files_card.setProperty("state", status.get("state", "info"))
+        self.files_card.style().unpolish(self.files_card)
+        self.files_card.style().polish(self.files_card)
+        self.files_card.setVisible(True)
 
     def set_compact(self, compact: bool) -> None:
         """Status strip, quality and gauges only (for a second monitor)."""

@@ -456,6 +456,13 @@ simheaven_compat = False
 using_custom_tiles = False
 # Color used for missing textures. an
 missing_color = [66, 77, 55]
+# How X-Plane gets the textures. fuse: a virtual file system (WinFsp,
+# macFUSE or FUSE) builds each texture while X-Plane reads it. files
+# (experimental): no virtual file system; AutoOrtho writes textures to real
+# files ahead of X-Plane, and an X-Plane plugin holds a flight's loading
+# screen until the start area is built. Late textures show grey or blurry
+# until X-Plane's next read. Settings in [files].
+streaming_backend = fuse
 
 [streaming]
 # Streaming techniques adopted from OrthoStreamXP. Each one can be turned off
@@ -537,6 +544,30 @@ max_download_workers = 4
 # Minimum free-space reserve used by setup and scenery installation checks
 storage_safety_margin_gb = 2
 
+[files]
+# Files mode (streaming_backend = files). Folder holding the built textures.
+# Empty: <scenery_path>/z_autoortho/files. Must be NTFS, APFS, ext4, btrfs or
+# xfs (hard links and sparse files), best on the same disk as the scenery.
+root =
+# Disk budget in GB for built textures (at least 10).
+disk_gb = 20
+# Sharp textures are built this many km beyond what X-Plane reads around the
+# aircraft, so external views close to it look sharp too.
+camera_reach_km = 10
+# Unbuilt textures: link (hard links to one neutral texture; cheapest) or
+# sparse (a small file of their own each).
+materialize = link
+# UDP port on 127.0.0.1 where the X-Plane plugin asks whether to go on.
+gate_port = 49317
+# No level is built from imagery coarser than this zoom (Bing's coarser
+# imagery has clashing colours).
+imagery_floor_zl = 13
+# Install and update the AutoOrtho X-Plane plugin when files mode starts.
+install_plugin = True
+# Windows: exclude the files folder from Windows Search for this user (it only
+# acts when the folder is indexed; Home says so when it is).
+exclude_from_search = False
+
 [fuse]
 # Enable or disable multi-threading when using FUSE
 threading = True
@@ -579,6 +610,9 @@ python_allocation_tracing = False
 report_dir = {os.path.join(os.path.expanduser("~"), ".autoortho-data", "reports")}
 # Number of completed profiling sessions to retain.
 max_reports = 20
+# Record which texture level X-Plane reads at what distance (FUSE mode), to
+# calibrate files mode. Local files in ~/.autoortho-data/telemetry, never sent.
+read_telemetry = True
 
 [seasons]
 seasons_convert_workers = 4

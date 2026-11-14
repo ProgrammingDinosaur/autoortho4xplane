@@ -1,6 +1,7 @@
 # Plan: Files mode, streaming without FUSE
 
-Status: proposed, not started.
+Status: **beta: everything that needs no real-flight data is built; not yet flown** (see §13 for what was built,
+what was measured on Windows and where the implementation departs from this plan).
 Related: [settings-refactor-proposal.md](settings-refactor-proposal.md) (settings registry, governor),
 [governor-behind-detection-plan.md](governor-behind-detection-plan.md) (read-based signals that files mode replaces).
 Prior art: OrthoStudio XP Live (`D:\Programs\orthostudio-xp`, `docs/specs/live.md` and `docs/specs/live/*.md`).
@@ -964,3 +965,113 @@ relicensing AutoOrtho under the GPL. Rules for this work:
   OrthoStudio document they come from in our docstrings, as this plan does.
 - Developers implementing a component should work from this plan and our own measurements, not with
   OrthoStudio's source open side by side.
+
+---
+
+## 13. Implementation status (2026-11-13)
+
+### What exists
+
+| Plan item | Where | State |
+|---|---|---|
+| Phase 1 seam | `autoortho/texture_service.py`, `TileCacher.open_tile/close_tile(max_zoom=)` | done; equivalence with `Tile.read_dds_bytes` checked against real imagery (`AO_NETWORK_TESTS=1`) |
+| `files_worker` run mode | `worker_modes.py`, `__main__.py`, `files_mode/worker.py`, `process_supervisor.start_mount_worker(run_mode=, worker_args=)` | done; a test proves the worker, session and `getortho` import no FUSE module |
+| Pack, junctions, safety rule | `files_mode/pack.py`, `fsops.py`, `fsops_windows.py` | done; tests cover refusing real folders and foreign links, and removing a pack without following its `terrain` junction |
+| Catalogue | `files_mode/catalogue.py`, `geo.py` | done (from `.ter` **names**, see below) |
+| Window, materializer, neutral pool | `window.py`, `materializer.py`, `neutral.py` | done, with NTFS link-limit rollover |
+| Store and writer | `store.py`, `dds_layout.py` | done: sparse files, first build by rename, upgrades in place, stand-in copy-up, coarsen by hole punching |
+| Rings, planner, scheduler | `rings.py`, `planner.py`, `scheduler.py`, `flightfeed.py` | done (vectorised; under 1 ms for small packs) |
+| Gate and plugin | `gate.py`, `autoortho/xplane_plugin/ao_gate.c` | done; Windows binary built with MSVC (`build_win.bat`); macOS and Linux via `Makefile` (not built here) |
+| Disk budget | `evict.py` | done |
+| Parent integration | `AOMount.start_files_mode/stop_files_mode`, `[files]` settings, `autoortho.streaming_backend` | done; FUSE mode unchanged |
+| Stand-in X-Plane | `tools/files_mode/fake_xplane.py`, `tests/test_files_session.py` | done (synthetic region and flight) |
+| Diagnose | `files_mode/diagnose.py` | done |
+
+### Added in the second round
+
+| Plan item | Where | State |
+|---|---|---|
+| Season rebuild when the season key changes | `session._season_sweep` | every 60 s, built textures near the aircraft whose baked colours are out of date are requeued at low priority (rebuilt in place) |
+| SimBrief route input | `files_mode/route.py`, `planner.route_points` | the shared route snapshot (same stats keys as FUSE workers); the route ahead is its own polyline from the aircraft, cut at the lookahead |
+| Time exclusion | `files_mode/dsf_swap.py` | per-DSF hard links pointed at the region's DSF (day) or X-Plane's global scenery (night), only for squares X-Plane cannot be holding; off with a message when the files folder is on another disk |
+| Moving the aircraft in flight | `session.begin_relocation`, gate `POLL`, plugin flight loop | a jump of more than 20 km with the plugin present: the plugin's 1 s `POLL` is answered `PAUSE` until the new area is built (at most 120 s), then `RESUME`. The plugin only resumes a pause it started, and resumes on its own if AutoOrtho is silent for 10 s |
+| Governor | `files_mode/governor.py`, `AOMount.start_files_governor` | see below |
+| UI | Essentials "How X-Plane Gets the Textures", Home "Files mode" card (`files_mode/status.py`) | backend selector saved with the other settings; card shows start progress, late textures, queue, build rate, disk use, night swaps, plugin seen |
+
+**Governor in files mode.** FUSE's governor reads X-Plane's reads (near reads real or stand-in,
+prefetch misses, live-tile waits); none happen in files mode. `files_mode/governor.py` keeps its
+rules (one lever per decision, cooldowns, keep or revert, Auto / Advise / Off, protection first,
+pinned settings untouched) on files-mode signals: late textures split into *never queued*
+(planned late → lookahead, then ring margin), *queued* (→ builders, or downloads when builders sit
+idle), *building* (→ downloads, then builders); frame time, CPU and RAM lower builders. A move is
+judged by late textures per minute after 20 s and undone when they got 20 % worse. Levers reach the
+worker through `live_settings` (`files.builders`, `files.lookahead_s`, `files.margin`) and the
+broker (`autoortho.provider_origin_max_concurrency`). Thresholds are starting values, to be set
+from flight reports.
+
+### Added for the beta (third round)
+
+| Item | Where | State |
+|---|---|---|
+| Phase 0 telemetry | `files_mode/telemetry.py`, hook in `Tile._note_wanted_level`, `[diagnostics] read_telemetry` | FUSE mode writes the first read of each texture level: ground distance and height, size, screen, FOV, texture quality, opens (A1). Local JSON lines, capped per session |
+| Ring fitting | `files_mode/ring_fit.py`, `tools/files_mode/fit_rings.py` | fits rings per level (98th percentile, normalised to ZL16 at 2704 px / 65°), picks zoom vs size scaling and ground vs 3-D distance by spread, reports A1, A2, A6; writes `rings.json` |
+| Download priority by urgency | `getortho.files_priority`, `files_priority_for`, `LazyChunkGetter.submit` | a thread-local hint set per files-mode build: urgent → live, ≤ 60 s → imminent (50), later → prefetch. Unset in FUSE mode (no change there). Chunks already queued keep their priority |
+| Windows Search | `files_mode/windows_integration.py`, `[files] exclude_from_search` (off) | read-only check at every start (verified on Windows 11); Home and the log say when the folder is indexed. The exclusion call (`AddUserScopeRule` + `SaveAll`) is opt-in: it could not be exercised without changing this machine's settings |
+| Defender | Essentials button (UAC prompt), installer section `sec_defender` (unchecked) | the installer reads the folder from an existing `~/.autoortho`. The installer was not compiled here (no makensis) |
+| CI | `.github/workflows/files-mode.yml` | files-mode tests on Windows, Linux and macOS; plugin builds on all three, uploaded as artifacts |
+| Plugin digest guard | `xplane_plugin/stamp.py`, `bin/SOURCE_SHA256`, a test | fails when `ao_gate.c` changed without rebuilding |
+| Beta feedback | flight report *Files mode* section (`diagnostics._render_files_mode`), profiler started in files mode, `docs/files-mode.md` | user guide, settings, and what to send |
+
+### Left for real usage data
+
+- Ring table: from beta users' telemetry (`fit_rings.py`), then shipped as the default table.
+- Governor thresholds (`MIN_LATE`, `WORSE_FACTOR`, frame thresholds) from flight reports.
+- `materialize = link` vs `sparse` on Windows: decided by `files_replace_refused` in reports and a
+  Process Monitor capture of X-Plane's file sharing.
+- Disk budget default, builder counts, the cruise rule's heights.
+- Whether files mode can become the default (Phase 8).
+
+### Unverified until someone runs it
+
+- The plugin inside X-Plane (Windows binary built; macOS and Linux built by CI).
+- Windows Search exclusion's write path; the installer's Defender section.
+- Files mode on macOS and Linux (code paths written; tests run in CI only).
+
+### Measured on Windows 11 / NTFS while building it
+
+1. **A9 is real, and narrower than feared.** A name another process holds *mapped* cannot be
+   replaced (error 32), even with `FileRenameInfoEx` + POSIX semantics. Replacing a *sibling* hard
+   link of the same mapped file works, and **in-place writes into a mapped file work**. The store is
+   therefore: neutral link → first build by rename (before X-Plane maps it: the start hold and the
+   ring of squares ahead give the lead time) → every upgrade in place. In-place upgrades also write
+   only the new levels, which cuts the "3× disk writes" risk. A file with more than one link is
+   never written in place. A `sparse` strategy (`[files] materialize = sparse`) gives every name its
+   own file from the start, for the case real flights show X-Plane keeping mappings.
+2. **`os.ftruncate` is not sparse on Windows**: the C runtime extends by writing zeros. Files mode
+   sets the end of file with `SetFileInformationByHandle(FileEndOfFileInfo)` after
+   `FSCTL_SET_SPARSE`.
+3. **`GetCompressedFileSizeW` and `FileStandardInfo.AllocationSize` misreport sparse files**
+   (a stale 64 KB and 0). Allocation is summed from `FSCTL_QUERY_ALLOCATED_RANGES`, as `fsutil`
+   does. An unbuilt-level texture with its header and ≤256 px levels costs 128 KB.
+4. **The catalogue does not need to read `.ter` files.** A texture's centre follows from its name and
+   equals `LOAD_CENTER` to 1e-5° (3,000 random Europe textures checked). Europe: 420,709 textures in
+   2,187 squares, listed in 1.8 s, cached load in 0.2 s. `LOAD_CENTER`'s size is smaller than the
+   name-derived size only for partly covered high-latitude textures, so rings stay conservative.
+5. `X-Plane.prf` on X-Plane 12 / Windows has both `_tex_res` and `renopt_tex_res_04`; the higher
+   notch is used.
+
+### Departures from the plan (and why)
+
+- **Held X-Plane sends no UDP datarefs** (its main thread is blocked), so the parent's
+  `flight_state` goes stale during a start hold. Every `HOLD` carries the position, and the flight
+  feed uses it while the snapshot is stale.
+- **The plugin needs no SDK**: it looks up the XPLM functions in the already-loaded XPLM library at
+  run time. It holds on `LIVERY_LOADED` at the first flight and on message 115 (param 1) for a new
+  flight started from within a flight (OrthoStudio's hold test: no aircraft load, so no
+  `LIVERY_LOADED`).
+- **Dynamic zoom** (`max_zoom_mode = dynamic`) does not change a texture's file size in files mode:
+  the file takes the sharpest zoom the steps allow, and the planner builds only the levels each
+  distance needs. A file's size is fixed once materialized; a size change rebuilds it.
+- **Shutdown** sends `shutdown` on the control channel and waits before the supervisor's terminate
+  (TerminateProcess would skip link removal and the index flush); the parent removes leftover
+  links itself when X-Plane is not running.

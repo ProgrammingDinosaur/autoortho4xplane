@@ -608,6 +608,57 @@ PRIORITY_CACHE_REPAIR = 500
 _HEALING_RESERVED_CHUNKS = 8
 _MAX_DEFERRED_HEALING_ROWS = 64
 PRIORITY_NETWORK_HEALING = 600
+# Files mode: a build X-Plane may read within a minute (still foreground).
+PRIORITY_IMMINENT = 50
+
+# Files mode sets the download priority of a whole build from its urgency
+# (files_mode/scheduler.py); chunks submitted by that thread take it.
+# Unset in FUSE mode, so FUSE's per-read priorities are unchanged.
+_files_priority_local = threading.local()
+
+
+class files_priority:
+    """``with files_priority(PRIORITY_IMMINENT): ...`` for one build."""
+
+    def __init__(self, priority):
+        self.priority = priority
+        self._previous = None
+
+    def __enter__(self):
+        self._previous = getattr(_files_priority_local, "value", None)
+        _files_priority_local.value = self.priority
+        return self
+
+    def __exit__(self, *exc):
+        _files_priority_local.value = self._previous
+        return False
+
+
+def _apply_files_priority(obj):
+    value = getattr(_files_priority_local, "value", None)
+    if value is None or getattr(obj, "in_queue", False) or getattr(obj, "in_flight", False):
+        return
+    try:
+        current = getattr(obj, "priority", None)
+        if value < PRIORITY_PREFETCH:
+            # Urgent or imminent: never make a chunk less urgent than it is.
+            if current is None or current > value:
+                obj.priority = value
+            obj.prefetch = False
+        elif current is None or current < PRIORITY_PREFETCH:
+            obj.priority = value
+            obj.prefetch = True
+    except AttributeError:
+        pass
+
+
+def files_priority_for(urgency_s):
+    """Download priority of a files-mode build X-Plane reads in ``urgency_s``."""
+    if urgency_s <= 0:
+        return PRIORITY_LIVE
+    if urgency_s <= 60:
+        return PRIORITY_IMMINENT
+    return PRIORITY_PREFETCH
 def _remove_quietly(path):
     try:
         os.remove(path)
@@ -4216,7 +4267,9 @@ def _resolve_getter_workers():
 
     requested = max(1, int(getattr(CFG.autoortho, "fetch_threads", 32)))
     max_concurrent = resolve_provider_setting("provider_max_in_flight")
-    if os.getenv("AO_RUN_MODE") not in ("mount_worker", "macfuse_worker"):
+    if os.getenv("AO_RUN_MODE") not in (
+        "mount_worker", "macfuse_worker", "files_worker"
+    ):
         max_concurrent = min(max_concurrent, 8)
     workers = min(
         requested,
@@ -4253,6 +4306,8 @@ class LazyChunkGetter:
         return self._instance
 
     def submit(self, *args, **kwargs):
+        if args:
+            _apply_files_priority(args[0])
         return self._get().submit(*args, **kwargs)
 
     def reprioritize_queue(self):
@@ -5568,6 +5623,21 @@ def get_paging_model():
     if width and fov:
         model.use_screen(width, fov)
     return model
+
+
+_read_telemetry_instance = None
+
+
+def _read_telemetry():
+    """Files mode's Phase 0 recorder (FUSE reads), created on first use."""
+    global _read_telemetry_instance
+    if _read_telemetry_instance is None:
+        try:
+            from autoortho.files_mode import telemetry as _telemetry
+        except ImportError:
+            from files_mode import telemetry as _telemetry
+        _read_telemetry_instance = _telemetry.recorder(CFG)
+    return _read_telemetry_instance
 
 
 def current_camera():
@@ -14103,6 +14173,26 @@ class Tile(object):
             )
         except Exception as exc:  # statistics only
             log.debug(f"Paging sample for {self.id} failed: {exc}")
+        try:
+            # Files mode's calibration data (files_mode/telemetry.py).
+            ground = paging_model.ground_distance_m(
+                camera[0], camera[1],
+                *paging_model.tile_centre(self.row, self.col, self.tilename_zoom, Tile.width),
+            )
+            _read_telemetry().note(
+                self.row, self.col, self.maptype, self.tilename_zoom, mip,
+                int(self.dds.width), ground, camera[2],
+                paging_model.tile_size_m(
+                    paging_model.tile_centre(
+                        self.row, self.col, self.tilename_zoom, Tile.width)[0],
+                    self.tilename_zoom, Tile.width,
+                ),
+                getattr(datareftracker, "window_width", 0) or 0,
+                getattr(datareftracker, "fov_deg", 0) or 0,
+                getattr(self, "ao_opens", 0), (camera[0], camera[1]),
+            )
+        except Exception as exc:  # statistics only
+            log.debug(f"Read telemetry for {self.id} failed: {exc}")
 
     def _read_unsealed(self, offset, length):
         """Bytes served as they are now, without sealing any mipmap-0 row."""
@@ -18384,7 +18474,18 @@ class TileCacher(object):
                 self._touch_tile(idx, tile)
         return tile
 
-    def _open_tile(self, row, col, map_type, zoom):
+    def open_tile(self, row, col, map_type, zoom, max_zoom=None):
+        """Open (or reuse) a tile and take a reference.
+
+        ``max_zoom`` pins the build zoom instead of the target zoom rules;
+        files mode uses it so a texture keeps the size its file has.
+        """
+        return self._open_tile(row, col, map_type, zoom, max_zoom=max_zoom)
+
+    def close_tile(self, row, col, map_type, zoom):
+        return self._close_tile(row, col, map_type, zoom)
+
+    def _open_tile(self, row, col, map_type, zoom, max_zoom=None):
         map_type = self._resolve_maptype(row, col, map_type, zoom)
         idx = self._to_tile_id(row, col, map_type, zoom)
 
@@ -18392,6 +18493,16 @@ class TileCacher(object):
         reopened = False
         with self.tc_lock:
             tile = self.tiles.get(idx)
+            if (
+                tile is not None
+                and max_zoom is not None
+                and tile.max_zoom != int(max_zoom)
+                and tile.refs <= 0
+            ):
+                # A pinned zoom that differs from the cached tile's: rebuild.
+                self.tiles.pop(idx, None)
+                tile.close()
+                tile = None
             if not tile:
                 self.misses += 1
                 bump('tile_mem_miss')
@@ -18405,8 +18516,11 @@ class TileCacher(object):
                     col, row, map_type, zoom, 
                     cache_dir=self.cache_dir,
                     min_zoom=self.min_zoom,
-                    max_zoom=self._get_target_zoom_level(
-                        zoom, row=row, col=col, count=True
+                    max_zoom=(
+                        int(max_zoom) if max_zoom is not None
+                        else self._get_target_zoom_level(
+                            zoom, row=row, col=col, count=True
+                        )
                     ),
                 )
                 self.tiles[idx] = tile
@@ -18433,6 +18547,8 @@ class TileCacher(object):
                 reopened = True
 
             tile.refs += 1
+            # Opens of this texture (files mode's A1 check: one per sharper level).
+            tile.ao_opens = getattr(tile, "ao_opens", 0) + 1
         if reopened:
             # Outside tc_lock: takes tile-level locks. The ref taken above
             # keeps the tile from being evicted meanwhile.

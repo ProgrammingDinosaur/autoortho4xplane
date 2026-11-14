@@ -295,6 +295,8 @@ class AOMount:
         self._performance_profiler_env = {}
         self._download_broker = None
         self._download_broker_env = {}
+        self._files_mode_active = False
+        self.files_mode_error = None
 
         # Start shared stats manager and reporter/log servers
         self.start_stats_manager()
@@ -597,8 +599,16 @@ class AOMount:
                                 "local_time_sec": float(dt.local_time_sec),
                                 "pressure_alt": float(dt.pressure_alt),
                                 "sun_pitch": float(dt.sun_pitch),
+                                "window_width": float(dt.window_width),
+                                "fov_deg": float(dt.fov_deg),
+                                "paused": bool(dt.paused),
                                 "timestamp": time.time(),
                             }
+                            # Files mode inputs, when X-Plane sent them.
+                            for name in getattr(dt, "FILES_MODE_FIELDS", ()):
+                                value = getattr(dt, name, None)
+                                if value is not None:
+                                    flight_state[name] = float(value)
                         self._shared_store.set(
                             "flight_state", flight_state
                         )
@@ -1235,10 +1245,326 @@ class AOMount:
             self.unmount_sceneries()
         return handle
 
+    # ------------------------------------------------------------------
+    # Files mode: streaming without FUSE (docs/developer/files-mode-plan.md)
+    # ------------------------------------------------------------------
+    FILES_READY_TIMEOUT_S = 600.0
+    FILES_STOP_WAIT_S = 20.0
+
+    def streaming_backend(self):
+        section = getattr(self.cfg, "autoortho", None)
+        value = str(getattr(section, "streaming_backend", "fuse") or "fuse")
+        return "files" if value.strip().lower() == "files" else "fuse"
+
+    def _files_root(self):
+        files = getattr(self.cfg, "files", None)
+        root = str(getattr(files, "root", "") or "").strip() if files is not None else ""
+        if root:
+            return os.path.abspath(os.path.expanduser(root))
+        return os.path.join(self.cfg.paths.scenery_path, "z_autoortho", "files")
+
+    def _files_regions(self):
+        regions = {}
+        for scenery in getattr(self.cfg, "scenery_mounts", []) or []:
+            root = scenery.get("root")
+            if root and os.path.isdir(os.path.join(root, "terrain")):
+                regions[os.path.basename(os.path.normpath(root))] = root
+        return regions
+
+    def _files_pack(self):
+        try:
+            from autoortho.files_mode import pack as files_pack
+        except ImportError:
+            from files_mode import pack as files_pack
+        return files_pack.Pack(
+            self._files_root(),
+            getattr(self.cfg, "xplane_custom_scenery_path", None),
+            self._files_regions(),
+        )
+
+    def start_files_mode(self, blocking=True):
+        """Start the files worker; True once its pack is in place."""
+        try:
+            from autoortho.files_mode import preflight as files_preflight
+        except ImportError:
+            from files_mode import preflight as files_preflight
+        self._ensure_parent_services()
+        self.files_mode_error = None
+        custom = getattr(self.cfg, "xplane_custom_scenery_path", None)
+        regions = self._files_regions()
+        if not regions:
+            log.warning("No installed sceneries detected.  Exiting.")
+            return False
+        try:
+            if custom:
+                cleanup_stale_mount_folders(custom)
+        except Exception as exc:
+            log.warning("Failed to clean up stale mount folders: %s", exc)
+        files_root = self._files_root()
+        disk_gb = float(getattr(getattr(self.cfg, "files", None), "disk_gb", 20) or 20)
+        try:
+            files_preflight.check(files_root, disk_gb, self.cfg.paths.scenery_path)
+        except files_preflight.PreflightError as exc:
+            # Never fall back to FUSE silently: the user chose files mode.
+            self.files_mode_error = str(exc)
+            log.error("Files mode cannot start: %s", exc)
+            return False
+        args = [
+            "--files-root", files_root,
+            "--custom-scenery", custom or "",
+            "--xplane-path", getattr(self.cfg.paths, "xplane_path", "") or "",
+        ]
+        for name, root in sorted(regions.items()):
+            args += ["--region", f"{name}={root}"]
+        try:
+            aostats.set_stat("files_worker_state", {"state": "launching", "ts": time.time()})
+        except Exception:
+            pass
+        self._start_performance_diagnostics()
+        worker_env = dict(self._performance_profiler_env)
+        worker_env.update(self._download_broker_env)
+        worker_env["AO_MOUNT_WORKER_COUNT"] = "1"
+        loglevel = getattr(self.cfg.general, 'file_log_level', 'INFO').upper()
+        try:
+            handle = self.mount_worker_supervisor.start_mount_worker(
+                files_root, custom or files_root, "files", False,
+                stats_addr=self.stats_addr, stats_auth=self.stats_auth,
+                log_addr=self.log_addr, loglevel=loglevel, extra_env=worker_env,
+                run_mode="files_worker", worker_args=args,
+            )
+        except Exception as exc:
+            self.files_mode_error = f"Could not start the files worker: {exc}"
+            log.exception("Could not start the files worker")
+            return False
+        self.mount_workers.append(handle)
+        self.mac_os_procs.append(handle.process)
+        if self._performance_profiler is not None:
+            try:
+                self._performance_profiler.register_process(handle.pid, "files-worker")
+            except Exception:
+                pass
+        self._files_mode_active = True
+        self.mounts_running = True
+        if not self._wait_files_ready(handle):
+            self.stop_files_mode(force=True)
+            return False
+        log.info("Files mode running (%d regions; no virtual file system)", len(regions))
+        self.start_files_governor()
+        if not blocking:
+            return True
+        healthy = True
+        try:
+            def handle_sigterm(sig, frame):
+                raise SystemExit
+
+            signal.signal(signal.SIGTERM, handle_sigterm)
+            healthy = self._monitor_mount_workers()
+        except (KeyboardInterrupt, SystemExit) as err:
+            self.mounts_running = False
+            log.info(f"Exiting due to {err}")
+        finally:
+            log.info("Shutting down ...")
+            self.unmount_sceneries()
+        return healthy
+
+    def _wait_files_ready(self, handle):
+        deadline = time.monotonic() + self.FILES_READY_TIMEOUT_S
+        last_log = 0.0
+        while time.monotonic() < deadline:
+            if handle.process.poll() is not None:
+                self.files_mode_error = (
+                    f"The files worker exited with code {handle.process.returncode}"
+                )
+                log.error(self.files_mode_error)
+                return False
+            try:
+                state = aostats.get_stat("files_worker_state")
+            except Exception:
+                state = None
+            if isinstance(state, dict):
+                if state.get("state") == "ready":
+                    self._files_gate_port = state.get("port")
+                    threading.Thread(
+                        target=self._diagnose_files_mode, name="ao-files-diagnose",
+                        daemon=True,
+                    ).start()
+                    return True
+                if state.get("state") == "error":
+                    self.files_mode_error = str(state.get("error") or "files worker failed")
+                    log.error("Files mode failed to start: %s", self.files_mode_error)
+                    return False
+            if time.monotonic() - last_log > 15:
+                last_log = time.monotonic()
+                log.info("Files mode: setting up the pack and catalogues ...")
+            time.sleep(0.5)
+        self.files_mode_error = "The files worker did not become ready in time"
+        log.error(self.files_mode_error)
+        return False
+
+    def start_files_governor(self):
+        """The files-mode governor (files_mode/governor.py) as governor_service."""
+        if getattr(self, "governor_service", None) is not None:
+            return self.governor_service
+        try:
+            try:
+                from autoortho.files_mode import governor as files_governor
+                from autoortho.files_mode.session import builder_counts
+                from autoortho.files_mode.planner import LOOKAHEAD_S
+                from autoortho.files_mode.rings import MARGIN
+            except ImportError:
+                from files_mode import governor as files_governor
+                from files_mode.session import builder_counts
+                from files_mode.planner import LOOKAHEAD_S
+                from files_mode.rings import MARGIN
+            (governor_module, hardware_module, connection_module,
+             get_stat, _set_stat, RamBrake) = self._governor_modules()
+            active = self._resource_limits()
+            fuse_levers = governor_module.levers_for(self.cfg, active)
+            network = fuse_levers.get(files_governor.CONCURRENCY)
+            levers = files_governor.levers_for(self.cfg, active, network)
+            flight_builders, _start = builder_counts()
+            values = {
+                files_governor.BUILDERS: float(flight_builders),
+                files_governor.LOOKAHEAD: float(LOOKAHEAD_S),
+                files_governor.MARGIN: float(MARGIN),
+            }
+            pinned = set()
+            if network is not None:
+                section, key = files_governor.CONCURRENCY.split(".", 1)
+                try:
+                    values[files_governor.CONCURRENCY] = float(self.cfg.value(section, key))
+                except (TypeError, ValueError, AttributeError):
+                    values.pop(files_governor.CONCURRENCY, None)
+                try:
+                    if self.cfg.is_custom(section, key):
+                        pinned.add(files_governor.CONCURRENCY)
+                except Exception:
+                    pass
+            total = hardware_module.basic().ram_total or 0
+            result = connection_module.load_result()
+            governor = files_governor.FilesGovernor(
+                levers, values, mode=self._governor_mode(), pinned=pinned,
+                cpu_limit_percent=90.0,
+                ram_limit_bytes=(int((active.ram_gb - 0.5) * 1024 ** 3)
+                                 if active is not None and active.ram_gb else None),
+                brake_free_bytes=RamBrake.thresholds(total)[0] if total else None,
+                protect_sim_fps=str(getattr(getattr(self.cfg, "limits", None),
+                                            "protect_sim_fps", True)).lower()
+                in ("true", "1", "yes", "on"),
+                line_mbps=result.mbits if result is not None and result.mbits else None,
+            )
+
+            def flight():
+                try:
+                    from autoortho.datareftrack import dt
+                except ImportError:
+                    from datareftrack import dt
+                return dt.get_flight_data()
+
+            def broker_stats():
+                current = getattr(self, "_download_broker", None)
+                return current.server_stats(timeout=1.0) if current is not None else {}
+
+            service = files_governor.FilesGovernorService(
+                governor, read_stat=get_stat, publish=self.publish_levers,
+                flight=flight, broker_stats=broker_stats,
+            )
+            service.start()
+            self.governor_service = service
+            log.info("Files governor started (%s mode)", governor.mode)
+            return service
+        except Exception:
+            log.exception("Files governor could not start")
+            self.governor_service = None
+            return None
+
+    def _diagnose_files_mode(self):
+        try:
+            try:
+                from autoortho.files_mode import diagnose as files_diagnose
+            except ImportError:
+                from files_mode import diagnose as files_diagnose
+            files_diagnose.check(
+                self._files_pack(), getattr(self, "_files_gate_port", None),
+                getattr(self.cfg.paths, "xplane_path", None),
+            )
+        except Exception as exc:
+            log.warning("Files mode checks could not run: %s", exc)
+
+    def stop_files_mode(self, force=False):
+        """Stop the files worker and leave Custom Scenery as FUSE would."""
+        log.info("Stopping files mode ...")
+        self.mounts_running = False
+        service = getattr(self, "governor_service", None)
+        self.governor_service = None
+        if service is not None:
+            try:
+                service.stop()
+                summary = service.flight_summary()
+                aostats.set_stat("governor/summary", summary)
+                log.info("Files governor: %s", summary.get("verdict"))
+            except Exception as exc:
+                log.debug("Files governor stop: %s", exc)
+        try:
+            self._live_settings().clear()
+        except Exception:
+            pass
+        supervisor = self.mount_worker_supervisor
+        # The worker removes its links and flushes its index on "shutdown";
+        # terminating it would skip that (TerminateProcess on Windows).
+        supervisor.prepare_shutdown()
+        if not force:
+            for handle in list(self.mount_workers):
+                try:
+                    handle.process.wait(timeout=self.FILES_STOP_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    log.warning("Files worker pid %s is slow to stop", handle.pid)
+        stopped = self.stop_mount_workers(timeout=DEFAULT_WORKER_STOP_TIMEOUT)
+        try:
+            try:
+                from autoortho.files_mode import xpprefs as files_xpprefs
+            except ImportError:
+                from files_mode import xpprefs as files_xpprefs
+            if not files_xpprefs.xplane_running():
+                removed = self._files_pack().remove_links()
+                if removed:
+                    log.info("Removed files-mode links left behind: %s", removed)
+        except Exception as exc:
+            log.warning("Files-mode link cleanup failed: %s", exc)
+        if stopped is False:
+            log.error("Files worker still alive; keeping shared services for a retry")
+            return False
+        self.stop_download_broker()
+        self._finish_performance_diagnostics()
+        self.stop_reporter()
+        self.stop_stats_manager()
+        self.stop_log_server()
+        self._files_mode_active = False
+        self._active_mountpoints = []
+        log.info("Files mode stopped")
+        return True
+
+    def files_mode_stats(self):
+        try:
+            stats = aostats.get_stat("files_stats")
+            return stats if isinstance(stats, dict) else {}
+        except Exception:
+            return {}
+
     def mount_sceneries(self, blocking=True):
         if self.mount_workers or self._active_mountpoints:
             log.error("Cannot start streaming until previous mounts have stopped")
             return False
+        if self.streaming_backend() == "files":
+            return self.start_files_mode(blocking)
+        # FUSE mode: remove files-mode junctions first (same pack names).
+        try:
+            if getattr(self.cfg, "xplane_custom_scenery_path", None):
+                removed = self._files_pack().remove_links()
+                if removed:
+                    log.info("Removed files-mode links before mounting: %s", removed)
+        except Exception as exc:
+            log.debug("Files-mode link cleanup skipped: %s", exc)
         self._ensure_parent_services()
 
         # Clean up any stale mount folders left behind from a crash
@@ -1305,6 +1631,8 @@ class AOMount:
         return healthy
 
     def unmount_sceneries(self, force=False):
+        if getattr(self, "_files_mode_active", False):
+            return self.stop_files_mode(force=force)
         log.info("Unmounting ...")
         self.mounts_running = False
         self.stop_governor()

@@ -287,10 +287,11 @@ _GOVERNED = {
 _MEASURED = {"streaming.paging_k"}
 _USER_SECTIONS = (
     "paths", "seasons", "terrain", "time_exclusion", "simbrief", "guards",
-    "tuning", "governor", "windows",
+    "tuning", "governor", "windows", "files",
 )
 _USER = {
     "autoortho.maptype_override",
+    "autoortho.streaming_backend",
     "general.hide",
 }
 # Picked up by a running mount: read at call time (streaming options, cache
@@ -377,6 +378,10 @@ _RANGES = {
     "terrain.default_roughness": (0.0, 1.0),
     "time_exclusion.sun_night_threshold": (-18.0, 0.0),
     "time_exclusion.sun_day_threshold": (-18.0, 0.0),
+    "files.disk_gb": (10, 4096),
+    "files.camera_reach_km": (0, 100),
+    "files.gate_port": (1024, 65535),
+    "files.imagery_floor_zl": (10, 16),
 }
 
 

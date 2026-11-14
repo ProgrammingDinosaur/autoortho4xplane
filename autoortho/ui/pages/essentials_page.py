@@ -45,6 +45,8 @@ class EssentialsPage(QWidget):
     browse_requested = Signal(object)        # the QLineEdit to fill
     profile_requested = Signal(str)          # an altitude profile name
     governor_mode_changed = Signal(str)
+    backend_changed = Signal(str)            # "fuse" or "files"
+    defender_requested = Signal()
 
     def __init__(self, profile_names=(), parent=None):
         super().__init__(parent)
@@ -162,6 +164,31 @@ class EssentialsPage(QWidget):
         look_layout.addRow("", shine)
         layout.addWidget(look)
 
+        # -- Streaming backend -----------------------------------------------------
+        streaming = QGroupBox("How X-Plane Gets the Textures")
+        self.streaming_group = streaming
+        s_layout = QFormLayout(streaming)
+        self.backend_combo = QComboBox()
+        self.backend_combo.setAccessibleName("Streaming backend")
+        self.backend_combo.addItem("Virtual file system (WinFsp / macFUSE / FUSE)", "fuse")
+        self.backend_combo.addItem("Files, no virtual file system (experimental)", "files")
+        self.backend_label = QLabel()
+        self.backend_label.setWordWrap(True)
+        self.backend_label.setProperty("textRole", "secondary")
+        s_layout.addRow("Backend", self.backend_combo)
+        s_layout.addRow("", self.backend_label)
+        self.defender_button = QPushButton("Exclude the files folder from Microsoft Defender…")
+        self.defender_button.setToolTip(
+            "Defender scans every texture files mode writes. Windows asks for your "
+            "approval before adding the exclusion."
+        )
+        self.defender_button.clicked.connect(self.defender_requested.emit)
+        s_layout.addRow("", self.defender_button)
+        import sys as _sys
+        self.defender_button.setVisible(_sys.platform == "win32")
+        layout.addWidget(streaming)
+        self.backend_combo.currentIndexChanged.connect(self._backend_chosen)
+
         # -- Flight plan and app -------------------------------------------------
         other = QGroupBox("Flight Plan and App")
         o_layout = QFormLayout(other)
@@ -210,6 +237,32 @@ class EssentialsPage(QWidget):
     def _profile_chosen(self, name):
         if name and name != CUSTOM_PROFILE:
             self.profile_requested.emit(name)
+
+    BACKEND_TEXT = {
+        "fuse": ("AutoOrtho builds each texture while X-Plane reads it. Needs WinFsp, "
+                 "macFUSE or FUSE installed."),
+        "files": ("No driver needed: AutoOrtho writes textures to real files ahead of X-Plane, "
+                  "and a small X-Plane plugin holds a flight's loading screen until the area "
+                  "is built. A texture that is late shows grey or blurry until X-Plane reads "
+                  "it again. Uses disk space (Settings > Files). Takes effect at the next Run."),
+    }
+
+    def set_backend(self, value):
+        index = self.backend_combo.findData(value if value in self.BACKEND_TEXT else "fuse")
+        self.backend_combo.blockSignals(True)
+        self.backend_combo.setCurrentIndex(max(0, index))
+        self.backend_combo.blockSignals(False)
+        self._show_backend_text()
+
+    def backend(self):
+        return self.backend_combo.currentData() or "fuse"
+
+    def _show_backend_text(self):
+        self.backend_label.setText(self.BACKEND_TEXT.get(self.backend(), ""))
+
+    def _backend_chosen(self, _index):
+        self._show_backend_text()
+        self.backend_changed.emit(self.backend())
 
     def set_limits_text(self, text):
         self.limits_label.setText(text)

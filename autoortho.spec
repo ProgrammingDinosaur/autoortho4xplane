@@ -220,6 +220,12 @@ imgs_path = os.path.join(autoortho_path, 'imgs')
 if os.path.isdir(imgs_path):
     datas.append((imgs_path, 'autoortho/imgs'))
 
+# X-Plane plugin for files mode (installed into X-Plane by the files worker)
+_plugin_dir = {'win32': 'win_x64', 'darwin': 'mac_x64'}.get(sys.platform, 'lin_x64')
+plugin_bin_path = os.path.join(autoortho_path, 'xplane_plugin', 'bin', _plugin_dir)
+if os.path.isdir(plugin_bin_path):
+    datas.append((plugin_bin_path, f'autoortho/xplane_plugin/bin/{_plugin_dir}'))
+
 # 7-Zip license
 if sys.platform == 'win32':
     license_path = os.path.join(lib_path, '7zip', 'License.txt')

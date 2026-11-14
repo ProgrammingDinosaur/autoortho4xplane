@@ -147,7 +147,13 @@ def cleanup_stale_mount_folders(custom_scenery_path: str) -> int:
             log.debug(f"cleanup_stale_mount_folders: skipping mounted folder: {folder_path}")
             continue
 
-        if not os.path.isdir(folder_path) or os.path.islink(folder_path):
+        # Links and junctions (files mode's packs) are never touched here.
+        is_junction = getattr(os.path, "isjunction", lambda _p: False)
+        if (
+            not os.path.isdir(folder_path)
+            or os.path.islink(folder_path)
+            or is_junction(folder_path)
+        ):
             continue
         
         # Check if folder is empty or contains only placeholder content

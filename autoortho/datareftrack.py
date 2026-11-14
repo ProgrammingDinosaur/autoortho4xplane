@@ -255,8 +255,27 @@ class DatarefTracker(object):
          "Time per frame (smoothed by X-Plane)", 4),
         ("sim/time/paused", "",
          "1 while the simulator is paused", 0),
+        # Files mode (streaming without FUSE): ground track, vertical speed,
+        # X-Plane's scenery loads, and the camera relative to the aircraft.
+        ("sim/flightmodel/position/hpath", "°",
+         "Ground track", 0),
+        ("sim/flightmodel/position/vh_ind", "m/s",
+         "Vertical speed", 1),
+        ("sim/graphics/scenery/async_scenery_load_in_progress", "",
+         "1 while X-Plane loads scenery in flight", 0),
+        ("sim/graphics/view/view_x", "m", "Camera x (local)", 0),
+        ("sim/graphics/view/view_y", "m", "Camera y (local)", 0),
+        ("sim/graphics/view/view_z", "m", "Camera z (local)", 0),
+        ("sim/flightmodel/position/local_x", "m", "Aircraft x (local)", 0),
+        ("sim/flightmodel/position/local_y", "m", "Aircraft y (local)", 0),
+        ("sim/flightmodel/position/local_z", "m", "Aircraft z (local)", 0),
     ]
     # fmt:on
+    # Names of the optional values from index 12 on, as attributes.
+    FILES_MODE_FIELDS = (
+        "hpath", "vh_ind", "async_scenery_load",
+        "view_x", "view_y", "view_z", "local_x", "local_y", "local_z",
+    )
 
     def __init__(self):
         """
@@ -283,6 +302,9 @@ class DatarefTracker(object):
         self.fov_deg = 0.0  # horizontal field of view (0 = unknown)
         self.frame_period = 0.0  # seconds per frame (0 = unknown)
         self.paused = False
+        # Files mode values (None until X-Plane sends them).
+        for name in self.FILES_MODE_FIELDS:
+            setattr(self, name, None)
         self.connected = False
         self.data_valid = False
         self.has_ever_connected = False  # True once first connection established
@@ -661,6 +683,12 @@ class DatarefTracker(object):
                             self.frame_period = frame_period
                         if paused is not None and paused >= 0:
                             self.paused = paused > 0.5
+                        # Missing values are decoded as -1.0; a real -1.0
+                        # is rare enough for these to be treated as missing.
+                        for offset, name in enumerate(self.FILES_MODE_FIELDS):
+                            index = 12 + offset
+                            if len(values) > index and values[index] != -1.0:
+                                setattr(self, name, values[index])
                         self.data_valid = True
                         
                         # Feed the flight averager (alt is in meters, convert to feet)

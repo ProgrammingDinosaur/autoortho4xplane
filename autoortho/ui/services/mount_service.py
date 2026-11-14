@@ -28,7 +28,10 @@ class MountService:
                     (
                         "Streaming started."
                         if success
-                        else "Scenery mounts could not be started."
+                        else (
+                            getattr(self.controller, "files_mode_error", None)
+                            or "Scenery mounts could not be started."
+                        )
                     ),
                 )
             )

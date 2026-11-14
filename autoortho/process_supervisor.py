@@ -91,9 +91,16 @@ class AOProcessSupervisor:
         log_addr=None,
         loglevel="INFO",
         extra_env=None,
+        run_mode="mount_worker",
+        worker_args=None,
     ) -> WorkerHandle:
+        """Start a supervised worker.
+
+        ``run_mode``/``worker_args`` start another kind of worker (files mode)
+        through the same crash collection, job object and control channel.
+        """
         env = os.environ.copy()
-        env["AO_RUN_MODE"] = "mount_worker"
+        env["AO_RUN_MODE"] = run_mode
         env["AO_WORKER_CONTROL_STDIN"] = "1"
 
         if stats_addr:
@@ -118,18 +125,22 @@ class AOProcessSupervisor:
             cmd = [sys.executable, "-m", "autoortho"]
             cwd = str(_REPO_ROOT)
 
-        cmd += [
-            "--root",
-            os.path.expanduser(root),
-            "--mountpoint",
-            os.path.expanduser(mountpoint),
-            "--loglevel",
-            str(loglevel).upper(),
-        ]
-        if volname:
-            cmd += ["--volname", str(volname)]
-        if nothreads:
-            cmd.append("--nothreads")
+        if worker_args is not None:
+            cmd += [str(arg) for arg in worker_args]
+            cmd += ["--loglevel", str(loglevel).upper()]
+        else:
+            cmd += [
+                "--root",
+                os.path.expanduser(root),
+                "--mountpoint",
+                os.path.expanduser(mountpoint),
+                "--loglevel",
+                str(loglevel).upper(),
+            ]
+            if volname:
+                cmd += ["--volname", str(volname)]
+            if nothreads:
+                cmd.append("--nothreads")
 
         log_dir = Path.home() / ".autoortho-data" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)

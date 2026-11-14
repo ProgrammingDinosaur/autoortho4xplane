@@ -9,14 +9,15 @@ if getattr(sys, 'frozen', False):
 
 # This gate precedes imports of mount setup, Qt and native libraries. The
 # collector attaches from another process and can observe Windows fast-fail.
-if sys.platform == "win32" and os.environ.get("AO_RUN_MODE") in ("mount_worker", "macfuse_worker"):
+_AO_WORKER_RUN_MODES = ("mount_worker", "macfuse_worker", "files_worker")
+if sys.platform == "win32" and os.environ.get("AO_RUN_MODE") in _AO_WORKER_RUN_MODES:
     if __package__:
         from .windows_crash import wait_for_collector, check_native_build
     else:
         from windows_crash import wait_for_collector, check_native_build
     wait_for_collector()
     check_native_build()
-elif os.environ.get("AO_RUN_MODE") in ("mount_worker", "macfuse_worker"):
+elif os.environ.get("AO_RUN_MODE") in _AO_WORKER_RUN_MODES:
     if __package__:
         from .posix_crash import enable_worker_fault_logging
     else:
@@ -24,11 +25,19 @@ elif os.environ.get("AO_RUN_MODE") in ("mount_worker", "macfuse_worker"):
     enable_worker_fault_logging()
 
 try:
-    from autoortho.worker_modes import is_mount_worker_mode
+    from autoortho.worker_modes import is_mount_worker_mode, is_files_worker_mode
 except ImportError:
-    from worker_modes import is_mount_worker_mode
+    from worker_modes import is_mount_worker_mode, is_files_worker_mode
 
-if is_mount_worker_mode():
+if is_files_worker_mode():
+    # Files mode (streaming without FUSE): never imports a FUSE module.
+    try:
+        from autoortho.files_mode.worker import main as _ao_files_main
+    except ImportError:
+        from files_mode.worker import main as _ao_files_main
+    _ao_files_main()
+    os._exit(0)
+elif is_mount_worker_mode():
     try:
         from autoortho.mount_worker import main as _ao_worker_main
     except ImportError:

@@ -1504,6 +1504,8 @@ def _build_session_summary(
         "delivery": delivery,
         # The governor's verdict for the flight (governor.Governor.summary).
         "flight": _sanitize_json((stats_snapshot or {}).get("governor/summary") or {}),
+        # Files mode (streaming without FUSE): the worker's last counters.
+        "files_mode": _sanitize_json((stats_snapshot or {}).get("files_stats") or {}),
         "process_profiles": process_profiles,
     }
 
@@ -1845,6 +1847,51 @@ def _render_flight(flight: dict) -> list:
     return lines
 
 
+_FILES_MODE_ROWS = (
+    ("files_builds", "Textures built"),
+    ("files_build_failures", "Builds failed"),
+    ("files_late_total", "Late textures (needed now, built coarser)"),
+    ("files_late_never_queued", "  of which planned too late"),
+    ("files_late_queued", "  of which waiting in the queue"),
+    ("files_late_building", "  of which still building"),
+    ("files_start_s", "Last start hold (s)"),
+    ("files_holds", "Start holds"),
+    ("files_relocations", "Aircraft moved in flight"),
+    ("files_replace_refused", "File replacements refused (Windows)"),
+    ("files_in_place", "Upgrades written in place"),
+    ("files_bytes_written", "Bytes written"),
+    ("files_disk_used_bytes", "Disk used (bytes)"),
+    ("files_pause_s", "Paused for X-Plane's scenery loads (s)"),
+    ("files_patchy", "Patchy textures"),
+    ("files_season_refresh", "Season rebuilds"),
+    ("files_dsf_swaps", "Time-exclusion DSF swaps"),
+    ("files_evicted_bytes", "Freed by the disk budget (bytes)"),
+    ("files_plan_ms", "Planner pass (ms)"),
+    ("files_plugin_seen", "X-Plane plugin seen"),
+    ("files_search_indexed", "Windows Search indexes the files folder"),
+)
+
+
+def _render_files_mode(files: dict) -> list:
+    if not files:
+        return []
+    lines = ["", "## Files mode", "", "| Measure | Value |", "|---|---:|"]
+    for key, label in _FILES_MODE_ROWS:
+        if key in files:
+            value = files[key]
+            if isinstance(value, float):
+                value = f"{value:,.1f}"
+            elif isinstance(value, int):
+                value = f"{value:,}"
+            lines.append(f"| {label} | {_markdown_escape(value)} |")
+    levers = files.get("files_levers")
+    if isinstance(levers, dict) and levers:
+        lines.append("")
+        lines.append("Levers at the end: " + ", ".join(
+            f"`{k}` = {v}" for k, v in sorted(levers.items())))
+    return lines
+
+
 def _render_markdown(summary: dict) -> str:
     lines = [
         "# AutoOrtho Flight Performance Report",
@@ -1861,6 +1908,7 @@ def _render_markdown(summary: dict) -> str:
     ]
     lines.extend(f"- {flag}" for flag in summary["diagnostic_flags"])
     lines.extend(_render_flight(summary.get("flight") or {}))
+    lines.extend(_render_files_mode(summary.get("files_mode") or {}))
 
     delivery = summary.get("delivery", {})
     lines.extend(

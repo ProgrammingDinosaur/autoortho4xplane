@@ -38,6 +38,7 @@ SetCompressorDictSize 32
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MULTIUSER_PAGE_INSTALLMODE
 !insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 
@@ -156,6 +157,25 @@ Section "!${PRODUCT_NAME}" sec_app
   noreboot:
 SectionEnd
 
+; Files mode (no FUSE) writes many textures; Defender scans each new file.
+; Unchecked by default: an exclusion weakens scanning of that folder, so only
+; on the user's choice. The folder comes from an existing AutoOrtho config.
+Section /o "Exclude the files-mode folder from Microsoft Defender" sec_defender
+  ReadINIStr $0 "$PROFILE\.autoortho" "files" "root"
+  StrCmp $0 "" 0 defender_have_root
+  ReadINIStr $1 "$PROFILE\.autoortho" "paths" "scenery_path"
+  StrCmp $1 "" defender_skip
+  StrCpy $0 "$1\z_autoorthoiles"
+defender_have_root:
+  CreateDirectory "$0"
+  DetailPrint "Adding a Microsoft Defender exclusion for $0"
+  nsExec::ExecToLog `powershell.exe -NoProfile -NonInteractive -Command "Add-MpPreference -ExclusionPath '$0'"`
+  Goto defender_done
+defender_skip:
+  DetailPrint "AutoOrtho is not set up yet: after setup, use Essentials > Exclude the files folder from Microsoft Defender."
+defender_done:
+SectionEnd
+
 Section "Uninstall"
   SetRegView 32
   SetShellVarContext all
@@ -221,6 +241,8 @@ Function .onMouseOverSection
 
     StrCmp $0 ${sec_app} "" +2
       SendMessage $R0 ${WM_SETTEXT} 0 "STR:${PRODUCT_NAME}"
+    StrCmp $0 ${sec_defender} "" +2
+      SendMessage $R0 ${WM_SETTEXT} 0 "STR:Only for files mode. Defender stops scanning AutoOrtho's texture folder (faster flights; that folder is no longer scanned)."
 
 FunctionEnd
 
