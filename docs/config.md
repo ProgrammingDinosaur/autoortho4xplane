@@ -413,6 +413,16 @@ change, and eased back once the scenery is sharp again) and tells you what
 limits it (for example
 "the limit is your connection"), with links to the target and the limits.
 
+**Settings you set yourself, in Auto mode.** A value you set by hand (now or
+in an older config file) pins that setting: the tuning plan and auto-tuning
+leave it as it is. While auto-tuning is on, Home lists the pinned settings
+AutoOrtho would otherwise manage, with **Let AutoOrtho manage them** (back to
+the automatic values, saved at once and taken over mid-flight) and
+**Review** (the Expert table, showing only your own values). Dismiss the
+notice to keep them; it comes back only when another setting gets pinned.
+Pinning a setting on the Auto-Tuning page counts as keeping it. There is no
+need to delete your config file.
+
 The Auto-Tuning page lists the settings it may move, with the current
 value, the range your limits allow, where the value comes from (*Baseline*,
 *Learned*, *Governor* or *Pinned*), the last change and its reason, and a

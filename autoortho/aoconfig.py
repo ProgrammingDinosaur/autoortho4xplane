@@ -152,6 +152,9 @@ show_all_settings = False
 # Engine settings an older config set by hand, kept when AutoOrtho started
 # sizing them itself. Home offers to review them until dismissed.
 kept_values =
+# Settings auto-tuning would manage that you chose to keep as set (Home stops
+# offering to hand these back; a newly pinned one is offered again).
+dismissed_pinned =
 dismissed_update_version =
 # Hide when running
 hide = True
@@ -766,6 +769,18 @@ route_prefetch_radius_nm = 40
         "autoortho.simheaven_compat",
         "autoortho.missing_color",
     })
+
+    def pinned_tuned_values(self):
+        """Settings AutoOrtho sizes or tunes itself that hold the user's own
+        value, by "section.key" (the registry's "governed" owner).
+
+        Auto-tuning and the tuning plan leave these alone; Home offers to
+        hand them back while auto-tuning is on.
+        """
+        return sorted(
+            spec.name for spec in self.registry().by_owner("governed")
+            if spec.tier is not Tier.RETIRED and self.is_custom(spec.section, spec.key)
+        )
 
     def kept_engine_values(self):
         """Engine settings holding the user's own value, by "section.key"."""

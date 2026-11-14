@@ -244,6 +244,7 @@ _INTERNAL = {
     "general.last_page",
     "general.show_all_settings",
     "general.kept_values",
+    "general.dismissed_pinned",
     "general.dismissed_update_version",
 }
 
