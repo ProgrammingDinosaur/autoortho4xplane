@@ -330,6 +330,33 @@ static void release_pooled_decoder(tjhandle tjh, int from_pool) {
     tjDestroy(tjh);
 }
 
+/* Replace a pooled decoder after a TurboJPEG failure.
+ * libjpeg-turbo can leave a handle stuck mid-header after an error, so every
+ * later decode on it fails (even valid JPEGs). Swap in a fresh handle, keeping
+ * the pool slot. Returns the new handle (NULL on allocation failure, in which
+ * case the slot is freed and *from_pool cleared). */
+static tjhandle recover_pooled_decoder(tjhandle tjh, int* from_pool) {
+    tjhandle fresh = tjInitDecompress();
+    if (*from_pool && tjh && g_decoder_pool) {
+        int found = 0;
+        decoder_pool_lock();
+        for (int i = 0; i < g_decoder_pool_size; i++) {
+            if (g_decoder_pool[i] == tjh) {
+                g_decoder_pool[i] = fresh;           /* NULL -> recreated on next acquire */
+                if (!fresh) g_decoder_in_use[i] = 0;
+                found = 1;
+                break;
+            }
+        }
+        decoder_pool_unlock();
+        if (!found || !fresh) *from_pool = 0;
+    } else {
+        *from_pool = 0;
+    }
+    if (tjh) tjDestroy(tjh);
+    return fresh;
+}
+
 /* Helper to get directory containing a path */
 static void get_directory(char* dest, size_t dest_size, const char* path) {
     /* Use snprintf for safe copy with guaranteed null-termination */
@@ -1632,8 +1659,9 @@ AODDS_API int32_t aodds_build_from_jpegs(
                 
                 /* Get JPEG dimensions */
                 int width, height, subsamp, colorspace;
-                if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+                if (!tjh || tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                         &width, &height, &subsamp, &colorspace) < 0) {
+                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                     continue;
                 }
                 
@@ -1663,6 +1691,7 @@ AODDS_API int32_t aodds_build_from_jpegs(
                     } else {
                         free(buffer);
                     }
+                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                     continue;
                 }
                 
@@ -1691,8 +1720,10 @@ AODDS_API int32_t aodds_build_from_jpegs(
             }
             
             int width, height, subsamp, colorspace;
-            if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+            if (!tjh || tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                     &width, &height, &subsamp, &colorspace) < 0) {
+                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                is_persistent = aodecode_is_persistent_decoder(tjh);
                 continue;
             }
             
@@ -1707,6 +1738,8 @@ AODDS_API int32_t aodds_build_from_jpegs(
                               buffer, width, 0, height,
                               TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
                 free(buffer);
+                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                is_persistent = aodecode_is_persistent_decoder(tjh);
                 continue;
             }
             
@@ -1889,8 +1922,9 @@ AODDS_API int32_t aodds_build_single_mipmap(
                 }
                 
                 int width, height, subsamp, colorspace;
-                if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+                if (!tjh || tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                         &width, &height, &subsamp, &colorspace) < 0) {
+                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                     continue;
                 }
                 
@@ -1920,6 +1954,7 @@ AODDS_API int32_t aodds_build_single_mipmap(
                     } else {
                         free(buffer);
                     }
+                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                     continue;
                 }
                 
@@ -1948,8 +1983,10 @@ AODDS_API int32_t aodds_build_single_mipmap(
             }
             
             int width, height, subsamp, colorspace;
-            if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+            if (!tjh || tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                     &width, &height, &subsamp, &colorspace) < 0) {
+                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                is_persistent = aodecode_is_persistent_decoder(tjh);
                 continue;
             }
             
@@ -1964,6 +2001,8 @@ AODDS_API int32_t aodds_build_single_mipmap(
                               buffer, width, 0, height,
                               TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
                 free(buffer);
+                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                is_persistent = aodecode_is_persistent_decoder(tjh);
                 continue;
             }
             
@@ -2144,8 +2183,9 @@ AODDS_API int32_t aodds_build_partial_mipmap(
                 }
                 
                 int width, height, subsamp, colorspace;
-                if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+                if (!tjh || tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                         &width, &height, &subsamp, &colorspace) < 0) {
+                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                     continue;
                 }
                 
@@ -2175,6 +2215,7 @@ AODDS_API int32_t aodds_build_partial_mipmap(
                     } else {
                         free(buffer);
                     }
+                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                     continue;
                 }
                 
@@ -2203,8 +2244,10 @@ AODDS_API int32_t aodds_build_partial_mipmap(
             }
             
             int width, height, subsamp, colorspace;
-            if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+            if (!tjh || tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                     &width, &height, &subsamp, &colorspace) < 0) {
+                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                is_persistent = aodecode_is_persistent_decoder(tjh);
                 continue;
             }
             
@@ -2231,6 +2274,8 @@ AODDS_API int32_t aodds_build_partial_mipmap(
                 } else {
                     free(buffer);
                 }
+                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                is_persistent = aodecode_is_persistent_decoder(tjh);
                 continue;
             }
             
@@ -2380,8 +2425,9 @@ AODDS_API int32_t aodds_build_mipmap_chain(
                 }
 
                 int width, height, subsamp, colorspace;
-                if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+                if (!tjh || tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                         &width, &height, &subsamp, &colorspace) < 0) {
+                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                     continue;
                 }
 
@@ -2408,6 +2454,7 @@ AODDS_API int32_t aodds_build_mipmap_chain(
                     } else {
                         free(buffer);
                     }
+                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                     continue;
                 }
                 
@@ -2433,8 +2480,10 @@ AODDS_API int32_t aodds_build_mipmap_chain(
             }
             
             int width, height, subsamp, colorspace;
-            if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+            if (!tjh || tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                     &width, &height, &subsamp, &colorspace) < 0) {
+                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                is_persistent = aodecode_is_persistent_decoder(tjh);
                 continue;
             }
             
@@ -2449,6 +2498,8 @@ AODDS_API int32_t aodds_build_mipmap_chain(
                               buffer, width, 0, height,
                               TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
                 free(buffer);
+                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                is_persistent = aodecode_is_persistent_decoder(tjh);
                 continue;
             }
             
@@ -2674,9 +2725,10 @@ AODDS_API int32_t aodds_build_all_mipmaps_native(
                                 }
                                 
                                 int width, height, subsamp, colorspace;
-                                if (tjDecompressHeader3(tjh, jpeg_data_per_zoom[mip][i], 
+                                if (!tjh || tjDecompressHeader3(tjh, jpeg_data_per_zoom[mip][i], 
                                                         jpeg_sizes_per_zoom[mip][i],
                                                         &width, &height, &subsamp, &colorspace) < 0) {
+                                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                                     continue;
                                 }
                                 
@@ -2704,6 +2756,7 @@ AODDS_API int32_t aodds_build_all_mipmaps_native(
                                     } else {
                                         free(buffer);
                                     }
+                                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                                     continue;
                                 }
                                 
@@ -2729,9 +2782,11 @@ AODDS_API int32_t aodds_build_all_mipmaps_native(
                             }
                             
                             int width, height, subsamp, colorspace;
-                            if (tjDecompressHeader3(tjh, jpeg_data_per_zoom[mip][i], 
+                            if (!tjh || tjDecompressHeader3(tjh, jpeg_data_per_zoom[mip][i], 
                                                     jpeg_sizes_per_zoom[mip][i],
                                                     &width, &height, &subsamp, &colorspace) < 0) {
+                                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                                is_persistent = aodecode_is_persistent_decoder(tjh);
                                 continue;
                             }
                             
@@ -2747,6 +2802,8 @@ AODDS_API int32_t aodds_build_all_mipmaps_native(
                                               buffer, width, 0, height,
                                               TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
                                 free(buffer);
+                                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                                is_persistent = aodecode_is_persistent_decoder(tjh);
                                 continue;
                             }
                             
@@ -2906,8 +2963,9 @@ AODDS_API int32_t aodds_build_from_jpegs_to_file(
                 }
                 
                 int width, height, subsamp, colorspace;
-                if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+                if (!tjh || tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                         &width, &height, &subsamp, &colorspace) < 0) {
+                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                     continue;
                 }
                 
@@ -2935,6 +2993,7 @@ AODDS_API int32_t aodds_build_from_jpegs_to_file(
                     } else {
                         free(buffer);
                     }
+                    tjh = recover_pooled_decoder(tjh, &decoder_from_pool);
                     continue;
                 }
                 
@@ -2960,8 +3019,10 @@ AODDS_API int32_t aodds_build_from_jpegs_to_file(
             if (!jpeg_data[i] || jpeg_sizes[i] == 0) continue;
             
             int width, height, subsamp, colorspace;
-            if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+            if (!tjh || tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
                                     &width, &height, &subsamp, &colorspace) < 0) {
+                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                is_persistent = aodecode_is_persistent_decoder(tjh);
                 continue;
             }
             
@@ -2974,6 +3035,8 @@ AODDS_API int32_t aodds_build_from_jpegs_to_file(
                               buffer, width, 0, height,
                               TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
                 free(buffer);
+                tjh = (tjhandle)aodecode_recover_decoder(tjh);
+                is_persistent = aodecode_is_persistent_decoder(tjh);
                 continue;
             }
             
