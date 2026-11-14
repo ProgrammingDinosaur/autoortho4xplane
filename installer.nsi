@@ -165,7 +165,7 @@ Section /o "Exclude the files-mode folder from Microsoft Defender" sec_defender
   StrCmp $0 "" 0 defender_have_root
   ReadINIStr $1 "$PROFILE\.autoortho" "paths" "scenery_path"
   StrCmp $1 "" defender_skip
-  StrCpy $0 "$1\z_autoorthoiles"
+  StrCpy $0 "$1\z_autoortho\files"
 defender_have_root:
   CreateDirectory "$0"
   DetailPrint "Adding a Microsoft Defender exclusion for $0"
