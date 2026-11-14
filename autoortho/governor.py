@@ -121,6 +121,13 @@ NEAR_WAIT_LEVER = "streaming.near_wait_seconds"
 BAND_WAIT_LEVER = "streaming.band_max_wait_seconds"
 PAGING_LEAD_LEVER = "streaming.paging_lead_seconds"
 PREFETCH_CHUNKS_LEVER = "autoortho.prefetch_max_chunks"
+LIVE_BUILDERS_LEVER = "autoortho.live_builder_concurrency"
+# getortho.BUFFER_RAM_SHARE and the largest DDS buffer (8192 px, BC1).
+BUFFER_RAM_SHARE = 0.25
+BUFFER_BYTES_8K = 44_740_000
+# Live builds waiting for a build slot: at this share, more live tiles at
+# once would only queue longer; more build slots are the move.
+BUILD_WAIT_SHARE = 0.2
 # Behind the aircraft, by evidence (governor-behind-detection-plan.md): each
 # blurry near read in flight is classified by what prefetch had done for the
 # tile (prefetch_ledger.py). A prefetch lever moves only with at least
@@ -216,6 +223,11 @@ def levers_for(cfg, limits=None) -> Dict[str, LeverSpec]:
                   4, 4, max(8, min(64, threads * 2)), group="compute"),
         LeverSpec("autoortho.background_builder_workers", "Background builders",
                   1, 1, max(1, min(16, cores // 2)), group="compute"),
+        # Build slots for live tiles (DDS buffers and streaming builders,
+        # resized live): up to the cores plus two, and only as many DDS
+        # buffers as a quarter of the RAM limit holds (8K buffers).
+        LeverSpec(LIVE_BUILDERS_LEVER, "Live builders",
+                  2, 2, live_builders_ceiling(cores, ram_gb), group="compute"),
         LeverSpec("autoortho.predictive_dds_build_interval_ms", "Background build pause",
                   100, 100, 1000, unit="ms", group="compute"),
         LeverSpec("cache.cache_mem_limit", "Memory cache",
@@ -252,6 +264,14 @@ def levers_for(cfg, limits=None) -> Dict[str, LeverSpec]:
         specs.append(LeverSpec(TEXTURE_CAP_LEVER, "Texture size cap",
                                CAP_PX, 0, CAP_PX, unit="px", group="memory"))
     return {spec.name: spec for spec in specs}
+
+
+def live_builders_ceiling(cores, ram_gb) -> int:
+    """The most live builders the cores and the DDS buffers' RAM allow."""
+    by_cores = max(4, int(cores) + 2)
+    buffers = int(float(ram_gb) * 1024 ** 3 * BUFFER_RAM_SHARE // BUFFER_BYTES_8K)
+    by_ram = max(4, buffers - max(1, int(cores) // 2))
+    return max(4, min(32, by_cores, by_ram))
 
 
 def lever_state(cfg, levers: Dict[str, LeverSpec]):
@@ -354,6 +374,11 @@ class Sample:
     # AutoOrtho's own processes' CPU as a share of the whole PC (percent);
     # None when unknown (old recordings).
     ao_cpu_percent: Optional[float] = None
+    # Live builds that asked for a build slot (DDS buffer or streaming
+    # builder), waited for one, or gave up (cumulative).
+    build_slots: int = 0
+    build_slot_waits: int = 0
+    build_slot_timeouts: int = 0
     # The broker's per-origin ceilings, summed (0: unknown). With the
     # adaptive limit below its ceiling, the server is pacing downloads and a
     # higher ceiling would change nothing.
@@ -393,6 +418,9 @@ class Window:
     ao_cpu_percent: Optional[float] = None
     # The adaptive download limit sits at its ceiling (True when unknown).
     broker_ceiling_bound: bool = True
+    # Share of live builds that waited for a build slot.
+    build_wait_share: float = 0.0
+    build_slot_timeouts: int = 0
 
     @property
     def misses_total(self) -> int:
@@ -411,6 +439,8 @@ def window_of(samples: List[Sample]) -> Optional[Window]:
     err = last.req_err - first.req_err
     adm = last.admissions - first.admissions
     waits = last.admission_waits - first.admission_waits
+    builds = last.build_slots - first.build_slots
+    build_waits = last.build_slot_waits - first.build_slot_waits
     tts_n = last.time_to_sharp_count - first.time_to_sharp_count
     tts_ms = last.time_to_sharp_ms_total - first.time_to_sharp_ms_total
     recent = samples[-min(len(samples), 5):]
@@ -446,6 +476,8 @@ def window_of(samples: List[Sample]) -> Optional[Window]:
         pause_counts=_delta(last.pauses(), first.pauses()),
         ao_cpu_percent=(sum(ao_cpu) / len(ao_cpu)) if ao_cpu else None,
         broker_ceiling_bound=ceiling_bound,
+        build_wait_share=(build_waits / builds) if builds > 0 else 0.0,
+        build_slot_timeouts=max(0, last.build_slot_timeouts - first.build_slot_timeouts),
     )
 
 
@@ -509,6 +541,7 @@ STATE_TEXT = {
     "network_paced": "Network-bound, server pacing downloads",
     "compute": "Compute-bound",
     "compute_limit": "Compute-bound at the CPU limit",
+    "build_slots": "Live tiles waiting for build slots",
     "wait": "Waiting too briefly",
     "slow_imagery": "Imagery arrives late",
     "behind_wide": "Prefetch corridor too narrow",
@@ -657,6 +690,12 @@ class Governor:
         line_full = bool(capacity) and w.mbps >= 0.9 * min(capacity)
         if w.fidelity is None:
             return "warming_up"
+        if w.build_wait_share > BUILD_WAIT_SHARE:
+            # Live tiles queue for build slots: admitting more would only
+            # lengthen that queue.
+            if self.cpu_at_limit(w):
+                return "compute_limit"
+            return "build_slots"
         if w.admission_wait_share > 0.2:
             if self.cpu_at_limit(w):
                 return "compute_limit"
@@ -821,6 +860,7 @@ class Governor:
         "network_full": [("autoortho.prefetch_radius_nm", -1)],
         # The server sets the pace: give what it sends to near scenery.
         "network_paced": [("autoortho.prefetch_radius_nm", -1)],
+        "build_slots": [(LIVE_BUILDERS_LEVER, +1)],
         "compute": [
             ("autoortho.live_tile_admission", +1),
             ("autoortho.background_builder_workers", +1),
@@ -983,6 +1023,7 @@ class Governor:
             "network_pushback": "the imagery server",
             "compute": "the CPU",
             "compute_limit": "the CPU limit",
+            "build_slots": "build slots (the CPU-core and RAM limits)",
             "memory": "memory",
             "wait": "waiting time",
             "slow_imagery": "how fast the imagery server answers",
@@ -1036,6 +1077,11 @@ class Governor:
             parts.append(f"{w.mbps:.0f} Mbit/s")
             if w.broker_saturated:
                 parts.append("queue full")
+        elif state == "build_slots":
+            parts.append(f"{w.build_wait_share * 100:.0f} % of live builds waited")
+            if w.build_slot_timeouts:
+                parts.append(f"{w.build_slot_timeouts} gave up")
+            parts.append(f"CPU {w.cpu_percent:.0f} %")
         elif state.startswith("compute"):
             parts.append(f"{w.admission_wait_share * 100:.0f} % of tiles waited")
             parts.append(f"CPU {w.cpu_percent:.0f} %")
@@ -1094,6 +1140,8 @@ class Governor:
             return -(w.miss_counts.get(kind, 0) / max(1, w.near_reads))
         if state.startswith("network"):
             return w.mbps * (1 - w.error_share)
+        if state == "build_slots":
+            return -w.build_wait_share
         if state.startswith("compute"):
             return -w.admission_wait_share
         if state == "memory":
@@ -1652,6 +1700,9 @@ class GovernorService:
             req_err=self._counter("req_err"),
             bytes_dl=self._counter("bytes_dl"),
             admission_waits=self._counter("live_admission_waits"),
+            build_slots=self._counter("live_build_slots"),
+            build_slot_waits=self._counter("live_build_slot_waits"),
+            build_slot_timeouts=self._counter("live_build_slot_timeouts"),
             admissions=self._counter("live_admissions"),
             time_to_sharp_ms_total=self._counter("time_to_sharp_ms_total"),
             time_to_sharp_count=self._counter("time_to_sharp_count"),

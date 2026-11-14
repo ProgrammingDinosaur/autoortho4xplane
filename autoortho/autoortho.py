@@ -1147,12 +1147,70 @@ class AOMount:
             service.start()
             self.governor_service = service
             self._governor_key = key
+            self._governor_plan = self._plan_record()
             log.info("Governor started (%s)", mode)
             return service
         except Exception:
             log.exception("Could not start the governor")
             self.governor_service = None
             return None
+
+    def _plan_record(self):
+        """What the tuning plan started this flight from (None without one).
+
+        The target, the plan's need, line and ratio, and each setting it
+        planned (the download ceiling too, when the line sized it).
+        """
+        plan = getattr(self.cfg, "_plan", None)
+        if plan is None:
+            return None
+        record = plan.describe()
+        try:
+            ao = self.cfg.autoortho
+            record["target"] = {
+                "mode": str(getattr(ao, "max_zoom_mode", "fixed")),
+                "zoom": int(getattr(ao, "max_zoom", 16)),
+                "airport_zoom": int(getattr(ao, "max_zoom_near_airports", 18)),
+            }
+        except (AttributeError, TypeError, ValueError):
+            pass
+        try:
+            if self.cfg.source("autoortho", "provider_origin_max_concurrency") == "planned":
+                record["values"]["autoortho.provider_origin_max_concurrency"] = str(
+                    self.cfg.value("autoortho", "provider_origin_max_concurrency")
+                )
+                record["reasons"]["autoortho.provider_origin_max_concurrency"] = (
+                    "downloads the measured line carries"
+                )
+        except Exception:
+            pass
+        return record
+
+    @staticmethod
+    def _settled_plan(record, governor):
+        """The plan record with where each planned setting ended up.
+
+        ``settings`` maps each planned setting to {planned, settled, moved}:
+        the gap between plan and settled value is the plan's error.
+        """
+        if not record:
+            return None
+        out = dict(record)
+        settings = {}
+        for name, text in record.get("values", {}).items():
+            try:
+                planned = float(text)
+            except (TypeError, ValueError):
+                continue
+            settled = governor.values.get(name)
+            entry = {"planned": planned, "reason": record.get("reasons", {}).get(name, "")}
+            if settled is not None:
+                entry["settled"] = float(settled)
+                entry["moved"] = float(settled) != planned
+                entry["pinned"] = name in governor.pinned
+            settings[name] = entry
+        out["settings"] = settings
+        return out
 
     def stop_governor(self):
         """Stop it; leave the flight summary for the report; learn."""
@@ -1166,6 +1224,9 @@ class AOMount:
             governor = service.governor
             summary = (service.flight_summary() if hasattr(service, "flight_summary")
                        else governor.summary())
+            plan = self._settled_plan(getattr(self, "_governor_plan", None), governor)
+            if plan:
+                summary["plan"] = plan
             set_stat("governor/summary", summary)
             self.last_flight = summary
             self._after_flight = True     # Home shows the last-flight card

@@ -78,6 +78,22 @@ class Plan:
             return None
         return self.capacity_mbps / self.need_mbps
 
+    def describe(self) -> dict:
+        """The plan's inputs and values, for the flight summary and report.
+
+        Flight reports compare these with where auto-tuning settled, which
+        is how the rules above get calibrated.
+        """
+        ratio = self.ratio
+        return {
+            "need_mbps": round(self.need_mbps, 1),
+            "capacity_mbps": (round(self.capacity_mbps, 1)
+                              if self.capacity_mbps else None),
+            "ratio": round(ratio, 2) if ratio is not None else None,
+            "values": dict(self.values),
+            "reasons": dict(self.reasons),
+        }
+
 
 def _round_to(value: float, step: float) -> float:
     return round(value / step) * step

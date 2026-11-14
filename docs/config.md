@@ -393,7 +393,11 @@ The rules that keep it steady: one change at a time, a 30-second wait per
 setting (two minutes after an undo), bigger steps while a flight is loading
 and while the scenery is far below the target (under 85 % sharp), a
 two-minute settling time before a change that fixed a bottleneck can be
-eased back, and nothing above your limits. Compute-bound means AutoOrtho's
+eased back, and nothing above your limits. When live tiles queue for build
+slots (the DDS buffers and streaming builders) rather than for admission,
+auto-tuning raises **Live builders** (`live_builder_concurrency`) and resizes
+those pools while you fly, within your CPU-core limit and a quarter of your
+RAM limit for the buffers. Compute-bound means AutoOrtho's
 own processes use what your CPU-core limit allows them (or the whole PC is
 busy); X-Plane's CPU use alone does not count against AutoOrtho. A full
 download queue raises the downloads ceiling only when the adaptive limit
@@ -446,8 +450,10 @@ learned settings** clears both.
 **Flight verdict.** The performance report gains a *Flight verdict* section:
 *Smooth flight*, *A few blurry moments* or *Often blurry*, sharpness by
 phase (loading, taxi, departure and arrival, cruise), the number of changes
-kept and undone, peak download speed, brake activations, and what was
-learned for next time. Its *Blurry moments by cause* table gives, per phase,
+kept and undone, peak download speed, brake activations, what was
+learned for next time, and a *Tuning plan* table: the target's need, your
+line, and for each planned setting the planned value beside where
+auto-tuning left it. Its *Blurry moments by cause* table gives, per phase,
 the share of blurry nearby tiles by what prefetch had done for them (the
 causes in the table above).
 

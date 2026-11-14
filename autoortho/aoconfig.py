@@ -281,9 +281,11 @@ background_builder_workers = 2
 predictive_dds_memory_mb = 512
 # Number of concurrent tile build workers (1-32)
 # Controls how many tiles can be built simultaneously by the native pipeline
+# (the DDS buffers and streaming builders, with background_builder_workers).
 # Higher values = faster tile processing, more CPU/RAM usage
 # Lower values = less resource usage, potential stutters
-# Recommended: 4 (low-end), 8 (mid-range, default), 16-32 (high-end CPU)
+# Auto-tuning raises it while live tiles wait for build slots and resizes
+# the pools while streaming; a value set here is never changed.
 live_builder_concurrency = 8
 # End-to-end live tile requests admitted before allocating composition state.
 # Keep this high enough to saturate downloads while bounding ZL17 working memory.
@@ -346,12 +348,11 @@ pipeline_mode = auto
 #   - ~43MB per buffer when higher zoom levels are configured (8K textures)
 #   - ~43MB per buffer when using custom tiles (assumes worst case)
 # 
-# Default: Automatically calculated as (prefetch_workers + live_builder_concurrency)
-# This ensures optimal parallelism: each worker can have its own buffer.
-# Maximum is capped to (prefetch_workers + live_builder_concurrency) since
-# more buffers than workers would never be used simultaneously.
-# 
-# The value here (10) is a reasonable fallback = 2 prefetch + 8 live (defaults)
+# Unless set here: background_builder_workers + live_builder_concurrency,
+# within a quarter of the RAM limit, resized while streaming as auto-tuning
+# moves the builders. A value set here is a fixed size.
+#
+# The value here (10) is the packaged 2 background + 8 live builders.
 buffer_pool_size = 10
 # === LIVE AOPIPELINE SETTINGS ===
 # These control the optimized pipeline for live (on-demand) DDS builds when
@@ -381,8 +382,9 @@ live_aopipeline_min_chunk_ratio = 1.0
 streaming_builder_enabled = True
 # Size of the streaming builder pool (2-64)
 # Each builder handles one tile at a time. Pool size determines
-# how many tiles can be built concurrently.
-# Recommended: 4 (default), increase to 8-16 for faster CPUs, up to 64 for high-end systems
+# how many tiles can be built concurrently. Unless set here it follows
+# background_builder_workers + live_builder_concurrency (builders are small
+# and created on demand), resized while streaming. A value set here is fixed.
 streaming_builder_pool_size = 4
 # === TILE QUEUE SETTINGS ===
 # When all buffer pool slots are busy, tiles wait in a queue instead of

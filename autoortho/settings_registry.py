@@ -303,6 +303,7 @@ _LIVE = {
     "streaming.paging_lead_seconds",
     "autoortho.live_tile_admission",
     "autoortho.background_builder_workers",
+    "autoortho.live_builder_concurrency",
     "autoortho.predictive_dds_build_interval_ms",
     "autoortho.predictive_dds_memory_mb",
     "cache.cache_mem_limit",

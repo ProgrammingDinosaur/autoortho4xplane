@@ -720,5 +720,22 @@ point from the target or the line), two bugs, and loose spots. Changes:
   published again.
 - **Learning** stores only levers that settled away from their baseline, so
   later plan improvements are not masked by stored copies of old defaults.
-- `live_builder_concurrency` stays start-only: it sizes the native buffer
-  and decoder pools at start. Its live counterpart is `live_tile_admission`.
+- **Build slots.** `live_builder_concurrency` was start-only and only sized
+  the DDS buffer pool (capped by `buffer_pool_size`, default 10) and the
+  decoder pool; the streaming builder pool ignored it (fixed 4). Raising
+  `live_tile_admission` past those pools only queued tiles at them, which
+  the governor could not see. Now both pools are resizable
+  (`DDSBufferPool.resize`, `StreamingBuilderPool.resize`) and follow
+  background + live builders (`AoDDS.build_slot_count`) unless the user set
+  their size; DDS buffers stay within a quarter of the RAM limit. Live
+  builds count build-slot acquisitions, waits (> 10 ms) and timeouts
+  (`getortho.note_build_slot`); a build-wait share over 20 % is the
+  `build_slots` state (checked before the admission rule), which raises the
+  new `Live builders` lever (ceiling: cores + 2, and the 8K buffers a
+  quarter of the RAM limit holds). The decoder pool is sized for 48
+  builders (decoders are created on demand). Also fixed: a buffer handed to
+  a waiter just as its wait timed out was leaked.
+- **Plan in flight reports.** The flight summary's `plan` holds the target,
+  need, line, ratio and, per planned setting, the planned and settled values
+  (`AOMount._settled_plan`); the report renders it as a *Tuning plan* table.
+  Many reports side by side show which plan rule is off and by how much.
