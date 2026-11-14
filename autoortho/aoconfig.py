@@ -8,11 +8,21 @@ from types import SimpleNamespace
 
 # Handle imports for both package and direct Python execution.
 if __package__:
+    from autoortho import hardware
+    from autoortho import limits as limits_module
     from autoortho.utils.constants import system_type
     from autoortho.worker_modes import is_mount_worker_mode
+    from autoortho.settings_registry import (
+        Tier,
+        build_registry,
+        parse_value,
+    )
 else:
+    import hardware
+    import limits as limits_module
     from utils.constants import system_type
     from worker_modes import is_mount_worker_mode
+    from settings_registry import Tier, build_registry, parse_value
 
 import logging
 log = logging.getLogger(__name__)
@@ -24,57 +34,10 @@ class SectionParser(object):
     false = ['false', 'no', 'off']
 
     def __init__(self, /, **kwargs):
+        # Lists first, then booleans (text only), integers and floats; see
+        # settings_registry.parse_value.
         for k, v in kwargs.items():
-            # Normalize to string for parsing while tolerating None
-            sv = '' if v is None else str(v)
-            s = sv.strip()
-
-            # Detect list first (before other parsing)
-            if s.startswith('[') and s.endswith(']'):
-                try:
-                    parsed_val = ast.literal_eval(s)
-                except Exception:
-                    parsed_val = s
-            # Detect booleans (text-only, not '0'/'1' to avoid corrupting numbers)
-            elif s.lower() in self.true:
-                parsed_val = True
-            elif s.lower() in self.false:
-                parsed_val = False
-            # Try to parse as integer
-            elif s.lstrip('-').isdigit():
-                try:
-                    parsed_val = int(s)
-                except ValueError:
-                    parsed_val = s
-            # Try to parse as float
-            elif self._is_float(s):
-                try:
-                    parsed_val = float(s)
-                except ValueError:
-                    parsed_val = s
-            else:
-                parsed_val = s
-
-            self.__dict__.update({k: parsed_val})
-    
-    @staticmethod
-    def _is_float(s):
-        """Check if string looks like a float (contains decimal point or scientific notation)."""
-        if not s:
-            return False
-        # Remove leading minus sign for checking
-        s_check = s.lstrip('-')
-        # Must contain at least one digit
-        if not any(c.isdigit() for c in s_check):
-            return False
-        # Check for float patterns: decimal point or scientific notation
-        if '.' in s_check or 'e' in s_check.lower():
-            try:
-                float(s)
-                return True
-            except ValueError:
-                return False
-        return False
+            self.__dict__[k] = parse_value(v)
 
     def __repr__(self):
         items = (f"{k}={v!r}" for k, v in self.__dict__.items())
@@ -88,7 +51,80 @@ class SectionParser(object):
 
 # Bump when a release changes a default that existing configs must pick up,
 # and add the step to _migrate_config_revision.
-CONFIG_REVISION = 1
+CONFIG_REVISION = 2
+
+# From this revision the file holds only the settings the user changed; every
+# other setting is a commented "# key = default" line. Active lines in such a
+# file are the user's explicit choices, even when equal to the default.
+SPARSE_REVISION = 2
+
+# Shown at the top of [general] in the written file. Comment lines are read as
+# option keys (comment_prefixes='/') and dropped on load, so text before the
+# first section header would break parsing.
+_FILE_NOTE = (
+    "# Only the settings you changed are active. A line such as",
+    "# \"# max_zoom = 16\" is a default in use: delete the \"# \" and change",
+    "# the value to override it.",
+)
+
+_MISSING = object()
+
+
+def _normalized(section, value):
+    """A value in comparable form: parsed, and paths in canonical form."""
+    parsed = parse_value(value)
+    if section == "paths" and isinstance(parsed, str) and parsed:
+        return os.path.normcase(os.path.normpath(os.path.expanduser(parsed)))
+    return parsed
+
+
+def _same(a, b):
+    """Equal values of the same kind (True is not the integer 1 here)."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    return a == b
+
+
+def _new_parser():
+    return configparser.ConfigParser(
+        strict=False,
+        allow_no_value=True,
+        comment_prefixes='/',
+    )
+
+
+def _read_config_file(path):
+    """Read a config file as UTF-8, falling back to the locale encoding.
+
+    Releases before the sparse format wrote the file in the locale encoding
+    (cp1252 on Windows), which UTF-8 cannot read when a comment holds a dash.
+    Latin-1 is the last resort: it decodes any byte, and only comments hold
+    non-ASCII text in practice.
+    """
+    for encoding in ("utf-8", None, "latin-1"):
+        parser = _new_parser()
+        try:
+            parser.read(path, encoding=encoding)
+            return parser
+        except UnicodeDecodeError:
+            continue
+    return parser
+
+
+_REGISTRY = None
+
+
+def settings_registry():
+    """The registry of every packaged setting (built once)."""
+    global _REGISTRY
+    if _REGISTRY is None:
+        ranges = {
+            f"autoortho.{name}": spec["range"]
+            for name, spec in PROVIDER_SETTINGS.items()
+            if "range" in spec
+        }
+        _REGISTRY = build_registry(AOConfig._defaults, ranges)
+    return _REGISTRY
 
 
 class AOConfig(object):
@@ -111,6 +147,11 @@ window_height = 760
 window_x = 100
 window_y = 100
 last_page = Home
+# Settings shows every category (True) or only the essential ones (False).
+show_all_settings = False
+# Engine settings an older config set by hand, kept when AutoOrtho started
+# sizing them itself. Home offers to review them until dismissed.
+kept_values =
 dismissed_update_version =
 # Hide when running
 hide = True
@@ -157,32 +198,14 @@ max_zoom_mode = fixed
 # Altitude is "at or above" - tiles are rendered at the zoom level of the highest matching altitude.
 # The base step (altitude_ft: 0) cannot be removed and serves as the ground-level default.
 dynamic_zoom_steps = []
-# Per-chunk maximum wait time in seconds. This limits how long to wait for a SINGLE
-# chunk download before moving on. Works in combination with tile_time_budget:
-# - tile_time_budget: Total time for entire tile (all chunks combined)
-# - maxwait: Maximum time per individual chunk download
-# A chunk download will end when EITHER limit is reached, whichever comes first.
-# This prevents a single slow chunk from consuming the entire tile budget.
-# Recommended: 2.0 (fast networks), 5.0 (normal), 10.0 (slow networks)
+# RETIRED: the [streaming] wait bands are the only wait policy. These four are
+# read for old files only and ignored: maxwait is now band_max_wait_seconds
+# (near_wait_seconds while a flight starts), tile_time_budget the longest of
+# those, and the startup extension (suspend_maxwait) and the time budget
+# (use_time_budget) are always on.
 maxwait = 2.0
-# Temporarily increase maxwait to an effectively infinite value while X-Plane is
-# loading scenery data prior to starting the flight.  This allows more downloads to
-# succeed and reduce the use of backup chunks and missing chunks at the start of flight.
 suspend_maxwait = True
-# Use time budget system for tile requests. When enabled, the tile_time_budget
-# value represents the total wall-clock time for an ENTIRE tile (all mipmaps),
-# providing more predictable loading times. When disabled, falls back to legacy
-# per-chunk maxwait timing.
 use_time_budget = True
-# Maximum time in seconds X-Plane may spend waiting on a COMPLETE tile (all 5 mipmap levels).
-# The budget only advances while X-Plane is reading the tile: gaps between reads
-# (while X-Plane works on other tiles) do not count, and reopening a tile starts a
-# fresh budget. After this time, the tile is built with whatever has been downloaded.
-# Lower = faster loading, but may have more partial/blurry tiles
-# Higher = better quality, but longer initial load times
-# Recommended: 15.0 (very fast), 30.0 (balanced), 60.0 (quality)
-# Higher values remain available for users who explicitly prioritize completeness,
-# but 60 seconds is the safe default for a responsive initial load.
 tile_time_budget = 60.0
 # Fallback level when chunks fail to download in time:
 # none = Skip all fallbacks (fastest, may have missing tiles)
@@ -456,6 +479,8 @@ paging_prefetch = True
 # X-Plane's window and field of view, then measures it in flight.
 paging_k = 0
 # Fetch the level the aircraft will need this many seconds from now.
+# Auto-tuning may raise it (30-180 s) when blurry tiles were prefetched only
+# at a coarser level or too late; a value set here is never changed.
 paging_lead_seconds = 60
 # X-Plane opens all terrain (.ter) files of a scenery tile 20-45 s before it
 # reads their textures. Queue those textures as soon as their .ter is opened.
@@ -515,8 +540,9 @@ storage_safety_margin_gb = 2
 [fuse]
 # Enable or disable multi-threading when using FUSE
 threading = True
-# NOTE: build_timeout (FUSE lock timeout) is calculated dynamically based on
-# tile_time_budget. Formula: tile_time_budget + fallback_timeout (if enabled) + 15s.
+# NOTE: build_timeout (FUSE lock timeout) is calculated dynamically from the
+# tile budget (the longest [streaming] wait). Formula: that budget +
+# fallback_timeout (if enabled) + 15s.
 # This ensures the lock timeout always exceeds the maximum possible tile build time.
 
 [flightdata]
@@ -572,6 +598,58 @@ ter_patch_workers = 8
 
 [windows]
 prefer_winfsp = True
+
+[guards]
+# Warn when the zoom target or the memory cache looks too big for this PC
+# (graphics memory, RAM, disk). Warnings never block anything.
+warnings = True
+# Graphics memory X-Plane needs for itself beside AutoOrtho's photo textures,
+# in GB. Raise it for heavy aircraft or high X-Plane texture settings.
+xplane_vram_reserve_gb = 5
+# Emergency brake: while free RAM is very low, pause prefetch and background
+# builds and shrink the memory cache until it recovers.
+ram_brake = True
+
+[tuning]
+# Scale the memory cache, predictive build memory and builder counts to this
+# PC's cores and RAM. A value you set yourself always wins.
+hardware_baseline = True
+
+[governor]
+# Auto-tuning while streaming. auto: AutoOrtho adjusts engine settings live,
+# within the limits, to reach the quality target, and remembers what worked
+# for the next flight. advise: it only suggests changes (shown in Settings >
+# Auto-Tuning and the log). off: the configured values, as before.
+mode = advise
+# Keep a record of each flight's signals for replaying the governor offline.
+record_samples = True
+# Let auto-tuning cap photo textures at 4096 px when the textures X-Plane
+# holds near the graphics memory limit. A capped texture (8192 px at ZL17 on
+# ZL16 scenery, ZL19 near airports) takes a quarter of the graphics memory and
+# shows the detail of one zoom level lower. Your zoom target is not changed.
+allow_texture_cap = False
+# Set by auto-tuning: the largest texture built, in px (0: no cap). Applies to
+# textures opened after it changes.
+texture_cap_px = 0
+
+[limits]
+# What AutoOrtho may use of this PC. "auto" works it out from the hardware;
+# a number sets your own ceiling. AutoOrtho keeps the values it picks itself
+# under these limits; a value you set by hand is kept, with a warning.
+# RAM for AutoOrtho in GB (memory cache, build buffers, the app). auto: a
+# quarter of RAM plus 0.5 GB, leaving X-Plane at least 4 GB or 20 percent.
+ram_gb = auto
+# Graphics memory for photo textures in GB. auto: the card's memory minus
+# xplane_vram_reserve_gb in [guards].
+vram_gb = auto
+# Download speed in Mbit/s. auto: no limit.
+bandwidth_mbps = auto
+# Physical CPU cores for building textures. auto: all but two (all but one
+# on PCs with four cores or fewer).
+cpu_cores = auto
+# Protect X-Plane's frame rate: when X-Plane's frames get slower while
+# streaming, auto-tuning (Auto mode) eases off background work first.
+protect_sim_fps = True
 
 [time_exclusion]
 # Enable sun-position-based AutoOrtho exclusion.
@@ -630,29 +708,289 @@ route_prefetch_radius_nm = 40
             self.save()
 
 
+    @staticmethod
+    def registry():
+        return settings_registry()
+
     def load(self):
+        self._baseline = {}
         self.config.read_string(self._defaults)
-        user_config = configparser.ConfigParser(
-            strict=False,
-            allow_no_value=True,
-            comment_prefixes='/',
-        )
-        if os.path.isfile(self.conf_file):
+        file_exists = os.path.isfile(self.conf_file)
+        if file_exists:
             log.info(f"Config file found {self.conf_file} reading...")
-            user_config.read(self.conf_file)
-            self.config.read(self.conf_file)
+            user_config = _read_config_file(self.conf_file)
         else:
             log.info("No config file found. Using defaults...")
+            user_config = _new_parser()
+
+        # Comment lines are parsed as option keys; the commented defaults of a
+        # sparse file ("# key = value") must not reach the live config.
+        for section in user_config.sections():
+            if not self.config.has_section(section):
+                self.config.add_section(section)
+            for key, value in user_config.items(section, raw=True):
+                if not key.startswith('#'):
+                    self.config.set(section, key, value)
 
         self._explicit_options = {
-            section: set(user_config.options(section))
+            section: {
+                option for option in user_config.options(section)
+                if not option.startswith('#')
+            }
             for section in user_config.sections()
         }
+        self._loaded_explicit = {}
+        if file_exists and _file_revision(user_config) >= SPARSE_REVISION:
+            self._loaded_explicit = self._explicit_values(user_config)
         _migrate_legacy_provider_options(self, user_config)
-        if os.path.isfile(self.conf_file):
+        if file_exists:
             _migrate_config_revision(self, user_config)
         self.get_config()
+        self._apply_hardware_baseline()
+        if file_exists and _file_revision(user_config) < SPARSE_REVISION:
+            kept = self.kept_engine_values()
+            if kept:
+                self.set_value("general", "kept_values", ",".join(kept))
         return True
+
+    # Engine sections whose hand-set values Home offers to review after an
+    # upgrade, and the choices there that are the user's intent, not tuning.
+    _ENGINE_SECTIONS = ("autoortho", "streaming", "pydds", "fuse", "cache")
+    _NOT_ENGINE = frozenset({
+        "autoortho.using_custom_tiles",
+        "autoortho.simheaven_compat",
+        "autoortho.missing_color",
+    })
+
+    def kept_engine_values(self):
+        """Engine settings holding the user's own value, by "section.key"."""
+        kept = []
+        for spec in self.registry():
+            if spec.tier not in (Tier.TUNING, Tier.EXPERT):
+                continue
+            if spec.section not in self._ENGINE_SECTIONS:
+                continue
+            if spec.name in self._NOT_ENGINE:
+                continue
+            if self.is_custom(spec.section, spec.key):
+                kept.append(spec.name)
+        return sorted(kept)
+
+    def _apply_hardware_baseline(self, custom=None):
+        """Pick values for settings the user has not set (never written).
+
+        Three sources, in order, each only for settings still at their
+        packaged default:
+
+        * the hardware baseline (hardware.baseline_values), when on;
+        * the connection test's warm start for download concurrency;
+        * the limits in [limits], which lower any of the above.
+
+        Whether the baseline is on, and the limits, are fixed at load, so
+        changing them takes effect at the next start without pinning the old
+        values.
+        """
+        self._baseline = {}
+        self._automatic_sources = {}
+        registry = self.registry()
+        enabled = parse_value(
+            str(self._current_value("tuning", "hardware_baseline"))
+        ) is True
+        try:
+            info = hardware.basic()
+        except Exception as exc:
+            log.debug(f"Hardware unavailable: {exc}")
+            return
+        chosen = {}
+        sources = {}
+        if enabled:
+            for name, text in hardware.baseline_values(info).items():
+                chosen[name] = text
+                sources[name] = "hardware"
+        warm = _connection_warm_start(self)
+        if warm is not None:
+            chosen["autoortho.provider_origin_initial_concurrency"] = warm
+            sources["autoortho.provider_origin_initial_concurrency"] = "measured"
+        try:
+            active = limits_module.from_config(self, info)
+        except Exception as exc:
+            log.debug(f"Limits unavailable: {exc}")
+            active = None
+        if active is not None:
+            governed = {}
+            for name in limits_module.GOVERNED:
+                section, key = name.split(".", 1)
+                spec = registry.get(section, key)
+                if spec is not None:
+                    governed[name] = chosen.get(name, spec.default_text)
+            clamped = limits_module.clamp_automatic(governed, active)
+            for name, text in clamped.items():
+                if text != governed[name]:
+                    chosen[name] = text
+                    sources[name] = "limit"
+            ceiling = _bandwidth_concurrency_ceiling(self, active.bytes_per_second)
+            if ceiling is not None:
+                name = "autoortho.provider_origin_max_concurrency"
+                chosen[name] = ceiling
+                sources[name] = "limit"
+        for name, text in chosen.items():
+            section, key = name.split(".", 1)
+            spec = registry.get(section, key)
+            if spec is None or spec.tier is Tier.RETIRED:
+                continue
+            if _same(
+                _normalized(section, text),
+                _normalized(section, spec.default_text),
+            ):
+                continue
+            is_own = (
+                name in custom if custom is not None
+                else self.is_custom(section, spec.key)
+            )
+            self._baseline[(section, spec.key)] = text
+            self._automatic_sources[(section, spec.key)] = sources[name]
+            if not is_own:
+                self.set_value(section, spec.key, text)
+
+    def recompute_automatic(self):
+        """Work the automatic values out again (limits changed while running).
+
+        Settings holding the user's own value keep it; the others move to
+        the new automatic value, or back to the packaged default when no
+        rule applies any more. Returns {"section.key": new value} for what
+        changed, ready to publish as live levers.
+        """
+        registry = self.registry()
+        names = {f"{s}.{k}" for s, k in self._baseline}
+        names.update(limits_module.GOVERNED)
+        names.update({
+            "autoortho.provider_origin_max_concurrency",
+            "autoortho.provider_origin_initial_concurrency",
+        })
+        before = {}
+        custom = set()
+        for name in names:
+            section, key = name.split(".", 1)
+            if registry.get(section, key) is None:
+                continue
+            before[name] = self._current_value(section, key)
+            if self.is_custom(section, key):
+                custom.add(name)
+        self._apply_hardware_baseline(custom=custom)
+        changed = {}
+        for name, old in before.items():
+            section, key = name.split(".", 1)
+            if name not in custom and (section, key) not in self._baseline:
+                spec = registry.get(section, key)
+                self.set_value(section, key, spec.default_text)
+            new = self._current_value(section, key)
+            if not _same(_normalized(section, new), _normalized(section, old)):
+                changed[name] = new
+        return changed
+
+    def _explicit_values(self, user_config):
+        """The registered settings a sparse file sets, in comparable form."""
+        registry = self.registry()
+        values = {}
+        for section in user_config.sections():
+            for key, value in user_config.items(section, raw=True):
+                spec = registry.get(section, key)
+                if spec is None or spec.tier is Tier.RETIRED:
+                    continue
+                values[(section, spec.key)] = _normalized(section, value)
+        return values
+
+    # -- Value sources -----------------------------------------------------
+
+    def _current_value(self, section, key):
+        namespace = self.__dict__.get(section)
+        if namespace is not None and key in namespace.__dict__:
+            return namespace.__dict__[key]
+        return self.config.get(section, key, raw=True, fallback=None)
+
+    def value(self, section, key):
+        """The live value of a setting (None when unknown)."""
+        return self._current_value(section, key)
+
+    def automatic_text(self, section, key):
+        """The value a setting has when the user has not set it: the
+        hardware baseline for this PC, else the packaged default."""
+        baseline = getattr(self, "_baseline", {}).get((section, key))
+        if baseline is not None:
+            return baseline
+        spec = self.registry().get(section, key)
+        return None if spec is None else spec.default_text
+
+    def is_custom(self, section, key):
+        """Whether a setting holds the user's own value rather than the default.
+
+        A value differing from the default is custom. In a sparse file, an
+        active line equal to the default stays custom until the value changes,
+        so a deliberate choice is not dropped. Settings the registry does not
+        know (plugins, hand-added keys) are always custom; retired ones never.
+        """
+        spec = self.registry().get(section, key)
+        if spec is None:
+            return True
+        if spec.tier is Tier.RETIRED:
+            return False
+        current = _normalized(section, self._current_value(section, spec.key))
+        automatic = self.automatic_text(section, spec.key)
+        if not _same(current, _normalized(section, automatic)):
+            return True
+        loaded = self._loaded_explicit.get((section, spec.key), _MISSING)
+        return loaded is not _MISSING and _same(loaded, current)
+
+    def source(self, section, key):
+        """Where a setting's value comes from, for the settings UI.
+
+        'custom' (the user's), 'limit' (lowered to fit [limits]),
+        'hardware' (scaled to this PC), 'measured' (from the connection
+        test) or 'default'.
+        """
+        if self.is_custom(section, key):
+            return "custom"
+        if (section, key) in getattr(self, "_baseline", {}):
+            return getattr(self, "_automatic_sources", {}).get(
+                (section, key), "hardware"
+            )
+        return "default"
+
+    def _should_write(self, section, key):
+        spec = self.registry().get(section, key)
+        if spec is not None and spec.persist_always:
+            return True
+        return self.is_custom(section, key)
+
+    def set_value(self, section, key, value):
+        """Set one setting from its text form (as the config file holds it)."""
+        text = '' if value is None else str(value)
+        if not self.config.has_section(section):
+            self.config.add_section(section)
+        self.config.set(section, key, text)
+        namespace = self.__dict__.get(section)
+        if namespace is None:
+            namespace = SectionParser()
+            self.__dict__[section] = namespace
+        namespace.__dict__[key] = parse_value(text)
+
+    def pin(self, section, key):
+        """Keep the current value as the user's own: written to the file and
+        never moved by auto-tuning, even when it equals the automatic one."""
+        spec = self.registry().get(section, key)
+        if spec is None or spec.tier is Tier.RETIRED:
+            return
+        self._loaded_explicit[(section, spec.key)] = _normalized(
+            section, self._current_value(section, spec.key)
+        )
+
+    def reset_to_default(self, section, key):
+        """Return a registered setting to its default; it is then not written."""
+        spec = self.registry().get(section, key)
+        if spec is None:
+            raise KeyError(f"{section}.{key} is not a known setting")
+        self.set_value(section, spec.key, self.automatic_text(section, spec.key))
+        self._loaded_explicit.pop((section, spec.key), None)
 
 
     def _load_defaults_parser(self):
@@ -813,8 +1151,18 @@ route_prefetch_radius_nm = 40
         self.set_config()
 
         text = self.render_config_text()
-        with open(self.conf_file, 'w') as h:
+        with open(self.conf_file, 'w', encoding='utf-8') as h:
             h.write(text)
+        # What was written is now the user's explicit choice.
+        self._loaded_explicit = {
+            (spec.section, spec.key): _normalized(
+                spec.section,
+                self._current_value(spec.section, spec.key),
+            )
+            for spec in self.registry()
+            if spec.tier is not Tier.RETIRED
+            and self.is_custom(spec.section, spec.key)
+        }
         log.info(f"Wrote config file: {self.conf_file}")
 
     def render_config_text(self):
@@ -824,13 +1172,23 @@ route_prefetch_radius_nm = 40
         comment containing ``:`` or ``=`` collapses into one shared key per
         section and old comments survive forever in their original position.
         Writing from the template keeps every comment verbatim next to the
-        setting it describes and drops stale ones. Values come from the live
-        config; settings the template does not know are kept at the end of
-        their section.
+        setting it describes and drops stale ones.
+
+        Only custom settings (see :meth:`is_custom`) are active lines; every
+        other setting is written as ``# key = default`` so the file still
+        documents it. Retired settings and their comments are left out.
+        Settings the template does not know are kept at the end of their
+        section.
         """
+        registry = self.registry()
         lines = []
         written = {}
         section = None
+        pending_comments = []
+
+        def flush_comments():
+            lines.extend(pending_comments)
+            pending_comments.clear()
 
         def flush_extras(sect):
             if sect is None or not self.config.has_section(sect):
@@ -845,28 +1203,55 @@ route_prefetch_radius_nm = 40
         for raw_line in self._defaults.splitlines():
             stripped = raw_line.strip()
             if stripped.startswith('[') and stripped.endswith(']'):
+                flush_comments()
                 flush_extras(section)
                 if lines and lines[-1] != '':
                     lines.append('')
+                first_section = section is None
                 section = stripped[1:-1].strip()
                 written.setdefault(section, set())
                 lines.append(stripped)
+                if first_section:
+                    lines.extend(_FILE_NOTE)
                 continue
-            if not stripped or stripped.startswith('#') or section is None:
-                if stripped:
-                    lines.append(stripped)
+            if not stripped:
+                flush_comments()
+                continue
+            if stripped.startswith('#') or section is None:
+                pending_comments.append(stripped)
                 continue
             key = self.config.optionxform(
                 stripped.split('=', 1)[0].split(':', 1)[0].strip()
             )
-            if (
+            written[section].add(key)
+            spec = registry.get(section, key)
+            if spec is not None and spec.tier is Tier.RETIRED:
+                pending_comments.clear()
+                continue
+            flush_comments()
+            if not (
                 self.config.has_section(section)
                 and self.config.has_option(section, key)
             ):
-                lines.append(self._format_option(section, key))
-            else:
                 lines.append(stripped)
-            written[section].add(key)
+            elif spec is None or self._should_write(section, key):
+                lines.append(self._format_option(section, key))
+            elif (section, key) in self._baseline:
+                reason = {
+                    "limit": "lowered to fit [limits]",
+                    "measured": "from the connection test",
+                }.get(
+                    self._automatic_sources.get((section, key)),
+                    "set for this PC",
+                )
+                lines.append(
+                    f"# ({reason}; the packaged default is "
+                    f"{spec.default_text})"
+                )
+                lines.append(f"# {key} = {self._baseline[(section, key)]}")
+            else:
+                lines.append(f"# {key} = {spec.default_text}")
+        flush_comments()
         flush_extras(section)
 
         for sect in self.config.sections():
@@ -1076,13 +1461,88 @@ def resolve_provider_setting(name, cfg=None):
     return max(low, min(high, default))
 
 
+def _connection_module():
+    if __package__:
+        from autoortho import connection_test
+    else:
+        import connection_test
+    return connection_test
+
+
+def _connection_for(cfg):
+    """The last connection test, when it measured this provider."""
+    try:
+        module = _connection_module()
+        result = module.load_result()
+    except Exception:
+        return None
+    if result is None:
+        return None
+    provider = module.provider_for(
+        getattr(getattr(cfg, "autoortho", None), "maptype_override", "")
+    )
+    return result if result.provider == provider else None
+
+
+def _connection_warm_start(cfg):
+    """Starting download concurrency from the last connection test, as text.
+
+    The adaptive controller still moves from there; this only spares it the
+    climb (or the overload) at the start of every flight. A test of another
+    provider says nothing about this one's servers, so it is not used.
+    """
+    result = _connection_for(cfg)
+    if result is None or result.suggested <= 0:
+        return None
+    low, high = PROVIDER_SETTINGS["provider_origin_initial_concurrency"]["range"]
+    try:
+        floor = int(resolve_provider_setting("provider_origin_min_concurrency", cfg))
+        ceiling = int(resolve_provider_setting("provider_max_in_flight", cfg))
+    except Exception:
+        floor, ceiling = 1, high
+    value = max(floor, min(ceiling, int(result.suggested)))
+    return str(max(max(1, low), min(high, value)))
+
+
+# A chunk's typical round trip when no connection test says otherwise:
+# 16 KB in about 0.13 s.
+_DEFAULT_REQUEST_BYTES_PER_S = 16_000 / 0.13
+
+
+def _bandwidth_concurrency_ceiling(cfg, bytes_per_second):
+    """Downloads at once a bandwidth limit needs, with half again to spare.
+
+    More at once than that only queues inside the rate limiter. Text, or
+    None when no limit applies.
+    """
+    if not bytes_per_second:
+        return None
+    per_request = _DEFAULT_REQUEST_BYTES_PER_S
+    result = _connection_for(cfg)
+    if result is not None and result.suggested > 0:
+        chosen = next(
+            (r for r in result.rounds if r.at_once == result.suggested), None
+        )
+        if chosen is not None and chosen.chunks and chosen.mean_chunk_seconds > 0:
+            per_request = (chosen.bytes / chosen.chunks) / chosen.mean_chunk_seconds
+    needed = int(bytes_per_second / max(1.0, per_request) * 1.5) + 1
+    try:
+        floor = int(resolve_provider_setting("provider_origin_min_concurrency", cfg))
+        ceiling = int(resolve_provider_setting("provider_max_in_flight", cfg))
+    except Exception:
+        floor, ceiling = 1, 1024
+    return str(max(floor, min(ceiling, needed)))
+
+
 def _migrate_config_revision(cfg, user_config):
     """Apply one-time default changes to configs saved by older releases.
 
-    Every save writes every setting, so a saved value cannot tell a user's
-    choice from an old default. The revision marks which changes a file has
-    already seen; each step runs once and the next save records the new
-    revision.
+    Before revision 2 every save wrote every setting, so a saved value cannot
+    tell a user's choice from an old default. The revision marks which changes
+    a file has already seen; each step runs once and the next save records the
+    new revision. From revision 2 the file is sparse (only custom settings are
+    active), so a changed default reaches every user who never set it and new
+    steps are rarely needed.
     """
     try:
         revision = int(
@@ -1111,7 +1571,23 @@ def _migrate_config_revision(cfg, user_config):
                 "(new default; rows that miss their deadline now use "
                 "lower-resolution imagery instead of the missing color)"
             )
+    if revision < 2:
+        # Sparse format: settings equal to their default become commented
+        # "# key = default" lines at the next save (the loaded file had no
+        # explicit choices recorded, see AOConfig.load), and retired settings
+        # are dropped.
+        log.info(
+            "Config will now store only changed settings; values equal to "
+            "their defaults follow future default changes"
+        )
     cfg.config.set("general", "config_revision", str(CONFIG_REVISION))
+
+
+def _file_revision(user_config):
+    try:
+        return int(user_config.get("general", "config_revision", fallback="0"))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _migrate_legacy_provider_options(cfg, user_config):

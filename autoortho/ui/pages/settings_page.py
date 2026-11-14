@@ -1,10 +1,14 @@
-"""Categorized settings workspace with search and presets."""
+"""Categorized settings workspace with search.
+
+Two views: the essential categories only (the default, for most users), or
+every category. Searching always looks through every category.
+"""
 
 from dataclasses import dataclass
 
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtWidgets import (
-    QComboBox,
+    QCheckBox,
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
@@ -27,11 +31,12 @@ class CategoryEntry:
     name: str
     page: QWidget
     searchable_text: str = ""
+    essential: bool = False
 
 
 class SettingsPage(QWidget):
-    preset_requested = Signal(str)
     restore_defaults_requested = Signal(str)
+    show_all_changed = Signal(bool)
 
     def __init__(self, apply_button, revert_button, restart_label, parent=None):
         super().__init__(parent)
@@ -45,23 +50,15 @@ class SettingsPage(QWidget):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search settings…")
         self.search_edit.setAccessibleName("Search settings")
-        self.preset_combo = QComboBox()
-        self.preset_combo.addItems(
-            [
-                "Choose performance profile…",
-                "Balanced",
-                "Quality",
-                "Low Bandwidth",
-                "Low Resource",
-            ]
+        self.show_all_check = QCheckBox("Show &all settings")
+        self.show_all_check.setToolTip(
+            "Off: only the settings most people need. AutoOrtho sizes the "
+            "rest for this PC. On: every category."
         )
         title_row.addWidget(title)
         title_row.addStretch()
-        preset_label = QLabel("&Performance profile")
-        preset_label.setBuddy(self.preset_combo)
         title_row.addWidget(self.search_edit)
-        title_row.addWidget(preset_label)
-        title_row.addWidget(self.preset_combo)
+        title_row.addWidget(self.show_all_check)
         root.addLayout(title_row)
 
         body = QHBoxLayout()
@@ -100,9 +97,7 @@ class SettingsPage(QWidget):
         self.category_list.currentRowChanged.connect(
             self._show_category_row
         )
-        self.preset_combo.currentTextChanged.connect(
-            self._preset_selected
-        )
+        self.show_all_check.toggled.connect(self._show_all_toggled)
 
     def add_category(
         self,
@@ -112,6 +107,7 @@ class SettingsPage(QWidget):
         recommendation="",
         numeric_bindings=(),
         restore_defaults=True,
+        essential=False,
     ):
         page_content = QWidget()
         content_layout = QVBoxLayout(page_content)
@@ -195,7 +191,9 @@ class SettingsPage(QWidget):
             )
         text = " ".join(search_parts).lower()
         self.entries.append(
-            CategoryEntry(name, wrapper, searchable_text=text)
+            CategoryEntry(
+                name, wrapper, searchable_text=text, essential=bool(essential)
+            )
         )
         self.stack.addWidget(wrapper)
         self._refresh_categories()
@@ -213,6 +211,10 @@ class SettingsPage(QWidget):
             "Platform & Mounting": "Advanced",
         }
         name = aliases.get(name, name)
+        entry = next((e for e in self.entries if e.name == name), None)
+        if entry is not None and not entry.essential and not self.show_all:
+            # Asking for a category means wanting to see it.
+            self.set_show_all(True)
         for row in range(self.category_list.count()):
             item = self.category_list.item(row)
             if item.data(Qt.ItemDataRole.UserRole) == name:
@@ -233,6 +235,8 @@ class SettingsPage(QWidget):
         self.category_list.clear()
         for entry in self.entries:
             if query and query not in entry.searchable_text:
+                continue
+            if not query and not self.show_all and not entry.essential:
                 continue
             item = QListWidgetItem(entry.name)
             item.setData(Qt.ItemDataRole.UserRole, entry.name)
@@ -269,13 +273,22 @@ class SettingsPage(QWidget):
     def category_names(self):
         return [entry.name for entry in self.entries]
 
-    def _preset_selected(self, name):
-        if name == "Choose performance profile…":
-            return
-        self.preset_requested.emit(name)
-        self.preset_combo.blockSignals(True)
-        self.preset_combo.setCurrentIndex(0)
-        self.preset_combo.blockSignals(False)
+    @property
+    def show_all(self):
+        return self.show_all_check.isChecked()
+
+    def set_show_all(self, show_all):
+        self.show_all_check.setChecked(bool(show_all))
+
+    def _show_all_toggled(self, checked):
+        self._refresh_categories()
+        self.show_all_changed.emit(bool(checked))
+
+    def visible_category_names(self):
+        return [
+            self.category_list.item(row).data(Qt.ItemDataRole.UserRole)
+            for row in range(self.category_list.count())
+        ]
 
     @staticmethod
     def _bind_slider(slider, spin, scale):

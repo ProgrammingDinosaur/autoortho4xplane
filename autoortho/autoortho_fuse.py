@@ -33,6 +33,11 @@ except ImportError:
     from utils.constants import system_type
 
 try:
+    from autoortho import wait_bands
+except ImportError:
+    import wait_bands
+
+try:
     from autoortho.time_exclusion import time_exclusion_manager
 except ImportError:
     from time_exclusion import time_exclusion_manager
@@ -242,25 +247,17 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
             allow_other=True,
         ))
     elif system_type == 'darwin':
-        # Calculate daemon_timeout based on max possible tile_time_budget + 60s buffer.
-        # This prevents macFUSE from killing the worker when operations take longer
-        # than the default 60 second timeout.
+        # Calculate daemon_timeout based on the longest possible tile budget
+        # + 60s buffer. This prevents macFUSE from killing the worker when
+        # operations take longer than the default 60 second timeout.
         #
-        # Max tile_time_budget calculation (matches _calculate_build_timeout):
-        # - Base: tile_time_budget (default 180s)
-        # - Startup multiplier: 10x during initial loading (capped at 1800s)
+        # Longest tile budget (matches _calculate_build_timeout):
+        # - Base: wait_bands.tile_budget_seconds() (the longest band wait)
+        # - Startup: the first-load budget (10x, capped at 1800s)
         # - Fallback: + fallback_timeout if enabled (default 30s)
         # - Buffer: + 15s for DDS operations
         # - Safety: + 60s additional buffer for daemon_timeout
-        tile_budget = getattr(CFG.autoortho, 'tile_time_budget', 180.0)
-        if isinstance(tile_budget, str):
-            try:
-                tile_budget = float(tile_budget)
-            except ValueError:
-                tile_budget = 180.0
-        
-        # Use max startup budget (10x multiplier, capped at 1800s)
-        max_startup_budget = min(tile_budget * 10.0, 1800.0)
+        max_startup_budget = wait_bands.tile_budget_seconds(initial_load=True)
         
         # Add fallback timeout if enabled
         fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)
@@ -930,42 +927,26 @@ class AutoOrtho(Operations):
 
     def _calculate_build_timeout(self):
         """
-        Calculate dynamic build_timeout based on tile_time_budget settings.
-        
+        Calculate dynamic build_timeout from the tile budget (wait_bands).
+
         This ensures the FUSE lock timeout is always sufficient for tile building:
-        - Base: tile_time_budget (time allowed for chunk downloads)
-        - Startup: applies same multiplier (3x, capped at 300s) when suspend_maxwait 
-          is enabled and not yet connected to X-Plane
+        - Base: wait_bands.tile_budget_seconds() (time allowed for chunk downloads)
+        - Startup: the first-load budget while X-Plane has not connected yet
         - Extended: + fallback_timeout if fallback_extends_budget is enabled
         - Buffer: + 15 seconds for DDS operations and overhead
         
         Returns timeout in seconds (int).
         """
-        # Get tile_time_budget (default 120s)
-        tile_budget = getattr(CFG.autoortho, 'tile_time_budget', 120.0)
-        if isinstance(tile_budget, str):
-            try:
-                tile_budget = float(tile_budget)
-            except ValueError:
-                tile_budget = 120.0
-        
-        # Account for startup multiplier - must match getortho.py logic
-        # During initial startup (before first connection), budget is multiplied.
-        # Uses has_ever_connected to distinguish true startup from temporary disconnects
-        # caused by stuttering (which should NOT get extended timeouts).
+        # The first-load budget applies before X-Plane ever connected (must
+        # match getortho.py); stutters that briefly drop the connection do
+        # not get extended timeouts.
+        initial_load = False
         try:
             from datareftrack import dt as datareftracker
-            suspend_maxwait = getattr(CFG.autoortho, 'suspend_maxwait', True)
-            if isinstance(suspend_maxwait, str):
-                suspend_maxwait = suspend_maxwait.lower().strip() in ('true', '1', 'yes', 'on')
-            
-            if suspend_maxwait and not getattr(datareftracker, 'has_ever_connected', False):
-                # Match getortho.py: 10x multiplier for initial loading
-                startup_multiplier = 10.0
-                max_startup_budget = 1800.0
-                tile_budget = min(tile_budget * startup_multiplier, max_startup_budget)
+            initial_load = not getattr(datareftracker, 'has_ever_connected', False)
         except ImportError:
             pass  # datareftracker not available, use base budget
+        tile_budget = wait_bands.tile_budget_seconds(initial_load)
         
         # Check if fallback extends the budget
         fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)
@@ -1516,9 +1497,9 @@ class AutoOrtho(Operations):
             request_started = time.monotonic()
             lock = self._tile_locks[key]
             
-            # Calculate build_timeout dynamically based on tile_time_budget
+            # Calculate build_timeout dynamically from the tile budget (wait_bands)
             # This ensures the FUSE lock timeout is always >= the tile build time
-            # Formula: tile_time_budget + fallback_timeout (if enabled) + 15s buffer
+            # Formula: tile budget + fallback_timeout (if enabled) + 15s buffer
             #
             # The buffer accounts for:
             # - DDS read/write operations after tile is built
@@ -1588,22 +1569,28 @@ class AutoOrtho(Operations):
             admitted = False
             lock_held = True
             try:
-                admitted = getortho.acquire_live_tile_slot(
-                    max(0.0, request_deadline - time.monotonic())
-                )
-                if not admitted:
-                    read_outcome = "fallback"
-                    log.error(
-                        "Live tile admission timeout for %s after %ss",
-                        key,
-                        build_timeout,
-                    )
-                    return _generate_fallback_dds_bytes(offset, length)
                 with profile_span(
                     "tile.cache_lookup",
                     tile_id=tile_id,
                 ):
                     t = self.tc._get_tile(row, col, maptype, zoom)
+                # Admission bounds detailed builds. Header chunks and
+                # base-level reads skip it: queued behind near reads that
+                # wait up to a minute while a flight loads, they would time
+                # out into the fallback texture instead of the base level.
+                needs_slot = getattr(t, "needs_live_slot", None)
+                if needs_slot is None or needs_slot(offset, length):
+                    admitted = getortho.acquire_live_tile_slot(
+                        max(0.0, request_deadline - time.monotonic())
+                    )
+                    if not admitted:
+                        read_outcome = "fallback"
+                        log.error(
+                            "Live tile admission timeout for %s after %ss",
+                            key,
+                            build_timeout,
+                        )
+                        return _generate_fallback_dds_bytes(offset, length)
                 # Tile/build coordinators provide the fine-grained safety below.
                 # Release the FUSE lookup lock before cache, network, decode, or
                 # compression work so disjoint row reads can proceed together.

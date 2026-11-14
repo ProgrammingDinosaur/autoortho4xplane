@@ -342,24 +342,29 @@ QFrame#statusCard {{
     border-radius: 0;
 }}
 QFrame#statusCard QLabel,
+QFrame#noticeFrame QLabel,
 QFrame#SceneryCard QLabel,
 QFrame#compactHeader QLabel,
 QFrame#updateBanner QLabel {{
     background-color: transparent;
 }}
 QFrame#statusCard[state="success"],
+QFrame#noticeFrame[state="success"],
 QFrame#SceneryCard[state="success"] {{
     border-left: 3px solid {colors.success};
 }}
 QFrame#statusCard[state="warning"],
+QFrame#noticeFrame[state="warning"],
 QFrame#SceneryCard[state="warning"] {{
     border-left: 3px solid {colors.warning};
 }}
 QFrame#statusCard[state="error"],
+QFrame#noticeFrame[state="error"],
 QFrame#SceneryCard[state="error"] {{
     border-left: 3px solid {colors.error};
 }}
 QFrame#statusCard[state="info"],
+QFrame#noticeFrame[state="info"],
 QFrame#SceneryCard[state="info"] {{
     border-left: 3px solid {colors.info};
 }}

@@ -492,8 +492,6 @@ def test_strict_tile_budget_keeps_initial_load_extension(
         "_prefetch_quality_mode",
         lambda: PrefetchQualityMode.STRICT_TARGET,
     )
-    monkeypatch.setattr(getortho.CFG.autoortho, "use_time_budget", True)
-    monkeypatch.setattr(getortho.CFG.autoortho, "suspend_maxwait", True)
     monkeypatch.setattr(
         getortho.CFG.autoortho, "strict_target_deadline_sec", 120.0
     )

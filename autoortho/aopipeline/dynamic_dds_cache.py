@@ -55,6 +55,15 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
+
+def _writes_allowed_default() -> bool:
+    return True
+
+
+# Replaced by getortho with the disk brake's check: new DDS entries are
+# skipped while the cache drive is nearly full.
+writes_allowed = _writes_allowed_default
+
 # Current DDM schema version. Bump when the metadata format changes
 # in a backwards-incompatible way.
 # v2 -> v3: added "populated_mipmaps" for incremental DDS persistence
@@ -1465,6 +1474,9 @@ class DynamicDDSCache:
             True on success, False on failure
         """
         if not self._enabled:
+            return False
+        if not writes_allowed():
+            # The cache drive is nearly full (see ram_brake.DiskBrake).
             return False
 
         if not dds_bytes or len(dds_bytes) < 128:

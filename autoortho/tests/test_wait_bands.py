@@ -119,3 +119,39 @@ def test_pause_comes_back_when_flag_is_off(monkeypatch):
     controller = getortho.LivePressureController()
     controller.live_read_start()
     assert controller.is_under_pressure("network")
+
+
+# -- wait consolidation: the bands replace maxwait / tile_time_budget --------
+
+
+def test_derived_waits_follow_the_bands(monkeypatch):
+    monkeypatch.setattr(streaming_options, "_raw",
+                        lambda name: {"near_wait_seconds": 45.0,
+                                      "band_max_wait_seconds": 8.0}.get(
+                                          name, streaming_options.DEFAULTS[name]))
+    assert wait_bands.chunk_wait_seconds(starting=False) == 8.0
+    assert wait_bands.chunk_wait_seconds(starting=True) == 45.0
+    assert wait_bands.tile_budget_seconds() == 45.0
+    assert wait_bands.tile_budget_seconds(initial_load=True) == 450.0
+    assert wait_bands.http_read_timeout_seconds() == 9.0
+
+
+def test_tile_budget_never_cuts_a_band_wait_short(monkeypatch):
+    monkeypatch.setattr(streaming_options, "_raw",
+                        lambda name: {"near_wait_seconds": 5.0,
+                                      "band_max_wait_seconds": 12.0}.get(
+                                          name, streaming_options.DEFAULTS[name]))
+    assert wait_bands.tile_budget_seconds() == 12.0
+    big = {"near_wait_seconds": 600.0}
+    monkeypatch.setattr(streaming_options, "_raw",
+                        lambda name: big.get(name, streaming_options.DEFAULTS[name]))
+    assert wait_bands.tile_budget_seconds(initial_load=True) == wait_bands.INITIAL_LOAD_CAP_S
+
+
+def test_row_wait_is_the_band_wait_not_the_retired_maxwait(monkeypatch):
+    tile = getortho.Tile.__new__(getortho.Tile)
+    monkeypatch.setattr(getortho.CFG.autoortho, "maxwait", 0.1, raising=False)
+    monkeypatch.setattr(getortho, "flight_is_starting", lambda near_read=False: False)
+    assert tile.get_maxwait() == wait_bands.wait_seconds(wait_bands.NEAR, False)
+    monkeypatch.setattr(getortho, "flight_is_starting", lambda near_read=False: True)
+    assert tile.get_maxwait() == wait_bands.wait_seconds(wait_bands.NEAR, True)

@@ -1502,6 +1502,8 @@ def _build_session_summary(
         "metadata": parent_metadata,
         "diagnostic_flags": diagnostics,
         "delivery": delivery,
+        # The governor's verdict for the flight (governor.Governor.summary).
+        "flight": _sanitize_json((stats_snapshot or {}).get("governor/summary") or {}),
         "process_profiles": process_profiles,
     }
 
@@ -1753,6 +1755,96 @@ def _markdown_escape(value: Any) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
+_PHASE_NAMES = {
+    "starting": "Starting",
+    "taxi": "Taxi",
+    "departure_arrival": "Departure and arrival",
+    "cruise": "Cruise",
+    "idle": "Not connected",
+}
+
+
+# Blurry near reads in flight by what prefetch had done for the tile
+# (prefetch_ledger.MISS_KINDS), in the report's words.
+_MISS_NAMES = {
+    "never_wide": "Never queued, outside the corridor",
+    "never_inside": "Never queued, inside the corridor",
+    "never_paused": "Never queued, prefetch paused",
+    "never_turn": "Never queued, in a turn",
+    "coarse": "Queued at a coarser level only",
+    "late": "Queued, not ready in time",
+    "evicted": "Ready, then dropped from memory",
+    "done": "Ready (blurry for another reason)",
+}
+
+
+def _render_miss_causes(flight: dict) -> list:
+    """*Blurry moments by cause*: the share of each miss kind, by phase."""
+    by_phase = {
+        phase: kinds for phase, kinds in (flight.get("misses_by_phase") or {}).items()
+        if sum(kinds.values())
+    }
+    if not by_phase:
+        return []
+    phases = list(by_phase)
+    lines = [
+        "",
+        "### Blurry moments by cause",
+        "",
+        "| Cause | " + " | ".join(_PHASE_NAMES.get(p, p) for p in phases) + " |",
+        "|---|" + "---:|" * len(phases),
+    ]
+    totals = {phase: sum(kinds.values()) for phase, kinds in by_phase.items()}
+    for kind, name in _MISS_NAMES.items():
+        if not any(by_phase[p].get(kind) for p in phases):
+            continue
+        cells = [
+            f"{100.0 * by_phase[p].get(kind, 0) / totals[p]:.0f} %" for p in phases
+        ]
+        lines.append(f"| {name} | " + " | ".join(cells) + " |")
+    lines.append(
+        "| Blurry tiles counted | " + " | ".join(f"{totals[p]:,}" for p in phases) + " |"
+    )
+    return lines
+
+
+def _render_flight(flight: dict) -> list:
+    """The governor's verdict: fidelity by phase, guards, what was learned."""
+    if not flight:
+        return []
+    lines = ["", "## Flight verdict", "", f"**{flight.get('verdict', '')}**"]
+    if flight.get("fidelity") is not None:
+        lines.append(
+            f"- Sharp at target: {float(flight['fidelity']) * 100:.0f} % of nearby reads"
+        )
+    phases = flight.get("fidelity_by_phase") or {}
+    if phases:
+        lines.extend(["", "| Phase | Sharp at target |", "|---|---:|"])
+        for phase, value in phases.items():
+            lines.append(f"| {_PHASE_NAMES.get(phase, phase)} | {float(value) * 100:.0f} % |")
+    lines.extend(_render_miss_causes(flight))
+    lines.append("")
+    lines.append(
+        f"- Auto-tuning: {flight.get('mode', 'off')}, "
+        f"{flight.get('decisions', 0)} decisions "
+        f"({flight.get('kept', 0)} kept, {flight.get('reverted', 0)} undone)"
+    )
+    lines.append(f"- Peak download: {flight.get('peak_mbps', 0)} Mbit/s")
+    lines.append(
+        f"- Memory brake: {flight.get('ram_brake_activations', 0)} times; "
+        f"disk brake: {flight.get('disk_brake_activations', 0)} times"
+    )
+    learned = flight.get("learned") or {}
+    if learned:
+        lines.append(
+            "- Learned for next time: "
+            + ", ".join(f"{k.split('.', 1)[1]} {v:g}" for k, v in learned.items())
+        )
+    if flight.get("notice"):
+        lines.append(f"- {flight['notice']}")
+    return lines
+
+
 def _render_markdown(summary: dict) -> str:
     lines = [
         "# AutoOrtho Flight Performance Report",
@@ -1768,6 +1860,7 @@ def _render_markdown(summary: dict) -> str:
         "",
     ]
     lines.extend(f"- {flag}" for flag in summary["diagnostic_flags"])
+    lines.extend(_render_flight(summary.get("flight") or {}))
 
     delivery = summary.get("delivery", {})
     lines.extend(

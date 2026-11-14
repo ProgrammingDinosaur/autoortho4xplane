@@ -42,7 +42,7 @@ If AutoOrtho suddenly stops working after it previously worked, check that the `
 <a name="missing-color-tiles"></a>
 ### I see occasional blurry and/or green (missing color) tiles
 
-Missing color tiles (typically green) occur when AutoOrtho cannot retrieve imagery within the time budget. This section explains why this happens and how to minimize it.
+Missing color tiles (typically green) occur when AutoOrtho cannot retrieve imagery within the time it may wait. This section explains why this happens and how to minimize it.
 
 #### Why do missing color tiles happen?
 
@@ -59,11 +59,11 @@ Each zoom level requires 4× more resources. Lowering your max zoom dramatically
 2. Lower "Max Zoom Level" from ZL17/18 to ZL16 or ZL15
 3. This reduces chunks per tile from 1024/4096 down to 256/64
 
-**Option 2 - Increase Time Budget:**
-1. Open AutoOrtho Settings
-2. Go to the Settings tab → Performance Tuning section
-3. Increase "Tile Time Budget" to 15-20 seconds
-4. This gives more time for chunks to download
+**Option 2 - Wait Longer for Nearby Imagery:**
+1. Open AutoOrtho Settings → Streaming
+2. Raise "Wait for nearby imagery in flight" to 8-10 seconds
+3. This gives nearby textures more time to download (or set Auto-tuning to
+   Auto, which raises it when nearby imagery keeps arriving just too late)
 
 **Option 3 - Enable Full Fallbacks:**
 1. Set "Fallback Level" to "Full (Best Quality)"
@@ -73,13 +73,13 @@ Each zoom level requires 4× more resources. Lowering your max zoom dramatically
 **Recommended settings for minimal missing tiles:**
 ```ini
 maptype_override_zoom = 16
-use_time_budget = True
-tile_time_budget = 300.0
+band_max_wait_seconds = 10.0
+near_wait_seconds = 120.0
 fallback_level = full
 fallback_extends_budget = True
 ```
 
-**Trade-off Warning:** Higher time budgets and extended fallbacks may cause longer loading times and occasional stuttering. See the [Performance Tuning Guide](performance.md) for a detailed explanation of the quality vs. speed trade-off.
+**Trade-off Warning:** Longer waits and extended fallbacks may cause longer loading times and occasional stuttering. See the [Performance Tuning Guide](performance.md) for a detailed explanation of the quality vs. speed trade-off.
 
 For ZL17, **Allow incomplete native partial builds** is an additional opt-in
 trade-off. Disabled (the default) preserves strict quality and uses the normal
@@ -106,16 +106,15 @@ If you're seeing many missing tiles with `fallback_level = full`, check these:
 
 Stuttering occurs when X-Plane waits for AutoOrtho to provide imagery. To minimize stutters:
 
-1. **Use Time Budget System:** Keep `use_time_budget = True` (default)
-2. **Use a bounded tile budget:** Start with the 60-second default
+1. **Keep the waits short:** "Wait for nearby imagery in flight" at the 6-second default or lower
+2. **Let auto-tuning help:** Auto mode eases off background work when X-Plane's frame rate drops
 3. **Use cache-only fallbacks:** Set `fallback_level = cache` to avoid network delays during fallbacks
 4. **Enable prefetching:** Keep `prefetch_enabled = True` to download tiles ahead of your aircraft
 5. **Increase prefetch lookahead:** Set `prefetch_lookahead = 30` or higher for faster aircraft
 
 **Recommended settings for stutter-free flying:**
 ```ini
-use_time_budget = True
-tile_time_budget = 60
+band_max_wait_seconds = 6.0
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
@@ -162,7 +161,7 @@ See the [Performance Tuning Guide](performance.md#zoom-level-critical-performanc
 
 | Setting | What it controls |
 |---------|-----------------|
-| **Tile Time Budget** | Total seconds to wait for a tile before returning partial results |
+| **Wait for nearby imagery** | Seconds a read of a nearby texture may wait for real imagery (longer while a flight loads) |
 | **Fallback Level** | How aggressively to find replacement imagery for failed chunks |
 | **Fallback Extends Budget** | Whether to continue network fallbacks after budget is exhausted |
 | **Prefetch Enabled** | Whether to download tiles ahead of your aircraft |
@@ -210,23 +209,21 @@ Provider-side throttling can still make Apple slower than another source.
 
 ---
 
-### What's the difference between maxwait and tile_time_budget?
+### What happened to maxwait and tile_time_budget?
 
-| Setting | Scope | Behavior |
-|---------|-------|----------|
-| `maxwait` (legacy) | Per-chunk timeout | Each of 256 chunks waits up to this long |
-| `tile_time_budget` (new) | Whole-tile budget | Total wall-clock time for entire tile request |
+They were replaced by one wait policy, the wait bands: how long a read waits
+depends on how near the texture is (see the
+[Performance Tuning Guide](performance.md#wait-policy-wait-bands)).
 
-**Example:** With `maxwait = 1.5s` and 256 chunks:
-- Worst case: 256 × 1.5s = 384 seconds (due to serial execution)
-- Actual time varies widely based on parallelism
+| Old setting | Now |
+|-------------|-----|
+| `maxwait` (per chunk) | `band_max_wait_seconds` in flight, `near_wait_seconds` while a flight loads |
+| `tile_time_budget` (per tile) | the longest of those two waits |
+| `use_time_budget` | always on |
+| `suspend_maxwait` | always on: the first load gets ten times the tile budget |
 
-**Example:** With `tile_time_budget = 60s`:
-- Always release a tile to X-Plane within 60 seconds, plus any explicitly
-  configured shared fallback extension
-- May have some missing chunks if network is slow or zoom level is high
-
-**Recommendation:** Keep `use_time_budget = True` to use the new predictable system.
+Old values in your config file are ignored and dropped the next time it is
+saved.
 
 ### Time exclusion re-activated after scenery reload
 

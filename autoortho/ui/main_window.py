@@ -6,6 +6,7 @@ import os
 import sys
 import shutil
 import pathlib
+import dataclasses
 import threading
 import time
 import logging
@@ -35,6 +36,7 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.task_manager import TaskManager, TaskPanel
     from autoortho.ui.task_models import TaskState, TaskType
     from autoortho.ui.readiness import (
+        ReadinessCheck,
         ReadinessStatus,
         SceneryChoice,
         build_readiness,
@@ -54,6 +56,19 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.shell import ApplicationShell
     from autoortho.ui.pages.scenery_page import SceneryLibraryPage
     from autoortho.ui.pages.settings_page import SettingsPage
+    from autoortho.ui.pages.expert_settings_page import ExpertSettingsPage
+    from autoortho.ui.widgets.target_cost_panel import TargetCostPanel
+    from autoortho.ui.widgets.mirror import mirror
+    from autoortho.ui.widgets.notice_bar import Notice
+    from autoortho.settings_registry import parse_value
+    from autoortho.ui.pages.essentials_page import EssentialsPage
+    from autoortho.ui.pages.tuning_page import TuningPage
+    from autoortho import governor as governor_module
+    from autoortho import home_snapshot as home_snapshot_module
+    from autoortho.ui.widgets.limits_editor import LimitsEditor
+    from autoortho.ui.widgets.connection_test_panel import ConnectionTestPanel
+    from autoortho import guards, hardware
+    from autoortho import limits as limits_module
     from autoortho.ui.pages.flight_plan_page import FlightPlanPage
     from autoortho.ui.pages.diagnostics_page import DiagnosticsPage
     from autoortho.ui.dynamic_zoom_editor import DynamicZoomEditor, PRESETS
@@ -92,6 +107,7 @@ else:
     from ui.task_manager import TaskManager, TaskPanel
     from ui.task_models import TaskState, TaskType
     from ui.readiness import (
+        ReadinessCheck,
         ReadinessStatus,
         SceneryChoice,
         build_readiness,
@@ -111,6 +127,20 @@ else:
     from ui.shell import ApplicationShell
     from ui.pages.scenery_page import SceneryLibraryPage
     from ui.pages.settings_page import SettingsPage
+    from ui.pages.expert_settings_page import ExpertSettingsPage
+    from ui.widgets.target_cost_panel import TargetCostPanel
+    from ui.widgets.mirror import mirror
+    from ui.widgets.notice_bar import Notice
+    from settings_registry import parse_value
+    from ui.pages.essentials_page import EssentialsPage
+    from ui.pages.tuning_page import TuningPage
+    import governor as governor_module
+    import home_snapshot as home_snapshot_module
+    from ui.widgets.limits_editor import LimitsEditor
+    from ui.widgets.connection_test_panel import ConnectionTestPanel
+    import guards
+    import hardware
+    import limits as limits_module
     from ui.pages.flight_plan_page import FlightPlanPage
     from ui.pages.diagnostics_page import DiagnosticsPage
     from ui.dynamic_zoom_editor import DynamicZoomEditor, PRESETS
@@ -136,7 +166,7 @@ from PySide6.QtWidgets import (
     QSlider, QTextEdit, QFileDialog, QMessageBox, QScrollArea,
     QSplashScreen, QGroupBox, QProgressBar, QStatusBar, QFrame, QSpinBox, QDoubleSpinBox,
     QColorDialog, QRadioButton, QMenu, QStyle,
-    QDialog, QApplication
+    QDialog, QApplication, QAbstractSlider, QAbstractSpinBox, QSystemTrayIcon
 )
 from PySide6.QtCore import (
     Qt, Signal, QTimer, QSize, QPoint, QObject, QEvent
@@ -215,6 +245,8 @@ class ConfigUI(QMainWindow):
     """Main configuration UI window using PyQt6"""
 
     SETTINGS_WIDGET_ATTRS = (
+        "protect_sim_fps_check",
+        "allow_texture_cap_check",
         "scenery_path_edit",
         "xplane_path_edit",
         "cache_dir_edit",
@@ -241,10 +273,8 @@ class ConfigUI(QMainWindow):
         "max_zoom_mode_combo",
         "max_zoom_slider",
         "max_zoom_near_airports_slider",
-        "use_time_budget_check",
-        "tile_budget_slider",
-        "maxwait_slider",
-        "suspend_maxwait_check",
+        "band_wait_slider",
+        "near_wait_slider",
         "fallback_level_combo",
         "fallback_extends_budget_check",
         "fallback_timeout_slider",
@@ -303,6 +333,7 @@ class ConfigUI(QMainWindow):
         "sun_day_threshold_spin",
     )
     RESTART_REQUIRED_SETTINGS = {
+        "expert_settings",
         "scenery_path_edit",
         "xplane_path_edit",
         "cache_dir_edit",
@@ -318,10 +349,6 @@ class ConfigUI(QMainWindow):
         "max_zoom_mode_combo",
         "max_zoom_slider",
         "max_zoom_near_airports_slider",
-        "use_time_budget_check",
-        "tile_budget_slider",
-        "maxwait_slider",
-        "suspend_maxwait_check",
         "fallback_level_combo",
         "fallback_extends_budget_check",
         "fallback_timeout_slider",
@@ -377,6 +404,102 @@ class ConfigUI(QMainWindow):
         "dynamic_zoom_steps",
         "missing_color",
     }
+    # Settings a dedicated control already edits. The Expert settings table
+    # shows them read-only so two controls never disagree about one value.
+    # tests/test_expert_settings_page.py checks this against every
+    # "self.cfg.<section>.<key> =" assignment in this module.
+    WIDGET_BOUND_SETTINGS = frozenset({
+        "autoortho.background_builder_workers",
+        "autoortho.buffer_pool_size",
+        "autoortho.download_dispatch_workers",
+        "autoortho.dynamic_zoom_steps",
+        "autoortho.fallback_extends_budget",
+        "autoortho.fallback_level",
+        "autoortho.fallback_timeout",
+        "autoortho.fetch_threads",
+        "autoortho.live_builder_concurrency",
+        "autoortho.live_tile_admission",
+        "autoortho.maptype_override",
+        "autoortho.max_zoom",
+        "autoortho.max_zoom_mode",
+        "autoortho.max_zoom_near_airports",
+        "autoortho.missing_color",
+        "autoortho.native_partial_allow_incomplete",
+        "autoortho.persist_partial_dds_cache",
+        "autoortho.pipeline_mode",
+        "autoortho.predictive_dds_build_interval_ms",
+        "autoortho.predictive_dds_enabled",
+        "autoortho.predictive_dds_use_fallbacks",
+        "autoortho.prefetch_admission_burst",
+        "autoortho.prefetch_enabled",
+        "autoortho.prefetch_interval",
+        "autoortho.prefetch_lookahead",
+        "autoortho.prefetch_max_chunks",
+        "autoortho.prefetch_quality_grace_sec",
+        "autoortho.prefetch_quality_mode",
+        "autoortho.prefetch_radius_nm",
+        "autoortho.provider_adaptive_concurrency",
+        "autoortho.provider_adaptive_controller_v2",
+        "autoortho.provider_max_connections",
+        "autoortho.provider_max_in_flight",
+        "autoortho.provider_origin_cooldown_seconds",
+        "autoortho.provider_origin_decrease_factor",
+        "autoortho.provider_origin_initial_concurrency",
+        "autoortho.provider_queue_timeout",
+        "autoortho.simheaven_compat",
+        "autoortho.strict_target_deadline_sec",
+        "autoortho.tile_image_cache_mb",
+        "autoortho.using_custom_tiles",
+        "cache.auto_clean_cache",
+        "cache.cache_mem_limit",
+        "cache.file_cache_size",
+        "diagnostics.checkpoint_interval_seconds",
+        "diagnostics.performance_profiling",
+        "diagnostics.python_allocation_tracing",
+        "diagnostics.sample_interval_seconds",
+        "flightdata.webui_port",
+        "flightdata.xplane_udp_port",
+        "fuse.threading",
+        "general.console_log_level",
+        "general.file_log_level",
+        "general.hide",
+        "paths.cache_dir",
+        "paths.download_dir",
+        "paths.long_term_cache_dir",
+        "paths.scenery_path",
+        "paths.xplane_path",
+        "pydds.compressor",
+        "pydds.format",
+        "scenery.max_download_workers",
+        "scenery.noclean",
+        "scenery.storage_safety_margin_gb",
+        "seasons.compress_dsf",
+        "seasons.enabled",
+        "seasons.fal_saturation",
+        "seasons.seasons_convert_workers",
+        "seasons.spr_saturation",
+        "seasons.sum_saturation",
+        "seasons.win_saturation",
+        "simbrief.prefetch_while_parked",
+        "simbrief.route_consideration_radius_nm",
+        "simbrief.route_deviation_threshold_nm",
+        "simbrief.use_flight_data",
+        "governor.mode",
+        "limits.ram_gb",
+        "limits.vram_gb",
+        "limits.bandwidth_mbps",
+        "limits.cpu_cores",
+        "limits.protect_sim_fps",
+        "governor.allow_texture_cap",
+        "streaming.band_max_wait_seconds",
+        "streaming.near_wait_seconds",
+        "simbrief.userid",
+        "time_exclusion.default_to_exclusion",
+        "time_exclusion.enabled",
+        "time_exclusion.sun_day_threshold",
+        "time_exclusion.sun_night_threshold",
+        "windows.prefer_winfsp",
+    })
 
     @staticmethod
     def _publish_simbrief_to_workers(data, enabled=None):
@@ -415,6 +538,9 @@ class ConfigUI(QMainWindow):
     status_update = Signal(str)
     log_update = Signal(str)
     show_error = Signal(str)
+    hardware_detected = Signal()
+    # Home's snapshot, once a second (home_snapshot.build).
+    home_snapshot_ready = Signal(object)
 
     def __init__(self, cfg, *args, **kwargs):
         super().__init__()
@@ -856,7 +982,7 @@ class ConfigUI(QMainWindow):
             )
         self.setTabOrder(
             self.categorized_settings_page.search_edit,
-            self.categorized_settings_page.preset_combo,
+            self.categorized_settings_page.show_all_check,
         )
         self.setTabOrder(
             self.scenery_library_page.search_edit,
@@ -898,6 +1024,28 @@ class ConfigUI(QMainWindow):
     def _build_phase3_pages(self):
         self.phase3_active = True
         self.home_page = self.shell.page("home")
+        self._notices = {}
+        self.home_page.notice_bar.action_triggered.connect(
+            self._on_notice_action
+        )
+        self.home_page.notice_bar.dismissed.connect(self._dismiss_notice)
+        self.home_snapshot_ready.connect(self.home_page.set_snapshot)
+        self.home_page.primary_action_requested.connect(self.on_run)
+        self.home_page.tuning_requested.connect(
+            lambda: self.navigate_to("settings", "Auto-Tuning")
+        )
+        self.home_page.edit_target_requested.connect(
+            lambda: self.navigate_to("settings", "Essentials")
+        )
+        self.home_page.open_library_requested.connect(
+            lambda: self.navigate_to("scenery-library")
+        )
+        self.home_page.open_report_requested.connect(
+            lambda: self.navigate_to("diagnostics")
+        )
+        self.home_page.last_flight_dismissed.connect(self._dismiss_last_flight)
+        self.home_page.compact_changed.connect(self._on_home_compact)
+        self._after_flight = False
 
         self.scenery_library_page = SceneryLibraryPage()
         self.scenery_library_page.install_requested.connect(
@@ -948,6 +1096,18 @@ class ConfigUI(QMainWindow):
             self.revert_button,
             self.restart_notice_label,
         )
+        self._build_limits_group()
+        self._build_essentials_page()
+        self.categorized_settings_page.add_category(
+            "Essentials",
+            [self.essentials_page],
+            recommendation=(
+                "The settings most people need. AutoOrtho sizes everything "
+                "else for this PC; turn on Show all settings to see it."
+            ),
+            restore_defaults=False,
+            essential=True,
+        )
         self.categorized_settings_page.add_category(
             "General",
             [self.options_group, self.general_settings_group],
@@ -997,7 +1157,6 @@ class ConfigUI(QMainWindow):
                 "is used when Maximum detail mode is Dynamic."
             ),
             numeric_bindings=(
-                ("Minimum zoom", self.min_zoom_slider, 1, ""),
                 ("Maximum zoom", self.max_zoom_slider, 1, ""),
                 (
                     "Airport maximum zoom",
@@ -1006,6 +1165,26 @@ class ConfigUI(QMainWindow):
                     "",
                 ),
             ),
+        )
+        self.categorized_settings_page.add_category(
+            "Limits",
+            [self.limits_group],
+            recommendation=(
+                "Auto works each limit out from this PC. Set your own to keep "
+                "resources for other apps; AutoOrtho stays under them."
+            ),
+            restore_defaults=False,
+            essential=True,
+        )
+        self._build_tuning_page()
+        self.categorized_settings_page.add_category(
+            "Auto-Tuning",
+            [self.tuning_page],
+            recommendation=(
+                "What auto-tuning does while you fly: the bottleneck it found, "
+                "each change and its reason. Pin a value to keep it."
+            ),
+            restore_defaults=False,
         )
         self.categorized_settings_page.add_category(
             "Streaming",
@@ -1019,15 +1198,15 @@ class ConfigUI(QMainWindow):
             ),
             numeric_bindings=(
                 (
-                    "Tile time budget",
-                    self.tile_budget_slider,
+                    "Wait in flight",
+                    self.band_wait_slider,
                     1,
                     " s",
                 ),
                 (
-                    "Per-chunk wait",
-                    self.maxwait_slider,
-                    10,
+                    "Wait while loading",
+                    self.near_wait_slider,
+                    1,
                     " s",
                 ),
                 (
@@ -1095,8 +1274,30 @@ class ConfigUI(QMainWindow):
                 ),
             ),
         )
-        self.categorized_settings_page.preset_requested.connect(
-            self._apply_settings_preset
+        self.expert_settings_page = ExpertSettingsPage(
+            self.cfg,
+            locked_names=self.WIDGET_BOUND_SETTINGS,
+        )
+        self.expert_settings_page.changed.connect(
+            self._on_settings_control_changed
+        )
+        self.categorized_settings_page.add_category(
+            "All Settings (Expert)",
+            [self.expert_settings_page],
+            recommendation=(
+                "Every AutoOrtho setting with its default and whether you "
+                "changed it. Only changed settings are stored in your config "
+                "file; the rest follow AutoOrtho's defaults."
+            ),
+            restore_defaults=False,
+        )
+        self._refresh_kept_values_notice()
+        self.categorized_settings_page.set_show_all(
+            str(getattr(self.cfg.general, "show_all_settings", False)).lower()
+            in ("true", "1", "yes", "on")
+        )
+        self.categorized_settings_page.show_all_changed.connect(
+            self._on_show_all_settings_changed
         )
         self.categorized_settings_page.restore_defaults_requested.connect(
             self._restore_category_defaults
@@ -1193,119 +1394,1021 @@ class ConfigUI(QMainWindow):
         self._dynamic_zoom_manager = manager.clone()
         self._update_dynamic_summary()
         self._update_buffer_pool_label()
+        self._schedule_target_cost()
         self._on_settings_control_changed()
 
-    def _apply_settings_preset(self, name):
-        presets = {
-            "Balanced": {
-                "max_zoom_slider": 16,
-                "tile_budget_slider": 120,
-                "maxwait_slider": 20,
-                "fallback_timeout_slider": 30,
-                "prefetch_lookahead_slider": 10,
-                "prefetch_max_chunks_slider": 64,
-                "prefetch_radius_slider": 30,
-                "background_workers_slider": 2,
-                "live_concurrency_slider": 8,
-                "provider_inflight_spinbox": 128,
-                "provider_connections_spinbox": 64,
-                "download_dispatch_workers_spinbox": 4,
-                "provider_queue_timeout_spinbox": 60,
-                "provider_initial_concurrency_spinbox": 64,
-                "provider_decrease_factor_spinbox": 0.7,
-                "provider_cooldown_spinbox": 5.0,
-                "live_tile_admission_spinbox": 16,
-                "tile_image_cache_mb_spinbox": 96,
-            },
-            "Quality": {
-                "max_zoom_slider": 17,
-                "tile_budget_slider": 300,
-                "maxwait_slider": 50,
-                "fallback_timeout_slider": 60,
-                "prefetch_lookahead_slider": 30,
-                "prefetch_max_chunks_slider": 96,
-                "prefetch_radius_slider": 50,
-                "background_workers_slider": 6,
-                "live_concurrency_slider": 12,
-                "provider_inflight_spinbox": 192,
-                "provider_connections_spinbox": 64,
-                "download_dispatch_workers_spinbox": 6,
-                "provider_queue_timeout_spinbox": 90,
-                "provider_initial_concurrency_spinbox": 64,
-                "provider_decrease_factor_spinbox": 0.7,
-                "provider_cooldown_spinbox": 5.0,
-                "live_tile_admission_spinbox": 20,
-                "tile_image_cache_mb_spinbox": 128,
-            },
-            "Low Bandwidth": {
-                "max_zoom_slider": 15,
-                "tile_budget_slider": 60,
-                "maxwait_slider": 30,
-                "fallback_timeout_slider": 30,
-                "prefetch_lookahead_slider": 10,
-                "prefetch_max_chunks_slider": 24,
-                "prefetch_radius_slider": 30,
-                "background_workers_slider": 2,
-                "live_concurrency_slider": 6,
-                "provider_inflight_spinbox": 64,
-                "provider_connections_spinbox": 32,
-                "download_dispatch_workers_spinbox": 3,
-                "provider_queue_timeout_spinbox": 90,
-                "provider_initial_concurrency_spinbox": 32,
-                "provider_decrease_factor_spinbox": 0.5,
-                "provider_cooldown_spinbox": 5.0,
-                "live_tile_admission_spinbox": 8,
-                "tile_image_cache_mb_spinbox": 64,
-            },
-            "Low Resource": {
-                "max_zoom_slider": 15,
-                "tile_budget_slider": 60,
-                "maxwait_slider": 20,
-                "fallback_timeout_slider": 20,
-                "prefetch_lookahead_slider": 5,
-                "prefetch_max_chunks_slider": 16,
-                "prefetch_radius_slider": 20,
-                "background_workers_slider": 1,
-                "live_concurrency_slider": 4,
-                "provider_inflight_spinbox": 64,
-                "provider_connections_spinbox": 16,
-                "download_dispatch_workers_spinbox": 2,
-                "provider_queue_timeout_spinbox": 60,
-                "provider_initial_concurrency_spinbox": 32,
-                "provider_decrease_factor_spinbox": 0.5,
-                "provider_cooldown_spinbox": 5.0,
-                "live_tile_admission_spinbox": 6,
-                "tile_image_cache_mb_spinbox": 64,
-            },
-        }
-        values = presets.get(name)
-        if values is None:
+    # -- Guards: what the zoom target costs on this PC -------------------
+
+    def _start_hardware_detection(self):
+        """Probe graphics memory off the UI thread (it can run a command)."""
+        if hardware.cached() is not None:
             return
-        for attr, value in values.items():
-            widget = getattr(self, attr, None)
-            if widget is not None:
-                widget.setValue(value)
-        if name == "Quality":
-            self.fallback_level_combo.setCurrentIndex(2)
-            self.fallback_extends_budget_check.setChecked(True)
-            self.suspend_maxwait_check.setChecked(True)
-        else:
-            self.fallback_level_combo.setCurrentIndex(1)
-            self.fallback_extends_budget_check.setChecked(False)
-            self.suspend_maxwait_check.setChecked(False)
-        self.provider_adaptive_check.setChecked(True)
-        self.native_partial_allow_incomplete_check.setChecked(True)
-        self.persist_partial_dds_cache_check.setChecked(
-            name != "Low Resource"
+
+        def probe():
+            try:
+                hardware.detect()
+            finally:
+                try:
+                    self.hardware_detected.emit()
+                except RuntimeError:
+                    pass  # window already gone
+
+        threading.Thread(
+            target=probe, name="HardwareDetect", daemon=True
+        ).start()
+
+    def _schedule_target_cost(self, *args):
+        timer = getattr(self, "_target_cost_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _target_from_controls(self):
+        """(mode, max_zoom, airport_zoom, steps) as the controls show them."""
+        dynamic = self.max_zoom_mode_combo.currentText() == "Dynamic"
+        steps = (
+            self._dynamic_zoom_manager.save_to_config()
+            if dynamic and hasattr(self, "_dynamic_zoom_manager")
+            else []
         )
-        if name in ("Balanced", "Quality", "Low Resource"):
-            dynamic_preset = {
-                "Balanced": "Airliner",
-                "Quality": "General Aviation",
-                "Low Resource": "Low VRAM",
-            }[name]
-            self.dynamic_zoom_editor.apply_preset(dynamic_preset)
+        return (
+            "dynamic" if dynamic else "fixed",
+            self.max_zoom_slider.value(),
+            self.max_zoom_near_airports_slider.value(),
+            steps,
+        )
+
+    def _update_target_cost(self):
+        panel = getattr(self, "target_cost_panel", None)
+        if panel is None:
+            return
+        essentials = getattr(self, "essentials_page", None)
+        enabled = guards.warnings_enabled(self.cfg)
+        if essentials is not None:
+            essentials.cost_panel.setVisible(enabled)
+        if not enabled:
+            panel.setVisible(False)
+            return
+        panel.setVisible(True)
+        hw = hardware.cached() or hardware.basic()
+        mode, zoom, airport, steps = self._target_from_controls()
+        try:
+            results = guards.check_target(
+                mode,
+                zoom,
+                airport,
+                steps,
+                hw,
+                cache_mem_limit_gb=self.mem_cache_slider.value(),
+                cache_dir=self.cache_dir_edit.text().strip(),
+                reserve_gb=guards.reserve_gb(self.cfg),
+                k=guards.paging_k(self.cfg),
+                fmt=guards.texture_format(self.cfg),
+                limits=self._limits_from_controls(hw),
+                connection=self._connection_result(),
+                disk_cache_gb=self.file_cache_slider.value() or None,
+                cache_used_bytes=getattr(self, "_cache_usage_bytes", None),
+                disk_margin_gb=self._disk_margin_gb(),
+            )
+        except Exception:
+            log.exception("Could not estimate the zoom target's cost")
+            return
+        panel.set_results(results, hw.summary())
+        essentials = getattr(self, "essentials_page", None)
+        if essentials is not None:
+            essentials.cost_panel.set_results(results, hw.summary())
+
+    def _disk_margin_gb(self):
+        try:
+            return max(2.0, float(self.cfg.scenery.storage_safety_margin_gb))
+        except (AttributeError, TypeError, ValueError):
+            return 2.0
+
+    def _apply_guard_fix(self, fix):
+        """Put a suggested fix into the controls (pending until Apply)."""
+        changes = dict(fix.changes)
+        limit_changes = {
+            key.split(".", 1)[1]: value
+            for key, value in changes.items()
+            if key.startswith("limits.")
+        }
+        if limit_changes and hasattr(self, "limits_editor"):
+            values = self.limits_editor.values()
+            values.update(limit_changes)
+            self.limits_editor.set_values(values)
+        if "cache.file_cache_size" in changes:
+            self.file_cache_slider.setValue(
+                int(float(changes["cache.file_cache_size"]))
+            )
+        if changes.get("autoortho.max_zoom_mode") == "fixed":
+            self.max_zoom_mode_combo.setCurrentText("Fixed")
+        if "autoortho.max_zoom" in changes:
+            self.max_zoom_slider.setValue(int(changes["autoortho.max_zoom"]))
+        if "autoortho.max_zoom_near_airports" in changes:
+            self.max_zoom_near_airports_slider.setValue(
+                int(changes["autoortho.max_zoom_near_airports"])
+            )
+        if "autoortho.dynamic_zoom_steps" in changes:
+            manager = DynamicZoomManager()
+            manager.load_from_config(changes["autoortho.dynamic_zoom_steps"])
+            self._dynamic_zoom_manager = manager
+            if self.phase3_active:
+                self.dynamic_zoom_editor.set_manager(self._dynamic_zoom_manager)
+            self._update_dynamic_summary()
+            self._update_buffer_pool_label()
+        if "cache.cache_mem_limit" in changes:
+            self.mem_cache_slider.setValue(
+                int(float(changes["cache.cache_mem_limit"]))
+            )
+        self._schedule_target_cost()
         self._on_settings_control_changed()
+
+    def _apply_wizard_target(self, target):
+        dynamic = target.get("mode") == "dynamic" and target.get("steps")
+        self.max_zoom_slider.setValue(int(target.get("max_zoom", 16)))
+        self.max_zoom_near_airports_slider.setValue(
+            int(target.get("airport_zoom", 18))
+        )
+        if dynamic:
+            manager = DynamicZoomManager()
+            manager.load_from_config(target["steps"])
+            self._dynamic_zoom_manager = manager
+            if self.phase3_active:
+                self.dynamic_zoom_editor.set_manager(manager)
+            self._update_dynamic_summary()
+        self.max_zoom_mode_combo.setCurrentText(
+            "Dynamic" if dynamic else "Fixed"
+        )
+        self._update_zoom_mode_visibility()
+
+    # -- Home notices -----------------------------------------------------
+
+    def set_notice(self, notice):
+        self._notices[notice.id] = notice
+        self._publish_notices()
+
+    def clear_notice(self, notice_id):
+        if self._notices.pop(notice_id, None) is not None:
+            self._publish_notices()
+
+    def _publish_notices(self):
+        if self.phase3_active:
+            self.home_page.set_notices(list(self._notices.values()))
+
+    def _kept_value_names(self):
+        raw = str(getattr(self.cfg.general, "kept_values", "") or "")
+        names = [name.strip() for name in raw.split(",") if name.strip()]
+        kept = []
+        for name in names:
+            section, _, key = name.partition(".")
+            if key and self.cfg.is_custom(section, key):
+                kept.append(name)
+        return kept
+
+    def _refresh_kept_values_notice(self):
+        names = self._kept_value_names()
+        if not names:
+            self.clear_notice("kept_values")
+            return
+        registry = self.cfg.registry()
+        labels = []
+        for name in names[:3]:
+            section, _, key = name.partition(".")
+            spec = registry.get(section, key)
+            labels.append(spec.label if spec is not None else key)
+        more = f" and {len(names) - 3} more" if len(names) > 3 else ""
+        count = "1 of your own values was" if len(names) == 1 else (
+            f"{len(names)} of your own values were"
+        )
+        self.set_notice(Notice(
+            "kept_values",
+            "info",
+            "AutoOrtho now sizes engine settings for this PC. "
+            f"{count} kept: {', '.join(labels)}{more}.",
+            (("review", "Review"), ("automatic", "Use automatic values")),
+        ))
+
+    def _on_notice_action(self, notice_id, action):
+        if notice_id == "governor_advice" and action == "apply":
+            decision = getattr(self, "_latest_advice", None)
+            if decision is not None:
+                self._apply_advice(decision)
+            return
+        if notice_id == "scenery_task_failed":
+            self.navigate_to("scenery-library")
+            return
+        if notice_id == "governor_unreachable":
+            self.navigate_to(
+                "settings", "Essentials" if action == "target" else "Limits"
+            )
+            return
+        if notice_id == "kept_values":
+            if action == "review":
+                self.navigate_to("settings", "All Settings (Expert)")
+                self.expert_settings_page.only_custom_check.setChecked(True)
+            elif action == "automatic":
+                names = self._kept_value_names()
+                self._use_automatic_values(names)
+                self.cfg.general.kept_values = ""
+                self.clear_notice("kept_values")
+                self.navigate_to("settings", "All Settings (Expert)")
+                self.update_status_bar(
+                    f"{len(names)} settings set back to AutoOrtho's values. "
+                    "Press Apply to keep them."
+                )
+
+    def _dismiss_notice(self, notice_id):
+        if notice_id == "governor_advice":
+            decision = getattr(self, "_latest_advice", None)
+            if decision is not None:
+                self._dismissed_advice.add(decision.t)
+        if notice_id == "kept_values":
+            self.cfg.general.kept_values = ""
+            try:
+                self.cfg.save()
+            except Exception:
+                log.exception("Could not save the dismissed notice")
+        self.clear_notice(notice_id)
+
+    def _control_for(self, section, key):
+        """The control that owns a setting on the settings pages, if any."""
+        if f"{section}.{key}" not in self.WIDGET_BOUND_SETTINGS:
+            return None
+        for kind in (
+            QAbstractSlider, QAbstractSpinBox, QCheckBox, QComboBox, QLineEdit,
+        ):
+            widget = self.findChild(kind, key)
+            if widget is not None:
+                return widget
+        return None
+
+    def _use_automatic_values(self, names):
+        """Put AutoOrtho's own value back into each setting (pending Apply).
+
+        A control that owns the setting gets the value directly; anything
+        else is reset in the Expert table.
+        """
+        expert_rows = []
+        model = self.expert_settings_page.model
+        for name in names:
+            section, _, key = name.partition(".")
+            text = self.cfg.automatic_text(section, key)
+            if text is None:
+                continue
+            widget = self._control_for(section, key)
+            if widget is None:
+                for row in range(model.rowCount()):
+                    if model.spec(row).name == name:
+                        expert_rows.append(row)
+                continue
+            value = parse_value(text)
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            elif isinstance(widget, QComboBox):
+                widget.setCurrentText(str(value))
+            elif isinstance(widget, QLineEdit):
+                widget.setText(str(value))
+            else:
+                # Some sliders hold a scaled value (tenths, percent): the
+                # scale is the control's value over the saved one.
+                saved = self.cfg.value(section, key)
+                try:
+                    scale = widget.value() / float(saved) if float(saved) else 1.0
+                except (TypeError, ValueError):
+                    scale = 1.0
+                if not scale or abs(scale - round(scale)) > 1e-6:
+                    scale = 1.0
+                widget.setValue(type(widget.value())(float(value) * round(scale)))
+        if expert_rows:
+            model.reset_rows(expert_rows)
+        self._on_settings_control_changed()
+
+    def _build_essentials_page(self):
+        page = EssentialsPage(profile_names=list(PRESETS))
+        self.essentials_page = page
+        page.mode_combo.addItems(["Fixed", "By altitude"])
+        self._essentials_syncs = [
+            mirror(self.max_zoom_mode_combo, page.mode_combo, copy_items=False),
+            mirror(self.max_zoom_slider, page.zoom_spin),
+            mirror(self.max_zoom_near_airports_slider, page.airport_spin),
+            mirror(self.file_cache_slider, page.disk_cache_spin),
+            mirror(self.xplane_path_edit, page.xplane_edit),
+            mirror(self.scenery_path_edit, page.scenery_edit),
+            mirror(self.cache_dir_edit, page.cache_edit),
+            mirror(self.maptype_combo, page.maptype_combo),
+            mirror(self.seasons_enabled_check, page.seasons_check),
+            mirror(self.time_exclusion_enabled_check, page.night_check),
+            mirror(self.simbrief_userid_edit, page.simbrief_edit),
+            mirror(self.simbrief_use_flight_data_check, page.simbrief_check),
+            mirror(self.hide_check, page.hide_check),
+        ]
+        page.update_mode_rows()
+
+        sliders = (
+            self.spr_sat_slider,
+            self.sum_sat_slider,
+            self.fal_sat_slider,
+            self.win_sat_slider,
+        )
+
+        def show_strength(*_args):
+            average = round(sum(s.value() for s in sliders) / len(sliders))
+            page.seasons_strength.blockSignals(True)
+            page.seasons_strength.setValue(average)
+            page.seasons_strength.blockSignals(False)
+
+        def set_strength(value):
+            for slider in sliders:
+                slider.setValue(value)
+
+        for slider in sliders:
+            slider.valueChanged.connect(show_strength)
+        page.seasons_strength.valueChanged.connect(set_strength)
+        show_strength()
+        self._essentials_syncs.append(show_strength)
+
+        page.cost_panel.fix_requested.connect(self._apply_guard_fix)
+        page.cost_panel.suggest_requested.connect(self._suggest_target_for_pc)
+        page.navigate_requested.connect(
+            lambda name: self.navigate_to("settings", name)
+        )
+        page.library_requested.connect(
+            lambda: self.navigate_to("scenery-library")
+        )
+        page.browse_requested.connect(self.browse_folder)
+        page.profile_requested.connect(self._apply_zoom_profile)
+        self.limits_editor.changed.connect(self._refresh_essentials_limits)
+        self.hardware_detected.connect(self._refresh_essentials_limits)
+        self._refresh_essentials_limits()
+        self._refresh_essentials_profile()
+
+    def _sync_essentials(self):
+        """Bring the Essentials mirrors up to date (after a Revert, which
+        restores the full controls with their signals blocked)."""
+        page = getattr(self, "essentials_page", None)
+        if page is None:
+            return
+        for sync in getattr(self, "_essentials_syncs", ()):
+            sync()
+        page.update_mode_rows()
+        self._refresh_essentials_profile()
+        self._refresh_essentials_limits()
+
+    def _refresh_essentials_limits(self, *args):
+        page = getattr(self, "essentials_page", None)
+        if page is None:
+            return
+        hw = hardware.cached() or hardware.basic()
+        text = limits_module.describe(self._limits_from_controls(hw))
+        page.set_limits_text(
+            "AutoOrtho may use: RAM {ram_gb} · graphics memory {vram_gb} · "
+            "downloads {bandwidth_mbps} · CPU {cpu_cores}".format(**text)
+        )
+
+    def _refresh_essentials_profile(self):
+        page = getattr(self, "essentials_page", None)
+        if page is None or not hasattr(self, "_dynamic_zoom_manager"):
+            return
+        current = sorted(
+            (int(s["altitude_ft"]), int(s["zoom_level"]),
+             int(s.get("zoom_level_airports", 18)))
+            for s in self._dynamic_zoom_manager.save_to_config()
+        )
+        match = next(
+            (
+                name for name, preset in PRESETS.items()
+                if sorted(tuple(step) for step in preset) == current
+            ),
+            "",
+        )
+        page.show_profile(match)
+
+    def _apply_zoom_profile(self, name):
+        preset = PRESETS.get(name)
+        if not preset:
+            return
+        manager = DynamicZoomManager()
+        manager.load_from_config([
+            {"altitude_ft": alt, "zoom_level": zoom, "zoom_level_airports": airport}
+            for alt, zoom, airport in preset
+        ])
+        self._dynamic_zoom_manager = manager
+        if self.phase3_active:
+            self.dynamic_zoom_editor.set_manager(manager)
+        self._update_dynamic_summary()
+        self._update_buffer_pool_label()
+        self._schedule_target_cost()
+        self._on_settings_control_changed()
+
+    def _on_show_all_settings_changed(self, show_all):
+        self.cfg.general.show_all_settings = bool(show_all)
+
+    # -- Auto-tuning (governor) ------------------------------------------------
+
+    def _build_tuning_page(self):
+        modes = [
+            (mode, governor_module.MODE_LABELS[mode])
+            for mode in governor_module.MODES
+        ]
+        page = TuningPage(modes)
+        self.tuning_page = page
+        page.set_mode(str(getattr(self.cfg.governor, "mode", "advise")))
+        self.allow_texture_cap_check = page.texture_cap_check
+        self.allow_texture_cap_check.setChecked(
+            governor_module.texture_cap_allowed(self.cfg)
+        )
+        page.mode_changed.connect(self._on_settings_control_changed)
+        page.pin_toggled.connect(self._toggle_pin)
+        page.reset_learned_requested.connect(self._reset_learned)
+        page.export_requested.connect(self._export_tuning_report)
+        essentials = getattr(self, "essentials_page", None)
+        if essentials is not None:
+            essentials.set_governor_modes(
+                modes,
+                page.mode_combo.currentData(),
+                "Auto adjusts downloads, workers and memory while you fly, "
+                "within your limits. Settings > Auto-Tuning shows each change.",
+            )
+            self._essentials_syncs.append(
+                mirror(page.mode_combo, essentials.governor_combo, copy_items=False)
+            )
+        self._dismissed_advice = set()
+        self._tuning_timer = QTimer(self)
+        self._tuning_timer.setInterval(1000)
+        self._tuning_timer.timeout.connect(self._refresh_tuning)
+        self._tuning_timer.start()
+        self._refresh_tuning()
+
+    def _static_tuning_snapshot(self):
+        hw = hardware.cached() or hardware.basic()
+        levers = governor_module.levers_for(self.cfg, self._limits_from_controls(hw))
+        values, baseline, pinned = {}, {}, []
+        for name in levers:
+            section, key = name.split(".", 1)
+            try:
+                values[name] = float(self.cfg.value(section, key))
+            except (TypeError, ValueError):
+                continue
+            try:
+                baseline[name] = float(self.cfg.automatic_text(section, key))
+            except (TypeError, ValueError):
+                baseline[name] = values[name]
+            if self.cfg.is_custom(section, key):
+                pinned.append(name)
+        return {
+            "mode": self.tuning_page.mode_combo.currentData(),
+            "state": "not_streaming",
+            "state_text": "Not streaming",
+            "fidelity": None, "mbps": 0.0, "cpu": 0.0, "error_share": 0.0,
+            "time_to_sharp_s": None,
+            "values": values, "baseline": baseline, "pinned": pinned,
+            "levers": levers, "decisions": [], "timeline": [],
+            "notice": None, "starting": False,
+        }
+
+    def _refresh_tuning(self):
+        page = getattr(self, "tuning_page", None)
+        if page is None:
+            return
+        service = getattr(self, "governor_service", None)
+        snapshot = service.snapshot() if service is not None else None
+        self._refresh_home(snapshot)
+        live = snapshot is not None
+        if snapshot is None:
+            snapshot = self._static_tuning_snapshot()
+        page.show_snapshot(snapshot, learned=getattr(self, "_governor_learned", None))
+        if not live:
+            page.status_label.setText(
+                "Not streaming. Auto-tuning starts with streaming; the table "
+                "shows what it may tune and the values it starts from."
+            )
+            self.clear_notice("governor_advice")
+            return
+        self._publish_governor_notices(snapshot)
+
+    # -- Home (proposal section 13) ---------------------------------------
+
+    def _home_target_text(self, altitude_ft=None):
+        auto = self.cfg.autoortho
+        if str(getattr(auto, "max_zoom_mode", "fixed")).lower() == "dynamic":
+            steps = getattr(self, "_dynamic_zoom_manager", None)
+            text = "By altitude"
+            try:
+                count = len(steps.get_steps()) if steps is not None else 0
+                if count:
+                    text += f" ({count} steps)"
+                if steps is not None and altitude_ft is not None:
+                    text += f" · ZL{steps.get_zoom_for_altitude(altitude_ft)} at this altitude"
+            except Exception:
+                pass
+            return text
+        return f"ZL{auto.max_zoom} · airports ZL{auto.max_zoom_near_airports}"
+
+    def _home_route(self):
+        data = getattr(self, "simbrief_flight_data", None)
+        if not data:
+            return ""
+        try:
+            origin = (data.get("origin") or {}).get("icao_code", "")
+            dest = (data.get("destination") or {}).get("icao_code", "")
+        except AttributeError:
+            return ""
+        return f"{origin} → {dest}" if origin and dest else ""
+
+    def _home_last_flight(self):
+        if getattr(self, "last_flight", None) is None:
+            self.last_flight = governor_module.load_last_flight()
+        return self.last_flight
+
+    def _refresh_home(self, governor_snapshot=None):
+        """Build Home's snapshot (1 Hz) and the taskbar summary."""
+        if not getattr(self, "phase3_active", False):
+            return
+        runtime = {
+            RuntimeState.STOPPED: "stopped",
+            RuntimeState.STARTING: "starting",
+            RuntimeState.RUNNING: "running",
+            RuntimeState.STOPPING: "running",
+            RuntimeState.ERROR: "error",
+        }.get(self.runtime_state, "stopped")
+        try:
+            from datareftrack import dt as tracker
+        except ImportError:
+            tracker = None
+        xplane = bool(tracker is not None and tracker.get_flight_data() is not None)
+        hw = hardware.cached() or hardware.basic()
+        try:
+            cores = limits_module.from_config(self.cfg, hw).cpu_cores
+        except Exception:
+            cores = None
+        home = (governor_snapshot or {}).get("home") or {}
+        mounted = len([
+            handle for handle in getattr(self, "mount_workers", [])
+            if handle.process.poll() is None
+        ]) or len(getattr(self.cfg, "scenery_mounts", []) or [])
+        snapshot = home_snapshot_module.build(
+            runtime=runtime,
+            governor=governor_snapshot,
+            packs=mounted,
+            xplane_connected=xplane,
+            provider=self.maptype_combo.currentText(),
+            route=self._home_route(),
+            target_text=self._home_target_text(home.get("altitude_ft")),
+            cpu_limit_cores=cores,
+            card_bytes=getattr(hw, "vram", None),
+            last_flight=self._home_last_flight(),
+            show_last_flight=getattr(self, "_after_flight", False),
+            mode_label=governor_module.MODE_LABELS.get(
+                (governor_snapshot or {}).get("mode", ""), ""
+            ),
+            now=time.monotonic(),
+        )
+        self.home_snapshot_ready.emit(snapshot)
+        self._update_tray_summary(snapshot)
+        # Taskbar summary while streaming (the window may be hidden).
+        base = getattr(self, "_base_window_title", None)
+        if base is None:
+            base = self._base_window_title = self.windowTitle()
+        self.setWindowTitle(
+            snapshot.summary if runtime == "running" and governor_snapshot else base
+        )
+
+    # -- system tray (general.hide) ---------------------------------------
+
+    _tray = None
+    _hidden_to_tray = False
+
+    def _ensure_tray(self):
+        if self._tray is not None:
+            return self._tray
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return None
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        tray = QSystemTrayIcon(icon, self)
+        menu = QMenu(self)
+        menu.addAction("Show AutoOrtho", self._restore_from_tray)
+        menu.addAction("Stop streaming", self.on_run)
+        menu.addSeparator()
+        menu.addAction("Quit", self.close)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        tray.setToolTip("AutoOrtho")
+        self._tray = tray
+        return tray
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._restore_from_tray()
+
+    def _restore_from_tray(self):
+        self._hidden_to_tray = False
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _update_tray(self):
+        """Minimize to the tray when streaming starts (general.hide); back after."""
+        check = getattr(self, "hide_check", None)
+        wanted = bool(check is not None and check.isChecked())
+        if self.runtime_state == RuntimeState.RUNNING and wanted:
+            tray = self._ensure_tray()
+            if tray is None:
+                return
+            tray.show()
+            if self.isVisible() and not self._hidden_to_tray:
+                self._hidden_to_tray = True
+                self.hide()
+        elif self.runtime_state in (RuntimeState.STOPPED, RuntimeState.ERROR):
+            if self._tray is not None:
+                self._tray.hide()
+            if self._hidden_to_tray:
+                self._restore_from_tray()
+
+    def _update_tray_summary(self, snapshot):
+        """The tray tooltip reads like Home's headline; ! when a notice waits."""
+        if self._tray is None or not self._tray.isVisible():
+            return
+        notices = list(getattr(self, "_notices", {}).values())
+        attention = any(n.level in ("warning", "error") for n in notices)
+        self._tray.setToolTip(("! " if attention else "") + snapshot.summary)
+
+    def _dismiss_last_flight(self):
+        self._after_flight = False
+        self._refresh_home(None)
+
+    def _on_home_compact(self, compact):
+        # A second monitor: the navigation rail goes too.
+        rail = getattr(self.shell, "navigation", None) or getattr(self.shell, "nav", None)
+        if rail is not None and hasattr(rail, "setVisible"):
+            rail.setVisible(not compact)
+        self.setMinimumSize(420 if compact else 820, 360 if compact else 620)
+
+    def _publish_governor_notices(self, snapshot):
+        if not self.phase3_active:
+            return
+        decisions = [
+            d for d in snapshot.get("decisions", [])
+            if not d.applied and d.t not in self._dismissed_advice
+        ]
+        if snapshot.get("mode") == "advise" and decisions:
+            latest = decisions[-1]
+            self._latest_advice = latest
+            self.set_notice(Notice(
+                "governor_advice",
+                "info",
+                f"Auto-tuning suggests: {latest.text()}.",
+                (("apply", "Apply"),),
+            ))
+        else:
+            self.clear_notice("governor_advice")
+        notice = snapshot.get("notice")
+        if notice:
+            self.set_notice(Notice(
+                "governor_unreachable",
+                "warning",
+                notice,
+                (("target", "Lower the target"), ("limits", "Raise a limit")),
+            ))
+        else:
+            self.clear_notice("governor_unreachable")
+
+    def _apply_advice(self, decision):
+        """Advise mode: the user accepts one suggestion.
+
+        It stays AutoOrtho's value, not a pinned setting: it goes to the
+        learned profile (the next flights start from it), the governor may
+        suggest moving it again, and Reset learned settings clears it.
+        """
+        publish = getattr(self, "publish_levers", None)
+        if publish is not None and self.runtime_state == RuntimeState.RUNNING:
+            publish({decision.lever: decision.new})
+        service = getattr(self, "governor_service", None)
+        if service is not None:
+            service.governor.values[decision.lever] = float(decision.new)
+        profile = getattr(self, "_governor_key", None)
+        if profile:
+            governor_module.LearnedProfiles().put_applied(
+                profile, decision.lever, decision.new
+            )
+            learned = dict(getattr(self, "_governor_learned", None) or {})
+            learned[decision.lever] = float(decision.new)
+            self._governor_learned = learned
+        else:
+            log.warning("No learned profile to keep %s in", decision.lever)
+        self._dismissed_advice.add(decision.t)
+        self.clear_notice("governor_advice")
+        self.update_status_bar(f"Applied: {decision.text()}")
+
+    def _set_control_from_text(self, widget, section, key, text, saved=None):
+        value = parse_value(text)
+        if isinstance(widget, QCheckBox):
+            widget.setChecked(bool(value))
+        elif isinstance(widget, QComboBox):
+            widget.setCurrentText(str(value))
+        elif isinstance(widget, QLineEdit):
+            widget.setText(str(value))
+        else:
+            if saved is None:
+                saved = self.cfg.value(section, key)
+            try:
+                scale = widget.value() / float(saved) if float(saved) else 1.0
+            except (TypeError, ValueError):
+                scale = 1.0
+            if not scale or abs(scale - round(scale)) > 1e-6:
+                scale = 1.0
+            widget.setValue(type(widget.value())(float(value) * round(scale)))
+
+    def _toggle_pin(self, name, pinned):
+        """Pin keeps the current value (auto-tuning will not move it);
+        unpin hands it back to AutoOrtho. Saved at once."""
+        section, _, key = name.partition(".")
+        service = getattr(self, "governor_service", None)
+        was_dirty = self.settings_session.dirty
+        if pinned:
+            current = service.governor.values.get(name) if service else None
+            if current is not None:
+                self.cfg.set_value(section, key, str(int(current) if float(current).is_integer() else current))
+            self.cfg.pin(section, key)
+        else:
+            saved = self.cfg.value(section, key)
+            self.cfg.reset_to_default(section, key)
+            widget = self._control_for(section, key)
+            if widget is not None:
+                self._set_control_from_text(
+                    widget, section, key, self.cfg.automatic_text(section, key), saved
+                )
+        try:
+            self.cfg.save()
+        except Exception:
+            log.exception("Could not save the pin")
+        if not was_dirty:
+            self.settings_session.mark_applied(self._snapshot_settings())
+        if service is not None:
+            if pinned:
+                service.governor.pinned.add(name)
+            else:
+                service.governor.pinned.discard(name)
+        self._refresh_tuning()
+
+    def _reset_learned(self):
+        governor_module.LearnedProfiles().clear()
+        self._governor_learned = {}
+        self.update_status_bar(
+            "Learned settings cleared. The next flight starts from this PC's values."
+        )
+
+    def _export_tuning_report(self):
+        import json as _json
+
+        service = getattr(self, "governor_service", None)
+        snapshot = service.snapshot() if service is not None else self._static_tuning_snapshot()
+        report = {
+            "mode": snapshot["mode"],
+            "state": snapshot["state_text"],
+            "fidelity": snapshot["fidelity"],
+            "values": snapshot["values"],
+            "baseline": snapshot["baseline"],
+            "pinned": list(snapshot["pinned"]),
+            "levers": {
+                name: {
+                    "label": spec.label, "minimum": spec.minimum,
+                    "maximum": spec.maximum, "step": spec.step, "unit": spec.unit,
+                }
+                for name, spec in snapshot["levers"].items()
+            },
+            "decisions": [
+                {"t": d.t, "lever": d.lever, "old": d.old, "new": d.new,
+                 "state": d.state, "reason": d.reason, "applied": d.applied,
+                 "outcome": d.outcome}
+                for d in snapshot["decisions"]
+            ],
+            "timeline": snapshot["timeline"],
+        }
+        os.makedirs(governor_module.DATA_DIR, exist_ok=True)
+        path = os.path.join(
+            governor_module.DATA_DIR,
+            time.strftime("tuning-report-%Y%m%d-%H%M%S.json"),
+        )
+        with open(path, "w", encoding="utf-8") as handle:
+            _json.dump(report, handle, indent=2)
+        self.tuning_report_path = path
+        self.update_status_bar(f"Tuning report saved: {path}")
+        return path
+
+    def _build_limits_group(self):
+        group = QGroupBox("Resource Limits")
+        self.limits_group = group
+        layout = QVBoxLayout(group)
+        intro = QLabel(
+            "What AutoOrtho may use of this PC. Values AutoOrtho picks itself "
+            "stay under these limits; a value you set by hand elsewhere is "
+            "kept, and the guards warn when it is over."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.limits_editor = LimitsEditor()
+        hw = hardware.cached() or hardware.basic()
+        self.limits_editor.set_hardware(hw, guards.reserve_gb(self.cfg))
+        self.limits_editor.set_values({
+            name: getattr(self.cfg.limits, name, limits_module.AUTO)
+            for name in limits_module.NAMES
+        })
+        self.limits_editor.changed.connect(self._schedule_target_cost)
+        self.limits_editor.changed.connect(self._on_settings_control_changed)
+        layout.addWidget(self.limits_editor)
+        self.protect_sim_fps_check = QCheckBox("Protect X-Plane's frame rate")
+        self.protect_sim_fps_check.setObjectName("protect_sim_fps_check")
+        self.protect_sim_fps_check.setChecked(
+            str(getattr(self.cfg.limits, "protect_sim_fps", True)).lower()
+            in ("true", "1", "yes", "on")
+        )
+        self.protect_sim_fps_check.setToolTip(
+            "When X-Plane's frames get slower while streaming, auto-tuning "
+            "(Auto mode) eases off background builds and prefetch first. "
+            "Needs X-Plane's data output (the same connection as the flight "
+            "data)."
+        )
+        layout.addWidget(self.protect_sim_fps_check)
+
+        test_title = QLabel("Connection test")
+        test_title.setStyleSheet("font-weight: bold; margin-top: 8px;")
+        layout.addWidget(test_title)
+        self.connection_test_panel = ConnectionTestPanel(
+            maptype=lambda: self.maptype_combo.currentText(),
+            max_connections=self._provider_max_connections,
+        )
+        self.connection_test_panel.measured.connect(self._on_connection_measured)
+        layout.addWidget(self.connection_test_panel)
+        self.hardware_detected.connect(self._refresh_limits_hardware)
+
+    def _provider_max_connections(self):
+        try:
+            if __package__ and __package__.startswith("autoortho."):
+                from autoortho.aoconfig import resolve_provider_setting
+            else:
+                from aoconfig import resolve_provider_setting
+            return int(
+                resolve_provider_setting("provider_max_connections", self.cfg)
+            )
+        except Exception:
+            return 160
+
+    def _refresh_limits_hardware(self):
+        if hasattr(self, "limits_editor"):
+            hw = hardware.cached() or hardware.basic()
+            self.limits_editor.set_hardware(hw, guards.reserve_gb(self.cfg))
+
+    def _on_connection_measured(self, result):
+        self._schedule_target_cost()
+        self.update_status_bar(f"Connection test: {result.summary}")
+
+    def _limits_from_controls(self, hw):
+        values = (
+            self.limits_editor.values()
+            if hasattr(self, "limits_editor")
+            else {
+                name: getattr(self.cfg.limits, name, limits_module.AUTO)
+                for name in limits_module.NAMES
+            }
+        )
+        return limits_module.resolve(values, hw, guards.reserve_gb(self.cfg))
+
+    def _connection_result(self):
+        panel = getattr(self, "connection_test_panel", None)
+        return panel.result if panel is not None else None
+
+    def _suggest_target_for_pc(self):
+        hw = hardware.cached() or hardware.basic()
+        fix = guards.suggest_target_for_pc(
+            hw,
+            self._limits_from_controls(hw),
+            self._connection_result(),
+            guards.reserve_gb(self.cfg),
+            k=guards.paging_k(self.cfg),
+            fmt=guards.texture_format(self.cfg),
+        )
+        if self.max_zoom_mode_combo.currentText() != "Fixed":
+            self.max_zoom_mode_combo.setCurrentText("Fixed")
+        self._apply_guard_fix(fix)
+        advice = f"Suggested {fix.label} Press Apply to keep it."
+        self.target_cost_panel.set_advice(advice)
+        essentials = getattr(self, "essentials_page", None)
+        if essentials is not None:
+            essentials.cost_panel.set_advice(advice)
+
+    def _expert_pending_split(self):
+        """(live, restart) pending Expert edits, each a sorted tuple."""
+        page = getattr(self, "expert_settings_page", None)
+        if page is None:
+            return (), ()
+        registry = self.cfg.registry()
+        live, restart = [], []
+        for name, value in sorted(page.model.pending().items()):
+            section, _, key = name.partition(".")
+            spec = registry.get(section, key)
+            (live if spec is not None and spec.live else restart).append(
+                (name, value)
+            )
+        return tuple(live), tuple(restart)
+
+    def _apply_expert_live(self, names):
+        """Publish Expert edits to live settings while streaming."""
+        if not names or self.runtime_state != RuntimeState.RUNNING:
+            return
+        publish = getattr(self, "publish_levers", None)
+        if publish is None:
+            return
+        levers = {}
+        for name in names:
+            section, _, key = name.partition(".")
+            levers[name] = self.cfg.value(section, key)
+        try:
+            publish(levers)
+        except Exception:
+            log.exception("Could not apply settings while streaming")
+
+    def _apply_limits_live(self):
+        """Limits take effect at once while streaming (live levers)."""
+        if self.runtime_state != RuntimeState.RUNNING:
+            return
+        apply = getattr(self, "apply_live_levers", None)
+        if apply is None:
+            return
+        try:
+            levers = apply()
+        except Exception:
+            log.exception("Could not apply the new limits while streaming")
+            return
+        if levers:
+            self.update_status_bar("New limits are in effect.")
+
+    def _refresh_resource_readiness(self):
+        """Re-check PC resources after a save; the other checks only depend
+        on paths and scenery, which have their own refresh."""
+        if self.current_readiness is None or not dataclasses.is_dataclass(
+            self.current_readiness
+        ):
+            return
+        self.current_readiness = self._with_resource_check(
+            self.current_readiness
+        )
+        if self.phase3_active:
+            self._update_shell_status()
+
+    def _with_resource_check(self, readiness):
+        resources = (
+            self._resource_readiness_check()
+            if dataclasses.is_dataclass(readiness)
+            else None
+        )
+        if resources is None:
+            return readiness
+        return dataclasses.replace(
+            readiness,
+            checks=tuple(
+                check for check in readiness.checks
+                if check.id != "resources"
+            ) + (resources,),
+        )
+
+    def _resource_readiness_check(self):
+        """Graphics memory and RAM guards for the saved config, for Home."""
+        if not guards.warnings_enabled(self.cfg):
+            return None
+        hw = hardware.cached() or hardware.basic()
+        try:
+            results = guards.check_config(
+                self.cfg, hw, with_fix=False, include_disk=False,
+                connection=self._connection_result(),
+            )
+        except Exception:
+            log.exception("Could not check PC resources")
+            return None
+        if getattr(self, "phase3_active", False):
+            self.home_page.set_target_lights(results)
+        problems = [
+            result for result in results
+            if result.resource in ("vram", "ram") and result.level.rank
+        ]
+        if not problems:
+            return ReadinessCheck(
+                id="resources",
+                title="PC resources",
+                status=ReadinessStatus.SUCCESS,
+                message="The zoom target and memory cache fit this PC.",
+            )
+        return ReadinessCheck(
+            id="resources",
+            title="PC resources",
+            status=ReadinessStatus.WARNING,
+            message=" ".join(problem.message for problem in problems),
+            fix_action=(
+                "Settings > Imagery shows what the zoom target needs and "
+                "suggests a fix."
+            ),
+        )
 
     def _restore_category_defaults(self, category):
         defaults = {
@@ -1333,10 +2436,8 @@ class ConfigUI(QMainWindow):
                 "sun_day_threshold_spin": -10.0,
             },
             "Streaming": {
-                "use_time_budget_check": True,
-                "tile_budget_slider": 60,
-                "maxwait_slider": 20,
-                "suspend_maxwait_check": True,
+                "band_wait_slider": 6,
+                "near_wait_slider": 60,
                 "fallback_level_combo": "Cache Only (Balanced)",
                 "fallback_extends_budget_check": False,
                 "fallback_timeout_slider": 30,
@@ -1479,8 +2580,15 @@ class ConfigUI(QMainWindow):
                 failure.title,
                 detail=failure.error,
             )
+            self.set_notice(Notice(
+                "scenery_task_failed",
+                "error",
+                f"Scenery install failed: {failure.title}. {failure.error or ''}".strip(),
+                (("library", "Open scenery library"),),
+            ))
         else:
             self.home_page.clear_recent_failure()
+            self.clear_notice("scenery_task_failed")
 
     def _update_shell_status(self):
         if not self.phase3_active:
@@ -1651,6 +2759,16 @@ class ConfigUI(QMainWindow):
             snapshot["dynamic_zoom_steps"] = (
                 self._dynamic_zoom_manager.save_to_config()
             )
+        if hasattr(self, "expert_settings_page"):
+            # Edits to live settings apply while streaming; only the others
+            # need a restart (RESTART_REQUIRED_SETTINGS has the first key).
+            live, restart = self._expert_pending_split()
+            snapshot["expert_settings"] = restart
+            snapshot["expert_live_settings"] = live
+        if hasattr(self, "limits_editor"):
+            snapshot["limits_editor"] = self.limits_editor.snapshot()
+        if hasattr(self, "tuning_page"):
+            snapshot["governor_mode"] = self.tuning_page.mode_combo.currentData()
         return snapshot
 
     def _initialize_settings_session(self):
@@ -1756,10 +2874,23 @@ class ConfigUI(QMainWindow):
                     self.dynamic_zoom_editor.set_manager(
                         self._dynamic_zoom_manager
                     )
+            if "expert_settings" in snapshot and hasattr(
+                self,
+                "expert_settings_page",
+            ):
+                self.expert_settings_page.restore(
+                    tuple(snapshot["expert_settings"])
+                    + tuple(snapshot.get("expert_live_settings", ()))
+                )
+            if "limits_editor" in snapshot and hasattr(self, "limits_editor"):
+                self.limits_editor.set_values(dict(snapshot["limits_editor"]))
+            if "governor_mode" in snapshot and hasattr(self, "tuning_page"):
+                self.tuning_page.set_mode(snapshot["governor_mode"])
+            self._sync_essentials()
+            self._schedule_target_cost()
 
             for method_name in (
                 "_update_zoom_mode_visibility",
-                "_update_time_budget_controls",
                 "_update_prefetch_controls",
                 "_update_predictive_dds_controls",
                 "_update_fallback_extends_control",
@@ -2000,6 +3131,7 @@ class ConfigUI(QMainWindow):
         return None
 
     def _apply_readiness_state(self, readiness):
+        readiness = self._with_resource_check(readiness)
         self.current_readiness = readiness
         symbols = {
             ReadinessStatus.PENDING: "○",
@@ -2054,6 +3186,8 @@ class ConfigUI(QMainWindow):
     def _on_storage_scan_completed(self, path, usage, free):
         if path != self.cache_dir_edit.text().strip():
             return
+        self._cache_usage_bytes = int(usage or 0)
+        self._schedule_target_cost()
         self.cache_storage_label.setText(
             f"Cache usage: {format_bytes(usage)} • "
             f"Free space: {format_bytes(free)}"
@@ -2135,10 +3269,29 @@ class ConfigUI(QMainWindow):
             self.setup_inference_worker = None
 
     def _show_setup_wizard(self):
+        mode, zoom, airport, steps = self._target_from_controls()
+        hw = hardware.cached() or hardware.basic()
         wizard = SetupWizard(
             initial_values=self._readiness_values(),
             scenery_choices=self._scenery_choices(),
             parent=self,
+            target={
+                "mode": mode,
+                "max_zoom": zoom,
+                "airport_zoom": airport,
+                "steps": steps,
+            },
+            limit_values=(
+                self.limits_editor.values()
+                if hasattr(self, "limits_editor") else None
+            ),
+            hardware_info=hw,
+            reserve_gb=guards.reserve_gb(self.cfg),
+            maptype=self.maptype_combo.currentText(),
+            max_connections=self._provider_max_connections(),
+            paging_k=guards.paging_k(self.cfg),
+            texture_format=guards.texture_format(self.cfg),
+            disk_cache_gb=self.file_cache_slider.value(),
         )
         if wizard.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2153,8 +3306,22 @@ class ConfigUI(QMainWindow):
                 selected_paths["long_term_cache_dir"]
             )
             self.download_dir_edit.setText(selected_paths["download_dir"])
+            # Older or test wizards may not have the quality and limits steps.
+            if hasattr(wizard, "selected_target"):
+                self._apply_wizard_target(wizard.selected_target())
+            if hasattr(wizard, "selected_limits") and hasattr(self, "limits_editor"):
+                self.limits_editor.set_values(wizard.selected_limits())
+            if hasattr(wizard, "selected_disk_cache_gb"):
+                self.file_cache_slider.setValue(wizard.selected_disk_cache_gb())
         finally:
             self._restoring_settings = False
+        quality_page = getattr(wizard, "quality_page", None)
+        if quality_page is not None and hasattr(self, "connection_test_panel"):
+            result = quality_page.connection_panel.result
+            if result is not None:
+                self.connection_test_panel.result = result
+                self.connection_test_panel.set_blocked("")
+        self._schedule_target_cost()
         self.settings_session.observe(self._snapshot_settings())
         self.cfg.general.setup_complete = True
         if not self.on_save():
@@ -2162,9 +3329,11 @@ class ConfigUI(QMainWindow):
             return
 
         self._run_readiness_checks()
+        installing = False
         for region_id in wizard.get_selected_region_ids():
             region = self.dl.regions.get(region_id)
             if region is not None and region.local_rel is None:
+                installing = True
                 QTimer.singleShot(
                     0,
                     lambda rid=region_id: self.on_install_scenery(
@@ -2172,6 +3341,16 @@ class ConfigUI(QMainWindow):
                         skip_confirmation=True,
                     ),
                 )
+        # "Start AutoOrtho when setup finishes": not while scenery is still
+        # being installed (it would mount half a region).
+        start_now = getattr(wizard, "start_now", None)
+        if callable(start_now) and start_now():
+            if installing:
+                self.update_status_bar(
+                    "Setup saved. Start streaming once the scenery has installed."
+                )
+            else:
+                QTimer.singleShot(0, self.on_run)
 
     def create_setup_tab(self):
         """Create the setup configuration tab"""
@@ -3368,7 +4547,13 @@ class ConfigUI(QMainWindow):
         )
         min_zoom_layout.addWidget(self.min_zoom_slider)
         min_zoom_layout.addWidget(self.min_zoom_label)
-        autoortho_layout.addLayout(min_zoom_layout)
+        # Expert setting now (settings refactor): the low-zoom base covers
+        # far scenery, so this row stays hidden and min_zoom is edited in
+        # All Settings (Expert). The slider still bounds the maximum zoom.
+        self.min_zoom_widget = QWidget()
+        self.min_zoom_widget.setLayout(min_zoom_layout)
+        self.min_zoom_widget.setVisible(False)
+        autoortho_layout.addWidget(self.min_zoom_widget)
 
         # === Max Zoom Mode Toggle ===
         # Allows switching between Fixed (single value) and Dynamic (altitude-based)
@@ -3497,6 +4682,30 @@ class ConfigUI(QMainWindow):
         # Now update visibility after all zoom widgets are created
         self._update_zoom_mode_visibility()
 
+        # What the target costs on this PC (guards), updated as controls move.
+        self.target_cost_panel = TargetCostPanel()
+        self.target_cost_panel.fix_requested.connect(self._apply_guard_fix)
+        self.target_cost_panel.suggest_requested.connect(
+            self._suggest_target_for_pc
+        )
+        autoortho_layout.addWidget(self.target_cost_panel)
+        self._target_cost_timer = QTimer(self)
+        self._target_cost_timer.setSingleShot(True)
+        self._target_cost_timer.setInterval(150)
+        self._target_cost_timer.timeout.connect(self._update_target_cost)
+        for signal in (
+            self.max_zoom_slider.valueChanged,
+            self.max_zoom_near_airports_slider.valueChanged,
+            self.max_zoom_mode_combo.currentTextChanged,
+            self.mem_cache_slider.valueChanged,
+            self.file_cache_slider.valueChanged,
+            self.cache_dir_edit.textChanged,
+        ):
+            signal.connect(self._schedule_target_cost)
+        self.hardware_detected.connect(self._schedule_target_cost)
+        self._start_hardware_detection()
+        self._update_target_cost()
+
         # Performance Tuning Section
         # Separator line for visual grouping
         perf_separator = QFrame()
@@ -3509,116 +4718,60 @@ class ConfigUI(QMainWindow):
         perf_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #6da4e3; margin-bottom: 5px;")
         autoortho_layout.addWidget(perf_header)
 
-        # Use Time Budget checkbox
-        time_budget_layout = QHBoxLayout()
-        self.use_time_budget_check = QCheckBox("Use time budget system (recommended)")
-        self.use_time_budget_check.setChecked(self.cfg.autoortho.use_time_budget)
-        self.use_time_budget_check.setObjectName('use_time_budget')
-        self.use_time_budget_check.setToolTip(
-            "When enabled, enforces a strict wall-clock time limit for tile requests.\n"
-            "This provides more predictable performance and reduces stuttering.\n\n"
-            "When disabled, falls back to legacy per-chunk maxwait behavior,\n"
-            "which can result in longer cumulative wait times.\n\n"
-            "Recommended: Enabled for most users."
+        # Waits: the [streaming] wait bands are the only wait policy (they
+        # replaced the tile time budget, per-chunk wait and startup
+        # extension). Auto-tuning may move both; a value set here is pinned.
+        band_wait_layout = QHBoxLayout()
+        self.band_wait_label_title = QLabel("Wait for nearby imagery in flight (seconds):")
+        self.band_wait_label_title.setToolTip(
+            "How long X-Plane's read of a nearby texture may wait for real\n"
+            "imagery while flying. Distant textures never wait: they get the\n"
+            "best data at hand and the real data is fetched behind them.\n\n"
+            "Longer = sharper nearby scenery, but X-Plane may pause longer\n"
+            "on a slow connection. Applies at once while streaming."
         )
-        self.use_time_budget_check.stateChanged.connect(self._update_time_budget_controls)
-        time_budget_layout.addWidget(self.use_time_budget_check)
-        autoortho_layout.addLayout(time_budget_layout)
+        band_wait_layout.addWidget(self.band_wait_label_title)
+        self.band_wait_slider = ModernSlider()
+        self.band_wait_slider.setRange(1, 30)
+        self.band_wait_slider.setSingleStep(1)
+        self.band_wait_slider.setValue(
+            max(1, min(30, int(round(float(self.cfg.streaming.band_max_wait_seconds)))))
+        )
+        self.band_wait_slider.setObjectName('band_max_wait_seconds')
+        self.band_wait_slider.setToolTip("Drag to adjust (1-30 seconds)")
+        self.band_wait_value_label = QLabel(str(self.band_wait_slider.value()))
+        self.band_wait_slider.valueChanged.connect(
+            lambda v: self.band_wait_value_label.setText(str(v))
+        )
+        band_wait_layout.addWidget(self.band_wait_slider)
+        band_wait_layout.addWidget(self.band_wait_value_label)
+        autoortho_layout.addLayout(band_wait_layout)
 
-        # Tile time budget slider
-        tile_budget_layout = QHBoxLayout()
-        self.tile_budget_label_title = QLabel("Tile time budget (seconds):")
-        self.tile_budget_label_title.setToolTip(
-            "Maximum wall-clock time for a COMPLETE tile (all mipmaps combined).\n"
-            "When this time is reached, the tile is built with whatever has been downloaded.\n\n"
-            "The budget only advances while X-Plane is reading this tile; time\n"
-            "spent on other tiles between reads does not count, and reopening\n"
-            "the tile starts a fresh budget.\n\n"
-            "Lower values = faster loading, but may have more missing/blurry areas\n"
-            "Higher values = better quality, but longer initial load times\n\n"
-            "Recommended values:\n"
-            "  • 60.0 - Fast (quicker loading, more partial tiles, do not use along high zoom levels)\n"
-            "  • 120.0 - Balanced (good for most users)\n"
-            "  • 300.0 - Quality (for fast networks, slower loading, use along high zoom levels, but beware of stuttering and loading times)"
+        near_wait_layout = QHBoxLayout()
+        self.near_wait_label_title = QLabel("Wait while a flight loads (seconds):")
+        self.near_wait_label_title.setToolTip(
+            "How long nearby reads may wait while a flight starts or X-Plane\n"
+            "loads a new place (X-Plane does not read those textures again\n"
+            "while parked, so waiting longer then gives sharp scenery from\n"
+            "the start). Before X-Plane first connects, a tile may take up\n"
+            "to ten times this. Applies at once while streaming."
         )
-        tile_budget_layout.addWidget(self.tile_budget_label_title)
-        self.tile_budget_slider = ModernSlider()
-        # Range: 1 to 300 seconds, with 1 second precision
-        # Each tile has 256 chunks (16x16), so adequate time is needed for full quality
-        self.tile_budget_slider.setRange(60, 600)  # 60 to 600 seconds in 1 second increments
-        self.tile_budget_slider.setSingleStep(1)
-        tile_budget_value = int(float(self.cfg.autoortho.tile_time_budget))
-        tile_budget_value = max(60, min(600, tile_budget_value))  # Clamp to valid range
-        self.tile_budget_slider.setValue(tile_budget_value)
-        self.tile_budget_slider.setObjectName('tile_time_budget')
-        self.tile_budget_slider.setToolTip(
-            "Drag to adjust tile time budget (60-600.0 seconds)"
+        near_wait_layout.addWidget(self.near_wait_label_title)
+        self.near_wait_slider = ModernSlider()
+        self.near_wait_slider.setRange(10, 300)
+        self.near_wait_slider.setSingleStep(5)
+        self.near_wait_slider.setValue(
+            max(10, min(300, int(round(float(self.cfg.streaming.near_wait_seconds)))))
         )
-        self.tile_budget_value_label = QLabel(f"{float(self.cfg.autoortho.tile_time_budget):.1f}")
-        self.tile_budget_slider.valueChanged.connect(
-            lambda v: self.tile_budget_value_label.setText(f"{v:.1f}")
+        self.near_wait_slider.setObjectName('near_wait_seconds')
+        self.near_wait_slider.setToolTip("Drag to adjust (10-300 seconds)")
+        self.near_wait_value_label = QLabel(str(self.near_wait_slider.value()))
+        self.near_wait_slider.valueChanged.connect(
+            lambda v: self.near_wait_value_label.setText(str(v))
         )
-        tile_budget_layout.addWidget(self.tile_budget_slider)
-        tile_budget_layout.addWidget(self.tile_budget_value_label)
-        autoortho_layout.addLayout(tile_budget_layout)
-
-        # Per-chunk max wait time (moved from general settings to performance)
-        maxwait_layout = QHBoxLayout()
-        self.maxwait_label_title = QLabel("Per-chunk max wait (seconds):")
-        self.maxwait_label_title.setToolTip(
-            "Maximum time to wait for a SINGLE chunk to download.\n\n"
-            "This is separate from the tile time budget:\n"
-            "  • Tile Budget: Total time for the entire tile (all chunks)\n"
-            "  • Per-chunk Max Wait: Timeout for each individual chunk download\n\n"
-            "A chunk will stop waiting when EITHER limit is reached.\n"
-            "This prevents a single slow chunk from consuming the entire tile budget.\n\n"
-            "Lower values = faster timeout per chunk, more fallback usage\n"
-            "Higher values = more patience per chunk, better for slow networks\n\n"
-            "Recommended values:\n"
-            "  • 2.0 - Fast networks\n"
-            "  • 5.0 - Normal networks (default)\n"
-            "  • 10.0 - Slow/unreliable networks"
-        )
-        maxwait_layout.addWidget(self.maxwait_label_title)
-        self.maxwait_slider = ModernSlider()
-        self.maxwait_slider.setRange(1, 100)  # 0.1 to 10.0 seconds
-        self.maxwait_slider.setSingleStep(1)
-        # Convert maxwait to int for slider (multiply by 10 for 0.1 precision)
-        maxwait_value = int(float(self.cfg.autoortho.maxwait) * 10)
-        maxwait_value = max(1, min(100, maxwait_value))
-        self.maxwait_slider.setValue(maxwait_value)
-        self.maxwait_slider.setObjectName('maxwait')
-        self.maxwait_slider.setToolTip(
-            "Drag to adjust per-chunk max wait time (0.1-10.0 seconds)"
-        )
-        self.maxwait_value_label = QLabel(f"{float(self.cfg.autoortho.maxwait):.1f}")
-        self.maxwait_slider.valueChanged.connect(
-            lambda v: self.maxwait_value_label.setText(f"{v/10:.1f}")
-        )
-        maxwait_layout.addWidget(self.maxwait_slider)
-        maxwait_layout.addWidget(self.maxwait_value_label)
-        autoortho_layout.addLayout(maxwait_layout)
-
-        # Extended loading time during startup
-        startup_loading_layout = QHBoxLayout()
-        self.suspend_maxwait_check = QCheckBox("Allow extra loading time during startup")
-        self.suspend_maxwait_check.setChecked(self.cfg.autoortho.suspend_maxwait)
-        self.suspend_maxwait_check.setObjectName('suspend_maxwait')
-        self.suspend_maxwait_check.setToolTip(
-            "Allow more time for tiles to load while X-Plane is loading scenery\n"
-            "before the flight starts.\n\n"
-            "When enabled:\n"
-            "  • With Time Budget: Uses 10x the tile time budget during startup\n"
-            "  • With Max Wait: Uses 20 seconds per chunk during startup\n\n"
-            "Benefits:\n"
-            "  • Reduces low-resolution and missing tiles at flight start\n"
-            "  • Better initial scenery quality\n\n"
-            "Trade-off:\n"
-            "  • May increase initial scenery loading time\n\n"
-            "Recommended: Enabled for best startup quality."
-        )
-        startup_loading_layout.addWidget(self.suspend_maxwait_check)
-        autoortho_layout.addLayout(startup_loading_layout)
+        near_wait_layout.addWidget(self.near_wait_slider)
+        near_wait_layout.addWidget(self.near_wait_value_label)
+        autoortho_layout.addLayout(near_wait_layout)
 
         # Fallback level dropdown
         fallback_layout = QHBoxLayout()
@@ -4353,9 +5506,6 @@ class ConfigUI(QMainWindow):
         # Initialize prefetch control states
         self._update_prefetch_controls()
 
-        # Initialize time budget control states
-        self._update_time_budget_controls()
-
         provider_header = QLabel("Provider Download Transport")
         provider_header.setStyleSheet(
             "font-weight: bold; font-size: 12px; color: #8ab4f8; margin-top: 10px;"
@@ -4734,7 +5884,7 @@ class ConfigUI(QMainWindow):
         missing_color_label.setToolTip(
             "This is the solid color used to fill a texture when\n"
             "scenery data cannot be fetched.  It can be useful to\n"
-            "set this to a more visible color when tuning the maxwait\n"
+            "set this to a more visible color when tuning the waits\n"
             "setting to make it easier to see missing textures."
         )
         self.missing_color_button = StyledButton("Select")
@@ -6279,29 +7429,6 @@ class ConfigUI(QMainWindow):
             else:
                 raise ValueError(f"Invalid instigator: {instigator}")
 
-    def _update_time_budget_controls(self):
-        """Update enabled state of performance tuning controls based on use_time_budget checkbox."""
-        use_time_budget = self.use_time_budget_check.isChecked()
-        
-        # Time budget controls tile-level timeout
-        # Maxwait controls per-chunk timeout (always enabled, works with or without time budget)
-        # When time budget is disabled, tile budget slider is disabled (falls back to legacy mode)
-        
-        self.tile_budget_slider.setEnabled(use_time_budget)
-        self.tile_budget_label_title.setEnabled(use_time_budget)
-        self.tile_budget_value_label.setEnabled(use_time_budget)
-        
-        # Maxwait is now always enabled - it's a per-chunk timeout that works with the tile budget
-        # When time budget is enabled: maxwait limits per-chunk waits within the tile budget
-        # When time budget is disabled: maxwait is the only timeout mechanism (legacy mode)
-        
-        # Update visual styling to indicate disabled state
-        disabled_style = "color: #666;"
-        enabled_style = ""
-        
-        self.tile_budget_label_title.setStyleSheet(enabled_style if use_time_budget else disabled_style)
-        self.tile_budget_value_label.setStyleSheet(enabled_style if use_time_budget else disabled_style)
-
     def _update_prefetch_controls(self):
         """Update enabled state of prefetch controls based on enable checkbox."""
         enabled = self.prefetch_enabled_check.isChecked()
@@ -6402,7 +7529,6 @@ class ConfigUI(QMainWindow):
         self.apply_prefetch_defaults_button.setVisible(unsafe)
 
     def _apply_recommended_prefetch_defaults(self):
-        self.maxwait_slider.setValue(50)
         self.prefetch_lookahead_slider.setValue(10)
         self.prefetch_max_chunks_slider.setValue(64)
         self.prefetch_admission_burst_spinbox.setValue(64)
@@ -6596,6 +7722,7 @@ class ConfigUI(QMainWindow):
         
         self._update_zoom_mode_visibility()
         self._update_buffer_pool_label()
+        self._schedule_target_cost()
 
     def _update_zoom_mode_visibility(self):
         """Show/hide zoom controls based on selected mode."""
@@ -6624,10 +7751,12 @@ class ConfigUI(QMainWindow):
                 )
             self._update_dynamic_summary()
             self._update_buffer_pool_label()
+            self._schedule_target_cost()
             self._on_settings_control_changed()
 
     def _update_dynamic_summary(self):
         """Update the summary label for dynamic zoom steps."""
+        self._refresh_essentials_profile()
         if not hasattr(self, '_dynamic_zoom_manager') or not hasattr(self, 'dynamic_zoom_summary'):
             return
         
@@ -7161,6 +8290,14 @@ class ConfigUI(QMainWindow):
     def _set_runtime_state(self, state, message=None):
         self.runtime_state = RuntimeState(state)
         self.running = self.runtime_state == RuntimeState.RUNNING
+        self._update_tray()
+        panel = getattr(self, "connection_test_panel", None)
+        if panel is not None:
+            panel.set_blocked(
+                ""
+                if self.runtime_state in (RuntimeState.STOPPED, RuntimeState.ERROR)
+                else "Stop streaming to run the test; it would share the connection."
+            )
 
         labels = {
             RuntimeState.STOPPED: ("Start Streaming", True),
@@ -8429,6 +9566,7 @@ class ConfigUI(QMainWindow):
     def save_config(self, persist=True, refresh_scenery=True):
         """Copy UI values to config, optionally persisting them to disk."""
         self.ready.clear()
+        self._changed_live_waits = []
 
         # Save paths
         self.cfg.paths.scenery_path = self.scenery_path_edit.text()
@@ -8460,9 +9598,26 @@ class ConfigUI(QMainWindow):
             self.cfg.cache.cache_mem_limit = str(
                 self.mem_cache_slider.value()
             )
+            if hasattr(self, "limits_editor"):
+                limit_values = self.limits_editor.values()
+                self.cfg.limits.ram_gb = limit_values["ram_gb"]
+                self.cfg.limits.vram_gb = limit_values["vram_gb"]
+                self.cfg.limits.bandwidth_mbps = limit_values["bandwidth_mbps"]
+                self.cfg.limits.cpu_cores = limit_values["cpu_cores"]
+            if hasattr(self, "protect_sim_fps_check"):
+                self.cfg.limits.protect_sim_fps = str(
+                    self.protect_sim_fps_check.isChecked()
+                )
+            if hasattr(self, "allow_texture_cap_check"):
+                self.cfg.governor.allow_texture_cap = str(
+                    self.allow_texture_cap_check.isChecked()
+                )
+            if hasattr(self, "tuning_page"):
+                self.cfg.governor.mode = (
+                    self.tuning_page.mode_combo.currentData() or "advise"
+                )
 
             # AutoOrtho settings
-            self.cfg.autoortho.min_zoom = str(self.min_zoom_slider.value())
             self.cfg.autoortho.max_zoom_near_airports = str(self.max_zoom_near_airports_slider.value())
             self.cfg.autoortho.max_zoom = str(self.max_zoom_slider.value())
             
@@ -8479,14 +9634,20 @@ class ConfigUI(QMainWindow):
             except ImportError:
                 pass  # Module not loaded yet, pool will be created correctly on first use
             
-            self.cfg.autoortho.maxwait = str(
-                self.maxwait_slider.value() / 10.0
-            )
-            self.cfg.autoortho.suspend_maxwait = self.suspend_maxwait_check.isChecked()
-            
-            # Performance tuning settings
-            self.cfg.autoortho.use_time_budget = self.use_time_budget_check.isChecked()
-            self.cfg.autoortho.tile_time_budget = str(self.tile_budget_slider.value())
+            # Waits (the [streaming] bands): published live when changed.
+            for key, slider in (
+                ("band_max_wait_seconds", self.band_wait_slider),
+                ("near_wait_seconds", self.near_wait_slider),
+            ):
+                try:
+                    before = float(getattr(self.cfg.streaming, key))
+                except (TypeError, ValueError):
+                    before = None
+                # A value between whole seconds (from the Expert table) is
+                # kept unless the slider moved.
+                if before is None or int(round(before)) != slider.value():
+                    setattr(self.cfg.streaming, key, str(float(slider.value())))
+                    self._changed_live_waits.append(f"streaming.{key}")
             self.cfg.autoortho.fallback_level = self._fallback_index_to_str(
                 self.fallback_level_combo.currentIndex()
             )
@@ -8661,9 +9822,40 @@ class ConfigUI(QMainWindow):
                 self.cfg.simbrief.use_flight_data = self.simbrief_use_flight_data_check.isChecked()
 
         if persist:
+            # Expert-table edits apply last: the keys it may edit have no
+            # other control, so nothing above overwrites them.
+            expert_page = getattr(self, "expert_settings_page", None)
+            live_edits = tuple(self._changed_live_waits)
+            if expert_page is not None:
+                live_edits += tuple(
+                    name for name, _value in self._expert_pending_split()[0]
+                )
+                expert_page.apply_to(self.cfg)
             if not self._persist_configuration(notify=True):
                 self.ready.set()
                 return False
+            if expert_page is not None:
+                expert_page.mark_saved()
+            # min_zoom is edited in the Expert table; keep the hidden slider
+            # that bounds the maximum zoom in step with it.
+            self.min_zoom_slider.blockSignals(True)
+            self.min_zoom_slider.setValue(int(self.cfg.autoortho.min_zoom))
+            self.min_zoom_label.setText(str(self.cfg.autoortho.min_zoom))
+            self.min_zoom_slider.blockSignals(False)
+            self._refresh_resource_readiness()
+            self._apply_limits_live()
+            self._apply_expert_live(live_edits)
+            service = getattr(self, "governor_service", None)
+            if service is not None:
+                service.set_mode(str(self.cfg.governor.mode))
+                if hasattr(self, "protect_sim_fps_check"):
+                    service.governor.protect_sim_fps = (
+                        self.protect_sim_fps_check.isChecked()
+                    )
+                if hasattr(self, "allow_texture_cap_check"):
+                    service.set_texture_cap_allowed(
+                        self.allow_texture_cap_check.isChecked()
+                    )
         else:
             self.cfg.set_config()
             self.cfg.refresh_derived_paths(create_missing=False)
@@ -9195,6 +10387,9 @@ class ConfigUI(QMainWindow):
         """Handle window close event without freezing UI during cache clean"""
         # If we're in the second pass (ready to close), just accept and exit
         if self._ready_to_close:
+            panel = getattr(self, "connection_test_panel", None)
+            if panel is not None:
+                panel.stop()
             event.accept()
             return
 
