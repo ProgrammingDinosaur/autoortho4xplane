@@ -27,7 +27,10 @@ if __package__ and __package__.startswith("autoortho."):
         remove_stale_temp_files,
     )
     from autoortho.utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
-    from autoortho.utils.custom_map import get_custom_map_config
+    from autoortho.utils.custom_map import (
+        discover_dsf_tiles,
+        get_custom_map_config,
+    )
     from autoortho.utils.simbrief_flight import simbrief_flight_manager
     from autoortho.ui.config_validation import (
         ConfigurationInput,
@@ -74,6 +77,7 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho import guards, hardware
     from autoortho import limits as limits_module
     from autoortho.ui.pages.flight_plan_page import FlightPlanPage
+    from autoortho.ui.widgets.custom_map_editor import CustomMapEditor
     from autoortho.ui.pages.diagnostics_page import DiagnosticsPage
     from autoortho.ui.dynamic_zoom_editor import DynamicZoomEditor, PRESETS
     from autoortho.ui.theme import (
@@ -102,7 +106,7 @@ else:
         remove_stale_temp_files,
     )
     from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
-    from utils.custom_map import get_custom_map_config
+    from utils.custom_map import discover_dsf_tiles, get_custom_map_config
     from utils.simbrief_flight import simbrief_flight_manager
     from ui.config_validation import (
         ConfigurationInput,
@@ -150,6 +154,7 @@ else:
     import hardware
     import limits as limits_module
     from ui.pages.flight_plan_page import FlightPlanPage
+    from ui.widgets.custom_map_editor import CustomMapEditor
     from ui.pages.diagnostics_page import DiagnosticsPage
     from ui.dynamic_zoom_editor import DynamicZoomEditor, PRESETS
     from ui.theme import (
@@ -1074,8 +1079,18 @@ class ConfigUI(QMainWindow):
             title="Scenery Library",
         )
 
-        self.flight_plan_page = FlightPlanPage(self.simbrief_group)
-        self.flight_plan_page.set_map_port(self.cfg.flightdata.webui_port)
+        self.custom_map_editor = CustomMapEditor(
+            get_custom_map_config(),
+            [m for m in MAPTYPES if m not in ("Use tile default", "Custom Map")],
+            scenery_path=lambda: self.cfg.ao_scenery_path,
+            discover=discover_dsf_tiles,
+        )
+        self.custom_map_editor.cellsChanged.connect(
+            self._on_custom_map_changed
+        )
+        self.flight_plan_page = FlightPlanPage(
+            self.simbrief_group, self.custom_map_editor
+        )
         self.simbrief_route_label.hide()
         self.simbrief_details_label.hide()
         self.shell.add_page(
@@ -2658,9 +2673,7 @@ class ConfigUI(QMainWindow):
             "settings": "Settings",
             "diagnostics": "Diagnostics",
         }.get(page, page)
-        if page == "flight-plan-map":
-            self.flight_plan_page.check_map_service()
-        elif page == "diagnostics":
+        if page == "diagnostics":
             self.diagnostics_page.refresh_reports()
         elif page == "scenery-library":
             self._refresh_phase3_task_views()
@@ -2778,11 +2791,6 @@ class ConfigUI(QMainWindow):
                 runtime_state=self.runtime_state.value,
             )
         self.flight_plan_page.set_influence(simbrief_active)
-        try:
-            port = self.cfg.flightdata.webui_port
-            self.flight_plan_page.set_map_port(port)
-        except Exception:
-            pass
 
     def _show_about(self):
         QMessageBox.about(
@@ -4276,7 +4284,7 @@ class ConfigUI(QMainWindow):
         self.setup_ui_logging()
 
     def create_custom_map_tab(self):
-        """Create the Custom Map editor tab with a button to open in browser."""
+        """Create the legacy Custom Map tab, which links to the map page."""
         custom_map_widget = QWidget()
         self.custom_map_widget = custom_map_widget
         layout = QVBoxLayout()
@@ -4288,20 +4296,22 @@ class ConfigUI(QMainWindow):
 
         # Info label
         info_label = QLabel(
-            "The Custom Map Editor lets you assign different map sources\n"
-            "to individual 1-degree tiles. It opens in your web browser."
+            "The Custom Map lets you assign different map sources\n"
+            "to individual 1-degree tiles."
         )
         info_label.setAlignment(Qt.AlignCenter)
         info_label.setStyleSheet("font-size: 14px; color: #ccc;")
         layout.addWidget(info_label)
 
         # Open button
-        open_btn = QPushButton("Open Map Editor in Browser")
+        open_btn = QPushButton("Open Custom Map")
         open_btn.setStyleSheet(
             "QPushButton { font-size: 16px; font-weight: bold; padding: 12px 24px; }"
         )
         open_btn.setFixedWidth(320)
-        open_btn.clicked.connect(self._open_custom_map_in_browser)
+        open_btn.clicked.connect(
+            lambda: self.navigate_to("flight-plan-map")
+        )
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         btn_layout.addWidget(open_btn)
@@ -4320,20 +4330,16 @@ class ConfigUI(QMainWindow):
 
         self.tabs.addTab(custom_map_widget, "Map")
 
-    def _open_custom_map_in_browser(self):
-        """Open the custom map editor in the default web browser."""
-        if self.phase3_active:
-            self.navigate_to("flight-plan-map")
-            self.flight_plan_page.check_map_service()
-            return
+    def _on_custom_map_changed(self):
+        """Tell running mount workers that the custom map was edited."""
         try:
-            import flighttrack
-            port = flighttrack.active_port
-        except (ImportError, AttributeError):
-            port = None
-        if not port:
-            port = self.cfg.flightdata.webui_port
-        webbrowser.open(f"http://localhost:{port}/custommap")
+            try:
+                import flighttrack
+            except ImportError:
+                from autoortho import flighttrack
+            flighttrack._notify_custom_map_workers()
+        except Exception:
+            log.debug("Custom map change notification failed", exc_info=True)
 
     def setup_ui_logging(self):
         """Set up the UI logging handler with the configured log level"""

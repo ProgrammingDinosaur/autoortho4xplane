@@ -1,36 +1,28 @@
 """Consolidated SimBrief flight-plan and custom-map workflow."""
 
-from PySide6.QtCore import QUrl, Signal, Qt
-from PySide6.QtGui import QDesktopServices
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QApplication,
+    QBoxLayout,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QPushButton,
     QScrollArea,
-    QStyle,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 if __package__ and __package__.startswith("autoortho."):
-    from autoortho.ui.theme import announce_accessible, repolish
+    from autoortho.ui.theme import repolish
 else:
-    from ui.theme import announce_accessible, repolish
+    from ui.theme import repolish
 
 
 class FlightPlanPage(QWidget):
-    map_ready_changed = Signal(bool)
-
-    def __init__(self, simbrief_widget, parent=None):
+    def __init__(self, simbrief_widget, map_editor=None, parent=None):
         super().__init__(parent)
-        self.map_url = ""
-        self.network = QNetworkAccessManager(self)
-        self.network.finished.connect(self._map_probe_finished)
+        self.map_editor = map_editor
 
         page_layout = QVBoxLayout(self)
         page_layout.setContentsMargins(0, 0, 0, 0)
@@ -54,7 +46,8 @@ class FlightPlanPage(QWidget):
         self.influence_label.setProperty("textRole", "secondary")
         root.addWidget(self.influence_label)
 
-        body = QHBoxLayout()
+        body = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self._body = body
         left = QVBoxLayout()
         simbrief_widget.setParent(self)
         left.addWidget(simbrief_widget)
@@ -86,46 +79,39 @@ class FlightPlanPage(QWidget):
         left.addWidget(summary)
         body.addLayout(left, 2)
 
-        map_group = QGroupBox("Custom Map Editor")
+        map_group = QGroupBox("Custom Map")
         map_layout = QVBoxLayout(map_group)
-        self.map_status = QLabel("Map service has not been checked.")
-        self.map_status.setAccessibleName("Map service status")
-        self.map_status.setWordWrap(True)
-        self.map_url_label = QLabel("")
-        self.map_url_label.setWordWrap(True)
-        self.map_url_label.setTextInteractionFlags(
-            self.map_url_label.textInteractionFlags()
-            | Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        self.open_map_button = QPushButton("&Open Map Editor")
-        self.open_map_button.setIcon(
-            self.style().standardIcon(
-                QStyle.StandardPixmap.SP_DialogOpenButton
-            )
-        )
-        self.open_map_button.setAccessibleName("Open custom map editor")
-        self.open_map_button.setEnabled(False)
-        self.open_map_button.clicked.connect(self.open_map)
-        copy_url = QPushButton("&Copy URL")
-        copy_url.clicked.connect(
-            lambda: QApplication.clipboard().setText(self.map_url)
-        )
-        retry = QPushButton("Check &Again")
-        retry.clicked.connect(self.check_map_service)
         map_description = QLabel(
-            "Assign imagery sources to individual one-degree scenery "
-            "tiles in your browser."
+            "Choose the imagery source for individual one-degree scenery "
+            "tiles. Tiles you leave unpainted use the default source. "
+            "Takes effect when Map type is set to Custom Map."
         )
         map_description.setWordWrap(True)
+        map_description.setProperty("textRole", "secondary")
         map_layout.addWidget(map_description)
-        map_layout.addWidget(self.map_status)
-        map_layout.addWidget(self.map_url_label)
-        map_layout.addWidget(self.open_map_button)
-        map_layout.addWidget(copy_url)
-        map_layout.addWidget(retry)
-        map_layout.addStretch()
-        body.addWidget(map_group, 1)
+        if map_editor is not None:
+            map_editor.setParent(map_group)
+            map_layout.addWidget(map_editor, 1)
+        else:
+            map_layout.addWidget(QLabel("The custom map is unavailable."))
+            map_layout.addStretch()
+        map_group.setMinimumHeight(460)
+        body.addWidget(map_group, 3)
         root.addLayout(body, 1)
+
+    # Below this width the map stacks under the flight details instead of
+    # sharing the row, so the map editor never gets squeezed.
+    STACK_BELOW_WIDTH = 1000
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        direction = (
+            QBoxLayout.Direction.TopToBottom
+            if self.width() < self.STACK_BELOW_WIDTH
+            else QBoxLayout.Direction.LeftToRight
+        )
+        if self._body.direction() != direction:
+            self._body.setDirection(direction)
 
     def set_flight_data(self, data):
         origin = data.get("origin", {})
@@ -176,47 +162,3 @@ class FlightPlanPage(QWidget):
             "success" if active else "secondary",
         )
         repolish(self.influence_label)
-
-    def set_map_port(self, port):
-        self.map_url = f"http://127.0.0.1:{int(port)}/custommap"
-        self.map_url_label.setText(self.map_url)
-
-    def check_map_service(self):
-        if not self.map_url:
-            self.map_status.setText("Map service port is not configured.")
-            return
-        self.map_status.setText("Checking local map service…")
-        self.open_map_button.setEnabled(False)
-        self.network.get(QNetworkRequest(QUrl(self.map_url)))
-
-    def _map_probe_finished(self, reply):
-        status_code = reply.attribute(
-            QNetworkRequest.Attribute.HttpStatusCodeAttribute
-        )
-        ready = (
-            reply.error() == reply.NetworkError.NoError
-            and isinstance(status_code, int)
-            and 200 <= status_code < 400
-        )
-        self.open_map_button.setEnabled(ready)
-        self.map_status.setText(
-            "Map service is ready."
-            if ready
-            else (
-                "Map service is not available. Start streaming, then check "
-                "again. The URL can still be copied for troubleshooting."
-            )
-        )
-        announce_accessible(self.map_status, self.map_status.text())
-        self.map_ready_changed.emit(ready)
-        reply.deleteLater()
-
-    def open_map(self):
-        if not self.map_url:
-            return
-        opened = QDesktopServices.openUrl(QUrl(self.map_url))
-        if not opened:
-            self.map_status.setText(
-                "The browser could not be opened. Copy the URL and open it "
-                "manually."
-            )

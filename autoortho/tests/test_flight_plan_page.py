@@ -27,10 +27,19 @@ def test_flight_plan_fields_and_influence(qt_app):
         }
     )
     page.set_influence(True)
-    page.set_map_port(5847)
 
     assert page.flight_fields["origin"].text() == "KJFK"
     assert page.flight_fields["cruise"].text() == "35,000 ft"
     assert page.route_text.toPlainText() == "DCT ROUTE"
     assert "actively controlling" in page.influence_label.text()
-    assert page.map_url == "http://127.0.0.1:5847/custommap"
+
+
+def test_flight_plan_page_embeds_map_editor(qt_app):
+    from PySide6.QtWidgets import QWidget
+
+    editor = QWidget()
+    page = FlightPlanPage(QGroupBox("SimBrief"), editor)
+
+    assert page.map_editor is editor
+    assert editor.parent() is not None
+    assert page.isAncestorOf(editor)

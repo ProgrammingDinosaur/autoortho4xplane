@@ -215,6 +215,11 @@ templates_path = os.path.join(autoortho_path, 'templates')
 if os.path.isdir(templates_path):
     datas.append((templates_path, 'autoortho/templates'))
 
+# Bundled data (world outline for the in-app Custom Map editor)
+data_path = os.path.join(autoortho_path, 'data')
+if os.path.isdir(data_path):
+    datas.append((data_path, 'autoortho/data'))
+
 # Images/icons for UI
 imgs_path = os.path.join(autoortho_path, 'imgs')
 if os.path.isdir(imgs_path):
