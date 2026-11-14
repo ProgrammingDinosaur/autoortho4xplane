@@ -611,8 +611,11 @@ xplane_vram_reserve_gb = 5
 ram_brake = True
 
 [tuning]
-# Scale the memory cache, predictive build memory and builder counts to this
-# PC's cores and RAM. A value you set yourself always wins.
+# Pick starting values for this PC, the quality target and the connection:
+# memory cache, predictive build memory and builder counts from the cores and
+# RAM; prefetch rate, corridor, lead time, waits and the download ceiling from
+# what the zoom target needs against the last connection test. Auto-tuning
+# fine-tunes from there. A value you set yourself always wins.
 hardware_baseline = True
 
 [governor]
@@ -620,7 +623,7 @@ hardware_baseline = True
 # within the limits, to reach the quality target, and remembers what worked
 # for the next flight. advise: it only suggests changes (shown in Settings >
 # Auto-Tuning and the log). off: the configured values, as before.
-mode = advise
+mode = auto
 # Keep a record of each flight's signals for replaying the governor offline.
 record_samples = True
 # Let auto-tuning cap photo textures at 4096 px when the textures X-Plane
@@ -779,19 +782,22 @@ route_prefetch_radius_nm = 40
     def _apply_hardware_baseline(self, custom=None):
         """Pick values for settings the user has not set (never written).
 
-        Three sources, in order, each only for settings still at their
-        packaged default:
+        Sources, in order, each only for settings the user has not set:
 
         * the hardware baseline (hardware.baseline_values), when on;
         * the connection test's warm start for download concurrency;
-        * the limits in [limits], which lower any of the above.
+        * the tuning plan (tuning_plan.py: the quality target against the
+          measured line and the PC), when the baseline is on;
+        * the limits in [limits], which lower any of the above;
+        * the download ceiling the line or the bandwidth limit carries.
 
         Whether the baseline is on, and the limits, are fixed at load, so
         changing them takes effect at the next start without pinning the old
-        values.
+        values (recompute_automatic works them out again mid-session).
         """
         self._baseline = {}
         self._automatic_sources = {}
+        self._plan = None
         registry = self.registry()
         enabled = parse_value(
             str(self._current_value("tuning", "hardware_baseline"))
@@ -816,6 +822,11 @@ route_prefetch_radius_nm = 40
         except Exception as exc:
             log.debug(f"Limits unavailable: {exc}")
             active = None
+        connection = _connection_for(self)
+        if enabled:
+            for name, text in _planned_values(self, chosen, active, connection).items():
+                chosen[name] = text
+                sources[name] = "planned"
         if active is not None:
             governed = {}
             for name in limits_module.GOVERNED:
@@ -828,11 +839,18 @@ route_prefetch_radius_nm = 40
                 if text != governed[name]:
                     chosen[name] = text
                     sources[name] = "limit"
-            ceiling = _bandwidth_concurrency_ceiling(self, active.bytes_per_second)
+        # Download ceiling: what the line (when measured and the baseline is
+        # on) or the bandwidth limit can carry, whichever is lower.
+        line = connection.mbits if enabled and connection is not None else 0
+        limit_mbps = active.bandwidth_mbps if active is not None else None
+        caps = [(c, src) for c, src in ((limit_mbps, "limit"), (line, "planned")) if c]
+        if caps:
+            capacity, source = min(caps, key=lambda item: item[0])
+            ceiling = _bandwidth_concurrency_ceiling(self, capacity * 1_000_000 / 8)
             if ceiling is not None:
                 name = "autoortho.provider_origin_max_concurrency"
                 chosen[name] = ceiling
-                sources[name] = "limit"
+                sources[name] = source
         for name, text in chosen.items():
             section, key = name.split(".", 1)
             spec = registry.get(section, key)
@@ -946,7 +964,8 @@ route_prefetch_radius_nm = 40
 
         'custom' (the user's), 'limit' (lowered to fit [limits]),
         'hardware' (scaled to this PC), 'measured' (from the connection
-        test) or 'default'.
+        test), 'planned' (sized for the quality target and connection) or
+        'default'.
         """
         if self.is_custom(section, key):
             return "custom"
@@ -1240,6 +1259,7 @@ route_prefetch_radius_nm = 40
                 reason = {
                     "limit": "lowered to fit [limits]",
                     "measured": "from the connection test",
+                    "planned": "sized for the quality target and connection",
                 }.get(
                     self._automatic_sources.get((section, key)),
                     "set for this PC",
@@ -1482,6 +1502,57 @@ def _connection_for(cfg):
         getattr(getattr(cfg, "autoortho", None), "maptype_override", "")
     )
     return result if result.provider == provider else None
+
+
+def _planned_values(cfg, chosen, active, connection):
+    """The tuning plan for the saved target, line and PC (tuning_plan.py).
+
+    ``chosen`` holds the values picked so far (hardware baseline); settings
+    not in it are at their packaged default. Best effort: {} on any failure.
+    """
+    try:
+        if __package__:
+            from autoortho import target_cost, tuning_plan
+        else:
+            import target_cost
+            import tuning_plan
+        registry = cfg.registry()
+
+        def current(name):
+            if name in chosen:
+                return chosen[name]
+            section, key = name.split(".", 1)
+            spec = registry.get(section, key)
+            return spec.default_text if spec is not None else None
+
+        try:
+            interval = float(current("autoortho.prefetch_interval") or 1.0)
+        except (TypeError, ValueError):
+            interval = 1.0
+        try:
+            workers = int(float(current("autoortho.background_builder_workers") or 2))
+        except (TypeError, ValueError):
+            workers = 2
+        names = (
+            "autoortho.predictive_dds_memory_mb",
+            "streaming.band_max_wait_seconds",
+            "streaming.near_wait_seconds",
+        )
+        result = tuning_plan.plan(
+            target_cost.target_cost_from_config(cfg),
+            line_mbps=connection.mbits if connection is not None else None,
+            bandwidth_mbps=active.bandwidth_mbps if active is not None else None,
+            chunk_seconds=connection.chunk_seconds if connection is not None else None,
+            background_workers=workers,
+            ram_limit_gb=active.ram_gb if active is not None else None,
+            prefetch_interval_s=interval,
+            current={name: current(name) for name in names},
+        )
+        cfg._plan = result
+        return dict(result.values)
+    except Exception as exc:
+        log.debug(f"Tuning plan unavailable: {exc}")
+        return {}
 
 
 def _connection_warm_start(cfg):

@@ -1819,7 +1819,7 @@ class ConfigUI(QMainWindow):
         ]
         page = TuningPage(modes)
         self.tuning_page = page
-        page.set_mode(str(getattr(self.cfg.governor, "mode", "advise")))
+        page.set_mode(str(getattr(self.cfg.governor, "mode", "auto")))
         self.allow_texture_cap_check = page.texture_cap_check
         self.allow_texture_cap_check.setChecked(
             governor_module.texture_cap_allowed(self.cfg)
@@ -2336,6 +2336,10 @@ class ConfigUI(QMainWindow):
             publish(levers)
         except Exception:
             log.exception("Could not apply settings while streaming")
+        # A setting the user set is now theirs: the governor stops moving it.
+        sync = getattr(self, "sync_governor", None)
+        if sync is not None:
+            sync()
 
     def _apply_limits_live(self):
         """Limits take effect at once while streaming (live levers)."""
@@ -9622,7 +9626,7 @@ class ConfigUI(QMainWindow):
                 )
             if hasattr(self, "tuning_page"):
                 self.cfg.governor.mode = (
-                    self.tuning_page.mode_combo.currentData() or "advise"
+                    self.tuning_page.mode_combo.currentData() or "auto"
                 )
 
             # AutoOrtho settings

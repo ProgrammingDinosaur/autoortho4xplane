@@ -316,6 +316,34 @@ seconds. Each activation is logged and counted in the performance report
 
 ## Auto-tuning
 
+### Starting values: the tuning plan
+
+Before a flight, AutoOrtho picks starting values for the settings you have
+not set yourself (`[tuning] hardware_baseline`, on by default):
+
+* from the PC: memory cache, predictive build memory and builder counts
+  (cores and RAM);
+* from the quality target and the connection: what the zoom target needs to
+  keep up at its busiest flight phase (the same estimate as the Download
+  line of the target cost panel), against the last connection test of this
+  imagery source, capped by your download limit.
+
+| Setting | Planned from |
+|---|---|
+| Prefetch chunks per cycle | Up to three times what the target needs per second, never more than the line carries (at least 64) |
+| Predictive build memory | One texture of the target per background builder, within a quarter of the RAM limit (only raised) |
+| Parallel downloads ceiling | What the line (or the download limit) carries, with the connection test's speed per download, and half again to spare |
+| Prefetch radius | 30 nm scaled by how much room the line has over the need: 15 nm on a tight line, up to 60 nm with plenty |
+| Prefetch lookahead, prefetch lead time | 10 min and 60 s with room to spare; up to twice (lead 2.5x) as long as the line gets tight, so prefetch starts earlier |
+| Wait for near imagery | 1.5x the time one full near texture of the target takes on the line, 6 to 12 s (only raised) |
+| Wait while starting | 1.2x the time to load a new area, 60 to 120 s (only raised) |
+
+Without a connection test only the first two are planned. Settings
+(**Expert**) shows these values with the source *Target and line*. Auto-tuning
+then fine-tunes from there in flight; a value you set yourself always wins.
+
+### In flight
+
 While streaming, AutoOrtho measures every 2 seconds how much of the nearby
 scenery X-Plane gets at the zoom you asked for (**% sharp at target**),
 along with download speed, errors, CPU, RAM and the flight phase. Every few
@@ -327,8 +355,8 @@ picks what it does with that:
 
 | Mode | What happens |
 |---|---|
-| **Auto** | Changes the setting while streaming, checks the next 20 seconds, and undoes the change if sharpness or the bottleneck got worse. |
-| **Advise** *(default for now)* | Works out the same changes but applies none. Home shows the latest suggestion with **Apply**, which uses it at once and keeps it for the next flights as a learned value (not a pinned one): auto-tuning may suggest moving it again, and **Reset learned settings** clears it. |
+| **Auto** *(default)* | Changes the setting while streaming, checks the result (after 10 to 20 seconds, up to a minute when too few nearby reads or a change of flight phase leave nothing to compare), and undoes the change if sharpness or the bottleneck got worse by more than chance explains. |
+| **Advise** | Works out the same changes but applies none. Home shows the latest suggestion with **Apply**, which uses it at once and keeps it for the next flights as a learned value (not a pinned one): auto-tuning may suggest moving it again, and **Reset learned settings** clears it. |
 | **Off** | Uses the configured values. Sharpness is still measured. |
 
 It waits longer only on evidence. When a nearby read stops waiting,
@@ -362,11 +390,23 @@ no clear cause, the state is *Blurry, cause unclear*: nothing moves, and
 after five minutes Home says so and points to the flight report.
 
 The rules that keep it steady: one change at a time, a 30-second wait per
-setting (two minutes after an undo), bigger steps only while a flight is
-loading, and nothing above your limits. Settings you set yourself are
+setting (two minutes after an undo), bigger steps while a flight is loading
+and while the scenery is far below the target (under 85 % sharp), a
+two-minute settling time before a change that fixed a bottleneck can be
+eased back, and nothing above your limits. Compute-bound means AutoOrtho's
+own processes use what your CPU-core limit allows them (or the whole PC is
+busy); X-Plane's CPU use alone does not count against AutoOrtho. A full
+download queue raises the downloads ceiling only when the adaptive limit
+has reached it; when the imagery server is setting the pace instead
+(*Network-bound, server pacing downloads*), prefetch narrows to give the
+nearby scenery what the server sends. Limits or settings you change while
+streaming reach auto-tuning at once: a value you set is pinned from then
+on, and new limits narrow the ranges it may use. Settings you set yourself are
 **pinned** and never moved. It never lowers your zoom target: when every
 setting it may move is at its limit for five minutes and sharpness stays
-under 95 %, it shortens prefetch and tells you what limits it (for example
+under 95 %, it shortens prefetch one step at a time (listed like any other
+change, and eased back once the scenery is sharp again) and tells you what
+limits it (for example
 "the limit is your connection"), with links to the target and the limits.
 
 The Auto-Tuning page lists the settings it may move, with the current
@@ -396,8 +436,8 @@ quarter of the memory, with the detail of one zoom level lower. Your zoom
 target is not changed, and textures X-Plane already holds keep their size.
 Without the permission, Home tells you instead.
 
-**Learning across flights.** In Auto mode, where the settings ended up is
-saved at unmount in `~/.autoortho-data/governor/learned.json`, keyed by the
+**Learning across flights.** In Auto mode, the settings that ended up away
+from their planned values are saved at unmount in `~/.autoortho-data/governor/learned.json`, keyed by the
 zoom target, the imagery source and a salted hash of your local network, so
 the next flight with the same key starts there. Suggestions you applied in
 Advise mode are kept in the same file and used in Advise and Auto. **Reset

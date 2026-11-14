@@ -11,19 +11,24 @@ mode it only lists its decisions. **Off** leaves every value as configured.
 Rules that keep it stable (proposal section 4.4):
 
 * one lever per decision, a cooldown per lever, bigger steps while a flight
-  is starting;
-* keep or revert: a change that made fidelity or its bottleneck worse is
-  undone and that lever waits four times longer;
+  is starting and while fidelity is far below the target;
+* keep or revert: a change that made fidelity (beyond chance) or its
+  bottleneck worse is undone and that lever waits four times longer; no
+  verdict across a change of flight phase;
 * levers stay inside the ranges the limits allow; settings the user set
-  (pinned) are never touched;
+  (pinned) are never touched; limits and settings applied mid-flight reach
+  it through :meth:`Governor.reconfigure`;
+* CPU is judged by AutoOrtho's own processes against its CPU-core limit,
+  downloads by whether the adaptive limit sits at its ceiling;
 * the target is never lowered: when every lever is at its limit and
-  fidelity stays low, the governor spends less on far work and tells the
-  user what limits it.
+  fidelity stays low, the governor spends less on far work (published
+  decisions) and tells the user what limits it.
 
-At the end of a flight it stores where the levers settled (learned
-profiles, keyed by target, provider and a salted network fingerprint) so the
-next flight starts there. Everything is decided from :class:`Sample` values,
-so recorded flights replay offline (:func:`replay`).
+Flights start from the tuning plan (``tuning_plan.py``: target, line and PC)
+and, in Auto, from where earlier flights settled away from it (learned
+profiles, keyed by target, provider and a salted network fingerprint).
+Everything is decided from :class:`Sample` values, so recorded flights
+replay offline (:func:`replay`).
 """
 
 from __future__ import annotations
@@ -75,8 +80,23 @@ MODE_LABELS = {
 SAMPLE_EVERY_S = 2.0
 WINDOW_S = 30.0
 DECIDE_EVERY_S = 6.0
+# Keep or revert: judged once the change has had JUDGE_AFTER_S (sooner, from
+# JUDGE_MIN_S, when plenty of near reads arrived). A verdict needs near reads
+# in the same flight phase; without them the wait goes on up to JUDGE_MAX_S,
+# then the change is kept (every move is made on evidence, so keeping is the
+# prior).
+JUDGE_MIN_S = 10.0
 JUDGE_AFTER_S = 20.0
+JUDGE_MAX_S = 60.0
 MIN_NEAR_READS = 20
+# Fidelity must fall by at least this much, and by two standard errors of the
+# difference, before a change is blamed for it.
+WORSE_FIDELITY = 0.02
+# Far below the target: steps grow by one more step's worth.
+FIDELITY_FAR = 0.85
+# A change kept for its bottleneck is not eased back by "headroom" this soon:
+# the room it shows is often what that change bought.
+HEADROOM_SETTLE_S = 120.0
 COOLDOWN_S = 30.0
 REVERT_COOLDOWN_FACTOR = 4.0
 UNREACHABLE_AFTER_S = 300.0
@@ -110,6 +130,15 @@ MIN_MISSES = 10
 MISS_DOMINANT_SHARE = 0.5
 # A bigger memory cache only while AutoOrtho uses under this share of its RAM limit.
 EVICTED_RAM_SHARE = 0.8
+# AutoOrtho's own CPU (its processes, as a share of the whole PC) against the
+# share the CPU-core limit allows: at the limit from this share of it, with
+# room to give back below HEADROOM_CPU_SHARE of it.
+AO_CPU_AT_LIMIT = 0.9
+HEADROOM_CPU_SHARE = 0.5
+# Levers whose configured 0 means "the largest allowed" (the provider's
+# ceiling); the governor works with that number instead.
+ZERO_IS_CEILING = ("autoortho.provider_origin_max_concurrency",)
+DEGRADE_LEVERS = ("autoortho.prefetch_lookahead", "autoortho.prefetch_radius_nm")
 # Dominant miss cause -> state. Turns and tiles that were complete have
 # nothing to tune.
 MISS_STATE = {
@@ -225,6 +254,43 @@ def levers_for(cfg, limits=None) -> Dict[str, LeverSpec]:
     return {spec.name: spec for spec in specs}
 
 
+def lever_state(cfg, levers: Dict[str, LeverSpec]):
+    """``(values, baseline, pinned)`` for ``levers`` from the config.
+
+    ``values`` is what each lever is set to now, ``baseline`` the value
+    AutoOrtho picks itself (planned for this PC, target and connection, or
+    the packaged default) and ``pinned`` the levers holding the user's own
+    value. A 0 that means "the largest allowed" (ZERO_IS_CEILING) becomes the
+    lever's maximum, so steps move from the real number. Values AutoOrtho
+    picked itself are kept inside the lever's range; the user's are not.
+    """
+    values, baseline, pinned = {}, {}, set()
+    for name, spec in levers.items():
+        section, key = name.split(".", 1)
+        try:
+            value = float(cfg.value(section, key))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        try:
+            base = float(cfg.automatic_text(section, key))
+        except (AttributeError, TypeError, ValueError):
+            base = value
+        if name in ZERO_IS_CEILING:
+            value = value if value > 0 else spec.maximum
+            base = base if base > 0 else spec.maximum
+        try:
+            custom = bool(cfg.is_custom(section, key))
+        except Exception:
+            custom = False
+        if custom:
+            pinned.add(name)
+        else:
+            value = spec.clamp(value)
+        values[name] = float(value)
+        baseline[name] = float(spec.clamp(base))
+    return values, baseline, pinned
+
+
 def texture_cap_allowed(cfg) -> bool:
     value = getattr(getattr(cfg, "governor", None), "allow_texture_cap", False)
     if isinstance(value, str):
@@ -285,6 +351,13 @@ class Sample:
     # Whether the flight was starting (the service's view), so a replay
     # judges each sample as the live governor did. None in old recordings.
     starting: Optional[bool] = None
+    # AutoOrtho's own processes' CPU as a share of the whole PC (percent);
+    # None when unknown (old recordings).
+    ao_cpu_percent: Optional[float] = None
+    # The broker's per-origin ceilings, summed (0: unknown). With the
+    # adaptive limit below its ceiling, the server is pacing downloads and a
+    # higher ceiling would change nothing.
+    broker_ceiling: int = 0
 
     def misses(self) -> Dict[str, int]:
         return {kind: int(getattr(self, f"near_miss_{kind}", 0) or 0) for kind in MISS_KINDS}
@@ -317,6 +390,9 @@ class Window:
     late_start: tuple = ()
     miss_counts: Dict[str, int] = field(default_factory=dict)
     pause_counts: Dict[str, int] = field(default_factory=dict)
+    ao_cpu_percent: Optional[float] = None
+    # The adaptive download limit sits at its ceiling (True when unknown).
+    broker_ceiling_bound: bool = True
 
     @property
     def misses_total(self) -> int:
@@ -343,6 +419,12 @@ def window_of(samples: List[Sample]) -> Optional[Window]:
         if s.broker_limit and (s.broker_active >= 0.9 * s.broker_limit or s.broker_waiting > 0)
     ) >= max(1, len(recent) // 2 + 1)
     frames = [s.frame_time_ms for s in samples if s.frame_time_ms]
+    ao_cpu = [s.ao_cpu_percent for s in recent if s.ao_cpu_percent is not None]
+    with_ceiling = [s for s in recent if s.broker_ceiling]
+    ceiling_bound = (
+        sum(1 for s in with_ceiling if s.broker_limit >= 0.9 * s.broker_ceiling)
+        >= len(with_ceiling) // 2 + 1
+    ) if with_ceiling else True
     return Window(
         seconds=dt,
         near_reads=near,
@@ -362,6 +444,8 @@ def window_of(samples: List[Sample]) -> Optional[Window]:
         late_start=tuple(last.late_start or ()),
         miss_counts=_delta(last.misses(), first.misses()),
         pause_counts=_delta(last.pauses(), first.pauses()),
+        ao_cpu_percent=(sum(ao_cpu) / len(ao_cpu)) if ao_cpu else None,
+        broker_ceiling_bound=ceiling_bound,
     )
 
 
@@ -422,6 +506,7 @@ STATE_TEXT = {
     "network_pushback": "Server pushing back",
     "network_room": "Network-bound, line has room",
     "network_full": "Network-bound, line full",
+    "network_paced": "Network-bound, server pacing downloads",
     "compute": "Compute-bound",
     "compute_limit": "Compute-bound at the CPU limit",
     "wait": "Waiting too briefly",
@@ -458,6 +543,7 @@ class Governor:
         brake_free_bytes: Optional[int] = None,
         protect_sim_fps: bool = False,
         vram_budget_bytes: Optional[int] = None,
+        ao_cpu_budget_percent: Optional[float] = None,
     ):
         self.levers = dict(levers)
         self.values = {name: float(values[name]) for name in levers if name in values}
@@ -466,7 +552,10 @@ class Governor:
         self.pinned = set(pinned)
         self.line_mbps = line_mbps
         self.bandwidth_mbps = bandwidth_mbps
+        # The whole PC's CPU (X-Plane included) counts as at its limit here.
         self.cpu_limit_percent = float(cpu_limit_percent)
+        # The share of the PC the CPU-core limit gives AutoOrtho (percent).
+        self.ao_cpu_budget_percent = ao_cpu_budget_percent
         self.ram_limit_bytes = ram_limit_bytes
         self.brake_free_bytes = brake_free_bytes
         self.protect_sim_fps = bool(protect_sim_fps)
@@ -479,8 +568,9 @@ class Governor:
         self.window: Optional[Window] = None
         self.starting = True
         self._cooldown_until: Dict[str, float] = {}
+        self._kept_at: Dict[str, float] = {}     # lever -> when a move was kept
         self._last_decision_t = -math.inf
-        self._pending: Optional[tuple] = None    # (decision, window before)
+        self._pending: Optional[tuple] = None    # (decision, window before, phase)
         self._limited_since: Optional[float] = None
         self.degraded: List[str] = []
         self.notice: Optional[str] = None
@@ -568,14 +658,23 @@ class Governor:
         if w.fidelity is None:
             return "warming_up"
         if w.admission_wait_share > 0.2:
-            if w.cpu_percent >= self.cpu_limit_percent:
+            if self.cpu_at_limit(w):
                 return "compute_limit"
             return "compute"
         if w.broker_saturated and w.error_share < 0.01:
-            return "network_full" if line_full else "network_room"
+            if line_full:
+                # Cutting far work only pays while scenery is blurry.
+                if w.fidelity < FIDELITY_GOOD:
+                    return "network_full"
+            elif not w.broker_ceiling_bound:
+                # The adaptive limit is below its ceiling: the server sets
+                # the pace and a higher ceiling would change nothing.
+                if w.fidelity < FIDELITY_GOOD:
+                    return "network_paced"
+            else:
+                return "network_room"
         if w.fidelity >= FIDELITY_GOOD:
-            if (w.cpu_percent < 0.5 * self.cpu_limit_percent and not w.broker_saturated
-                    and not frames_slow):
+            if self.cpu_has_room(w) and not w.broker_saturated and not frames_slow:
                 return "headroom"
             return "ok"
         if w.fidelity < FIDELITY_LOW:
@@ -586,6 +685,28 @@ class Governor:
                 return "slow_imagery"
             return self.miss_state(w)
         return "ok"
+
+    def _ao_cpu_known(self, w: Window) -> bool:
+        return bool(self.ao_cpu_budget_percent) and w.ao_cpu_percent is not None
+
+    def cpu_at_limit(self, w: Window) -> bool:
+        """No CPU to give: the PC is busy, or AutoOrtho is at its core limit.
+
+        The PC's CPU includes X-Plane's; AutoOrtho's own (its processes) is
+        compared with the share the CPU-core limit allows it.
+        """
+        if w.cpu_percent >= self.cpu_limit_percent:
+            return True
+        if self._ao_cpu_known(w):
+            return w.ao_cpu_percent >= AO_CPU_AT_LIMIT * self.ao_cpu_budget_percent
+        return False
+
+    def cpu_has_room(self, w: Window) -> bool:
+        """AutoOrtho uses well under what it may: its levers can ease off."""
+        if self._ao_cpu_known(w):
+            return (w.ao_cpu_percent < HEADROOM_CPU_SHARE * self.ao_cpu_budget_percent
+                    and w.cpu_percent < self.cpu_limit_percent)
+        return w.cpu_percent < HEADROOM_CPU_SHARE * self.cpu_limit_percent
 
     def miss_cause(self, w: Optional[Window] = None):
         """The dominant miss kind as ``(kind, count, total)``, or None.
@@ -698,6 +819,8 @@ class Governor:
             ("autoortho.prefetch_radius_nm", -1),
         ],
         "network_full": [("autoortho.prefetch_radius_nm", -1)],
+        # The server sets the pace: give what it sends to near scenery.
+        "network_paced": [("autoortho.prefetch_radius_nm", -1)],
         "compute": [
             ("autoortho.live_tile_admission", +1),
             ("autoortho.background_builder_workers", +1),
@@ -734,9 +857,12 @@ class Governor:
         if state == "headroom":
             # Ease off toward the baseline, one lever at a time.
             moves = []
+            now = self.samples[-1].t if self.samples else 0.0
             for name, value in self.values.items():
                 base = self.baseline.get(name)
                 if base is None or value == base or name == TEXTURE_CAP_LEVER:
+                    continue
+                if now - self._kept_at.get(name, -math.inf) < HEADROOM_SETTLE_S:
                     continue
                 moves.append((name, +1 if base > value else -1))
             return moves
@@ -749,6 +875,14 @@ class Governor:
             return []     # no RAM to give the cache
         return list(self._PLAN.get(state, ()))
 
+    def _step_factor(self, state, w: Optional[Window]) -> int:
+        """Steps per move: bigger while a flight starts and far below target."""
+        factor = 2 if self.starting else 1
+        if (state != "headroom" and w is not None and w.fidelity is not None
+                and w.fidelity < FIDELITY_FAR):
+            factor += 1
+        return factor
+
     def _decide(self, now: float) -> Optional[Decision]:
         state = self.state
         moves = self._candidates(state)
@@ -760,7 +894,7 @@ class Governor:
             if now < self._cooldown_until.get(name, -math.inf):
                 continue
             old = self.values[name]
-            step = spec.step * (2 if self.starting else 1)
+            step = spec.step * self._step_factor(state, w)
             target = old + direction * step
             if state == "headroom":
                 base = self.baseline[name]
@@ -780,14 +914,19 @@ class Governor:
             if self.mode == "auto":
                 decision = replace(decision, applied=True)
                 self.values[name] = new
-                self._pending = (decision, w)
+                self._pending = (decision, w, self._phase())
+                if state == "headroom" and name in self.degraded:
+                    self.degraded.remove(name)   # scenery is sharp again
             self.history.append(decision)
             return decision
         if state not in ("ok", "headroom", "warming_up", "paused") and (
             moves or state in STATE_MISS
         ) and state not in NOTICE_STATES:
-            self._note_limited(now, state)
+            return self._note_limited(now, state)
         return None
+
+    def _phase(self) -> str:
+        return phase_of(self.samples[-1], self.starting) if self.samples else "idle"
 
     def _note_persistent(self, now) -> None:
         """A state without moves that keeps coming back reaches the user once."""
@@ -819,32 +958,28 @@ class Governor:
                 "the flight report lists the blurry tiles by cause."
             )
 
-    def _note_limited(self, now, state):
-        """Every lever for this bottleneck is at its limit."""
+    def _note_limited(self, now, state) -> Optional[Decision]:
+        """Every lever for this bottleneck is at its limit.
+
+        After UNREACHABLE_AFTER_S of low fidelity: tell the user what limits
+        it and spend less on far work, one lever per call. Those moves are
+        decisions like any other (published in Auto, listed in Advise) but
+        are not judged: they trade a little far detail for near detail.
+        """
         if self._limited_since is None:
             self._limited_since = now
-            return
+            return None
         if now - self._limited_since < UNREACHABLE_AFTER_S:
-            return
+            return None
         if self.window is None or self.window.fidelity is None:
-            return
+            return None
         if self.window.fidelity >= FIDELITY_LOW:
-            return
+            return None
         self.state = "unreachable"
-        # Graceful degradation: spend less on far work first (never lower
-        # the target itself).
-        for name in ("autoortho.prefetch_lookahead", "autoortho.prefetch_radius_nm"):
-            spec = self.levers.get(name)
-            if spec is None or name in self.pinned or self._at_min(name):
-                continue
-            if name in self.degraded:
-                continue
-            self.degraded.append(name)
-            if self.mode == "auto":
-                self.values[name] = spec.clamp(self.values[name] - spec.step)
         limiting = {
             "network_room": "your connection",
             "network_full": "your connection",
+            "network_paced": "how fast the imagery server answers",
             "network_pushback": "the imagery server",
             "compute": "the CPU",
             "compute_limit": "the CPU limit",
@@ -864,6 +999,33 @@ class Governor:
             f"limit is {limiting}. Lower the zoom for this phase, raise the "
             "relevant limit, or keep it."
         )
+        # Graceful degradation: spend less on far work first (never lower
+        # the target itself).
+        for name in DEGRADE_LEVERS:
+            spec = self.levers.get(name)
+            if spec is None or name in self.pinned or name not in self.values:
+                continue
+            if name in self.degraded or self._at_min(name):
+                continue
+            if now < self._cooldown_until.get(name, -math.inf):
+                continue
+            old = self.values[name]
+            new = spec.clamp(old - spec.step)
+            self.degraded.append(name)
+            if new == old:
+                continue
+            decision = Decision(
+                now, name, spec.label, old, new, "unreachable",
+                f"target out of reach, limit is {limiting}: less far work",
+                outcome="kept",
+            )
+            self._cooldown_until[name] = now + COOLDOWN_S
+            if self.mode == "auto":
+                decision = replace(decision, applied=True)
+                self.values[name] = new
+            self.history.append(decision)
+            return decision
+        return None
 
     def _reason(self, state, w: Optional[Window]) -> str:
         if w is None:
@@ -940,27 +1102,51 @@ class Governor:
             return -(w.frame_time_ms or 0.0)
         return w.fidelity or 0.0
 
+    @staticmethod
+    def fidelity_worse(before: Window, after: Window) -> bool:
+        """Fidelity fell by more than chance explains.
+
+        Each window's fidelity is a share of near reads, so its standard
+        error is sqrt(p(1-p)/n); the drop must exceed two standard errors of
+        the difference and WORSE_FIDELITY.
+        """
+        if before.fidelity is None or after.fidelity is None:
+            return False
+        p1, n1 = before.fidelity, max(1, before.near_reads)
+        p2, n2 = after.fidelity, max(1, after.near_reads)
+        spread = math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
+        return p2 < p1 - max(WORSE_FIDELITY, 2 * spread)
+
     def _judge_pending(self, now: float) -> Optional[Decision]:
         if self._pending is None:
             return None
-        decision, before = self._pending
+        decision, before, phase = self._pending
         if decision.state == "vram":
             # The estimate covers 20 minutes of textures, so it falls slowly:
             # the cap stays for the session rather than being judged.
             self._pending = None
             self._mark(decision, "kept")
             return None
-        if now - decision.t < JUDGE_AFTER_S:
+        elapsed = now - decision.t
+        if elapsed < JUDGE_MIN_S:
             return None
-        self._pending = None
         # Judge on what happened since the change only.
         after = window_of([s for s in self.samples if s.t >= decision.t])
-        if before is None or after is None:
+        plenty = after is not None and after.near_reads >= 3 * MIN_NEAR_READS
+        if elapsed < JUDGE_AFTER_S and not plenty:
             return None
-        worse_fidelity = (
-            before.fidelity is not None and after.fidelity is not None
-            and after.fidelity < before.fidelity - 0.02
+        conclusive = (
+            before is not None and after is not None
+            and after.fidelity is not None and self._phase() == phase
         )
+        if not conclusive:
+            if elapsed < JUDGE_MAX_S:
+                return None          # wait for comparable reads
+            self._pending = None
+            self._mark(decision, "kept")
+            return None
+        self._pending = None
+        worse_fidelity = self.fidelity_worse(before, after)
         before_metric = self._metric(decision.state, before)
         worse_metric = (
             self._metric(decision.state, after)
@@ -985,10 +1171,76 @@ class Governor:
     def _mark(self, decision, outcome):
         if outcome == "kept":
             log.info("Governor: kept %s", decision.text())
+            if decision.state != "headroom":
+                now = self.samples[-1].t if self.samples else decision.t
+                self._kept_at[decision.lever] = now
         for index in range(len(self.history) - 1, -1, -1):
             if self.history[index] is decision:
                 self.history[index] = replace(decision, outcome=outcome)
                 return
+
+    # -- settings changed while flying -----------------------------------
+
+    def reconfigure(
+        self,
+        levers: Dict[str, LeverSpec],
+        values: Dict[str, float],
+        baseline: Dict[str, float],
+        pinned: Iterable[str],
+        *,
+        adopt: Iterable[str] = (),
+        **bounds,
+    ) -> Dict[str, float]:
+        """Take new limits or settings the user applied mid-flight.
+
+        ``levers``, ``values``, ``baseline`` and ``pinned`` are worked out
+        again from the config (:func:`lever_state`). A lever the user now
+        set keeps the user's value; one that went back to automatic, and the
+        ``adopt`` ones (whose automatic value the new limits changed), take
+        the config's value; the rest keep where the governor had them, inside
+        the new ranges. ``bounds`` replaces any of the constructor's limits
+        (``line_mbps``, ``ram_limit_bytes``, ...).
+
+        A change still being judged is dropped (its windows straddle the new
+        settings). Returns the values of every lever the governor tunes, to
+        publish, so the workers match the governor again.
+        """
+        pinned = set(pinned)
+        adopt = set(adopt)
+        old_values, old_pinned = self.values, self.pinned
+        new_values = {}
+        for name, spec in levers.items():
+            if name not in values:
+                continue
+            configured = float(values[name])
+            if name in pinned:
+                new_values[name] = configured
+            elif name in old_pinned or name in adopt or name not in old_values:
+                new_values[name] = float(spec.clamp(configured))
+            else:
+                new_values[name] = float(spec.clamp(old_values[name]))
+        self.levers = dict(levers)
+        self.values = new_values
+        self.baseline = {name: float(baseline.get(name, value))
+                         for name, value in new_values.items()}
+        self.pinned = pinned
+        self.degraded = [name for name in self.degraded if name not in pinned]
+        for key, value in bounds.items():
+            if key in ("line_mbps", "bandwidth_mbps", "ram_limit_bytes",
+                       "brake_free_bytes", "vram_budget_bytes",
+                       "ao_cpu_budget_percent"):
+                setattr(self, key, value)
+            elif key == "cpu_limit_percent" and value:
+                self.cpu_limit_percent = float(value)
+            elif key == "protect_sim_fps":
+                self.protect_sim_fps = bool(value)
+        if self._pending is not None:
+            decision = self._pending[0]
+            self._pending = None
+            self._mark(decision, "kept")
+        self._limited_since = None
+        return {name: value for name, value in self.values.items()
+                if name not in self.pinned}
 
     # -- reporting -------------------------------------------------------
 
@@ -1227,6 +1479,50 @@ class LearnedProfiles:
 # --------------------------------------------------------------- service
 
 
+class ProcessTreeCpu:
+    """CPU used by this process and its children, as a share of the PC.
+
+    psutil reports each process's CPU since its previous reading, in percent
+    of one logical CPU; the sum over AutoOrtho's processes (the app, the
+    mount workers, the download broker) divided by the logical CPUs is the
+    share of the whole PC. The process list is refreshed every ``refresh_s``
+    and the same Process objects are kept between readings, as psutil needs.
+    """
+
+    def __init__(self, refresh_s: float = 10.0, clock: Callable[[], float] = time.monotonic):
+        self._refresh_s = refresh_s
+        self._clock = clock
+        self._procs: Dict[int, object] = {}
+        self._listed_at = -math.inf
+
+    def __call__(self) -> Optional[float]:
+        try:
+            import psutil
+        except Exception:
+            return None
+        now = self._clock()
+        try:
+            if now - self._listed_at >= self._refresh_s:
+                me = psutil.Process()
+                current = {me.pid: me}
+                for child in me.children(recursive=True):
+                    current[child.pid] = child
+                # Keep the objects already primed for cpu_percent.
+                self._procs = {pid: self._procs.get(pid, proc)
+                               for pid, proc in current.items()}
+                self._listed_at = now
+            total = 0.0
+            for pid, proc in list(self._procs.items()):
+                try:
+                    total += float(proc.cpu_percent(interval=None))
+                except Exception:
+                    self._procs.pop(pid, None)
+            logical = psutil.cpu_count(logical=True) or os.cpu_count() or 1
+            return min(100.0, total / logical)
+        except Exception:
+            return None
+
+
 def _distance_m(a, b) -> float:
     lat1, lon1 = a
     lat2, lon2 = b
@@ -1259,8 +1555,10 @@ class GovernorService:
         sum_stat: Optional[Callable[[str], float]] = None,
         max_stat: Optional[Callable[[str], float]] = None,
         collect_stat: Optional[Callable[[str], list]] = None,
+        ao_cpu: Optional[Callable[[], Optional[float]]] = None,
     ):
         self.governor = governor
+        self._ao_cpu = ao_cpu if ao_cpu is not None else ProcessTreeCpu(clock=clock)
         self._read = read_stat
         self._sum = sum_stat
         self._max = max_stat
@@ -1311,14 +1609,21 @@ class GovernorService:
             ao_mb = float(self._read("cur_mem_mb") or 0)
         except (TypeError, ValueError):
             ao_mb = 0.0
-        active = limit = waiting = 0
+        try:
+            ao_cpu = self._ao_cpu()
+        except Exception:
+            ao_cpu = None
+        active = limit = waiting = ceiling = 0
         if self._broker_stats is not None:
             try:
                 stats = self._broker_stats() or {}
                 origins = stats.get("origins") or {}
                 for row in (origins.values() if isinstance(origins, dict) else origins):
                     active += int(row.get("active", 0) or 0)
-                    limit += int(min(row.get("limit", 0) or 0, row.get("ceiling", 1 << 30) or 0))
+                    row_ceiling = int(row.get("ceiling", 0) or 0)
+                    row_limit = int(row.get("limit", 0) or 0)
+                    limit += min(row_limit, row_ceiling) if row_ceiling else row_limit
+                    ceiling += row_ceiling
                 # Requests parked waiting for an origin permit: the queue is full.
                 waiting = int(stats.get("backlog_depth", 0) or 0)
             except Exception:
@@ -1359,6 +1664,8 @@ class GovernorService:
             broker_active=active,
             broker_limit=limit,
             broker_waiting=waiting,
+            broker_ceiling=ceiling,
+            ao_cpu_percent=ao_cpu,
             altitude_ft=altitude,
             speed_kt=speed,
             connected=connected,
@@ -1594,6 +1901,26 @@ class GovernorService:
     def set_mode(self, mode):
         with self._lock:
             self.governor.mode = mode if mode in MODES else "advise"
+
+    def reconfigure(self, levers, values, baseline, pinned, *, adopt=(), **bounds) -> dict:
+        """Governor.reconfigure under the lock; publishes the result in Auto.
+
+        In Advise and Off the workers run the configured values, so nothing
+        is published. Returns what was published.
+        """
+        with self._lock:
+            out = self.governor.reconfigure(
+                levers, values, baseline, pinned, adopt=adopt, **bounds
+            )
+            mode = self.governor.mode
+        if mode != "auto" or not out or self._publish is None:
+            return {}
+        try:
+            self._publish(dict(out))
+        except Exception:
+            log.exception("Governor could not publish its levers after a change")
+            return {}
+        return dict(out)
 
     def snapshot(self) -> dict:
         with self._lock:

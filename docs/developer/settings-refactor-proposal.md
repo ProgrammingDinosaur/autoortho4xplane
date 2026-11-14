@@ -1,6 +1,6 @@
 # Settings refactor proposal: Target, Limits, Governor
 
-Status: phases 1 to 9 implemented (see "Implementation notes" at the end); the governor ships in Advise mode until real flights confirm its decisions (revision 2)
+Status: phases 1 to 9 implemented (see "Implementation notes" at the end); the governor ships in Auto mode, starting from the tuning plan (see "Tuner completion" at the end)
 Scope: user-facing settings, how settings are stored and resolved, the setup wizard, and a live auto-tuning engine
 Reference studied: OrthoStreamXP (OSXP), shared with permission. This proposal borrows its measurement ideas but keeps AutoOrtho's own model.
 
@@ -558,7 +558,7 @@ If one of these explains a problem, it reaches Home **as a notice in plain words
   - keep/revert judged 20 s after a change on the samples since the change, against fidelity (−2 points) and the state's own metric (−5 %);
   - degradation shortens prefetch and sets a notice after 5 minutes with every lever for the bottleneck at its limit;
   - eleven levers (`levers_for()`), bounded by the limits: the provider ceiling, live tile admission, background builders and their pause, three memory budgets, two waits, and prefetch lookahead and radius.
-- **Advise** is the default for now, until real flights confirm the decisions (§11). The proposal's default is Auto; switching is a one-line change to `[governor] mode` in the template.
+- **Advise** was the default until the tuner completion below; **Auto** (the proposal's default) is the default now. Going back is a one-line change to `[governor] mode` in the template.
 - Learned profiles: `LearnedProfiles` in `~/.autoortho-data/governor/learned.json`, keyed by `profile_key()` (target hash, provider, `network_fingerprint()`, a salted hash of the local /24 networks). Applied as a warm start in Auto only; saved at unmount in Auto.
 - `protect_sim_fps` (`[limits]`, default on). The best 30 s frame-time average after starting is the reference. Frames more than 20 % slower than it, and under 40 fps, classify as `sim_fps`, which lowers background builders, lengthens the build pause and shortens prefetch. The change is kept while fidelity stays ≥ 95 %.
 - Transparency:
@@ -667,3 +667,58 @@ Implemented from [governor-behind-detection-plan.md](governor-behind-detection-p
 - `Sample.starting` is recorded, so `replay()` judges each sample as the live governor did (old recordings: unchanged).
 - Report: *Blurry moments by cause* by phase (`diagnostics._render_miss_causes`); `summary()` has `misses` and `misses_by_phase`, the timeline the window's miss counts.
 - The thresholds (`MIN_MISSES`, `MISS_DOMINANT_SHARE`, `WIDE_SHARE`) are the plan's starting values. The governor still ships in Advise, so the reports from the first flights can set them before Auto acts on them.
+
+### Tuner completion
+
+A review of the automatic configuration found it reactive only (no starting
+point from the target or the line), two bugs, and loose spots. Changes:
+
+- **Tuning plan** (`tuning_plan.py`, applied in `AOConfig._apply_hardware_baseline`
+  after the hardware baseline and before the limits, source `planned`):
+  `target_cost`'s busiest-phase need against the last connection test of the
+  provider (capped by the bandwidth limit) sets prefetch chunks per cycle,
+  prefetch radius, lookahead and paging lead, both waits (only raised) and
+  predictive build memory (only raised). The download ceiling
+  (`provider_origin_max_concurrency`) is sized from min(line, bandwidth
+  limit) with the test's per-request speed. Every planned value lies inside
+  the governor's lever range. Same switch as the baseline
+  (`[tuning] hardware_baseline`). Workers load the config themselves and
+  compute the same plan; `start_governor` calls `recompute_automatic` so the
+  parent matches them.
+- **Bug: concurrency 0.** `provider_origin_max_concurrency = 0` means "the
+  provider's ceiling", but the governor stepped from the number 0, so a
+  "raise" clamped to the 64 floor and cut the ceiling from 320 to 64.
+  `governor.lever_state()` now turns 0 into the lever's maximum and keeps
+  automatic values inside the lever ranges (corrections are published at
+  start).
+- **Bug: degradation was never published.** `_note_limited` lowered
+  prefetch levers in `values` only, so workers never saw it while the
+  learned profile stored it. Each step is now a `Decision` (state
+  `unreachable`, outcome `kept`, not judged), published in Auto and listed
+  in Advise; headroom eases it back once the scenery is sharp.
+- **CPU.** The service samples AutoOrtho's process tree
+  (`ProcessTreeCpu`, share of the PC) and the governor compares it with the
+  share the CPU-core limit allows (`ao_cpu_budget_percent`); the whole-PC
+  90 % still counts as "no CPU to give". Headroom uses AutoOrtho's share.
+- **Network.** Samples carry the broker's summed ceilings. A saturated queue
+  raises the ceiling only when the adaptive limit sits at it
+  (`network_room`); below it the server sets the pace (`network_paced`,
+  narrows prefetch). `network_full` and `network_paced` act only below 98 %
+  sharp.
+- **Keep or revert.** Judged from 10 s with 60+ near reads, else at 20 s;
+  waits up to 60 s for near reads in the same flight phase, then keeps.
+  Fidelity counts as worse only when it fell by more than 2 points and two
+  standard errors of the difference. A kept change is not eased back by
+  headroom for 120 s.
+- **Convergence.** One extra step's worth while under 85 % sharp (on top of
+  the doubled steps while starting); the plan supplies the starting point.
+- **Mid-flight changes.** `AOMount.sync_governor()` (after Apply of limits
+  and after live Expert edits) rebuilds levers, ranges, pins and bounds via
+  `Governor.reconfigure()`; values whose automatic value the new limits
+  changed are adopted, tuned values are clamped into the new ranges, a
+  pending verdict is dropped, and in Auto the governor's values are
+  published again.
+- **Learning** stores only levers that settled away from their baseline, so
+  later plan improvements are not masked by stored copies of old defaults.
+- `live_builder_concurrency` stays start-only: it sizes the native buffer
+  and decoder pools at start. Its live counterpart is `live_tile_admission`.

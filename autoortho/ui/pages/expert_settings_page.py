@@ -53,6 +53,7 @@ _AUTOMATIC_SOURCES = {
     "hardware": "This PC",
     "limit": "Your limits",
     "measured": "Measured",
+    "planned": "Target and line",
 }
 _NOT_CHANGED = ("Default",) + tuple(_AUTOMATIC_SOURCES.values())
 COL_SETTING, COL_VALUE, COL_DEFAULT, COL_SOURCE = range(4)
@@ -195,6 +196,7 @@ class ExpertSettingsModel(QAbstractTableModel):
             reason = {
                 "limit": "Lowered to fit your limits",
                 "measured": "From the connection test",
+                "planned": "Sized for your quality target and connection",
             }.get(
                 self._config.source(spec.section, spec.key),
                 "Scaled to this PC",
