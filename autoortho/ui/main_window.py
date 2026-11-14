@@ -22,6 +22,10 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.utils.mappers import map_kubilus_region_to_simheaven_region
     from autoortho.utils.dsf_utils import DsfUtils, dsf_utils
     from autoortho.utils.mount_utils import cleanup_mountpoint, safe_ismount
+    from autoortho.utils.cache_cleanup import (
+        delete_all_cache_contents,
+        remove_stale_temp_files,
+    )
     from autoortho.utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
     from autoortho.utils.custom_map import get_custom_map_config
     from autoortho.utils.simbrief_flight import simbrief_flight_manager
@@ -93,6 +97,10 @@ else:
     from utils.mappers import map_kubilus_region_to_simheaven_region
     from utils.dsf_utils import DsfUtils, dsf_utils
     from utils.mount_utils import cleanup_mountpoint, safe_ismount
+    from utils.cache_cleanup import (
+        delete_all_cache_contents,
+        remove_stale_temp_files,
+    )
     from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
     from utils.custom_map import get_custom_map_config
     from utils.simbrief_flight import simbrief_flight_manager
@@ -10269,6 +10277,7 @@ class ConfigUI(QMainWindow):
         """Clean cache with 2-phase deletion order:
         1. JPEGs (always delete all)
         2. Dynamic DDS (LRU eviction if still over budget)
+        3. Delete-all only: terrain index, seasons index and temp files
         """
         emit_progress = progress_callback or self.status_update.emit
         emit_progress(
@@ -10299,7 +10308,28 @@ class ConfigUI(QMainWindow):
                 if os.path.isdir(dds_root):
                     shutil.rmtree(dds_root, ignore_errors=True)
                     emit_progress("Phase 2: Deleted all DDS cache files.")
+                # --- Phase 3: everything else AutoOrtho keeps in the cache
+                # (terrain index, seasons index, interrupted temp files) ---
+                _, failures = delete_all_cache_contents(cache_dir)
+                if failures:
+                    emit_progress(
+                        f"Phase 3: {failures} cache entries could not be "
+                        "deleted (in use?)."
+                    )
+                    return (
+                        False,
+                        f"{failures} cache entries could not be deleted. "
+                        "Close any program using the cache folder and "
+                        "try again.",
+                        False,
+                    )
+                emit_progress("Phase 3: Deleted remaining cache files.")
             else:
+                temp_count = remove_stale_temp_files(cache_dir, cancel_event)
+                if temp_count:
+                    emit_progress(
+                        f"Removed {temp_count} leftover temporary files."
+                    )
                 try:
                     from autoortho.getortho import dynamic_dds_cache
                 except ImportError:
