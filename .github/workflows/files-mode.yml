@@ -1,0 +1,88 @@
+name: Files mode
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'autoortho/files_mode/**'
+      - 'autoortho/texture_service.py'
+      - 'autoortho/xplane_plugin/**'
+      - 'autoortho/tests/test_files_*.py'
+      - 'autoortho/tests/test_texture_service.py'
+      - 'tools/files_mode/**'
+      - '.github/workflows/files-mode.yml'
+  pull_request:
+    paths:
+      - 'autoortho/files_mode/**'
+      - 'autoortho/texture_service.py'
+      - 'autoortho/xplane_plugin/**'
+      - 'autoortho/tests/test_files_*.py'
+      - 'autoortho/tests/test_texture_service.py'
+      - 'tools/files_mode/**'
+      - '.github/workflows/files-mode.yml'
+  workflow_dispatch:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Qt libraries (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1
+      - name: Install
+        run: python -m pip install -U -r requirements.txt
+      - name: Files-mode tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: >
+          python -m pytest -q
+          autoortho/tests/test_files_geometry.py
+          autoortho/tests/test_files_pack.py
+          autoortho/tests/test_files_store.py
+          autoortho/tests/test_files_session.py
+          autoortho/tests/test_files_features.py
+          autoortho/tests/test_files_beta.py
+          autoortho/tests/test_texture_service.py
+
+  plugin:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            dir: win_x64
+          - os: ubuntu-22.04      # older glibc for wider Linux compatibility
+            dir: lin_x64
+          - os: macos-latest
+            dir: mac_x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Build (Windows, MSVC)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: autoortho\xplane_plugin\build_win.bat
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: make -C autoortho/xplane_plugin linux
+      - name: Build (macOS, universal)
+        if: runner.os == 'macOS'
+        run: make -C autoortho/xplane_plugin mac
+      - name: Check exports
+        if: runner.os != 'Windows'
+        run: nm -gU autoortho/xplane_plugin/bin/${{ matrix.dir }}/AutoOrtho.xpl 2>/dev/null | grep XPlugin || nm -D autoortho/xplane_plugin/bin/${{ matrix.dir }}/AutoOrtho.xpl | grep XPlugin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoOrtho-plugin-${{ matrix.dir }}
+          path: autoortho/xplane_plugin/bin/${{ matrix.dir }}/AutoOrtho.xpl
