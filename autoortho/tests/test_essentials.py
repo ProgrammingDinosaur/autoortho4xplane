@@ -171,8 +171,16 @@ def test_bandwidth_limit_sets_a_concurrency_ceiling(tmp_path):
         encoding="utf-8",
     )
     cfg = AOConfig(str(path))
-    # 610 needed, capped at the requests in flight.
+    # The 90 Mbit/s line is the tighter cap now: 11.25 MB/s at 16 KB per
+    # 0.13 s, half again: 138, sized from the line (the tuning plan).
+    assert cfg.autoortho.provider_origin_max_concurrency == 138
+    assert cfg.source("autoortho", "provider_origin_max_concurrency") == "planned"
+
+    connection_test.save_result(_result(mbits=900.0))
+    cfg = AOConfig(str(path))
+    # 610 needed for the 400 Mbit/s limit, capped at the requests in flight.
     assert cfg.autoortho.provider_origin_max_concurrency == 320
+    assert cfg.source("autoortho", "provider_origin_max_concurrency") == "limit"
 
 
 # -- guards: disk and limit fixes --------------------------------------------

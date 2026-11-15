@@ -152,6 +152,9 @@ show_all_settings = False
 # Engine settings an older config set by hand, kept when AutoOrtho started
 # sizing them itself. Home offers to review them until dismissed.
 kept_values =
+# Settings auto-tuning would manage that you chose to keep as set (Home stops
+# offering to hand these back; a newly pinned one is offered again).
+dismissed_pinned =
 dismissed_update_version =
 # Hide when running
 hide = True
@@ -281,9 +284,11 @@ background_builder_workers = 2
 predictive_dds_memory_mb = 512
 # Number of concurrent tile build workers (1-32)
 # Controls how many tiles can be built simultaneously by the native pipeline
+# (the DDS buffers and streaming builders, with background_builder_workers).
 # Higher values = faster tile processing, more CPU/RAM usage
 # Lower values = less resource usage, potential stutters
-# Recommended: 4 (low-end), 8 (mid-range, default), 16-32 (high-end CPU)
+# Auto-tuning raises it while live tiles wait for build slots and resizes
+# the pools while streaming; a value set here is never changed.
 live_builder_concurrency = 8
 # End-to-end live tile requests admitted before allocating composition state.
 # Keep this high enough to saturate downloads while bounding ZL17 working memory.
@@ -346,12 +351,11 @@ pipeline_mode = auto
 #   - ~43MB per buffer when higher zoom levels are configured (8K textures)
 #   - ~43MB per buffer when using custom tiles (assumes worst case)
 # 
-# Default: Automatically calculated as (prefetch_workers + live_builder_concurrency)
-# This ensures optimal parallelism: each worker can have its own buffer.
-# Maximum is capped to (prefetch_workers + live_builder_concurrency) since
-# more buffers than workers would never be used simultaneously.
-# 
-# The value here (10) is a reasonable fallback = 2 prefetch + 8 live (defaults)
+# Unless set here: background_builder_workers + live_builder_concurrency,
+# within a quarter of the RAM limit, resized while streaming as auto-tuning
+# moves the builders. A value set here is a fixed size.
+#
+# The value here (10) is the packaged 2 background + 8 live builders.
 buffer_pool_size = 10
 # === LIVE AOPIPELINE SETTINGS ===
 # These control the optimized pipeline for live (on-demand) DDS builds when
@@ -381,8 +385,9 @@ live_aopipeline_min_chunk_ratio = 1.0
 streaming_builder_enabled = True
 # Size of the streaming builder pool (2-64)
 # Each builder handles one tile at a time. Pool size determines
-# how many tiles can be built concurrently.
-# Recommended: 4 (default), increase to 8-16 for faster CPUs, up to 64 for high-end systems
+# how many tiles can be built concurrently. Unless set here it follows
+# background_builder_workers + live_builder_concurrency (builders are small
+# and created on demand), resized while streaming. A value set here is fixed.
 streaming_builder_pool_size = 4
 # === TILE QUEUE SETTINGS ===
 # When all buffer pool slots are busy, tiles wait in a queue instead of
@@ -611,8 +616,11 @@ xplane_vram_reserve_gb = 5
 ram_brake = True
 
 [tuning]
-# Scale the memory cache, predictive build memory and builder counts to this
-# PC's cores and RAM. A value you set yourself always wins.
+# Pick starting values for this PC, the quality target and the connection:
+# memory cache, predictive build memory and builder counts from the cores and
+# RAM; prefetch rate, corridor, lead time, waits and the download ceiling from
+# what the zoom target needs against the last connection test. Auto-tuning
+# fine-tunes from there. A value you set yourself always wins.
 hardware_baseline = True
 
 [governor]
@@ -620,7 +628,7 @@ hardware_baseline = True
 # within the limits, to reach the quality target, and remembers what worked
 # for the next flight. advise: it only suggests changes (shown in Settings >
 # Auto-Tuning and the log). off: the configured values, as before.
-mode = advise
+mode = auto
 # Keep a record of each flight's signals for replaying the governor offline.
 record_samples = True
 # Let auto-tuning cap photo textures at 4096 px when the textures X-Plane
@@ -762,6 +770,18 @@ route_prefetch_radius_nm = 40
         "autoortho.missing_color",
     })
 
+    def pinned_tuned_values(self):
+        """Settings AutoOrtho sizes or tunes itself that hold the user's own
+        value, by "section.key" (the registry's "governed" owner).
+
+        Auto-tuning and the tuning plan leave these alone; Home offers to
+        hand them back while auto-tuning is on.
+        """
+        return sorted(
+            spec.name for spec in self.registry().by_owner("governed")
+            if spec.tier is not Tier.RETIRED and self.is_custom(spec.section, spec.key)
+        )
+
     def kept_engine_values(self):
         """Engine settings holding the user's own value, by "section.key"."""
         kept = []
@@ -779,19 +799,22 @@ route_prefetch_radius_nm = 40
     def _apply_hardware_baseline(self, custom=None):
         """Pick values for settings the user has not set (never written).
 
-        Three sources, in order, each only for settings still at their
-        packaged default:
+        Sources, in order, each only for settings the user has not set:
 
         * the hardware baseline (hardware.baseline_values), when on;
         * the connection test's warm start for download concurrency;
-        * the limits in [limits], which lower any of the above.
+        * the tuning plan (tuning_plan.py: the quality target against the
+          measured line and the PC), when the baseline is on;
+        * the limits in [limits], which lower any of the above;
+        * the download ceiling the line or the bandwidth limit carries.
 
         Whether the baseline is on, and the limits, are fixed at load, so
         changing them takes effect at the next start without pinning the old
-        values.
+        values (recompute_automatic works them out again mid-session).
         """
         self._baseline = {}
         self._automatic_sources = {}
+        self._plan = None
         registry = self.registry()
         enabled = parse_value(
             str(self._current_value("tuning", "hardware_baseline"))
@@ -816,6 +839,11 @@ route_prefetch_radius_nm = 40
         except Exception as exc:
             log.debug(f"Limits unavailable: {exc}")
             active = None
+        connection = _connection_for(self)
+        if enabled:
+            for name, text in _planned_values(self, chosen, active, connection).items():
+                chosen[name] = text
+                sources[name] = "planned"
         if active is not None:
             governed = {}
             for name in limits_module.GOVERNED:
@@ -828,11 +856,18 @@ route_prefetch_radius_nm = 40
                 if text != governed[name]:
                     chosen[name] = text
                     sources[name] = "limit"
-            ceiling = _bandwidth_concurrency_ceiling(self, active.bytes_per_second)
+        # Download ceiling: what the line (when measured and the baseline is
+        # on) or the bandwidth limit can carry, whichever is lower.
+        line = connection.mbits if enabled and connection is not None else 0
+        limit_mbps = active.bandwidth_mbps if active is not None else None
+        caps = [(c, src) for c, src in ((limit_mbps, "limit"), (line, "planned")) if c]
+        if caps:
+            capacity, source = min(caps, key=lambda item: item[0])
+            ceiling = _bandwidth_concurrency_ceiling(self, capacity * 1_000_000 / 8)
             if ceiling is not None:
                 name = "autoortho.provider_origin_max_concurrency"
                 chosen[name] = ceiling
-                sources[name] = "limit"
+                sources[name] = source
         for name, text in chosen.items():
             section, key = name.split(".", 1)
             spec = registry.get(section, key)
@@ -946,7 +981,8 @@ route_prefetch_radius_nm = 40
 
         'custom' (the user's), 'limit' (lowered to fit [limits]),
         'hardware' (scaled to this PC), 'measured' (from the connection
-        test) or 'default'.
+        test), 'planned' (sized for the quality target and connection) or
+        'default'.
         """
         if self.is_custom(section, key):
             return "custom"
@@ -1240,6 +1276,7 @@ route_prefetch_radius_nm = 40
                 reason = {
                     "limit": "lowered to fit [limits]",
                     "measured": "from the connection test",
+                    "planned": "sized for the quality target and connection",
                 }.get(
                     self._automatic_sources.get((section, key)),
                     "set for this PC",
@@ -1482,6 +1519,57 @@ def _connection_for(cfg):
         getattr(getattr(cfg, "autoortho", None), "maptype_override", "")
     )
     return result if result.provider == provider else None
+
+
+def _planned_values(cfg, chosen, active, connection):
+    """The tuning plan for the saved target, line and PC (tuning_plan.py).
+
+    ``chosen`` holds the values picked so far (hardware baseline); settings
+    not in it are at their packaged default. Best effort: {} on any failure.
+    """
+    try:
+        if __package__:
+            from autoortho import target_cost, tuning_plan
+        else:
+            import target_cost
+            import tuning_plan
+        registry = cfg.registry()
+
+        def current(name):
+            if name in chosen:
+                return chosen[name]
+            section, key = name.split(".", 1)
+            spec = registry.get(section, key)
+            return spec.default_text if spec is not None else None
+
+        try:
+            interval = float(current("autoortho.prefetch_interval") or 1.0)
+        except (TypeError, ValueError):
+            interval = 1.0
+        try:
+            workers = int(float(current("autoortho.background_builder_workers") or 2))
+        except (TypeError, ValueError):
+            workers = 2
+        names = (
+            "autoortho.predictive_dds_memory_mb",
+            "streaming.band_max_wait_seconds",
+            "streaming.near_wait_seconds",
+        )
+        result = tuning_plan.plan(
+            target_cost.target_cost_from_config(cfg),
+            line_mbps=connection.mbits if connection is not None else None,
+            bandwidth_mbps=active.bandwidth_mbps if active is not None else None,
+            chunk_seconds=connection.chunk_seconds if connection is not None else None,
+            background_workers=workers,
+            ram_limit_gb=active.ram_gb if active is not None else None,
+            prefetch_interval_s=interval,
+            current={name: current(name) for name in names},
+        )
+        cfg._plan = result
+        return dict(result.values)
+    except Exception as exc:
+        log.debug(f"Tuning plan unavailable: {exc}")
+        return {}
 
 
 def _connection_warm_start(cfg):

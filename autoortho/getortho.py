@@ -868,39 +868,18 @@ def _get_dds_buffer_pool():
     try:
         native = _get_native_dds()
         if native is not None and hasattr(native, 'DDSBufferPool'):
-            # Calculate optimal pool size from worker counts
-            # Maximum concurrent builds = prefetch_workers + live_builder_concurrency
-            # More buffers than this would never be used simultaneously
-            try:
-                prefetch_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 4))
-                live_concurrency = int(getattr(CFG.autoortho, 'live_builder_concurrency', 8))
-            except (ValueError, TypeError):
-                prefetch_workers = 2
-                live_concurrency = 8
-            
-            # Optimal pool size = total concurrent workers (cap)
-            optimal_pool_size = prefetch_workers + live_concurrency
-            
-            # Get user-configured pool size (defaults to optimal)
-            try:
-                pool_size = int(getattr(CFG.autoortho, 'buffer_pool_size', optimal_pool_size))
-            except (ValueError, TypeError):
-                pool_size = optimal_pool_size
-            
-            # Clamp to valid range: minimum 2, maximum is optimal (no benefit exceeding workers)
-            pool_size = max(2, min(optimal_pool_size, pool_size))
-            
-            log.debug(f"DDS buffer pool sizing: configured={getattr(CFG.autoortho, 'buffer_pool_size', 'default')}, "
-                      f"optimal={optimal_pool_size} (prefetch={prefetch_workers} + live={live_concurrency}), "
-                      f"final={pool_size}")
-            
             # Calculate buffer size based on configuration
             buffer_size, size_name = _calc_required_buffer_size()
             if buffer_size is None:
                 log.debug("Could not determine buffer size, using default 4K")
                 buffer_size = native.DDSBufferPool.SIZE_4096x4096_BC1
                 size_name = "4K (default)"
-            
+
+            # One buffer per build slot (background + live builders, which
+            # the governor moves live), within the RAM share for buffers.
+            pool_size = _buffer_pool_target(buffer_size)
+            log.debug(f"DDS buffer pool sizing: {pool_size} buffers")
+
             _dds_buffer_pool = native.DDSBufferPool(
                 buffer_size=buffer_size,
                 pool_size=pool_size,
@@ -918,6 +897,71 @@ def _get_dds_buffer_pool():
     return _dds_buffer_pool
 
 
+
+
+# Share of the RAM limit the DDS buffers may take (they are allocated up front).
+BUFFER_RAM_SHARE = 0.25
+
+
+def _build_slots(setting: str, default: int) -> int:
+    try:
+        try:
+            from autoortho.aopipeline.AoDDS import build_slot_count
+        except ImportError:
+            from aopipeline.AoDDS import build_slot_count
+        return build_slot_count(CFG, setting, default)
+    except Exception:
+        return default
+
+
+def _buffer_pool_target(buffer_size: int) -> int:
+    """DDS buffers for the current build slots.
+
+    The user's own ``buffer_pool_size`` is kept as set. Otherwise one buffer
+    per build slot, capped to BUFFER_RAM_SHARE of the RAM limit.
+    """
+    size = _build_slots("buffer_pool_size", 10)
+    try:
+        custom = bool(CFG.is_custom("autoortho", "buffer_pool_size"))
+    except Exception:
+        custom = False
+    limit = globals().get("_ram_limit_bytes")
+    if not custom and limit and buffer_size:
+        size = min(size, max(2, int(limit * BUFFER_RAM_SHARE // buffer_size)))
+    return max(2, min(64, int(size)))
+
+
+def _resize_build_pools() -> None:
+    """Builder counts changed while streaming: resize the build pools."""
+    pool = _dds_buffer_pool
+    if pool is not None and hasattr(pool, "resize"):
+        try:
+            pool.resize(_buffer_pool_target(pool.buffer_size))
+        except Exception as exc:
+            log.debug(f"DDS buffer pool resize failed: {exc}")
+    try:
+        try:
+            from autoortho.aopipeline import AoDDS
+        except ImportError:
+            from aopipeline import AoDDS
+        builders = getattr(AoDDS, "_default_builder_pool", None)
+        if builders is not None and hasattr(builders, "resize"):
+            builders.resize(_build_slots("streaming_builder_pool_size", 4))
+    except Exception as exc:
+        log.debug(f"Streaming builder pool resize failed: {exc}")
+
+
+def note_build_slot(wait_ms: float, timed_out: bool = False) -> None:
+    """A live build asked for a build slot (DDS buffer or streaming builder).
+
+    The governor's signal that live tiles queue for build slots, which a
+    higher live-tile admission cannot fix.
+    """
+    bump("live_build_slots")
+    if timed_out or wait_ms > 10:
+        bump("live_build_slot_waits")
+    if timed_out:
+        bump("live_build_slot_timeouts")
 
 
 def _is_tile_queue_enabled() -> bool:
@@ -2005,6 +2049,12 @@ def _on_live_background_workers(value):
     workers = _live_int(value, 1, 16)
     if workers is not None and background_dds_builder is not None:
         background_dds_builder.set_max_workers(workers)
+    _resize_build_pools()
+
+
+def _on_live_builders(value):
+    if _live_int(value, 1, 32) is not None:
+        _resize_build_pools()
 
 
 def _on_live_build_interval(value):
@@ -2046,11 +2096,13 @@ def _on_live_ram_gb(value):
     _ram_limit_bytes = (
         int((gb - limits_module.APP_OVERHEAD_GB) * 1024 ** 3) if gb > 0 else None
     )
+    _resize_build_pools()     # the buffers' RAM share changed
 
 
 for _name, _hook in (
     ("autoortho.live_tile_admission", _on_live_admission),
     ("autoortho.background_builder_workers", _on_live_background_workers),
+    ("autoortho.live_builder_concurrency", _on_live_builders),
     ("autoortho.predictive_dds_build_interval_ms", _on_live_build_interval),
     ("autoortho.predictive_dds_memory_mb", _on_live_predictive_memory),
     ("cache.cache_mem_limit", _on_live_cache_limit),
@@ -9230,7 +9282,9 @@ def start_predictive_dds(tile_cacher=None) -> None:
     # With dynamic thread coordination, total OpenMP threads ~ cpu_count
     try:
         from autoortho.aopipeline import AoDDS
-        decoder_pool_size = AoDDS.calculate_decoder_pool_size(total_builders)
+        # Decoders are created on demand (~2 KB idle): size for the most
+        # builders the governor may run (16 background + 32 live).
+        decoder_pool_size = AoDDS.calculate_decoder_pool_size(max(total_builders, 48))
         if AoDDS.init_decoder_pool(decoder_pool_size):
             log.info(f"Decoder pool initialized: {decoder_pool_size} decoders "
                     f"(cpu×1.5={CURRENT_CPU_COUNT}×1.5, min={total_builders} builders)")
@@ -12340,12 +12394,14 @@ class Tile(object):
                 tile_id=self.id,
                 details={"path": "batch"},
             )
+            note_build_slot(wait_time_ms)
             if wait_time_ms > 10:  # Only track significant waits
                 bump('live_queue_wait_count')
                 log.debug(f"_try_aopipeline_build: Waited {wait_time_ms:.0f}ms for buffer for {self.id}")
-            
+
         except TimeoutError:
             wait_time_ms = (time.monotonic() - wait_start) * 1000
+            note_build_slot(wait_time_ms, timed_out=True)
             record_stage(
                 "dds.buffer_pool_wait",
                 wait_time_ms,
@@ -12698,9 +12754,11 @@ class Tile(object):
                 )
                 log.debug(f"_try_streaming_aopipeline_build: Builder pool timeout after {wait_time_ms:.0f}ms")
                 bump('streaming_builder_queue_timeout')
+                note_build_slot(wait_time_ms, timed_out=True)
                 return False
 
             wait_time_ms = (time.monotonic() - wait_start) * 1000
+            note_build_slot(wait_time_ms)
             record_stage(
                 "dds.builder_pool_wait",
                 wait_time_ms,
@@ -12761,10 +12819,12 @@ class Tile(object):
                     tile_id=self.id,
                     details={"path": "streaming"},
                 )
+                note_build_slot(wait_time_ms)
                 if wait_time_ms > 10:
                     bump('streaming_queue_wait_count')
-            
+
             except TimeoutError:
+                note_build_slot((time.monotonic() - wait_start) * 1000.0, timed_out=True)
                 record_stage(
                     "dds.buffer_pool_wait",
                     (time.monotonic() - wait_start) * 1000.0,

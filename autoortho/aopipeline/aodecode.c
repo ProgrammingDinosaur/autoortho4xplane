@@ -358,122 +358,173 @@ AODECODE_API void aodecode_pool_stats_ex(
 }
 
 /*============================================================================
- * Persistent TurboJPEG Decoder Pool
+ * Per-Thread TurboJPEG Decoder Handles
  *============================================================================
- * Maintains a pool of persistent TurboJPEG decoder handles, one per OpenMP
- * thread. This eliminates the overhead of creating/destroying handles in
- * each parallel decode loop (~0.15ms per thread per call).
+ * Each OS thread that decodes gets its own persistent TurboJPEG handle, held
+ * in thread-local storage (Windows FLS / POSIX pthread keys).  Handles are
+ * created lazily on first use and destroyed automatically when the thread
+ * exits, so long-lived worker threads (OpenMP pool, Python decode threads)
+ * pay the tjInitDecompress() cost only once.
  *
- * Thread Safety:
- * - Initialization uses mutex for thread-safe lazy init
- * - Each thread accesses only its own slot (indexed by omp_get_thread_num())
- * - Cleanup should only be called during shutdown
+ * WHY NOT INDEX BY omp_get_thread_num():
+ * A tjhandle is NOT thread-safe.  It embeds the libjpeg error manager whose
+ * jmp_buf is (re)armed by setjmp() at the start of every tjDecompress*()
+ * call.  omp_get_thread_num() is only unique *within one OpenMP team*:
+ *   - outside any parallel region it returns 0 for every caller thread
+ *     (e.g. Python threads calling aodecode_single via ctypes), and
+ *   - concurrent parallel regions started from different Python threads
+ *     (e.g. several streaming DDS builders finalizing at once) each have
+ *     their own thread 0..N-1.
+ * The old g_persistent_decoders[omp_get_thread_num()] scheme therefore
+ * handed the SAME tjhandle to several OS threads at once.  When one thread
+ * hit a decode error (truncated/corrupt JPEG) libjpeg longjmp()'d into a
+ * jmp_buf that another thread had just armed on its own stack.  On Windows
+ * the CRT validates the target frame and fail-fasts with 0xC0000409 /
+ * FAST_FAIL_INVALID_SET_OF_CONTEXT in msvcrt!_except_validate_jump_buffer
+ * (observed in the 3.1.0 field crash, aodecode_single -> tjDecompress2).
+ * Elsewhere it silently corrupts the stack or decoder state.
+ *
+ * Thread-local handles make the "one handle, one thread" invariant hold by
+ * construction, regardless of how the caller threads are organised.
  */
 
-/* Persistent TurboJPEG decoder handles - one per OpenMP thread */
-static tjhandle g_persistent_decoders[MAX_OMP_THREADS] = {NULL};
-static int g_decoders_initialized = 0;
-
-/* Mutex for thread-safe initialization */
 #ifdef AOPIPELINE_WINDOWS
-static CRITICAL_SECTION g_decoder_cs;
-static int g_decoder_cs_initialized = 0;
+static DWORD g_decoder_tls = FLS_OUT_OF_INDEXES;
+static INIT_ONCE g_decoder_tls_once = INIT_ONCE_STATIC_INIT;
 
-static void ensure_decoder_cs_init(void) {
-    if (!g_decoder_cs_initialized) {
-        InitializeCriticalSection(&g_decoder_cs);
-        g_decoder_cs_initialized = 1;
-    }
+static void WINAPI decoder_tls_destructor(void* value) {
+    if (value) tjDestroy((tjhandle)value);
 }
-#define DECODER_LOCK() do { ensure_decoder_cs_init(); EnterCriticalSection(&g_decoder_cs); } while(0)
-#define DECODER_UNLOCK() LeaveCriticalSection(&g_decoder_cs)
+
+static BOOL CALLBACK decoder_tls_init(PINIT_ONCE once, PVOID param, PVOID* ctx) {
+    (void)once; (void)param; (void)ctx;
+    g_decoder_tls = FlsAlloc(decoder_tls_destructor);
+    return TRUE;
+}
+
+static int decoder_tls_ready(void) {
+    InitOnceExecuteOnce(&g_decoder_tls_once, decoder_tls_init, NULL, NULL);
+    return g_decoder_tls != FLS_OUT_OF_INDEXES;
+}
+
+static tjhandle decoder_tls_get(void) {
+    return (tjhandle)FlsGetValue(g_decoder_tls);
+}
+
+static int decoder_tls_set(tjhandle tjh) {
+    return FlsSetValue(g_decoder_tls, (PVOID)tjh) ? 1 : 0;
+}
 #else
-static pthread_mutex_t g_decoder_mutex = PTHREAD_MUTEX_INITIALIZER;
-#define DECODER_LOCK() pthread_mutex_lock(&g_decoder_mutex)
-#define DECODER_UNLOCK() pthread_mutex_unlock(&g_decoder_mutex)
+static pthread_key_t g_decoder_tls;
+static int g_decoder_tls_ok = 0;
+static pthread_once_t g_decoder_tls_once = PTHREAD_ONCE_INIT;
+
+static void decoder_tls_destructor(void* value) {
+    if (value) tjDestroy((tjhandle)value);
+}
+
+static void decoder_tls_init(void) {
+    g_decoder_tls_ok = (pthread_key_create(&g_decoder_tls, decoder_tls_destructor) == 0);
+}
+
+static int decoder_tls_ready(void) {
+    pthread_once(&g_decoder_tls_once, decoder_tls_init);
+    return g_decoder_tls_ok;
+}
+
+static tjhandle decoder_tls_get(void) {
+    return (tjhandle)pthread_getspecific(g_decoder_tls);
+}
+
+static int decoder_tls_set(tjhandle tjh) {
+    return pthread_setspecific(g_decoder_tls, (const void*)tjh) == 0;
+}
 #endif
 
 /**
- * Get or create a persistent decoder for the current thread.
- * 
- * Returns the persistent decoder if available, or creates a new one
- * if this is the first call from this thread.
- * 
- * Falls back to creating a non-persistent handle if thread ID is out
- * of range - caller must check and destroy these with is_persistent_decoder().
+ * Get (or lazily create) the calling thread's persistent decoder.
+ *
+ * The returned handle is owned by the calling thread and must only be used
+ * by it.  If thread-local storage is unavailable, a fresh non-persistent
+ * handle is returned instead; callers detect this with
+ * is_persistent_decoder() and must tjDestroy() it themselves.
  */
 static tjhandle get_thread_decoder(void) {
-#if AOPIPELINE_HAS_OPENMP
-    int tid = omp_get_thread_num();
-    if (tid >= 0 && tid < MAX_OMP_THREADS) {
-        if (!g_persistent_decoders[tid]) {
-            /* Double-checked locking for thread-safe lazy init */
-            DECODER_LOCK();
-            if (!g_persistent_decoders[tid]) {
-                g_persistent_decoders[tid] = tjInitDecompress();
-            }
-            DECODER_UNLOCK();
-        }
-        return g_persistent_decoders[tid];
+    if (decoder_tls_ready()) {
+        tjhandle tjh = decoder_tls_get();
+        if (tjh) return tjh;
+        tjh = tjInitDecompress();
+        if (tjh && decoder_tls_set(tjh)) return tjh;
+        return tjh;  /* TLS store failed: caller owns and destroys it */
     }
-#endif
-    /* Fallback for non-OpenMP or thread ID overflow - caller must destroy */
     return tjInitDecompress();
 }
 
 /**
- * Check if a decoder handle is from the persistent pool.
- * 
- * Returns 1 if the handle is persistent (don't destroy it),
- * 0 if it was created as a fallback (caller should destroy).
+ * Returns 1 if tjh is the calling thread's persistent handle (don't destroy),
+ * 0 if it is a temporary handle the caller must destroy.
  */
 static int is_persistent_decoder(tjhandle tjh) {
-    if (!tjh) return 0;
-#if AOPIPELINE_HAS_OPENMP
-    for (int i = 0; i < MAX_OMP_THREADS; i++) {
-        if (g_persistent_decoders[i] == tjh) return 1;
+    if (!tjh || !decoder_tls_ready()) return 0;
+    return decoder_tls_get() == tjh;
+}
+
+/**
+ * Replace a decoder handle after a failed tjDecompressHeader3/tjDecompress2.
+ *
+ * libjpeg-turbo does not abort the underlying decompressor when it bails out
+ * of a header parse via longjmp, so the handle is left mid-header (e.g. with
+ * the SOI marker already "seen").  Every later call on that handle then fails
+ * too - even for perfectly valid JPEGs - which with persistent handles turns a
+ * single corrupt/truncated download into a permanently broken decoder for that
+ * thread.  Destroying and recreating the handle is cheap and errors are rare.
+ *
+ * If `old` was the calling thread's persistent handle, the replacement takes
+ * its place in thread-local storage.  Returns the new handle (may be NULL on
+ * allocation failure; get_thread_decoder() will retry later).
+ */
+static tjhandle recover_thread_decoder(tjhandle old) {
+    int persistent = is_persistent_decoder(old);
+    tjhandle fresh = tjInitDecompress();
+    if (persistent) {
+        if (!fresh || !decoder_tls_set(fresh)) {
+            /* Never leave TLS pointing at the handle we're about to destroy */
+            decoder_tls_set(NULL);
+        }
     }
-#endif
-    return 0;
+    if (old) tjDestroy(old);
+    return fresh;
+}
+
+AODECODE_API void* aodecode_recover_decoder(void* tjh) {
+    return (void*)recover_thread_decoder((tjhandle)tjh);
 }
 
 AODECODE_API void aodecode_init_persistent_decoders(void) {
-    if (g_decoders_initialized) return;
-    
-    DECODER_LOCK();
-    if (!g_decoders_initialized) {
+    /* Pre-create handles for the OpenMP worker threads so the first real
+     * decode burst doesn't pay tjInitDecompress() latency.  Other threads
+     * get theirs lazily on first use. */
+    if (!decoder_tls_ready()) return;
 #if AOPIPELINE_HAS_OPENMP
-        /* Initialize in parallel to create one handle per thread */
-        #pragma omp parallel
-        {
-            int tid = omp_get_thread_num();
-            if (tid >= 0 && tid < MAX_OMP_THREADS) {
-                if (!g_persistent_decoders[tid]) {
-                    g_persistent_decoders[tid] = tjInitDecompress();
-                }
-            }
-        }
-#else
-        /* Single-threaded: just init one decoder */
-        if (!g_persistent_decoders[0]) {
-            g_persistent_decoders[0] = tjInitDecompress();
-        }
-#endif
-        g_decoders_initialized = 1;
+    #pragma omp parallel
+    {
+        (void)get_thread_decoder();
     }
-    DECODER_UNLOCK();
+#else
+    (void)get_thread_decoder();
+#endif
 }
 
 AODECODE_API void aodecode_cleanup_persistent_decoders(void) {
-    DECODER_LOCK();
-    for (int i = 0; i < MAX_OMP_THREADS; i++) {
-        if (g_persistent_decoders[i]) {
-            tjDestroy(g_persistent_decoders[i]);
-            g_persistent_decoders[i] = NULL;
-        }
+    /* Handles belong to their threads and are destroyed on thread exit.
+     * Destroying another thread's handle here could race with an in-flight
+     * decode, so only release the calling thread's handle. */
+    if (!decoder_tls_ready()) return;
+    tjhandle tjh = decoder_tls_get();
+    if (tjh) {
+        decoder_tls_set(NULL);
+        tjDestroy(tjh);
     }
-    g_decoders_initialized = 0;
-    DECODER_UNLOCK();
 }
 
 AODECODE_API void* aodecode_get_thread_decoder(void) {
@@ -514,24 +565,34 @@ AODECODE_API void aodecode_warmup_full(aodecode_pool_t* pool) {
  *============================================================================*/
 
 /**
- * Internal: Decode a single JPEG using provided turbojpeg handle.
- * 
+ * Internal: Decode a single JPEG using the calling thread's turbojpeg handle.
+ *
  * This function is designed to be called from OpenMP parallel loops
- * where each thread has its own tjhandle.
+ * where each thread has its own tjhandle.  On a TurboJPEG failure the
+ * handle is replaced (see recover_thread_decoder) and *tjh_io updated, so
+ * one bad JPEG cannot poison later decodes on this thread.
  */
 static int decode_jpeg_internal(
-    tjhandle tjh,
+    tjhandle* tjh_io,
     const uint8_t* jpeg_data,
     uint32_t jpeg_length,
     aodecode_image_t* image,
     aodecode_pool_t* pool,
     char* error_buf
 ) {
-    if (!tjh || !jpeg_data || jpeg_length == 0 || !image) {
+    if (!tjh_io || !jpeg_data || jpeg_length == 0 || !image) {
         if (error_buf) safe_strcpy(error_buf, "Invalid parameters", 64);
         return 0;
     }
-    
+    if (!*tjh_io) {
+        *tjh_io = get_thread_decoder();  /* previous recovery failed - retry */
+        if (!*tjh_io) {
+            if (error_buf) safe_strcpy(error_buf, "Decoder init failed", 64);
+            return 0;
+        }
+    }
+    tjhandle tjh = *tjh_io;
+
     /* Get JPEG dimensions */
     int width, height, subsamp, colorspace;
     if (tjDecompressHeader3(tjh, jpeg_data, jpeg_length,
@@ -540,6 +601,7 @@ static int decode_jpeg_internal(
             const char* tj_err = tjGetErrorStr2(tjh);
             safe_strcpy(error_buf, tj_err ? tj_err : "Header parse failed", 64);
         }
+        *tjh_io = recover_thread_decoder(tjh);
         return 0;
     }
     
@@ -584,9 +646,10 @@ static int decode_jpeg_internal(
         } else {
             free(buffer);
         }
+        *tjh_io = recover_thread_decoder(tjh);
         return 0;
     }
-    
+
     /* Fill output structure */
     image->data = buffer;
     image->width = width;
@@ -618,8 +681,7 @@ AODECODE_API int32_t aodecode_batch(
     {
         /* Get persistent decoder for this thread (or create fallback) */
         tjhandle tjh = get_thread_decoder();
-        int is_persistent = is_persistent_decoder(tjh);
-        
+
         if (!tjh) {
             /* Thread can't decode - skip all its work */
         } else {
@@ -640,7 +702,7 @@ AODECODE_API int32_t aodecode_batch(
                     continue;
                 }
                 
-                if (decode_jpeg_internal(tjh, 
+                if (decode_jpeg_internal(&tjh,
                                          requests[i].jpeg_data,
                                          requests[i].jpeg_length,
                                          &requests[i].image,
@@ -651,8 +713,9 @@ AODECODE_API int32_t aodecode_batch(
                 }
             }
             
-            /* Only destroy non-persistent handles */
-            if (!is_persistent) {
+            /* Only destroy non-persistent handles (tjh may have been
+             * replaced by recover_thread_decoder, so re-check) */
+            if (tjh && !is_persistent_decoder(tjh)) {
                 tjDestroy(tjh);
             }
         }
@@ -690,8 +753,7 @@ AODECODE_API int32_t aodecode_from_cache(
     {
         /* Get persistent decoder for this thread (or create fallback) */
         tjhandle tjh = get_thread_decoder();
-        int is_persistent = is_persistent_decoder(tjh);
-        
+
         if (tjh) {
 #pragma omp for schedule(dynamic, 4)
             for (int32_t i = 0; i < count; i++) {
@@ -708,7 +770,7 @@ AODECODE_API int32_t aodecode_from_cache(
                 }
                 
                 char error[64];
-                if (decode_jpeg_internal(tjh,
+                if (decode_jpeg_internal(&tjh,
                                          cache_results[i].data,
                                          cache_results[i].length,
                                          &images[i],
@@ -718,8 +780,9 @@ AODECODE_API int32_t aodecode_from_cache(
                 }
             }
             
-            /* Only destroy non-persistent handles */
-            if (!is_persistent) {
+            /* Only destroy non-persistent handles (tjh may have been
+             * replaced by recover_thread_decoder, so re-check) */
+            if (tjh && !is_persistent_decoder(tjh)) {
                 tjDestroy(tjh);
             }
         }
@@ -750,16 +813,15 @@ AODECODE_API int32_t aodecode_single(
     
     /* Get persistent decoder (or create fallback) */
     tjhandle tjh = get_thread_decoder();
-    int is_persistent = is_persistent_decoder(tjh);
-    
+
     if (!tjh) return 0;
     
     char error[64];
-    int result = decode_jpeg_internal(tjh, jpeg_data, jpeg_length, 
+    int result = decode_jpeg_internal(&tjh, jpeg_data, jpeg_length, 
                                        image, pool, error);
     
-    /* Only destroy non-persistent handles */
-    if (!is_persistent) {
+    /* Only destroy non-persistent handles (tjh may have been replaced) */
+    if (tjh && !is_persistent_decoder(tjh)) {
         tjDestroy(tjh);
     }
     return result;

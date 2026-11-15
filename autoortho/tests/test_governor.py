@@ -139,7 +139,10 @@ def test_classifier_states():
         (dict(waits=10, admissions=20, cpu=50), "compute"),
         (dict(waits=10, admissions=20, cpu=95), "compute_limit"),
         (dict(active=128, limit=128, backlog=20, mbps=50), "network_room"),
-        (dict(active=128, limit=128, backlog=20, mbps=190), "network_full"),
+        (dict(active=128, limit=128, backlog=20, mbps=190, real=45, standin=5),
+         "network_full"),
+        # A full line while scenery is sharp: nothing to cut.
+        (dict(active=128, limit=128, backlog=20, mbps=190), "ok"),
         (dict(cpu=20), "headroom"),
         # Blurry, and the imagery came soon after the 6 s wait: wait longer.
         (dict(real=40, standin=10, late_flight=_late(8, 30)), "wait"),
@@ -187,10 +190,22 @@ def test_starting_uses_bigger_steps():
     decision = None
     for _ in range(6):
         decision = gov.observe(
-            flight.step(real=40, standin=10, late_start=_late(90, 10)), starting=True
+            flight.step(real=44, standin=6, late_start=_late(90, 10)), starting=True
         ) or decision
     assert decision.lever == "streaming.near_wait_seconds"
     assert decision.new == 80     # step 10, doubled while starting
+
+
+def test_far_below_target_takes_a_bigger_step():
+    gov = Governor(_levers(), VALUES, mode="advise")
+    flight = Flight()
+    decision = None
+    for _ in range(6):
+        decision = gov.observe(
+            flight.step(real=40, standin=10, late_start=_late(120, 10)), starting=True
+        ) or decision
+    assert decision.lever == "streaming.near_wait_seconds"
+    assert decision.new == 90     # step 10, x2 starting, +1 at 80 % sharp
 
 
 def test_keep_or_revert():
@@ -569,7 +584,8 @@ def test_late_prefetch_then_does_more_per_cycle():
     gov = _flying(mode="advise", pinned={gv.PAGING_LEAD_LEVER})
     decisions = _run(gov, Flight(), 6, **_blurry({"late": 4}))
     assert decisions[0].lever == gv.PREFETCH_CHUNKS_LEVER
-    assert (decisions[0].old, decisions[0].new) == (64, 128)
+    # Two steps of 64: the blurry flight is far below the target.
+    assert (decisions[0].old, decisions[0].new) == (64, 192)
 
 
 def test_late_prefetch_on_a_full_line_moves_nothing():
@@ -608,7 +624,8 @@ def test_kept_when_the_cause_fades():
     assert first and first[0].lever == "autoortho.prefetch_radius_nm"
     _run(gov, flight, 12, real=50, standin=0)
     assert gov.history[0].outcome == "kept"
-    assert gov.values["autoortho.prefetch_radius_nm"] == 40
+    # 30 + 2 x 10: the blurry flight was far below the target.
+    assert gov.values["autoortho.prefetch_radius_nm"] == 50
 
 
 def test_reverted_when_the_cause_grows():

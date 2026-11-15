@@ -981,7 +981,7 @@ class AOMount:
         return total
 
     def _governor_mode(self):
-        mode = str(getattr(getattr(self.cfg, "governor", None), "mode", "advise"))
+        mode = str(getattr(getattr(self.cfg, "governor", None), "mode", "auto"))
         return mode.strip().lower()
 
     def _governor_profile_key(self, governor_module, connection_module):
@@ -999,6 +999,57 @@ class AOMount:
             target, provider, governor_module.network_fingerprint()
         )
 
+    def _governor_bounds(self, hardware_module, RamBrake, active):
+        """The governor's limits: line, bandwidth, RAM, VRAM and CPU budget."""
+        total = hardware_module.basic().ram_total or 0
+        result = aoconfig._connection_for(self.cfg)
+        info = hardware_module.basic()
+        threads = getattr(active, "cpu_threads", None) if active is not None else None
+        logical = getattr(info, "logical_cores", 0) or os.cpu_count() or 0
+        return {
+            "line_mbps": result.mbits if result is not None and result.mbits else None,
+            "bandwidth_mbps": getattr(active, "bandwidth_mbps", None),
+            "ram_limit_bytes": (
+                int((active.ram_gb - 0.5) * 1024 ** 3)
+                if active is not None and active.ram_gb else None
+            ),
+            "brake_free_bytes": RamBrake.thresholds(total)[0] if total else None,
+            "protect_sim_fps": str(getattr(getattr(self.cfg, "limits", None),
+                                           "protect_sim_fps", True)).lower()
+            in ("true", "1", "yes", "on"),
+            "vram_budget_bytes": self._vram_budget_bytes(hardware_module, active),
+            # The share of the PC the CPU-core limit gives AutoOrtho.
+            "ao_cpu_budget_percent": (
+                min(100.0, 100.0 * threads / logical) if threads and logical else None
+            ),
+        }
+
+    def sync_governor(self, adopt=()):
+        """Hand settings applied mid-flight to the running governor.
+
+        Limits, the user's own values (now pinned) and values back on
+        automatic are worked out again from the config; ``adopt`` names the
+        automatic values the new limits changed, which the governor takes
+        over. In Auto the governor's values are published again so the
+        workers match it. Returns what was published.
+        """
+        service = getattr(self, "governor_service", None)
+        if service is None:
+            return {}
+        try:
+            (governor_module, hardware_module, _conn,
+             _get, _set, RamBrake) = self._governor_modules()
+            active = self._resource_limits()
+            levers = governor_module.levers_for(self.cfg, active)
+            values, baseline, pinned = governor_module.lever_state(self.cfg, levers)
+            return service.reconfigure(
+                levers, values, baseline, pinned, adopt=adopt,
+                **self._governor_bounds(hardware_module, RamBrake, active),
+            )
+        except Exception:
+            log.exception("Could not update the governor with the new settings")
+            return {}
+
     def start_governor(self):
         """Run the governor while streaming (Auto tunes, Advise suggests)."""
         if getattr(self, "governor_service", None) is not None:
@@ -1007,22 +1058,37 @@ class AOMount:
         try:
             (governor_module, hardware_module, connection_module,
              get_stat, set_stat, RamBrake) = self._governor_modules()
+            # The workers load the saved config fresh; work the automatic
+            # values (baseline, plan, limits) out again here so the governor
+            # starts from the same ones even if the target, the limits or
+            # the connection test changed since this process loaded it.
+            try:
+                refreshed = self.cfg.recompute_automatic()
+                if refreshed:
+                    self.publish_levers(refreshed)
+            except Exception:
+                log.debug("Could not refresh the automatic values", exc_info=True)
             active = self._resource_limits()
             levers = governor_module.levers_for(self.cfg, active)
-            values, baseline, pinned = {}, {}, set()
-            for name, spec in levers.items():
+            values, baseline, pinned = governor_module.lever_state(self.cfg, levers)
+            # Values AutoOrtho picked itself are kept inside the levers'
+            # ranges (and a 0 "largest allowed" is a number): make the
+            # workers match.
+            corrections = {}
+            for name, value in values.items():
+                if name in pinned:
+                    continue
                 section, key = name.split(".", 1)
                 try:
-                    values[name] = float(self.cfg.value(section, key))
+                    configured = float(self.cfg.value(section, key))
                 except (TypeError, ValueError):
                     continue
-                automatic = self.cfg.automatic_text(section, key)
-                try:
-                    baseline[name] = float(automatic)
-                except (TypeError, ValueError):
-                    baseline[name] = values[name]
-                if self.cfg.is_custom(section, key):
-                    pinned.add(name)
+                if configured != value and not (
+                    name in governor_module.ZERO_IS_CEILING and configured <= 0
+                ):
+                    corrections[name] = value
+            if corrections:
+                self.publish_levers(corrections)
             mode = self._governor_mode()
             key = self._governor_profile_key(governor_module, connection_module)
             # Auto starts where earlier flights settled; Advise and Auto both
@@ -1040,25 +1106,13 @@ class AOMount:
                 values.update(warm)
                 self.publish_levers(warm)
                 log.info("Governor: warm start from earlier flights: %s", warm)
-            total = hardware_module.basic().ram_total or 0
-            result = connection_module.load_result()
             governor = governor_module.Governor(
                 levers,
                 values,
                 baseline=baseline,
                 mode=mode,
                 pinned=pinned,
-                line_mbps=result.mbits if result is not None and result.mbits else None,
-                bandwidth_mbps=getattr(active, "bandwidth_mbps", None),
-                ram_limit_bytes=(
-                    int((active.ram_gb - 0.5) * 1024 ** 3)
-                    if active is not None and active.ram_gb else None
-                ),
-                brake_free_bytes=RamBrake.thresholds(total)[0] if total else None,
-                protect_sim_fps=str(getattr(getattr(self.cfg, "limits", None),
-                                            "protect_sim_fps", True)).lower()
-                in ("true", "1", "yes", "on"),
-                vram_budget_bytes=self._vram_budget_bytes(hardware_module, active),
+                **self._governor_bounds(hardware_module, RamBrake, active),
             )
             broker = getattr(self, "_download_broker", None)
 
@@ -1093,12 +1147,70 @@ class AOMount:
             service.start()
             self.governor_service = service
             self._governor_key = key
+            self._governor_plan = self._plan_record()
             log.info("Governor started (%s)", mode)
             return service
         except Exception:
             log.exception("Could not start the governor")
             self.governor_service = None
             return None
+
+    def _plan_record(self):
+        """What the tuning plan started this flight from (None without one).
+
+        The target, the plan's need, line and ratio, and each setting it
+        planned (the download ceiling too, when the line sized it).
+        """
+        plan = getattr(self.cfg, "_plan", None)
+        if plan is None:
+            return None
+        record = plan.describe()
+        try:
+            ao = self.cfg.autoortho
+            record["target"] = {
+                "mode": str(getattr(ao, "max_zoom_mode", "fixed")),
+                "zoom": int(getattr(ao, "max_zoom", 16)),
+                "airport_zoom": int(getattr(ao, "max_zoom_near_airports", 18)),
+            }
+        except (AttributeError, TypeError, ValueError):
+            pass
+        try:
+            if self.cfg.source("autoortho", "provider_origin_max_concurrency") == "planned":
+                record["values"]["autoortho.provider_origin_max_concurrency"] = str(
+                    self.cfg.value("autoortho", "provider_origin_max_concurrency")
+                )
+                record["reasons"]["autoortho.provider_origin_max_concurrency"] = (
+                    "downloads the measured line carries"
+                )
+        except Exception:
+            pass
+        return record
+
+    @staticmethod
+    def _settled_plan(record, governor):
+        """The plan record with where each planned setting ended up.
+
+        ``settings`` maps each planned setting to {planned, settled, moved}:
+        the gap between plan and settled value is the plan's error.
+        """
+        if not record:
+            return None
+        out = dict(record)
+        settings = {}
+        for name, text in record.get("values", {}).items():
+            try:
+                planned = float(text)
+            except (TypeError, ValueError):
+                continue
+            settled = governor.values.get(name)
+            entry = {"planned": planned, "reason": record.get("reasons", {}).get(name, "")}
+            if settled is not None:
+                entry["settled"] = float(settled)
+                entry["moved"] = float(settled) != planned
+                entry["pinned"] = name in governor.pinned
+            settings[name] = entry
+        out["settings"] = settings
+        return out
 
     def stop_governor(self):
         """Stop it; leave the flight summary for the report; learn."""
@@ -1112,14 +1224,21 @@ class AOMount:
             governor = service.governor
             summary = (service.flight_summary() if hasattr(service, "flight_summary")
                        else governor.summary())
+            plan = self._settled_plan(getattr(self, "_governor_plan", None), governor)
+            if plan:
+                summary["plan"] = plan
             set_stat("governor/summary", summary)
             self.last_flight = summary
             self._after_flight = True     # Home shows the last-flight card
             governor_module.save_last_flight(summary)
             if governor.mode == "auto":
+                # Only where the levers settled away from the automatic
+                # values: a lever back at its baseline follows the plan (and
+                # its later improvements) instead of a stored copy.
                 learned = {
                     name: value for name, value in governor.values.items()
                     if name not in governor.pinned
+                    and value != governor.baseline.get(name)
                 }
                 governor_module.LearnedProfiles().put(
                     getattr(self, "_governor_key", "default"),
@@ -1150,7 +1269,10 @@ class AOMount:
             levers["limits.cpu_threads"] = active.cpu_threads or 0
             levers["limits.ram_gb"] = active.ram_gb or 0
             levers["limits.bytes_per_second"] = active.bytes_per_second
-        return self.publish_levers(levers)
+        published = self.publish_levers(levers)
+        # The governor takes the new ranges and the changed automatic values.
+        published.update(self.sync_governor(adopt=changed))
+        return published
 
     def stop_download_broker(self):
         broker = getattr(self, "_download_broker", None)

@@ -22,6 +22,10 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.utils.mappers import map_kubilus_region_to_simheaven_region
     from autoortho.utils.dsf_utils import DsfUtils, dsf_utils
     from autoortho.utils.mount_utils import cleanup_mountpoint, safe_ismount
+    from autoortho.utils.cache_cleanup import (
+        delete_all_cache_contents,
+        remove_stale_temp_files,
+    )
     from autoortho.utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
     from autoortho.utils.custom_map import get_custom_map_config
     from autoortho.utils.simbrief_flight import simbrief_flight_manager
@@ -93,6 +97,10 @@ else:
     from utils.mappers import map_kubilus_region_to_simheaven_region
     from utils.dsf_utils import DsfUtils, dsf_utils
     from utils.mount_utils import cleanup_mountpoint, safe_ismount
+    from utils.cache_cleanup import (
+        delete_all_cache_contents,
+        remove_stale_temp_files,
+    )
     from utils.dynamic_zoom import DynamicZoomManager, BASE_ALTITUDE_FT
     from utils.custom_map import get_custom_map_config
     from utils.simbrief_flight import simbrief_flight_manager
@@ -1292,6 +1300,7 @@ class ConfigUI(QMainWindow):
             restore_defaults=False,
         )
         self._refresh_kept_values_notice()
+        self._refresh_pinned_tuning_notice()
         self.categorized_settings_page.set_show_all(
             str(getattr(self.cfg.general, "show_all_settings", False)).lower()
             in ("true", "1", "yes", "on")
@@ -1587,7 +1596,100 @@ class ConfigUI(QMainWindow):
             (("review", "Review"), ("automatic", "Use automatic values")),
         ))
 
+    def _pinned_tuning_names(self):
+        """Settings auto-tuning would manage that hold the user's own value,
+        while auto-tuning is on (Auto); empty otherwise."""
+        mode = str(getattr(getattr(self.cfg, "governor", None), "mode", "auto"))
+        if mode.strip().lower() != "auto":
+            return []
+        try:
+            return list(self.cfg.pinned_tuned_values())
+        except Exception:
+            log.debug("Could not list pinned settings", exc_info=True)
+            return []
+
+    def _dismissed_pinned(self):
+        raw = str(getattr(self.cfg.general, "dismissed_pinned", "") or "")
+        return {name.strip() for name in raw.split(",") if name.strip()}
+
+    def _refresh_pinned_tuning_notice(self):
+        """Offer to hand pinned settings back to auto-tuning.
+
+        Shown in Auto mode while settings it would manage hold the user's own
+        value, unless the user kept exactly these (a newly pinned one is
+        offered again). The upgrade notice for older files covers the same
+        ground, so this one waits for it.
+        """
+        names = self._pinned_tuning_names()
+        if (not names or "kept_values" in self._notices
+                or set(names) <= self._dismissed_pinned()):
+            self.clear_notice("pinned_tuning")
+            return
+        registry = self.cfg.registry()
+        labels = []
+        for name in names[:3]:
+            section, _, key = name.partition(".")
+            spec = registry.get(section, key)
+            labels.append(spec.label if spec is not None else key)
+        more = f" and {len(names) - 3} more" if len(names) > 3 else ""
+        if len(names) == 1:
+            what, them = "1 setting you set yourself", "it"
+        else:
+            what, them = f"{len(names)} settings you set yourself", "them"
+        self.set_notice(Notice(
+            "pinned_tuning",
+            "info",
+            f"Auto-tuning leaves {what} as you set {them}: "
+            f"{', '.join(labels)}{more}. Let AutoOrtho manage {them}?",
+            (("review", "Review"), ("manage", f"Let AutoOrtho manage {them}")),
+        ))
+
+    def _unpin_settings(self, names):
+        """Hand settings back to AutoOrtho: automatic value, saved at once,
+        and the running governor takes them over (published in Auto)."""
+        if not names:
+            return
+        was_dirty = self.settings_session.dirty
+        for name in names:
+            section, _, key = name.partition(".")
+            saved = self.cfg.value(section, key)
+            try:
+                self.cfg.reset_to_default(section, key)
+            except KeyError:
+                continue
+            widget = self._control_for(section, key)
+            if widget is not None:
+                self._set_control_from_text(
+                    widget, section, key, self.cfg.automatic_text(section, key), saved
+                )
+        # Set by hand again later, it is offered again.
+        kept = self._dismissed_pinned() - set(names)
+        self.cfg.general.dismissed_pinned = ",".join(sorted(kept))
+        try:
+            self.cfg.save()
+        except Exception:
+            log.exception("Could not save the unpinned settings")
+        if not was_dirty:
+            self.settings_session.mark_applied(self._snapshot_settings())
+        sync = getattr(self, "sync_governor", None)
+        if sync is not None:
+            sync(adopt=tuple(names))
+        self._refresh_tuning()
+
     def _on_notice_action(self, notice_id, action):
+        if notice_id == "pinned_tuning":
+            names = self._pinned_tuning_names()
+            if action == "review":
+                self.navigate_to("settings", "All Settings (Expert)")
+                self.expert_settings_page.only_custom_check.setChecked(True)
+            elif action == "manage":
+                self._unpin_settings(names)
+                self.clear_notice("pinned_tuning")
+                self.update_status_bar(
+                    f"{len(names)} settings handed back to AutoOrtho; "
+                    "auto-tuning manages them now."
+                )
+            return
         if notice_id == "governor_advice" and action == "apply":
             decision = getattr(self, "_latest_advice", None)
             if decision is not None:
@@ -1627,7 +1729,17 @@ class ConfigUI(QMainWindow):
                 self.cfg.save()
             except Exception:
                 log.exception("Could not save the dismissed notice")
+        if notice_id == "pinned_tuning":
+            # Keep these as set; a setting pinned later is offered again.
+            kept = self._dismissed_pinned() | set(self._pinned_tuning_names())
+            self.cfg.general.dismissed_pinned = ",".join(sorted(kept))
+            try:
+                self.cfg.save()
+            except Exception:
+                log.exception("Could not save the dismissed notice")
         self.clear_notice(notice_id)
+        if notice_id == "kept_values":
+            self._refresh_pinned_tuning_notice()
 
     def _control_for(self, section, key):
         """The control that owns a setting on the settings pages, if any."""
@@ -1811,7 +1923,7 @@ class ConfigUI(QMainWindow):
         ]
         page = TuningPage(modes)
         self.tuning_page = page
-        page.set_mode(str(getattr(self.cfg.governor, "mode", "advise")))
+        page.set_mode(str(getattr(self.cfg.governor, "mode", "auto")))
         self.allow_texture_cap_check = page.texture_cap_check
         self.allow_texture_cap_check.setChecked(
             governor_module.texture_cap_allowed(self.cfg)
@@ -2126,19 +2238,17 @@ class ConfigUI(QMainWindow):
         section, _, key = name.partition(".")
         service = getattr(self, "governor_service", None)
         was_dirty = self.settings_session.dirty
-        if pinned:
-            current = service.governor.values.get(name) if service else None
-            if current is not None:
-                self.cfg.set_value(section, key, str(int(current) if float(current).is_integer() else current))
-            self.cfg.pin(section, key)
-        else:
-            saved = self.cfg.value(section, key)
-            self.cfg.reset_to_default(section, key)
-            widget = self._control_for(section, key)
-            if widget is not None:
-                self._set_control_from_text(
-                    widget, section, key, self.cfg.automatic_text(section, key), saved
-                )
+        if not pinned:
+            self._unpin_settings([name])
+            self._refresh_pinned_tuning_notice()
+            return
+        current = service.governor.values.get(name) if service else None
+        if current is not None:
+            self.cfg.set_value(section, key, str(int(current) if float(current).is_integer() else current))
+        self.cfg.pin(section, key)
+        # Pinned on purpose: Home does not offer to hand it back.
+        kept = self._dismissed_pinned() | {name}
+        self.cfg.general.dismissed_pinned = ",".join(sorted(kept))
         try:
             self.cfg.save()
         except Exception:
@@ -2146,10 +2256,7 @@ class ConfigUI(QMainWindow):
         if not was_dirty:
             self.settings_session.mark_applied(self._snapshot_settings())
         if service is not None:
-            if pinned:
-                service.governor.pinned.add(name)
-            else:
-                service.governor.pinned.discard(name)
+            service.governor.pinned.add(name)
         self._refresh_tuning()
 
     def _reset_learned(self):
@@ -2328,6 +2435,10 @@ class ConfigUI(QMainWindow):
             publish(levers)
         except Exception:
             log.exception("Could not apply settings while streaming")
+        # A setting the user set is now theirs: the governor stops moving it.
+        sync = getattr(self, "sync_governor", None)
+        if sync is not None:
+            sync()
 
     def _apply_limits_live(self):
         """Limits take effect at once while streaming (live levers)."""
@@ -9614,7 +9725,7 @@ class ConfigUI(QMainWindow):
                 )
             if hasattr(self, "tuning_page"):
                 self.cfg.governor.mode = (
-                    self.tuning_page.mode_combo.currentData() or "advise"
+                    self.tuning_page.mode_combo.currentData() or "auto"
                 )
 
             # AutoOrtho settings
@@ -9845,6 +9956,8 @@ class ConfigUI(QMainWindow):
             self._refresh_resource_readiness()
             self._apply_limits_live()
             self._apply_expert_live(live_edits)
+            # Auto-tuning just turned on, or a setting was set by hand.
+            self._refresh_pinned_tuning_notice()
             service = getattr(self, "governor_service", None)
             if service is not None:
                 service.set_mode(str(self.cfg.governor.mode))
@@ -10269,6 +10382,7 @@ class ConfigUI(QMainWindow):
         """Clean cache with 2-phase deletion order:
         1. JPEGs (always delete all)
         2. Dynamic DDS (LRU eviction if still over budget)
+        3. Delete-all only: terrain index, seasons index and temp files
         """
         emit_progress = progress_callback or self.status_update.emit
         emit_progress(
@@ -10299,7 +10413,28 @@ class ConfigUI(QMainWindow):
                 if os.path.isdir(dds_root):
                     shutil.rmtree(dds_root, ignore_errors=True)
                     emit_progress("Phase 2: Deleted all DDS cache files.")
+                # --- Phase 3: everything else AutoOrtho keeps in the cache
+                # (terrain index, seasons index, interrupted temp files) ---
+                _, failures = delete_all_cache_contents(cache_dir)
+                if failures:
+                    emit_progress(
+                        f"Phase 3: {failures} cache entries could not be "
+                        "deleted (in use?)."
+                    )
+                    return (
+                        False,
+                        f"{failures} cache entries could not be deleted. "
+                        "Close any program using the cache folder and "
+                        "try again.",
+                        False,
+                    )
+                emit_progress("Phase 3: Deleted remaining cache files.")
             else:
+                temp_count = remove_stale_temp_files(cache_dir, cancel_event)
+                if temp_count:
+                    emit_progress(
+                        f"Removed {temp_count} leftover temporary files."
+                    )
                 try:
                     from autoortho.getortho import dynamic_dds_cache
                 except ImportError:

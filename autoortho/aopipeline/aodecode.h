@@ -284,18 +284,19 @@ AODECODE_API const char* aodecode_version(void);
 /**
  * Initialize persistent decoder handles.
  * 
- * Creates one TurboJPEG decompressor per OpenMP thread for reuse.
+ * Pre-creates a TurboJPEG decompressor for each OpenMP worker thread (other
+ * threads create theirs lazily on first decode).
  * Call this once during application startup for optimal first-tile latency.
  * 
- * Thread Safety: Safe to call from multiple threads (uses internal locking).
+ * Thread Safety: Safe to call from multiple threads.
  */
 AODECODE_API void aodecode_init_persistent_decoders(void);
 
 /**
  * Cleanup persistent decoder handles.
  * 
- * Destroys all cached TurboJPEG decompressors. Call during application
- * shutdown to release resources.
+ * Destroys the calling thread's cached TurboJPEG decompressor. Handles owned
+ * by other threads are destroyed automatically when those threads exit.
  * 
  * Thread Safety: Should only be called when no decode operations are active.
  */
@@ -304,9 +305,11 @@ AODECODE_API void aodecode_cleanup_persistent_decoders(void);
 /**
  * Get a persistent decoder handle for the current thread.
  * 
- * Returns the cached TurboJPEG decompressor for this thread, creating it
- * if necessary. If OpenMP is not available or thread ID is out of range,
- * creates a new handle that must be destroyed by the caller.
+ * Returns the calling OS thread's cached TurboJPEG decompressor (held in
+ * thread-local storage), creating it if necessary. The handle must only be
+ * used by the calling thread; it is destroyed automatically on thread exit.
+ * If thread-local storage is unavailable, creates a new handle that must be
+ * destroyed by the caller.
  * 
  * Use aodecode_is_persistent_decoder() to check if destruction is needed.
  * 
@@ -321,6 +324,17 @@ AODECODE_API void* aodecode_get_thread_decoder(void);
  * @return 1 if persistent (don't destroy), 0 if temporary (caller must destroy)
  */
 AODECODE_API int aodecode_is_persistent_decoder(void* tjh);
+
+/**
+ * Replace a decoder handle after a failed tjDecompressHeader3/tjDecompress2.
+ *
+ * libjpeg-turbo can leave a handle stuck mid-header after an error, making
+ * every subsequent decode on it fail. Call this on any TurboJPEG failure:
+ * it destroys `tjh` and returns a fresh handle. If `tjh` was the calling
+ * thread's persistent handle, the new one replaces it (check again with
+ * aodecode_is_persistent_decoder()). May return NULL on allocation failure.
+ */
+AODECODE_API void* aodecode_recover_decoder(void* tjh);
 
 /**
  * Full warmup of the decode pipeline.

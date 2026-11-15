@@ -1842,6 +1842,48 @@ def _render_flight(flight: dict) -> list:
         )
     if flight.get("notice"):
         lines.append(f"- {flight['notice']}")
+    lines.extend(_render_plan(flight.get("plan") or {}))
+    return lines
+
+
+def _render_plan(plan: dict) -> list:
+    """The tuning plan the flight started from, and where each setting ended.
+
+    The gap between "Planned" and "Ended at" is what calibrates the plan.
+    """
+    settings = plan.get("settings") or {}
+    if not plan or not settings:
+        return []
+    lines = ["", "### Tuning plan"]
+    target = plan.get("target") or {}
+    need = plan.get("need_mbps")
+    capacity = plan.get("capacity_mbps")
+    ratio = plan.get("ratio")
+    text = []
+    if target:
+        mode = target.get("mode", "fixed")
+        text.append(
+            f"target {mode} ZL{target.get('zoom', '?')}"
+            f" (airports ZL{target.get('airport_zoom', '?')})"
+        )
+    if need is not None:
+        text.append(f"needs about {need:g} Mbit/s")
+    text.append(f"line {capacity:g} Mbit/s (x{ratio:g} the need)"
+                if capacity and ratio is not None else "no connection test")
+    lines.extend(["", "- " + "; ".join(text), "",
+                  "| Setting | Planned | Ended at | Why |", "|---|---:|---:|---|"])
+    for name, entry in sorted(settings.items()):
+        settled = entry.get("settled")
+        if settled is None:
+            ended = "—"
+        elif entry.get("pinned"):
+            ended = f"{settled:g} (yours)"
+        else:
+            ended = f"**{settled:g}**" if entry.get("moved") else f"{settled:g}"
+        lines.append(
+            f"| {_markdown_escape(name.split('.', 1)[-1])} | {entry.get('planned', 0):g} "
+            f"| {ended} | {_markdown_escape(str(entry.get('reason', '')))} |"
+        )
     return lines
 
 

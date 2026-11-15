@@ -372,3 +372,71 @@ def test_minimize_to_tray_while_streaming(qt_app, config_ui, monkeypatch):
     config_ui._set_runtime_state(RuntimeState.STOPPED)
     assert not config_ui._hidden_to_tray and config_ui.isVisible()
     config_ui.hide_check.setChecked(False)
+
+
+# -- pinned settings in Auto mode ---------------------------------------------
+
+
+def _pin(config_ui, key, value):
+    config_ui.cfg.set_value("autoortho", key, value)
+    config_ui.cfg.pin("autoortho", key)
+
+
+def test_pinned_tuned_values_lists_only_settings_autoortho_manages(tmp_path):
+    cfg = AOConfig(str(tmp_path / ".autoortho"))
+    cfg.set_value("autoortho", "live_builder_concurrency", "5")
+    cfg.set_value("autoortho", "prefetch_radius_nm", "45")
+    cfg.set_value("autoortho", "using_custom_tiles", "True")   # the user's, not tuning
+    assert cfg.pinned_tuned_values() == [
+        "autoortho.live_builder_concurrency", "autoortho.prefetch_radius_nm",
+    ]
+
+
+def test_auto_mode_offers_to_hand_pinned_settings_back(qt_app, config_ui):
+    _pin(config_ui, "live_builder_concurrency", "5")
+    _pin(config_ui, "buffer_pool_size", "10")
+    config_ui._refresh_pinned_tuning_notice()
+    notice = config_ui._notices.get("pinned_tuning")
+    assert notice is not None
+    assert "2 settings you set yourself" in notice.text
+    assert ("manage", "Let AutoOrtho manage them") in notice.actions
+
+    config_ui._on_notice_action("pinned_tuning", "manage")
+    assert "pinned_tuning" not in config_ui._notices
+    reloaded = AOConfig(config_ui.cfg.conf_file)
+    assert reloaded.pinned_tuned_values() == []
+    assert reloaded.source("autoortho", "live_builder_concurrency") != "custom"
+    assert config_ui.settings_session.dirty is False
+
+
+def test_kept_pins_stay_quiet_until_a_new_one(qt_app, config_ui):
+    _pin(config_ui, "live_builder_concurrency", "5")
+    config_ui._refresh_pinned_tuning_notice()
+    config_ui._dismiss_notice("pinned_tuning")
+    config_ui._refresh_pinned_tuning_notice()
+    assert "pinned_tuning" not in config_ui._notices
+    reloaded = AOConfig(config_ui.cfg.conf_file)
+    assert "autoortho.live_builder_concurrency" in str(reloaded.general.dismissed_pinned)
+
+    _pin(config_ui, "prefetch_radius_nm", "45")
+    config_ui._refresh_pinned_tuning_notice()
+    notice = config_ui._notices.get("pinned_tuning")
+    assert notice is not None and "2 settings" in notice.text
+
+
+def test_no_offer_outside_auto_mode(qt_app, config_ui):
+    _pin(config_ui, "live_builder_concurrency", "5")
+    config_ui.cfg.governor.mode = "advise"
+    config_ui._refresh_pinned_tuning_notice()
+    assert "pinned_tuning" not in config_ui._notices
+
+
+def test_pinning_on_the_tuning_page_is_not_offered_back(qt_app, config_ui):
+    config_ui._toggle_pin("autoortho.prefetch_radius_nm", True)
+    config_ui._refresh_pinned_tuning_notice()
+    assert "pinned_tuning" not in config_ui._notices
+    # Unpinned, then set by hand again: offered again.
+    config_ui._toggle_pin("autoortho.prefetch_radius_nm", False)
+    _pin(config_ui, "prefetch_radius_nm", "45")
+    config_ui._refresh_pinned_tuning_notice()
+    assert "pinned_tuning" in config_ui._notices
