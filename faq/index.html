@@ -381,6 +381,26 @@
   
 
       
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../developer/governor-behind-detection-plan/" class="md-tabs__link">
+          
+  
+  
+  Developer
+
+        </a>
+      </li>
+    
+  
+
+      
     </ul>
   </div>
 </nav>
@@ -730,10 +750,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#whats-the-difference-between-maxwait-and-tile_time_budget" class="md-nav__link">
+  <a href="#what-happened-to-maxwait-and-tile_time_budget" class="md-nav__link">
     <span class="md-ellipsis">
       
-        What's the difference between maxwait and tile_time_budget?
+        What happened to maxwait and tile_time_budget?
       
     </span>
   </a>
@@ -1242,6 +1262,119 @@
   
 
     
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_11" id="__nav_11_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Developer
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_11">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Developer
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../developer/governor-behind-detection-plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plan: detecting "behind the aircraft" from prefetch misses
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../developer/settings-refactor-proposal/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings refactor proposal: Target, Limits, Governor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
   </ul>
 </nav>
                   </div>
@@ -1425,10 +1558,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#whats-the-difference-between-maxwait-and-tile_time_budget" class="md-nav__link">
+  <a href="#what-happened-to-maxwait-and-tile_time_budget" class="md-nav__link">
     <span class="md-ellipsis">
       
-        What's the difference between maxwait and tile_time_budget?
+        What happened to maxwait and tile_time_budget?
       
     </span>
   </a>
@@ -1817,7 +1950,7 @@
 <h2 id="general-issues">General Issues</h2>
 <p><a name="missing-color-tiles"></a></p>
 <h3 id="i-see-occasional-blurry-andor-green-missing-color-tiles">I see occasional blurry and/or green (missing color) tiles</h3>
-<p>Missing color tiles (typically green) occur when AutoOrtho cannot retrieve imagery within the time budget. This section explains why this happens and how to minimize it.</p>
+<p>Missing color tiles (typically green) occur when AutoOrtho cannot retrieve imagery within the time it may wait. This section explains why this happens and how to minimize it.</p>
 <h4 id="why-do-missing-color-tiles-happen">Why do missing color tiles happen?</h4>
 <ol>
 <li><strong>Time Budget Exhaustion:</strong> Each tile request has a time limit. If chunks don't download in time, they may appear as missing color.</li>
@@ -1831,23 +1964,23 @@ Each zoom level requires 4× more resources. Lowering your max zoom dramatically
 1. Open AutoOrtho Settings
 2. Lower "Max Zoom Level" from ZL17/18 to ZL16 or ZL15
 3. This reduces chunks per tile from 1024/4096 down to 256/64</p>
-<p><strong>Option 2 - Increase Time Budget:</strong>
-1. Open AutoOrtho Settings
-2. Go to the Settings tab → Performance Tuning section
-3. Increase "Tile Time Budget" to 15-20 seconds
-4. This gives more time for chunks to download</p>
+<p><strong>Option 2 - Wait Longer for Nearby Imagery:</strong>
+1. Open AutoOrtho Settings → Streaming
+2. Raise "Wait for nearby imagery in flight" to 8-10 seconds
+3. This gives nearby textures more time to download (or set Auto-tuning to
+   Auto, which raises it when nearby imagery keeps arriving just too late)</p>
 <p><strong>Option 3 - Enable Full Fallbacks:</strong>
 1. Set "Fallback Level" to "Full (Best Quality)"
 2. Enable "Allow fallbacks to extend time budget"
 3. This allows AutoOrtho to download lower-detail alternatives when high-detail fails</p>
 <p><strong>Recommended settings for minimal missing tiles:</strong></p>
 <pre><code class="language-ini">maptype_override_zoom = 16
-use_time_budget = True
-tile_time_budget = 300.0
+band_max_wait_seconds = 10.0
+near_wait_seconds = 120.0
 fallback_level = full
 fallback_extends_budget = True
 </code></pre>
-<p><strong>Trade-off Warning:</strong> Higher time budgets and extended fallbacks may cause longer loading times and occasional stuttering. See the <a href="../performance/">Performance Tuning Guide</a> for a detailed explanation of the quality vs. speed trade-off.</p>
+<p><strong>Trade-off Warning:</strong> Longer waits and extended fallbacks may cause longer loading times and occasional stuttering. See the <a href="../performance/">Performance Tuning Guide</a> for a detailed explanation of the quality vs. speed trade-off.</p>
 <p>For ZL17, <strong>Allow incomplete native partial builds</strong> is an additional opt-in
 trade-off. Disabled (the default) preserves strict quality and uses the normal
 fallback path if any requested chunk misses its deadline. Enabled, it completes
@@ -1872,15 +2005,14 @@ flight.</p>
 <h3 id="how-do-i-get-the-smoothest-flying-experience-with-minimal-stutters">How do I get the smoothest flying experience with minimal stutters?</h3>
 <p>Stuttering occurs when X-Plane waits for AutoOrtho to provide imagery. To minimize stutters:</p>
 <ol>
-<li><strong>Use Time Budget System:</strong> Keep <code>use_time_budget = True</code> (default)</li>
-<li><strong>Use a bounded tile budget:</strong> Start with the 60-second default</li>
+<li><strong>Keep the waits short:</strong> "Wait for nearby imagery in flight" at the 6-second default or lower</li>
+<li><strong>Let auto-tuning help:</strong> Auto mode eases off background work when X-Plane's frame rate drops</li>
 <li><strong>Use cache-only fallbacks:</strong> Set <code>fallback_level = cache</code> to avoid network delays during fallbacks</li>
 <li><strong>Enable prefetching:</strong> Keep <code>prefetch_enabled = True</code> to download tiles ahead of your aircraft</li>
 <li><strong>Increase prefetch lookahead:</strong> Set <code>prefetch_lookahead = 30</code> or higher for faster aircraft</li>
 </ol>
 <p><strong>Recommended settings for stutter-free flying:</strong></p>
-<pre><code class="language-ini">use_time_budget = True
-tile_time_budget = 60
+<pre><code class="language-ini">band_max_wait_seconds = 6.0
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
@@ -1925,8 +2057,8 @@ prefetch_lookahead = 30
 </thead>
 <tbody>
 <tr>
-<td><strong>Tile Time Budget</strong></td>
-<td>Total seconds to wait for a tile before returning partial results</td>
+<td><strong>Wait for nearby imagery</strong></td>
+<td>Seconds a read of a nearby texture may wait for real imagery (longer while a flight loads)</td>
 </tr>
 <tr>
 <td><strong>Fallback Level</strong></td>
@@ -1976,36 +2108,38 @@ Provider-side throttling can still make Apple slower than another source.</p>
 <li><strong>Check config file:</strong> Verify your <code>~/.autoortho</code> file has the expected values</li>
 </ol>
 <hr />
-<h3 id="whats-the-difference-between-maxwait-and-tile_time_budget">What's the difference between maxwait and tile_time_budget?</h3>
+<h3 id="what-happened-to-maxwait-and-tile_time_budget">What happened to maxwait and tile_time_budget?</h3>
+<p>They were replaced by one wait policy, the wait bands: how long a read waits
+depends on how near the texture is (see the
+<a href="../performance/#wait-policy-wait-bands">Performance Tuning Guide</a>).</p>
 <table>
 <thead>
 <tr>
-<th>Setting</th>
-<th>Scope</th>
-<th>Behavior</th>
+<th>Old setting</th>
+<th>Now</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>maxwait</code> (legacy)</td>
-<td>Per-chunk timeout</td>
-<td>Each of 256 chunks waits up to this long</td>
+<td><code>maxwait</code> (per chunk)</td>
+<td><code>band_max_wait_seconds</code> in flight, <code>near_wait_seconds</code> while a flight loads</td>
 </tr>
 <tr>
-<td><code>tile_time_budget</code> (new)</td>
-<td>Whole-tile budget</td>
-<td>Total wall-clock time for entire tile request</td>
+<td><code>tile_time_budget</code> (per tile)</td>
+<td>the longest of those two waits</td>
+</tr>
+<tr>
+<td><code>use_time_budget</code></td>
+<td>always on</td>
+</tr>
+<tr>
+<td><code>suspend_maxwait</code></td>
+<td>always on: the first load gets ten times the tile budget</td>
 </tr>
 </tbody>
 </table>
-<p><strong>Example:</strong> With <code>maxwait = 1.5s</code> and 256 chunks:
-- Worst case: 256 × 1.5s = 384 seconds (due to serial execution)
-- Actual time varies widely based on parallelism</p>
-<p><strong>Example:</strong> With <code>tile_time_budget = 60s</code>:
-- Always release a tile to X-Plane within 60 seconds, plus any explicitly
-  configured shared fallback extension
-- May have some missing chunks if network is slow or zoom level is high</p>
-<p><strong>Recommendation:</strong> Keep <code>use_time_budget = True</code> to use the new predictable system.</p>
+<p>Old values in your config file are ignored and dropped the next time it is
+saved.</p>
 <h3 id="time-exclusion-re-activated-after-scenery-reload">Time exclusion re-activated after scenery reload</h3>
 <p><strong>Symptom:</strong> You have "Default to Exclusion" enabled, the exclusion correctly deactivated when sim time showed daytime, but after triggering "Reload Scenery" the exclusion incorrectly re-activated and you see global scenery instead of orthos.</p>
 <p><strong>Solution:</strong> This issue has been fixed. AutoOrtho now preserves the exclusion decision made based on actual sim time during temporary disconnections (like scenery reload).</p>

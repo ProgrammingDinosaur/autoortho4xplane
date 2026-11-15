@@ -1,0 +1,3350 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../governor-behind-detection-plan/">
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
+    
+    
+      
+        <title>Settings refactor proposal: Target, Limits, Governor - AutoOrtho Continued</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#settings-refactor-proposal-target-limits-governor" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="AutoOrtho Continued" class="md-header__button md-logo" aria-label="AutoOrtho Continued" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AutoOrtho Continued
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Settings refactor proposal: Target, Limits, Governor
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/ProgrammingDinosaur/autoortho4xplane" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Instructions
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../config/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Configuration
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../details/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Approach
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../faq/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  FAQ and Troubleshooting
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../info/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Info Attributions and Other Projects
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../macos-stability/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  macOS shutdown and native pipeline stability
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../native-crash-diagnostics/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Native crash diagnostics
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../performance/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Performance Tuning Guide
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../scenery/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Scenery Setup
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../windows-native-diagnostics/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Windows native crash diagnostics
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../governor-behind-detection-plan/" class="md-tabs__link">
+          
+  
+  
+  Developer
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="AutoOrtho Continued" class="md-nav__button md-logo" aria-label="AutoOrtho Continued" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    AutoOrtho Continued
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/ProgrammingDinosaur/autoortho4xplane" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Instructions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../details/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Approach
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../faq/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    FAQ and Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../info/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Info Attributions and Other Projects
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../macos-stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    macOS shutdown and native pipeline stability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../native-crash-diagnostics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Native crash diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Tuning Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../scenery/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scenery Setup
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../windows-native-diagnostics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Windows native crash diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_11" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_11" id="__nav_11_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Developer
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_11_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_11">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Developer
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../governor-behind-detection-plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plan: detecting "behind the aircraft" from prefetch misses
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings refactor proposal: Target, Limits, Governor
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings refactor proposal: Target, Limits, Governor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Summary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-what-we-take-from-osxp-and-what-we-do-differently" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. What we take from OSXP, and what we do differently
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-autoortho-today-the-problems-this-solves" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. AutoOrtho today: the problems this solves
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-concepts-in-detail" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Concepts in detail
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Concepts in detail">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#41-target-what-the-user-wants" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.1 Target: what the user wants
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#42-limits-what-the-user-allows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.2 Limits: what the user allows
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#43-guards-protection-that-warns-but-does-not-block" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.3 Guards: protection that warns but does not block
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#44-governor-how-autoortho-gets-there" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.4 Governor: how AutoOrtho gets there
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4.4 Governor: how AutoOrtho gets there">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#control-loops" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Control loops
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#signals-sampled-every-2-s-smoothed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Signals (sampled every 2 s, smoothed)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bottleneck-classifier-rule-table-evaluated-each-tick" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bottleneck classifier (rule table, evaluated each tick)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rules-that-keep-it-stable" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rules that keep it stable
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#graceful-degradation-when-the-target-is-out-of-reach" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Graceful degradation when the target is out of reach
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#learning-across-flights-the-slow-loop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Learning across flights (the slow loop)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#modes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Modes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-transparency" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Transparency
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Transparency">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#51-home-live-tuning-card-while-mounted" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.1 Home: live tuning card (while mounted)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#52-tuning-page" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.2 Tuning page
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#53-log-and-report" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.3 Log and report
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-settings-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Settings structure
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Settings structure">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#61-one-registry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.1 One registry
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#62-layered-resolution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2 Layered resolution
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#63-ui-tiers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.3 UI tiers
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#64-apply-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.4 Apply model
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-first-run-wizard-six-steps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. First-run wizard (six steps)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-engine-work-making-levers-live" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Engine work: making levers live
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-setting-classification-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. Setting classification (summary)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#10-migration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        10. Migration
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#11-rollout-each-phase-can-ship-on-its-own" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        11. Rollout (each phase can ship on its own)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#12-risks-and-open-questions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        12. Risks and open questions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#13-home-main-menu-revamp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13. Home (main menu) revamp
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="13. Home (main menu) revamp">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#131-what-home-shows-today" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.1 What Home shows today
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#132-principles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.2 Principles
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#133-layout-while-flying" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.3 Layout while flying
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#134-the-other-states" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.4 The other states
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#135-what-stays-off-home" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.5 What stays off Home
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#136-optional-extras" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.6 Optional extras
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#137-data-plumbing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.7 Data plumbing
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#appendix-a-osxp-source-map-for-the-ported-pieces" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Appendix A: OSXP source map (for the ported pieces)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#implementation-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Implementation notes
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Implementation notes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#phase-1-registry-sparse-file-expert-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 1 (registry, sparse file, Expert table)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-2-hardware-baseline-guards-ram-brake" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 2 (hardware baseline, guards, RAM brake)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-3-limits-connection-test-wizard-steps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 3 (limits, connection test, wizard steps)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phases-1-3-completed-essentials-and-the-remaining-gaps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phases 1-3 completed (Essentials and the remaining gaps)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-4-live-levers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 4 (live levers)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phases-5-6-governor-advise-and-auto" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phases 5-6 (governor: Advise and Auto)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-7-wait-consolidation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 7 (wait consolidation)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-8-texture-size-lever" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 8 (texture-size lever)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-9-home-revamp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 9 (Home revamp)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#follow-ups-from-the-orthostreamxp-comparison" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Follow-ups from the OrthoStreamXP comparison
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#behind-the-aircraft-by-evidence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Behind the aircraft, by evidence
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tuner-completion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tuner completion
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Summary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-what-we-take-from-osxp-and-what-we-do-differently" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. What we take from OSXP, and what we do differently
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-autoortho-today-the-problems-this-solves" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. AutoOrtho today: the problems this solves
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-concepts-in-detail" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Concepts in detail
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Concepts in detail">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#41-target-what-the-user-wants" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.1 Target: what the user wants
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#42-limits-what-the-user-allows" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.2 Limits: what the user allows
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#43-guards-protection-that-warns-but-does-not-block" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.3 Guards: protection that warns but does not block
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#44-governor-how-autoortho-gets-there" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.4 Governor: how AutoOrtho gets there
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4.4 Governor: how AutoOrtho gets there">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#control-loops" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Control loops
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#signals-sampled-every-2-s-smoothed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Signals (sampled every 2 s, smoothed)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#bottleneck-classifier-rule-table-evaluated-each-tick" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bottleneck classifier (rule table, evaluated each tick)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rules-that-keep-it-stable" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rules that keep it stable
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#graceful-degradation-when-the-target-is-out-of-reach" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Graceful degradation when the target is out of reach
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#learning-across-flights-the-slow-loop" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Learning across flights (the slow loop)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#modes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Modes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-transparency" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Transparency
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Transparency">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#51-home-live-tuning-card-while-mounted" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.1 Home: live tuning card (while mounted)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#52-tuning-page" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.2 Tuning page
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#53-log-and-report" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.3 Log and report
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-settings-structure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Settings structure
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Settings structure">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#61-one-registry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.1 One registry
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#62-layered-resolution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2 Layered resolution
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#63-ui-tiers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.3 UI tiers
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#64-apply-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.4 Apply model
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-first-run-wizard-six-steps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. First-run wizard (six steps)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-engine-work-making-levers-live" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Engine work: making levers live
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-setting-classification-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. Setting classification (summary)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#10-migration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        10. Migration
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#11-rollout-each-phase-can-ship-on-its-own" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        11. Rollout (each phase can ship on its own)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#12-risks-and-open-questions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        12. Risks and open questions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#13-home-main-menu-revamp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13. Home (main menu) revamp
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="13. Home (main menu) revamp">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#131-what-home-shows-today" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.1 What Home shows today
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#132-principles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.2 Principles
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#133-layout-while-flying" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.3 Layout while flying
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#134-the-other-states" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.4 The other states
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#135-what-stays-off-home" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.5 What stays off Home
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#136-optional-extras" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.6 Optional extras
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#137-data-plumbing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13.7 Data plumbing
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#appendix-a-osxp-source-map-for-the-ported-pieces" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Appendix A: OSXP source map (for the ported pieces)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#implementation-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Implementation notes
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Implementation notes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#phase-1-registry-sparse-file-expert-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 1 (registry, sparse file, Expert table)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-2-hardware-baseline-guards-ram-brake" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 2 (hardware baseline, guards, RAM brake)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-3-limits-connection-test-wizard-steps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 3 (limits, connection test, wizard steps)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phases-1-3-completed-essentials-and-the-remaining-gaps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phases 1-3 completed (Essentials and the remaining gaps)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-4-live-levers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 4 (live levers)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phases-5-6-governor-advise-and-auto" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phases 5-6 (governor: Advise and Auto)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-7-wait-consolidation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 7 (wait consolidation)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-8-texture-size-lever" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 8 (texture-size lever)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-9-home-revamp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 9 (Home revamp)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#follow-ups-from-the-orthostreamxp-comparison" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Follow-ups from the OrthoStreamXP comparison
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#behind-the-aircraft-by-evidence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Behind the aircraft, by evidence
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tuner-completion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tuner completion
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="settings-refactor-proposal-target-limits-governor">Settings refactor proposal: Target, Limits, Governor</h1>
+<p>Status: phases 1 to 9 implemented (see "Implementation notes" at the end); the governor ships in Auto mode, starting from the tuning plan (see "Tuner completion" at the end)
+Scope: user-facing settings, how settings are stored and resolved, the setup wizard, and a live auto-tuning engine
+Reference studied: OrthoStreamXP (OSXP), shared with permission. This proposal borrows its measurement ideas but keeps AutoOrtho's own model.</p>
+<hr />
+<h2 id="1-summary">1. Summary</h2>
+<p>AutoOrtho asks beginners to set about 89 controls across 148 config keys. Most of those controls set <em>how the engine works</em> (workers, budgets, buffers, broker limits) rather than <em>what the user wants</em>. Users copy values from forum posts that were tuned for someone else's PC, overload their machine, and blame AutoOrtho.</p>
+<p>This proposal splits settings into three things the user can reason about, plus one thing the user never has to set:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Who owns it</th>
+<th>What it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Target</strong></td>
+<td>User</td>
+<td><em>What I want to see.</em> An imagery zoom level, either <strong>fixed</strong> or <strong>by altitude</strong> (the existing dynamic zoom steps), with a separate airport zoom.</td>
+</tr>
+<tr>
+<td><strong>Limits</strong></td>
+<td>User (auto by default)</td>
+<td><em>What I allow AutoOrtho to use.</em> RAM, graphics memory, download bandwidth, CPU share, disk. Detected automatically; the user can lower any of them.</td>
+</tr>
+<tr>
+<td><strong>Guards</strong></td>
+<td>AutoOrtho</td>
+<td><em>Protection.</em> RAM/VRAM/disk/bandwidth checks before a flight and emergency brakes during it. They warn and offer a fix, but never block.</td>
+</tr>
+<tr>
+<td><strong>Governor</strong></td>
+<td>AutoOrtho</td>
+<td><em>How to get there.</em> A background control loop that adjusts every engine setting <strong>live, during the flight</strong>, to deliver the target as closely and as quickly as the machine, the network and the limits allow. It remembers what worked for next time.</td>
+</tr>
+</tbody>
+</table>
+<p>What makes this AutoOrtho's own rather than a copy of OSXP:</p>
+<ul>
+<li><strong>The user keeps the zoom-level vocabulary</strong> and the altitude-based profiles that experienced users value. They are not replaced by named presets.</li>
+<li><strong>Tuning is continuous, not post-flight.</strong> OSXP suggests one change after each flight and waits for the user's OK. AutoOrtho adjusts within seconds, during the flight, inside limits the user set. An <em>Advise</em> mode keeps the OSXP-style "suggest, you apply" behaviour for users who prefer it.</li>
+<li><strong>Everything the governor does is visible.</strong> A live panel shows target vs delivered quality, the current bottleneck, every adjusted value, its allowed range, and the reason for its last change. Any value can be pinned so the governor leaves it alone.</li>
+<li><strong>Resource limits are a first-class setting.</strong> The user can say "never use more than 8 GB RAM or 100 Mbit/s", and the governor treats that as a hard ceiling.</li>
+<li><strong>A new Home page (§13) shows it all working:</strong> quality delivered against the target, resource use against limits, what AutoOrtho is doing ahead of the aircraft, and what the tuner changed. The layout changes with the state (stopped, loading, flying, after flight) and keeps engine internals off the page.</li>
+</ul>
+<hr />
+<h2 id="2-what-we-take-from-osxp-and-what-we-do-differently">2. What we take from OSXP, and what we do differently</h2>
+<table>
+<thead>
+<tr>
+<th>OSXP idea</th>
+<th>AutoOrtho adopts?</th>
+<th>AutoOrtho version</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One quality knob (<code>level-change</code>) that hides zoom levels</td>
+<td><strong>No</strong></td>
+<td>The user picks a target zoom level (fixed or altitude profile). Presets are only shortcuts that fill in the target.</td>
+</tr>
+<tr>
+<td>Presets carry every hidden setting</td>
+<td><strong>Partly</strong></td>
+<td>Hidden settings come from the hardware baseline and the governor's learned profile, not from fixed preset tables.</td>
+</tr>
+<tr>
+<td>Connection test (rounds of 16 to 256 parallel downloads, 30 s)</td>
+<td><strong>Yes</strong></td>
+<td>Used as the governor's warm start on first run and as a feasibility check in the wizard.</td>
+</tr>
+<tr>
+<td>VRAM detection from the driver registry</td>
+<td><strong>Yes</strong>, extended</td>
+<td>Windows registry as OSXP, plus Linux/macOS sources. Feeds the guards.</td>
+</tr>
+<tr>
+<td>Graphics memory measured per texture size from flights</td>
+<td><strong>Yes</strong></td>
+<td>Feeds the VRAM guard and the target cost preview.</td>
+</tr>
+<tr>
+<td>Paging model with <code>k</code> measured in flight</td>
+<td><strong>Already ported</strong> (<code>paging_model.py</code>)</td>
+<td>The governor stores the fitted <code>k</code> so each flight starts from it.</td>
+</tr>
+<tr>
+<td>Post-flight tuner: one step per flight, opt-in</td>
+<td><strong>Changed</strong></td>
+<td>Becomes the slow loop of the governor (cross-flight learning). Live tuning handles the rest. Opt-in behaviour remains as <em>Advise</em> mode.</td>
+</tr>
+<tr>
+<td>Per-preset tuned store, Reset</td>
+<td><strong>Yes</strong>, generalised</td>
+<td>Learned profiles are stored per (target profile, imagery provider, network), with Reset.</td>
+</tr>
+<tr>
+<td>Cap texture size at 4096 px and shrink finer imagery</td>
+<td><strong>Optional lever</strong></td>
+<td>Off by default because it changes what the user asked for. If the user allows it, the governor can use it to fit VRAM limits without lowering the zoom level.</td>
+</tr>
+<tr>
+<td>No altitude settings</td>
+<td><strong>No</strong></td>
+<td>Dynamic zoom steps stay. They now also get a cost preview and VRAM checks.</td>
+</tr>
+<tr>
+<td>Settings read-only while streaming</td>
+<td><strong>No</strong></td>
+<td>Targets and limits can change while flying; the governor adapts. Only mount-level settings (paths, FUSE) require unmounting.</td>
+</tr>
+<tr>
+<td>Flight report with a verdict</td>
+<td><strong>Yes</strong>, extended</td>
+<td>Adds target fidelity per flight phase and what the governor learned.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3-autoortho-today-the-problems-this-solves">3. AutoOrtho today: the problems this solves</h2>
+<ul>
+<li><strong>148 keys, about 89 controls, 9 categories.</strong> There are two waiting systems side by side (<code>maxwait</code> / <code>tile_time_budget</code> / <code>fallback_*</code> and the <code>[streaming]</code> wait bands), 13 provider settings plus 3 legacy names, and about 12 worker and memory sizes.</li>
+<li><strong>Engine settings are frozen at startup.</strong> For example: <code>live_builder_concurrency</code> and <code>background_builder_workers</code> size thread pools once (<code>getortho.py:8740</code>), <code>live_tile_admission</code> creates a fixed <code>BoundedSemaphore</code> (<code>getortho.py:1418</code>), and prefetch radius and lookahead are read in the prefetcher constructor (<code>getortho.py:5344</code>). Only the broker's per-origin AIMD controller adapts at runtime.</li>
+<li><strong>No real resource checks.</strong> RAM and VRAM appear only in tooltip text ("every extra ZL increases VRAM … by 4x"). Nothing compares a chosen target with the machine. Because the texture size is <code>256 × chunks</code> (<code>_calc_required_buffer_size()</code> switches to 8K at ZL17 bulk or ZL19 airports), one slider step can quietly quadruple graphics memory.</li>
+<li><strong>Profiles are fixed tables.</strong> The four "performance profiles" (<code>ui/main_window.py:_apply_settings_preset</code>) write UI widgets with values that suit nobody's PC in particular. For example, "Quality" sets <code>tile_time_budget</code> to 300 s.</li>
+<li><strong>The wizard does not ask what the user wants and measures nothing.</strong></li>
+<li><strong>Settings are defined in four or five places:</strong> the <code>_defaults</code> string, two widget-name dictionaries, <code>ui/config_validation.py</code>, and the slider ranges.</li>
+</ul>
+<hr />
+<h2 id="4-concepts-in-detail">4. Concepts in detail</h2>
+<h3 id="41-target-what-the-user-wants">4.1 Target: what the user wants</h3>
+<p>The existing keys stay, with the same meaning, so current configs keep working:</p>
+<ul>
+<li><code>max_zoom_mode = fixed | dynamic</code></li>
+<li><code>max_zoom</code>, <code>max_zoom_near_airports</code> (fixed mode)</li>
+<li><code>dynamic_zoom_steps</code> (altitude → zoom and airport zoom)</li>
+</ul>
+<p>What changes is how they are presented and checked:</p>
+<ul>
+<li><strong>Quality target page</strong> with two modes:</li>
+<li><em>Fixed:</em> two sliders (Scenery ZL, Airport ZL).</li>
+<li><em>By altitude:</em> the existing step editor and chart (<code>ui/dynamic_zoom_editor.py</code>), with its Airliner / General Aviation / Low VRAM presets.</li>
+<li><strong>Live cost preview</strong> under the target, recomputed on every change:</li>
+<li>Graphics memory for photo textures near the aircraft, against this PC's card (from the paging model, the texture size per step and measured flight data).</li>
+<li>Download per new 1° area, and the Mbit/s needed to keep up at a typical speed for that altitude step.</li>
+<li>Disk per 1° area.</li>
+<li>A traffic light for each, from the guards (§4.3).</li>
+<li><strong>Target presets are shortcuts, not modes.</strong> Picking "Airliner" fills the steps; the user can then edit them. A short "Not sure? Let AutoOrtho suggest a target" button uses the connection test plus detected hardware to fill in a target that should be reachable.</li>
+<li><code>min_zoom</code> moves to Expert. The low-zoom base already covers far scenery.</li>
+</ul>
+<p><strong>Target fidelity</strong> is the governor's goal, and the number shown to the user:</p>
+<blockquote>
+<p><em>Target fidelity</em> = the share of X-Plane's near-band reads (mips 0 to 1) answered at the target zoom within the wait budget, over the last N minutes.</p>
+</blockquote>
+<p>Plus <em>time to sharp</em>: after a new area loads, how long until near reads are at the target.</p>
+<h3 id="42-limits-what-the-user-allows">4.2 Limits: what the user allows</h3>
+<p>New <code>[limits]</code> section. Every value defaults to <code>auto</code> (derived from the detected machine). The user can set a lower ceiling:</p>
+<table>
+<thead>
+<tr>
+<th>Limit</th>
+<th><code>auto</code> means</th>
+<th>Governs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ram_gb</code></td>
+<td>AutoOrtho may use up to about 25 % of physical RAM, and always leaves max(4 GB, 20 %) free for X-Plane and Windows</td>
+<td>memory cache, predictive memory, tile image cache, write buffers, build buffers</td>
+</tr>
+<tr>
+<td><code>vram_gb</code></td>
+<td>card memory minus an X-Plane reserve (about 5 GB, adjustable)</td>
+<td>the target's projected photo-texture memory; texture-size lever if allowed</td>
+</tr>
+<tr>
+<td><code>bandwidth_mbps</code></td>
+<td>unlimited (the governor finds the line's capacity)</td>
+<td>download concurrency ceiling, plus an optional token bucket so other apps keep some bandwidth</td>
+</tr>
+<tr>
+<td><code>cpu_cores</code></td>
+<td>physical cores minus 2, kept for X-Plane</td>
+<td>builder workers, native pipeline threads, background builds</td>
+</tr>
+<tr>
+<td><code>disk_cache_gb</code></td>
+<td>today's <code>file_cache_size</code></td>
+<td>disk budget manager</td>
+</tr>
+<tr>
+<td><code>protect_sim_fps</code> <em>(optional)</em></td>
+<td>off</td>
+<td>if on, the governor backs off background work when X-Plane's frame time rises while AutoOrtho is busy (needs the <code>sim/operation/misc/frame_rate_period</code> dataref added to <code>datareftrack.py</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>Limits are <strong>hard ceilings for the governor</strong>. The governor never exceeds them, even if fidelity suffers. When a limit is the reason the target isn't reached, the UI says so ("Bandwidth limit 50 Mbit/s reached; target fidelity 81 %").</p>
+<h3 id="43-guards-protection-that-warns-but-does-not-block">4.3 Guards: protection that warns but does not block</h3>
+<p>Today AutoOrtho has no RAM or VRAM checks beyond tooltip text, so these are new. They run in three places:</p>
+<ol>
+<li><strong>When editing the target or limits.</strong> The cost preview turns amber or red, with a one-line reason and a <strong>Fix</strong> button. Fix offers the nearest target that fits (for example "lower airport ZL to 18"), or raises the relevant limit if headroom exists.</li>
+<li>VRAM: projected photo-texture memory for the highest step + X-Plane reserve &gt; card → red.</li>
+<li>RAM: limits set above what the machine can spare → red.</li>
+<li>Disk: cache folder free space &lt; cache limit + safety margin → amber.</li>
+<li>Bandwidth: measured capacity (connection test or learned profile) &lt; what the target needs at that step's typical speed → amber ("expect blurry moments in new areas").</li>
+<li><strong>At mount time.</strong> The same checks run once more and show a notice on Home if something changed (another drive, new card, very low free RAM).</li>
+<li><strong>During the flight (emergency brakes).</strong> These act immediately, outside the governor's normal step rules:</li>
+<li>Free RAM below max(1.5 GB, 8 %) → pause prefetch, shrink caches to their minimum, drop background builds. Release gradually once RAM recovers.</li>
+<li>AutoOrtho's own memory above <code>ram_gb</code> → same.</li>
+<li>Disk free below the safety margin → stop writing new cache entries, keep serving.</li>
+<li>Each activation shows on the live panel and in the log, and is counted in the flight report.</li>
+</ol>
+<h3 id="44-governor-how-autoortho-gets-there">4.4 Governor: how AutoOrtho gets there</h3>
+<p>The governor runs in the parent process. It sees every mount worker's stats (through the existing <code>aostats</code> manager store), the broker, and system counters. It adjusts <em>levers</em> within the ranges allowed by the limits.</p>
+<h4 id="control-loops">Control loops</h4>
+<table>
+<thead>
+<tr>
+<th>Loop</th>
+<th>Period</th>
+<th>Mechanism</th>
+<th>Owner</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fast</td>
+<td>sub-second</td>
+<td>per-origin AIMD in the broker, priority queues, wait bands</td>
+<td>existing code, unchanged</td>
+</tr>
+<tr>
+<td><strong>Medium</strong></td>
+<td>5 to 10 s</td>
+<td><strong>bottleneck controller:</strong> find what is holding fidelity back, move one lever one step, check the result, keep or revert</td>
+<td><strong>new</strong></td>
+</tr>
+<tr>
+<td>Slow</td>
+<td>per flight and across flights</td>
+<td>learned profile: stores where the medium loop settled, the fitted paging <code>k</code>, measured graphics memory; warm-starts the next flight; tells the user when the target is consistently out of reach</td>
+<td>new</td>
+</tr>
+</tbody>
+</table>
+<p>The medium loop sets the <em>ceilings</em> the fast loop works inside. For example, the governor raises the broker's per-origin maximum, and AIMD still ramps up to it response by response. The two loops do not fight.</p>
+<h4 id="signals-sampled-every-2-s-smoothed">Signals (sampled every 2 s, smoothed)</h4>
+<ul>
+<li><strong>Fidelity and waits:</strong> near and middle reads served at target vs below target, stand-ins, wait-band timeouts, <code>chunk_missing_count</code>, <code>upscaled_chunk_count</code>, <code>row_batch_deadline_expired</code>.</li>
+<li><strong>Network:</strong> throughput, tile latency (p50/p90), error and timeout share per origin, broker queue depth and time spent queued.</li>
+<li><strong>Compute:</strong> builder utilisation, <code>streaming_builder_queue_wait_count</code>, tile-queue waits, AutoOrtho CPU %, system CPU %.</li>
+<li><strong>Memory:</strong> free RAM, AutoOrtho RSS (parent + workers), cache hit rates (<code>tile_mem_hits</code> / <code>tile_mem_miss</code>).</li>
+<li><strong>Flight context:</strong> phase (starting / taxi / climb / cruise / approach) from <code>wait_bands.StartTracker</code>, altitude, ground speed, current dynamic zoom step.</li>
+<li><strong>Optional:</strong> X-Plane frame time (see <code>protect_sim_fps</code>).</li>
+</ul>
+<h4 id="bottleneck-classifier-rule-table-evaluated-each-tick">Bottleneck classifier (rule table, evaluated each tick)</h4>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Signs</th>
+<th>Lever moved (one step)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Network-bound, line has room</strong></td>
+<td>broker queue full, no errors, tile latency stable, throughput under the measured line capacity and under <code>bandwidth_mbps</code></td>
+<td>raise download concurrency ceiling</td>
+</tr>
+<tr>
+<td><strong>Network-bound, line full / server pushing back</strong></td>
+<td>errors or timeouts &gt; 3 %, or latency rising with no throughput gain</td>
+<td>lower concurrency ceiling; reduce prefetch depth so live reads get the line</td>
+</tr>
+<tr>
+<td><strong>Compute-bound</strong></td>
+<td>chunks waiting in builder queues, builders 100 % busy, CPU under <code>cpu_cores</code></td>
+<td>raise live builders (then background builders)</td>
+</tr>
+<tr>
+<td><strong>Compute-bound at limit</strong></td>
+<td>same, but CPU at limit, or sim frame time rising</td>
+<td>lower background builds, raise build interval; keep live builders</td>
+</tr>
+<tr>
+<td><strong>Memory pressure</strong></td>
+<td>free RAM falling toward the guard, or RSS near <code>ram_gb</code></td>
+<td>shrink tile image cache, then predictive memory, then memory cache</td>
+</tr>
+<tr>
+<td><strong>Wait-bound</strong></td>
+<td>near reads time out, but the real chunk arrives soon after (p80 ≤ 12 s)</td>
+<td>raise <code>band_max_wait_seconds</code> (or <code>near_wait_seconds</code> while starting)</td>
+</tr>
+<tr>
+<td><strong>Behind the aircraft</strong></td>
+<td>near reads hit tiles that prefetch never queued, line and CPU have room</td>
+<td>extend prefetch lookahead and radius</td>
+</tr>
+<tr>
+<td><strong>Headroom everywhere</strong></td>
+<td>fidelity ≥ 98 % and resources well under limits</td>
+<td>slowly decay levers toward the baseline, to free resources for X-Plane</td>
+</tr>
+<tr>
+<td><strong>Target unreachable</strong></td>
+<td>every lever at its limit for N minutes, fidelity still low</td>
+<td>no lever left: degrade gracefully (below) and notify</td>
+</tr>
+</tbody>
+</table>
+<h4 id="rules-that-keep-it-stable">Rules that keep it stable</h4>
+<ul>
+<li>One lever per tick. Hysteresis bands. A cooldown per lever (for example 30 s).</li>
+<li><strong>Keep or revert:</strong> after a change, compare fidelity and the bottleneck signal over the next window. If either is worse, revert and put that lever on a longer cooldown. This is a simple hill-climb with rollback, so the governor can't drift into a bad state.</li>
+<li>Phase-aware step sizes: big steps while the flight is starting (getting to sharp scenery quickly matters most), small steps in cruise.</li>
+<li><strong>Pinned values are never touched.</strong> Hard limits are never exceeded.</li>
+</ul>
+<h4 id="graceful-degradation-when-the-target-is-out-of-reach">Graceful degradation when the target is out of reach</h4>
+<p>Applied in this order, each step shown on the live panel:</p>
+<ol>
+<li>Spend less on far work: shorter prefetch lookahead, smaller radius.</li>
+<li>Far and middle bands may use a zoom one level below target (mostly already true via the low-zoom base and wait bands; the governor makes it explicit and measured).</li>
+<li><strong>Optional, if the user allowed it:</strong> cap texture size (shrink imagery above 4096 px instead of building 8K). Same zoom level, a quarter of the VRAM.</li>
+<li>Notify the user: "Your ZL18 target reached 72 % fidelity in cruise. The limit is your connection (about 60 Mbit/s). Options: lower the cruise step to ZL16 · raise the bandwidth limit · keep it".</li>
+</ol>
+<p>The governor <strong>never silently lowers the user's target</strong>. Only the user changes the target.</p>
+<h4 id="learning-across-flights-the-slow-loop">Learning across flights (the slow loop)</h4>
+<ul>
+<li>At unmount, save the converged lever values, the measured line capacity, the fitted paging <code>k</code> and the measured graphics memory to <code>~/.autoortho-data/profile/learned.json</code>, keyed by (target profile hash, imagery provider, network fingerprint such as gateway MAC or SSID hash).</li>
+<li>The next flight with the same key <strong>starts from those values</strong>, so it is near-optimal from the first minute.</li>
+<li>First ever flight: warm start from the connection test (concurrency) and the hardware baseline (workers and memory).</li>
+<li><strong>Reset learned settings</strong> on the Tuning page clears the profile.</li>
+</ul>
+<h4 id="modes">Modes</h4>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Auto</strong> <em>(default)</em></td>
+<td>Adjusts live, within limits, shows everything.</td>
+</tr>
+<tr>
+<td><strong>Advise</strong></td>
+<td>Computes the same decisions but only lists them on Home (OSXP style). Nothing changes without Apply.</td>
+</tr>
+<tr>
+<td><strong>Off</strong></td>
+<td>Fixed values from the registry and user settings, as today. For A/B testing and troubleshooting.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="5-transparency">5. Transparency</h2>
+<p>The governor must be easy to inspect. Users should be able to see what it is doing without reading the log.</p>
+<h3 id="51-home-live-tuning-card-while-mounted">5.1 Home: live tuning card (while mounted)</h3>
+<pre><code>Quality target   ZL17 · airports ZL18 (By altitude: &quot;General Aviation&quot;, step 0-5000 ft)
+Delivering       96 % at target · sharp in 38 s after the last area load
+Bottleneck       Network: 142 of ~160 Mbit/s       [Limits: RAM 6.1/8 GB · CPU 6/10 cores · VRAM ok]
+Last change      +16 parallel downloads: queue was full, no errors (12 s ago)       [Details]
+</code></pre>
+<h3 id="52-tuning-page">5.2 Tuning page</h3>
+<ul>
+<li><strong>Table:</strong> setting · current value · allowed range (from limits) · source (<em>baseline / learned / governor / pinned</em>) · last change and reason · pin toggle.</li>
+<li><strong>Timeline chart</strong> for the session: fidelity, throughput, CPU, RAM, with each governor decision marked. Click a marker to see the decision and what happened after.</li>
+<li>Buttons: <strong>Mode</strong> (Auto / Advise / Off) · <strong>Reset learned settings</strong> · <strong>Export tuning report</strong>.</li>
+</ul>
+<h3 id="53-log-and-report">5.3 Log and report</h3>
+<ul>
+<li>Every decision is logged on one line: <code>Governor: raise provider ceiling 128→144 (network-bound: queue 100 %, errors 0.2 %, 142 Mbit/s); fidelity 91 %→?</code>, followed by a <code>kept</code> or <code>reverted</code> line.</li>
+<li>The flight report (existing <code>diagnostics</code> Markdown/JSON) gains:</li>
+<li>a verdict line,</li>
+<li>fidelity by phase,</li>
+<li>guard activations,</li>
+<li>what was learned for next time ("starts next flight at 144 parallel downloads, 10 live builders").</li>
+</ul>
+<hr />
+<h2 id="6-settings-structure">6. Settings structure</h2>
+<h3 id="61-one-registry">6.1 One registry</h3>
+<p>Replace the <code>_defaults</code> string, the widget-name dictionaries and the scattered ranges with one registry (<code>autoortho/settings/registry.py</code>):</p>
+<pre><code class="language-python">@dataclass(frozen=True)
+class SettingSpec:
+    key: str                 # &quot;autoortho.live_builder_concurrency&quot;
+    type: type
+    default: Any
+    range: tuple | None      # absolute bounds; limits may narrow them
+    tier: Tier               # ESSENTIAL | TUNING | EXPERT | INTERNAL | RETIRED
+    owner: Owner             # TARGET | LIMIT | USER | GOVERNED | HARDWARE | FIXED
+    live: bool               # can change without remount
+    lever: LeverSpec | None  # for GOVERNED: step size, cooldown, which limit bounds it
+    label: str
+    help: str
+    replaced_by: str | None
+</code></pre>
+<h3 id="62-layered-resolution">6.2 Layered resolution</h3>
+<p>From lowest to highest priority:</p>
+<pre><code>packaged default
+  → hardware baseline     (cores, RAM, VRAM: computed at start)
+  → learned profile       (from previous flights with the same target/provider/network)
+  → governor live value   (in memory only, during the flight)
+  → user pin              (explicit value: the governor never touches it)
+clamped by limits         (hard ceiling for everything above, except pins, which the guards warn about)
+= effective value + source + reason
+</code></pre>
+<ul>
+<li><strong>The ini stores intent only:</strong> paths, target, limits, mode, look settings and pins. Values equal to their computed value are not written. A fresh file is about 25 lines instead of about 150.</li>
+<li><strong>Startup consumers do not change.</strong> The resolver runs inside <code>AOConfig.load()</code> and fills the same <code>CFG.&lt;section&gt;.&lt;key&gt;</code> attributes read today.</li>
+<li><strong>Live levers</strong> need the engine changes in §8.</li>
+</ul>
+<h3 id="63-ui-tiers">6.3 UI tiers</h3>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Contents</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Essentials</strong> (about 15 controls)</td>
+<td>Quality target (Fixed / By altitude + presets + cost preview) · Limits (Auto, or custom sliders) · Governor mode · X-Plane / Scenery / Cache folders · Cache limit · Imagery source · Seasons on/off + strength · Night exclusion · Reduce sunrise shine · SimBrief ID + use flight plan · Hide window while running</td>
+</tr>
+<tr>
+<td><strong>Tuning</strong> (live)</td>
+<td>The table, timeline and buttons from §5.2</td>
+</tr>
+<tr>
+<td><strong>Expert</strong></td>
+<td>A searchable table of every registry key: effective value, default, source and help. Editing a value pins it. Home shows "3 pinned expert values · Review". The current category pages (DDS, pipeline, FUSE, provider, diagnostics) can stay as grouped views over the same registry during the transition.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="64-apply-model">6.4 Apply model</h3>
+<p>Keep Apply/Revert. Targets, limits and mode are <code>live=True</code>: Apply takes effect immediately and the governor adapts. Mount-level keys (paths, FUSE, pipeline mode) show "Takes effect at next mount" and are disabled while mounted.</p>
+<hr />
+<h2 id="7-first-run-wizard-six-steps">7. First-run wizard (six steps)</h2>
+<ol>
+<li><strong>Welcome and checks:</strong> FUSE / WinFsp / macFUSE readiness (merges today's Dependencies page).</li>
+<li><strong>X-Plane:</strong> auto-detect first, browse second.</li>
+<li><strong>Scenery:</strong> install a region or point at existing packages.</li>
+<li><strong>Cache:</strong> one folder, free space, a suggested cache limit. Long-term cache and download directory move to Expert.</li>
+<li><strong>Quality target:</strong></li>
+<li>Pick Fixed or By altitude, with presets.</li>
+<li><strong>Test my connection</strong> (30 s, OSXP's method through AutoOrtho's broker). The cost preview turns green, amber or red for this PC.</li>
+<li>"Suggest a target for me" fills in a target that should be reachable.</li>
+<li>The test result also seeds the governor.</li>
+<li><strong>Limits and ready:</strong> "Use what's available (recommended)" or set limits. Summary, plus "Start AutoOrtho now".</li>
+</ol>
+<hr />
+<h2 id="8-engine-work-making-levers-live">8. Engine work: making levers live</h2>
+<p>Most levers are read once today. Each needs a small, mechanical change so the governor can move it.</p>
+<table>
+<thead>
+<tr>
+<th>Lever</th>
+<th>Read today</th>
+<th>Change</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Download concurrency ceiling</td>
+<td>broker <code>_adaptive_config</code> at start</td>
+<td>broker accepts <code>set_origin_ceiling()</code> from the parent (same process; easy)</td>
+</tr>
+<tr>
+<td>Bandwidth cap</td>
+<td>none</td>
+<td>token bucket in the broker dispatcher</td>
+</tr>
+<tr>
+<td><code>live_builder_concurrency</code>, <code>background_builder_workers</code></td>
+<td>pool sizes at <code>getortho.py:8740</code></td>
+<td>create pools at the ceiling (the <code>cpu_cores</code> limit); gate them with a <strong>resizable semaphore</strong> whose permit count the governor sets</td>
+</tr>
+<tr>
+<td><code>live_tile_admission</code></td>
+<td><code>BoundedSemaphore</code> at <code>getortho.py:1418</code></td>
+<td>same resizable gate</td>
+</tr>
+<tr>
+<td><code>prefetch_lookahead</code>, <code>prefetch_radius_nm</code>, <code>prefetch_max_chunks</code></td>
+<td>prefetcher constructor (<code>getortho.py:5344</code>)</td>
+<td>read through a <code>LiveSettings</code> accessor each cycle</td>
+</tr>
+<tr>
+<td><code>predictive_dds_memory_mb</code>, <code>tile_image_cache_mb</code>, <code>cache_mem_limit</code></td>
+<td>budgets at init</td>
+<td>budget objects with <code>resize()</code>; shrinking evicts down to the new size</td>
+</tr>
+<tr>
+<td><code>band_max_wait_seconds</code>, <code>near_wait_seconds</code>, <code>paging_k</code></td>
+<td><code>streaming_options</code> (already read at call time)</td>
+<td>none</td>
+</tr>
+<tr>
+<td>Texture size cap (optional)</td>
+<td>none</td>
+<td><code>TexturePlan</code> + downscale before encode + plan-keyed DDS cache (the largest item; can come last)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Parent → worker channel.</strong> Mount workers are separate processes (<code>process_supervisor.py</code>). Add a small <code>governor/</code> key space to the existing <code>aostats</code> manager store (already shared and authenticated). The governor writes lever values there; each worker's <code>LiveSettings</code> polls it every 1 to 2 s. No new IPC mechanism is needed.</p>
+<p><strong>Wait consolidation.</strong> Before the governor can tune waits cleanly, the wait bands should be the only live-read policy. List every caller of <code>_row_wait_seconds()</code> / <code>QualityDeadlinePolicy</code> that still uses <code>tile_time_budget</code> / <code>maxwait</code>, move them to band budgets, then retire the legacy keys.</p>
+<hr />
+<h2 id="9-setting-classification-summary">9. Setting classification (summary)</h2>
+<p>Owner: <strong>T</strong> target · <strong>L</strong> limit · <strong>U</strong> user · <strong>G</strong> governed lever · <strong>H</strong> hardware baseline · <strong>M</strong> measured/learned · <strong>F</strong> fixed default · <strong>R</strong> retire.</p>
+<table>
+<thead>
+<tr>
+<th>Group</th>
+<th>Keys</th>
+<th>Owner</th>
+<th>Tier</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Target</td>
+<td><code>max_zoom_mode</code>, <code>max_zoom</code>, <code>max_zoom_near_airports</code>, <code>dynamic_zoom_steps</code></td>
+<td>T</td>
+<td>Essentials</td>
+</tr>
+<tr>
+<td>Limits <em>(new)</em></td>
+<td><code>limits.ram_gb</code>, <code>vram_gb</code>, <code>bandwidth_mbps</code>, <code>cpu_cores</code>, <code>protect_sim_fps</code>; <code>cache.file_cache_size</code> → <code>disk_cache_gb</code></td>
+<td>L</td>
+<td>Essentials</td>
+</tr>
+<tr>
+<td>Governor <em>(new)</em></td>
+<td><code>governor.mode</code>, <code>allow_texture_cap</code>, <code>xplane_vram_reserve_gb</code></td>
+<td>U</td>
+<td>Essentials / Expert</td>
+</tr>
+<tr>
+<td>Paths</td>
+<td><code>xplane_path</code>, <code>scenery_path</code>, <code>cache_dir</code></td>
+<td>U</td>
+<td>Essentials</td>
+</tr>
+<tr>
+<td></td>
+<td><code>long_term_cache_dir</code>, <code>download_dir</code>, <code>dsf_dir</code>, <code>log_file</code></td>
+<td>U</td>
+<td>Expert</td>
+</tr>
+<tr>
+<td>Look</td>
+<td><code>maptype_override</code>, <code>seasons.enabled</code>, <code>terrain.default_roughness</code>, <code>time_exclusion.enabled</code>, <code>simbrief.userid</code>, <code>simbrief.use_flight_data</code>, <code>general.hide</code></td>
+<td>U</td>
+<td>Essentials</td>
+</tr>
+<tr>
+<td>Governed: network</td>
+<td><code>provider_max_in_flight</code>, <code>provider_origin_initial_concurrency</code>, <code>provider_origin_max_concurrency</code></td>
+<td>G (+M warm start)</td>
+<td>Tuning</td>
+</tr>
+<tr>
+<td>Governed: compute</td>
+<td><code>live_builder_concurrency</code>, <code>background_builder_workers</code>, <code>live_tile_admission</code>, <code>buffer_pool_size</code>, <code>streaming_builder_pool_size</code>, <code>predictive_dds_build_interval_ms</code></td>
+<td>G (bounded by <code>cpu_cores</code>)</td>
+<td>Tuning</td>
+</tr>
+<tr>
+<td>Governed: memory</td>
+<td><code>cache_mem_limit</code>, <code>predictive_dds_memory_mb</code>, <code>tile_image_cache_mb</code>, <code>cache_write_buffer_mb</code></td>
+<td>G (bounded by <code>ram_gb</code>)</td>
+<td>Tuning</td>
+</tr>
+<tr>
+<td>Governed: prefetch</td>
+<td><code>prefetch_lookahead</code>, <code>prefetch_radius_nm</code>, <code>prefetch_max_chunks</code></td>
+<td>G</td>
+<td>Tuning</td>
+</tr>
+<tr>
+<td>Governed: waits</td>
+<td><code>near_wait_seconds</code>, <code>band_max_wait_seconds</code></td>
+<td>G</td>
+<td>Tuning</td>
+</tr>
+<tr>
+<td>Measured</td>
+<td><code>paging_k</code>, graphics memory per size, line capacity</td>
+<td>M</td>
+<td>Tuning (read-only)</td>
+</tr>
+<tr>
+<td>Engine constants</td>
+<td>AIMD constants (<code>provider_origin_min/increase/threshold/decrease/cooldown</code>), <code>download_dispatch_workers</code>, <code>provider_queue_timeout</code>, <code>prefetch_interval</code>, <code>prefetch_admission_burst</code>, <code>tile_queue_max_size</code>, <code>native_pipeline_threads</code>, <code>pipeline_mode</code>, <code>[pydds]</code>, <code>[fuse]</code>, <code>[flightdata]</code>, <code>[diagnostics]</code>, DDS cache keys, <code>[streaming]</code> A/B switches, <code>fallback_*</code>, <code>prefetch_quality_*</code>, <code>min_zoom</code>, <code>missing_color</code>, <code>simheaven_compat</code>, <code>using_custom_tiles</code>, season saturations, remaining SimBrief / night keys</td>
+<td>F</td>
+<td>Expert</td>
+</tr>
+<tr>
+<td>Retire now</td>
+<td><code>live_aopipeline_min_chunk_ratio</code>, <code>ephemeral_dds_cache_mb</code>, <code>max_concurrent_downloads</code>, <code>http2_max_connections</code>, <code>prefetch_pipeline_v2</code> (after one release); <code>fetch_threads</code> only for HTTP/1.1 mode</td>
+<td>R</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Retire after wait consolidation</td>
+<td><code>maxwait</code>, <code>suspend_maxwait</code>, <code>use_time_budget</code>, <code>tile_time_budget</code></td>
+<td>R</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="10-migration">10. Migration</h2>
+<ul>
+<li>Bump <code>CONFIG_REVISION</code> and extend <code>_migrate_config_revision()</code>.</li>
+<li><strong>Target keys are kept as they are.</strong> Nobody's scenery changes after the update.</li>
+<li>Engine keys equal to the old packaged defaults are dropped and become governed.</li>
+<li><strong>Engine keys that differ become pins.</strong> The governor respects them. Home shows "AutoOrtho now tunes engine settings automatically. 4 of your values were kept as pinned · Review", with <strong>Unpin all</strong>.</li>
+<li>Old retired keys are migrated (<code>_migrate_legacy_provider_options</code> exists) and removed.</li>
+<li>The four performance profiles are removed. Their intent is now covered by the target presets, the limits and the governor.</li>
+</ul>
+<hr />
+<h2 id="11-rollout-each-phase-can-ship-on-its-own">11. Rollout (each phase can ship on its own)</h2>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Content</th>
+<th>Risk</th>
+<th>User benefit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>1. Registry + resolver</strong></td>
+<td>Registry generated from <code>_defaults</code>; resolver fills <code>CFG</code>; sparse writes; retire R keys; Expert table</td>
+<td>Low: consumers unchanged</td>
+<td>Smaller config, visible overrides</td>
+</tr>
+<tr>
+<td><strong>2. Hardware baseline + guards</strong></td>
+<td>Detect cores/RAM/VRAM/disk; derive starting values; cost preview and guard checks on the target page; emergency RAM brake</td>
+<td>Low</td>
+<td>Protection from over-sized targets</td>
+</tr>
+<tr>
+<td><strong>3. Limits + connection test</strong></td>
+<td><code>[limits]</code>; port the connection test; wizard Quality and Limits steps</td>
+<td>Low</td>
+<td>Fast setup, safe ceilings</td>
+</tr>
+<tr>
+<td><strong>4. Live levers</strong></td>
+<td>Resizable gates and budgets, <code>LiveSettings</code>, parent → worker channel</td>
+<td>Medium: touches pool creation</td>
+<td>Prerequisite for the governor</td>
+</tr>
+<tr>
+<td><strong>5. Governor in Advise mode</strong></td>
+<td>Signals, classifier, decisions shown but not applied; live panel and timeline</td>
+<td>Low: changes nothing</td>
+<td>Validates decisions on real flights</td>
+</tr>
+<tr>
+<td><strong>6. Governor in Auto mode</strong></td>
+<td>Applies decisions with keep/revert; learned profiles and warm start</td>
+<td>Medium</td>
+<td>Settings tune themselves</td>
+</tr>
+<tr>
+<td><strong>7. Wait consolidation</strong></td>
+<td>Bands become the only live policy; retire legacy wait keys</td>
+<td>Medium</td>
+<td>Removes the most confusing group</td>
+</tr>
+<tr>
+<td><strong>8. Optional texture-size lever</strong></td>
+<td><code>TexturePlan</code>, downscale before encode, plan-keyed DDS cache</td>
+<td>Medium–high: native pipeline</td>
+<td>Higher zoom within VRAM limits</td>
+</tr>
+<tr>
+<td><strong>9. Home revamp (§13)</strong></td>
+<td>State-based layout, <code>HomeSnapshot</code> from the sampler, notices, last-flight card. Can start after phase 2 with stats only; the fidelity hero and Auto-tuning block arrive with phases 5–6</td>
+<td>Low: UI only</td>
+<td>Users see what AutoOrtho is doing and whether it keeps up</td>
+</tr>
+</tbody>
+</table>
+<p>Shipping Advise before Auto lets us compare the governor's decisions with what experienced users would do, using real flight reports, before it changes anything.</p>
+<hr />
+<h2 id="12-risks-and-open-questions">12. Risks and open questions</h2>
+<ul>
+<li><strong>Oscillation and noise.</strong> Mitigated by one lever per tick, hysteresis, cooldowns, keep/revert, and smoothing over windows. Needs a <strong>replay harness</strong>: record signals from real flights (the diagnostics checkpoints already capture much of this) and run the governor offline against them in tests.</li>
+<li><strong>Interaction with AIMD.</strong> The governor only moves ceilings; AIMD keeps the per-response loop. Check that a lower ceiling never undercuts AIMD's floor (<code>provider_origin_min_concurrency</code>).</li>
+<li><strong>Latency of the cross-process channel.</strong> A 1 to 2 s poll is fine for the medium loop. Emergency brakes should run in each worker locally as well, not only in the parent.</li>
+<li><strong>Pinned values that break the target.</strong> The guards warn ("pinned live_builder_concurrency=2 is limiting fidelity"), but pins are respected.</li>
+<li><strong>VRAM accuracy on macOS and Linux.</strong> Unknown VRAM → no VRAM warnings and a conservative suggested target.</li>
+<li><strong>Network fingerprint privacy.</strong> Store only a salted hash, locally.</li>
+<li><strong>Frame-time protection</strong> needs a new dataref subscription. Verify how fast <code>datareftrack</code> updates and how noisy the value is before relying on it.</li>
+<li><strong>Restart semantics:</strong> confirm per key what a running mount can pick up live, and set <code>SettingSpec.live</code> accordingly.</li>
+</ul>
+<hr />
+<h2 id="13-home-main-menu-revamp">13. Home (main menu) revamp</h2>
+<p>The Target / Limits / Governor model needs a front page that shows it working. Today's Home can't do that.</p>
+<h3 id="131-what-home-shows-today">13.1 What Home shows today</h3>
+<p><code>ui/pages/home_page.py</code> shows <strong>ten cards of equal weight</strong> in a 2-column grid: Runtime, Readiness, X-Plane, Mounted Scenery, Provider, SimBrief, Cache, Task, Throughput, Recent Failure.</p>
+<ul>
+<li><strong>Nothing about streaming.</strong> <em>Task</em> and <em>Throughput</em> are filled from the scenery-package download task manager (<code>_refresh_phase3_task_views</code>), not from the streaming engine. While flying, Home shows no imagery speed, no quality, and no resource use.</li>
+<li><strong>Everything has the same weight.</strong> "SimBrief: No flight plan" takes as much space as "Runtime".</li>
+<li><strong>Cards stay up when they have nothing to say.</strong> For example "✓ No recent failures" and "○ Idle".</li>
+<li><strong>No sense of time.</strong> There are no trends, so you can't tell "slow right now" from "slow all flight".</li>
+<li>The raw counters exist (<code>aostats</code>, the web <code>templates/stats.html</code> page), but they are engine counters (chunks, hits, queue skips), not answers.</li>
+</ul>
+<h3 id="132-principles">13.2 Principles</h3>
+<ol>
+<li><strong>Answer four questions, in this order:</strong></li>
+<li>Is it working?</li>
+<li>Am I getting the quality I asked for?</li>
+<li>What is it using?</li>
+<li>Do I need to do anything?</li>
+<li><strong>Every number must be actionable or reassuring.</strong> If a value would not change what the user understands or decides, it belongs on the Tuning or Diagnostics page, not on Home.</li>
+<li><strong>The layout follows the state.</strong> Stopped, Starting, Flying and After flight each show what matters then. Cards don't sit around showing nothing useful.</li>
+<li><strong>One headline, detail on demand.</strong> Each block has one number. Clicking it opens the detail (Tuning page, timeline, diagnostics report).</li>
+<li><strong>Plain units.</strong> % sharp, Mbit/s, GB, minutes and nm. Never chunks, mipmaps, permits or queue depths.</li>
+<li><strong>Calm updates.</strong> Numbers refresh at 1 Hz with smoothing; trend lines use 5 s buckets. Values freeze, labelled "paused", while X-Plane is paused. Nothing flickers.</li>
+</ol>
+<h3 id="133-layout-while-flying">13.3 Layout while flying</h3>
+<pre><code>┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ ● Flying with AutoOrtho   4 scenery packs · X-Plane connected        [ Unmount ]   │  status strip
+│   EDDM → LOWI · climbing 8,400 ft · 260 kt · Bing                                    │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│ ⚠ Your ZL18 airport target reached 74 % at LOWI. Limit: connection (~60 Mbit/s).     │  notices (0–3)
+│   [Lower airport ZL to 17]  [Raise bandwidth limit]  [Keep]                          │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│ SCENERY QUALITY                                                                       │  hero
+│   96 % sharp at target        Target ZL17 · airports ZL18 · step &quot;5,000–12,000 ft&quot;   │
+│   ▁▂▅▇█████▇██████▆███  (session; red = blurry moments)   Sharp 38 s after last load │
+├────────────────────────────┬────────────────────────────┬────────────────────────────┤
+│ NETWORK          ◆ limit   │ COMPUTER                   │ GRAPHICS MEMORY            │  resource gauges
+│ 142 Mbit/s of ~160         │ CPU 6 of 10 cores          │ ~3.1 GB photo textures     │
+│ ▃▅▇▇▆▇█▇  0.3 % retries    │ RAM 6.1 of 8 GB (AO)       │ of 7 GB budget (12 GB card)│
+├────────────────────────────┴────────────────────────────┴────────────────────────────┤
+│ ACTIVITY   18,420 textures served · 71 % from cache · 3.8 GB downloaded              │
+│            Building 9 now · Ahead of you: next ~6 min / 26 nm ready                  │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│ AUTO-TUNING (Auto)   +16 parallel downloads: queue full, no errors · 12 s ago         │
+│                      7 changes this flight · 2 pinned values           [See tuning]  │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+  Open map · Scenery library · Diagnostics
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>Block</th>
+<th>What it answers</th>
+<th>Source</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Status strip</strong></td>
+<td>Working? One state pill, the main action, X-Plane link, aircraft phase, altitude, ground speed, provider. It replaces the Runtime, X-Plane, Mounted Scenery and Provider cards.</td>
+<td>runtime state, <code>datareftrack</code>, <code>wait_bands.StartTracker</code></td>
+</tr>
+<tr>
+<td><strong>Notices</strong></td>
+<td>Do I need to act? At most 3, sorted by severity, each with buttons, dismissable. Sources: target unreachable, guard activations, readiness problems, update available, Advise-mode suggestions, worker crash/restart. It replaces the Recent Failure card and only appears when there is something to say.</td>
+<td>governor, guards, readiness, crash handler</td>
+</tr>
+<tr>
+<td><strong>Scenery quality (hero)</strong></td>
+<td>Am I getting what I asked for? Fidelity % (last 5 min), the active target and dynamic-zoom step, time to sharp, and a session trend with blurry moments in red. Clicking it opens the timeline.</td>
+<td>governor fidelity metric (§4.1)</td>
+</tr>
+<tr>
+<td><strong>Resource gauges</strong></td>
+<td>What is it using? Three compact gauges: usage against limit or capacity, with the colour showing headroom. The gauge the governor considers the bottleneck gets a ◆ chip. RAM shows AutoOrtho's own use against <code>ram_gb</code>; a second line appears only when <em>system</em> free RAM is low.</td>
+<td>broker throughput and retries, psutil, VRAM estimate</td>
+</tr>
+<tr>
+<td><strong>Activity</strong></td>
+<td>Is it ahead of me? Textures served, cache share, data downloaded, builds in progress, and <strong>prefetch horizon</strong> (how far along the predicted path is already sharp, in minutes and nm).</td>
+<td><code>aostats</code> counters, prefetcher, paging model</td>
+</tr>
+<tr>
+<td><strong>Auto-tuning</strong></td>
+<td>What changed and why? Mode, last decision with its reason, number of changes, number of pins.</td>
+<td>governor decision log</td>
+</tr>
+</tbody>
+</table>
+<h3 id="134-the-other-states">13.4 The other states</h3>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Home shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Stopped (ready)</strong></td>
+<td>Status strip with <strong>Mount</strong>. A one-line <em>Ready to fly ✓</em> that expands into the readiness checklist only when something is wrong. <strong>Quality target</strong> summary with the cost-preview traffic lights (§4.1) and an <em>Edit</em> link. <strong>Last flight</strong> card (below). <strong>Storage</strong>: cache used / limit and disk free, from the existing storage scan. Installed scenery regions, with an update badge.</td>
+</tr>
+<tr>
+<td><strong>Starting / X-Plane loading</strong></td>
+<td>A progress block that replaces the hero: <em>Mounting 4 packs ✓ · Waiting for X-Plane ✓ · Loading area: 63 % of nearby scenery sharp (about 40 s left)</em>. Users currently stare at X-Plane's loading screen with no idea whether AutoOrtho is working; near-band reads during <code>StartTracker.starting</code> give this number directly.</td>
+</tr>
+<tr>
+<td><strong>Flying</strong></td>
+<td>§13.3.</td>
+</tr>
+<tr>
+<td><strong>Paused / in menu</strong></td>
+<td>Same layout, dimmed. The pill reads <em>Paused</em>, and the counters stop.</td>
+</tr>
+<tr>
+<td><strong>After flight</strong> (until the next mount or dismiss)</td>
+<td><strong>Last flight</strong> card expanded. Verdict (<em>Smooth flight</em> / <em>A few blurry moments</em> / <em>Often blurry</em>), average fidelity by phase (departure, cruise, arrival), distance and duration, data downloaded and cache share, guard activations, and <em>Learned for next time</em> (the warm-start values). Buttons: <em>Open report</em>, <em>Open map with blurry spots</em>.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="135-what-stays-off-home">13.5 What stays off Home</h3>
+<p>These remain on the Tuning page, Diagnostics, or the web stats page. They are useful when troubleshooting but are noise for everyone else:</p>
+<ul>
+<li>chunk counts, hit/miss counters, submit-skip reasons, partial-build and healing counts</li>
+<li>mip levels, per-band read counts, paging <code>k</code></li>
+<li>broker queue depth, per-origin AIMD limits, connection counts</li>
+<li>buffer pool, builder queue lengths, per-stage latency histograms</li>
+<li>per-process memory and PIDs, FUSE thread counts</li>
+<li>scenery-package install task progress (moves to a small badge on <em>Scenery library</em> plus a notice when finished or failed)</li>
+</ul>
+<p>If one of these explains a problem, it reaches Home <strong>as a notice in plain words</strong>, not as a raw number. For example: "Imagery server is refusing requests (12 % retries); downloads were slowed down automatically".</p>
+<h3 id="136-optional-extras">13.6 Optional extras</h3>
+<ul>
+<li><strong>Tray / taskbar summary:</strong> when the window is hidden (<code>general.hide</code>), the tray tooltip reads <code>AutoOrtho · 96 % sharp · 142 Mbit/s · Flying</code>, and the icon turns amber or red with a notice. It is cheap and useful for users who keep the window hidden.</li>
+<li><strong>Tile radar:</strong> a small QPainter widget, no web view. It shows tiles around the aircraft coloured by state (sharp at target / building / below target / not loaded), plus the prefetch corridor. It shows at a glance whether AutoOrtho is ahead of the aircraft. Clicking it opens the full map.</li>
+<li><strong>Compact window mode:</strong> status strip + hero + gauges only, for a second monitor.</li>
+</ul>
+<h3 id="137-data-plumbing">13.7 Data plumbing</h3>
+<ul>
+<li><strong>The UI does not poll the stats store.</strong> The governor's sampler (§4.4) already collects every signal each 2 s. It publishes a <code>HomeSnapshot</code> dataclass at 1 Hz with smoothed values and the session trend buffers. <code>HomePage</code> gets it through one Qt signal and only formats it.</li>
+<li><strong>New metrics needed:</strong></li>
+<li>fidelity and time to sharp (governor)</li>
+<li>loading progress at start (near-band reads during <code>starting</code>)</li>
+<li>prefetch horizon (prefetcher + predicted path)</li>
+<li>photo-texture VRAM estimate (as <code>GraphicsMemoryMeter</code> in OSXP)</li>
+</ul>
+<p>Everything else exists today.
+- <strong>Governor in Off mode:</strong> the sampler still runs, so Home shows the same stats without the Auto-tuning block.
+- <strong>Accessibility:</strong> every gauge and colour has a text equivalent (<code>setAccessibleName</code> with the full sentence), state is never shown by colour alone, and keyboard focus order follows the reading order above.</p>
+<hr />
+<h2 id="appendix-a-osxp-source-map-for-the-ported-pieces">Appendix A: OSXP source map (for the ported pieces)</h2>
+<table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>File (under <code>OrthoStreamXP/src/OrthoStreamXP/</code>)</th>
+<th>Used for</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Connection test</td>
+<td><code>Setup/Settings/ConnectionTest.cs</code></td>
+<td>Wizard test, governor warm start</td>
+</tr>
+<tr>
+<td>VRAM detection, per-size memory</td>
+<td><code>Tuning/GraphicsMemory.cs</code></td>
+<td>Guards, cost preview</td>
+</tr>
+<tr>
+<td>Preset advisor</td>
+<td><code>Tuning/PresetAdvisor.cs</code></td>
+<td>"Suggest a target for me"</td>
+</tr>
+<tr>
+<td>Post-flight rules</td>
+<td><code>Tuning/Tuner.cs</code></td>
+<td>Seeds the classifier's rule table and thresholds</td>
+</tr>
+<tr>
+<td>Flight measurements</td>
+<td><code>Tuning/FlightFacts.cs</code></td>
+<td>Signal list, RAM-low threshold</td>
+</tr>
+<tr>
+<td>Tuned store, Reset</td>
+<td><code>Tuning/TunedSettings.cs</code></td>
+<td>Learned profile store</td>
+</tr>
+<tr>
+<td>Texture size cap</td>
+<td><code>Textures/TextureQuality.cs</code></td>
+<td>Optional lever (phase 8)</td>
+</tr>
+<tr>
+<td>Paging model</td>
+<td><code>Scenery/Paging/PagingModel.cs</code></td>
+<td>Already ported as <code>autoortho/paging_model.py</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="implementation-notes">Implementation notes</h2>
+<h3 id="phase-1-registry-sparse-file-expert-table">Phase 1 (registry, sparse file, Expert table)</h3>
+<ul>
+<li>The registry is <code>autoortho/settings_registry.py</code>, built from the existing <code>_defaults</code> template, so there is still one place to change a default.</li>
+<li><code>AOConfig.is_custom()</code> / <code>source()</code> / <code>reset_to_default()</code> / <code>set_value()</code>; the file stores only custom settings as active lines (<code>CONFIG_REVISION = 2</code>).</li>
+<li>The Expert table is <code>autoortho/ui/pages/expert_settings_page.py</code>; settings with a control elsewhere are read-only there.</li>
+</ul>
+<h3 id="phase-2-hardware-baseline-guards-ram-brake">Phase 2 (hardware baseline, guards, RAM brake)</h3>
+<ul>
+<li><code>autoortho/hardware.py</code>: cores and RAM (psutil) and graphics memory (Windows registry as in OSXP, <code>nvidia-smi</code> / sysfs on Linux, unified memory on Apple silicon). <code>baseline_values()</code> holds the scaling rules.</li>
+<li>Resolution layer: <code>AOConfig._apply_hardware_baseline()</code> sets non-custom keys to the baseline; <code>automatic_text()</code> is what reset gives; <code>source()</code> returns <code>"hardware"</code>. Baseline values are not written to the file. <code>[tuning] hardware_baseline</code> turns it off (fixed at load, so turning it off never pins the scaled values).</li>
+<li><code>autoortho/target_cost.py</code>: the cost model. Per flight phase it flies a straight 20-minute path and sums, per texture, the detail wanted at closest approach from <code>paging_model.mip_for_k</code> (graphics memory, imagery bytes at 16 KB a chunk, download rate). Departure phases add the ZL18 airport textures wanted on the ground. About 2 ms per target.</li>
+<li><code>autoortho/guards.py</code>: VRAM / RAM / disk / download checks and <code>suggest_target()</code>, a greedy one-level-at-a-time search for the nearest target within 90 % of the card. The disk guard uses free space only; the bandwidth guard waits for the phase 3 connection test.</li>
+<li>UI: <code>autoortho/ui/widgets/target_cost_panel.py</code> under the zoom controls, fed from the controls before Apply; a "PC resources" readiness check (graphics memory and RAM only) shows on Home and in Diagnostics and is refreshed after each save.</li>
+<li><code>autoortho/ram_brake.py</code>: each worker samples free RAM at most once a second; engaged, it skips prefetch cycles, holds background builds and halves the memory cache limit in the tile clean loop. Counted as <code>ram_brake_activations</code>.</li>
+<li>Not done in phase 2: the mount-time notice uses the readiness check rather than a separate Home banner (phase 9 revisits Home).</li>
+</ul>
+<h3 id="phase-3-limits-connection-test-wizard-steps">Phase 3 (limits, connection test, wizard steps)</h3>
+<ul>
+<li><code>autoortho/limits.py</code>: <code>[limits]</code> <code>ram_gb</code>, <code>vram_gb</code>, <code>bandwidth_mbps</code>, <code>cpu_cores</code>, each <code>auto</code> or a number (registry kind <code>auto</code>). <code>resolve()</code> gives the effective limits; <code>clamp_automatic()</code> lowers the automatic values of <code>cache_mem_limit</code>, <code>predictive_dds_memory_mb</code> and the two builder counts. Auto limits never lower the hardware baseline (tested). <code>protect_sim_fps</code> is left for the governor phases, and <code>disk_cache_gb</code> stays <code>cache.file_cache_size</code>.</li>
+<li>Resolution order in <code>AOConfig._apply_hardware_baseline()</code>: packaged default, hardware baseline, connection-test warm start (<code>provider_origin_initial_concurrency</code>), limits; user values are never clamped. <code>source()</code> adds <code>"limit"</code> and <code>"measured"</code>.</li>
+<li>Engine: the RAM brake also engages when AutoOrtho's aggregated worker memory exceeds <code>ram_gb</code> minus the app's share; <code>AO_CPU_THREAD_LIMIT</code> (set by the parent) sizes <code>_native_cpu_budget()</code> and each worker's OpenMP variables (<code>process_supervisor.apply_openmp_budget</code>); the broker gets <code>max_bytes_per_second</code> and throttles body reads with a token bucket (<code>_ByteRateLimiter</code>).</li>
+<li><code>autoortho/connection_test.py</code>: OSXP's method (rounds of 16 to 256, steady middle 10-90 %, fewest at once reaching 90 % with under 1 % failed) over an httpx HTTP/2 client like the broker's. Provider URLs moved to <code>autoortho/provider_urls.py</code>, shared with <code>getortho.Chunk</code> (identical URLs, checked against the old templates). A live run against Bing took 3.3 s: 90 Mbit/s, 64 at once, 15-19 KB a chunk.</li>
+<li>Guards: the graphics memory budget is the custom <code>vram_gb</code> when set; the download check compares the need with the connection test and the bandwidth limit; the RAM check warns above the RAM limit; <code>suggest_target_for_pc()</code> picks the sharpest fixed target both allow.</li>
+<li>UI: Settings &gt; Limits (<code>LimitsEditor</code>, <code>ConnectionTestPanel</code>), "Suggest a target for this PC" in the cost panel, and two wizard steps (Quality target, Limits) before Review.</li>
+</ul>
+<h3 id="phases-1-3-completed-essentials-and-the-remaining-gaps">Phases 1-3 completed (Essentials and the remaining gaps)</h3>
+<ul>
+<li>Essentials tier (§6.3): <code>ui/pages/essentials_page.py</code>, the first settings category. Its controls mirror the full controls (<code>ui/widgets/mirror.py</code>), so saving, Revert and change tracking are unchanged. <code>SettingsPage</code> shows only essential categories (Essentials, Limits) until <strong>Show all settings</strong> (<code>general.show_all_settings</code>); search covers everything. The governor mode row is in place for phases 5-6.</li>
+<li>The performance profiles are removed (§10). <code>min_zoom</code> is no longer on the Imagery page (§6.3, §9); its hidden slider still bounds the maximum zoom.</li>
+<li>Migration notice (§10): converting a pre-sparse file records hand-set engine values in <code>general.kept_values</code>; Home shows them (<code>ui/widgets/notice_bar.py</code>, the notice area phase 9 builds on) with <strong>Review</strong> and <strong>Use automatic values</strong> (controls found by object name, scaled sliders handled; settings without a control are reset in the Expert table).</li>
+<li>Registry (§6.1): <code>SettingSpec.owner</code> (target / limit / user / governed / measured / internal / fixed, as §9) and <code>live</code> (true for the call-time streaming options). Per-lever step and cooldown live with the governor (phase 5). <code>prefetch_pipeline_v2</code> is marked <code>retire_after</code>; <code>fetch_threads</code> is already labelled as the HTTP/1.1 fallback.</li>
+<li>Wizard (§7): six steps (checks on Welcome, X-Plane, Scenery with its folder, Image cache with a suggested limit and More folders, Quality, Limits and ready with "Start AutoOrtho when setup finishes").</li>
+<li>Guards: the disk check counts what the cache may still take; fixes can return a custom graphics memory limit to Auto, raise a custom download limit, or lower the disk cache. Low-disk brake (<code>ram_brake.DiskBrake</code>) on JPEG cache writes and DDS cache stores.</li>
+<li>Limits: the connection warm start applies only to the provider tested; a bandwidth limit sets <code>provider_origin_max_concurrency</code> from the measured per-request rate.</li>
+<li>Not done here: <code>protect_sim_fps</code> and measured graphics memory belong to the governor sampler (phases 5 and 9); <code>disk_cache_gb</code> remains <code>cache.file_cache_size</code> (owner "limit"); <code>prefetch_pipeline_v2</code> retires one release later.</li>
+</ul>
+<h3 id="phase-4-live-levers">Phase 4 (live levers)</h3>
+<ul>
+<li><code>autoortho/live_settings.py</code>: <code>LiveSettings</code> publishes lever values from the parent into the stats store (<code>governor/levers</code> plus a generation key); each worker polls every 1.5 s (a daemon thread started with the prefetcher), writes changed values into its <code>CFG</code> and runs registered hooks. <code>ResizableGate</code> is a resizable bounded semaphore.</li>
+<li>getortho hooks: <code>live_tile_admission</code> (now a <code>ResizableGate</code>), <code>background_builder_workers</code> (the pool is created at its ceiling of 16; the coordinator dispatches up to the live value), <code>predictive_dds_build_interval_ms</code>, <code>predictive_dds_memory_mb</code>, <code>cache_mem_limit</code> (the clean loop evicts down to a lowered value), prefetch lookahead / radius / chunks / interval (the prefetcher reloads), <code>limits.cpu_threads</code> (native thread budget) and <code>limits.ram_gb</code> (the brake's limit). <code>tile_image_cache_mb</code> and <code>cache_write_buffer_mb</code> are read at use, so a published value applies to new tiles and writes.</li>
+<li><code>live_builder_concurrency</code>, <code>buffer_pool_size</code>, <code>streaming_builder_pool_size</code>, <code>provider_max_in_flight</code> and <code>provider_origin_initial_concurrency</code> size pools at start and stay start-only; live builds are bounded live through <code>live_tile_admission</code> and the thread budget. OpenMP's per-worker <code>OMP_THREAD_LIMIT</code> is fixed at spawn, so a raised CPU limit takes full effect at the next start.</li>
+<li>Broker: a <code>CONFIG</code> control message (<code>HTTP2Broker.configure()</code>) moves the adaptive controller's ceiling (<code>set_maximum</code>, never under its floor, at most the worker count) and the token bucket's rate (0 removes it).</li>
+<li>Parent: <code>AOMount.publish_levers()</code> and <code>apply_live_levers()</code> (recomputes automatic values with <code>AOConfig.recompute_automatic()</code> and publishes what changed); levers are cleared at unmount. The UI applies limits and live Expert edits at once while streaming; <code>SettingSpec.live</code> marks what is live, and only non-live Expert edits raise the restart notice.</li>
+</ul>
+<h3 id="phases-5-6-governor-advise-and-auto">Phases 5-6 (governor: Advise and Auto)</h3>
+<ul>
+<li><code>autoortho/governor.py</code>. <code>GovernorService</code> runs in the parent while streaming (started after the mounts, stopped first at unmount) and samples every 2 s:</li>
+<li>worker counters from the stats store: <code>near_reads_real</code> / <code>near_reads_standin</code> (the fidelity metric, counted in <code>getortho._read_dds_bytes_budgeted</code>), <code>req_ok</code> / <code>req_err</code>, <code>bytes_dl</code>, <code>live_admission_waits</code> / <code>live_admissions</code>, <code>time_to_sharp_ms_*</code> and the brake counts;</li>
+<li>the broker's <code>server_stats()</code> (origin limit and active count, backlog);</li>
+<li>psutil CPU and RAM;</li>
+<li><code>datareftrack</code> (AGL, ground speed, and now <code>sim/operation/misc/frame_rate_period</code> and <code>sim/time/paused</code>).</li>
+<li><code>Governor</code> is pure (no I/O or clocks of its own):</li>
+<li>a 30 s <code>Window</code>, a classifier with the states of §4.4 plus <code>sim_fps</code>, and a move plan per state;</li>
+<li>one decision at a time, at most every 6 s; per-lever cooldown 30 s (half while starting, four times after a revert); double steps while starting;</li>
+<li>keep/revert judged 20 s after a change on the samples since the change, against fidelity (−2 points) and the state's own metric (−5 %);</li>
+<li>degradation shortens prefetch and sets a notice after 5 minutes with every lever for the bottleneck at its limit;</li>
+<li>eleven levers (<code>levers_for()</code>), bounded by the limits: the provider ceiling, live tile admission, background builders and their pause, three memory budgets, two waits, and prefetch lookahead and radius.</li>
+<li><strong>Advise</strong> was the default until the tuner completion below; <strong>Auto</strong> (the proposal's default) is the default now. Going back is a one-line change to <code>[governor] mode</code> in the template.</li>
+<li>Learned profiles: <code>LearnedProfiles</code> in <code>~/.autoortho-data/governor/learned.json</code>, keyed by <code>profile_key()</code> (target hash, provider, <code>network_fingerprint()</code>, a salted hash of the local /24 networks). Applied as a warm start in Auto only; saved at unmount in Auto.</li>
+<li><code>protect_sim_fps</code> (<code>[limits]</code>, default on). The best 30 s frame-time average after starting is the reference. Frames more than 20 % slower than it, and under 40 fps, classify as <code>sim_fps</code>, which lowers background builders, lengthens the build pause and shortens prefetch. The change is kept while fidelity stays ≥ 95 %.</li>
+<li>Transparency:</li>
+<li>Settings &gt; Auto-Tuning (<code>ui/pages/tuning_page.py</code>): the table, timeline and buttons of §5.2, refreshed each second;</li>
+<li>Home notices for Advise suggestions (<strong>Apply</strong> pins the value) and for an unreachable target;</li>
+<li>a log line per decision;</li>
+<li><code>governor/summary</code> in the stats store becomes the report's <em>Flight verdict</em> section (<code>diagnostics._render_flight</code>).</li>
+<li>Replay: <code>[governor] record_samples</code> writes <code>samples-*.jsonl</code>. <code>load_samples()</code> + <code>replay()</code> run the same rules offline (<code>tests/test_governor.py</code>).</li>
+<li>Not done here:</li>
+<li>the fitted paging <code>k</code> is not stored in the learned profile (it is fitted in each worker); the measured graphics memory peak is (since phase 8);</li>
+<li>the far/middle "one level below target" step of §4.4 degradation is left to the existing low-zoom base and wait bands;</li>
+<li>texture capping is phase 8.</li>
+</ul>
+<h3 id="phase-7-wait-consolidation">Phase 7 (wait consolidation)</h3>
+<ul>
+<li>The wait bands are the only wait policy. <code>wait_bands.py</code> derives what the retired keys did:</li>
+<li><code>chunk_wait_seconds(starting)</code> replaces <code>maxwait</code>: a near read's band wait, so a row may use what is left of the read's band budget;</li>
+<li><code>tile_budget_seconds(initial_load)</code> replaces <code>tile_time_budget</code>: the longest band wait (60 s by default, as before), ×10 up to 30 minutes before X-Plane first connects;</li>
+<li><code>http_read_timeout_seconds()</code> replaces <code>maxwait + 1</code> for the HTTP/1.1 read timeout.</li>
+<li><code>suspend_maxwait</code> and <code>use_time_budget</code> are always on.</li>
+<li>Callers moved:</li>
+<li><code>Tile.get_maxwait()</code> (every live row wait goes through it and <code>QualityDeadlinePolicy</code>), <code>_get_or_create_tile_time_budget()</code>, the <code>get_img()</code> fallback budget, the two live-transition budgets, the initial-load priority penalty and the healing timeout (a fixed 10 s, its old default);</li>
+<li>in <code>autoortho_fuse.py</code>, the macFUSE <code>daemon_timeout</code> and <code>_calculate_build_timeout()</code>.</li>
+<li><code>maxwait</code>, <code>suspend_maxwait</code>, <code>use_time_budget</code> and <code>tile_time_budget</code> are <code>RETIRED</code> in the registry: kept in the template for old files, ignored, and never written.</li>
+<li>UI: the four legacy controls on the Streaming page became two sliders bound to <code>[streaming] band_max_wait_seconds</code> ("Wait for nearby imagery in flight") and <code>near_wait_seconds</code> ("Wait while a flight loads"). They are live: a changed value is published to the workers on Apply; an unchanged one is not republished, so the governor's value stands.</li>
+<li>Behaviour change to watch in flight reports: a near row may now wait up to the band wait (6 s in flight, 60 s while starting) instead of <code>maxwait</code> (2 s) plus grace.</li>
+<li>Docs: <code>performance.md</code> (wait policy, startup loading, recommended configurations, the stale profile presets section), <code>faq.md</code> and <code>config.md</code>.</li>
+</ul>
+<h3 id="phase-8-texture-size-lever">Phase 8 (texture-size lever)</h3>
+<ul>
+<li><code>autoortho/texture_plan.py</code>:</li>
+<li>texture sizes (4096 px at the file zoom, doubling per level);</li>
+<li><code>capped_zoom()</code>, which lowers a build zoom until the texture fits the cap;</li>
+<li><code>texture_bytes()</code> (BC1 half a byte a pixel, BC3 one, a third more for the levels);</li>
+<li><code>HeldTextures</code>, OSXP's graphics memory meter: each texture at the finest level X-Plane read in the last 20 minutes.</li>
+<li>Engine:</li>
+<li>the cap is a clamp in <code>TileCacher._get_target_zoom_level()</code>, so live tiles and the prefetcher agree. It applies to tiles opened after <code>[governor] texture_cap_px</code> changes (a live setting), since X-Plane keeps a texture's size while it holds it;</li>
+<li>the DDS caches are keyed by the build zoom (<code>{tile}_z{zoom}</code>), so a capped texture is plan-keyed without a new key;</li>
+<li><code>texture_capped_tiles</code> counts capped opens;</li>
+<li>each worker's <code>_note_wanted_level()</code> feeds <code>held_textures</code>; the clean loop publishes <code>graphics_memory_bytes:&lt;pid&gt;</code>, and the governor sums them.</li>
+<li>Downscale before encode is left out. A capped texture is built at the zoom that fits, not downloaded one level finer and shrunk as OSXP does: that costs four times the downloads and decodes for a small sharpness gain, and the 8K buffer pool stays sized for uncapped textures.</li>
+<li>Governor:</li>
+<li><code>allow_texture_cap</code> adds the <code>governor.texture_cap_px</code> lever (0 or 4096);</li>
+<li>the <code>vram</code> state (the estimate at 95 % of <code>guards.vram_budget()</code>) caps textures once. That decision is kept without judging (the estimate falls over 20 minutes) and never eased off in headroom;</li>
+<li>without the permission, the governor sets a notice instead;</li>
+<li>the summary records <code>peak_graphics_memory_gb</code> and <code>texture_cap_px</code>.</li>
+<li>UI: "Allow smaller textures when graphics memory is short" on the Auto-Tuning page. It is live: allowing it adds the lever to a running governor; withdrawing it lifts a cap (publishes 0). The status line shows the estimate against the budget.</li>
+</ul>
+<h3 id="phase-9-home-revamp">Phase 9 (Home revamp)</h3>
+<ul>
+<li><code>autoortho/home_snapshot.py</code>: <code>build()</code> turns the governor snapshot and the app's state into a <code>HomeSnapshot</code>. It is pure, no Qt:</li>
+<li>state: stopped / starting / flying / paused / after flight;</li>
+<li>the status strip, the hero and its 5 s trend buckets;</li>
+<li>the gauges with a level and a bottleneck chip mapped from the governor state;</li>
+<li>activity, the auto-tuning lines, the radar and the tray/taskbar summary.
+  The main window builds it once a second (with the Auto-Tuning refresh) and sends it through one signal (<code>home_snapshot_ready</code>).</li>
+<li>Sampler additions (<code>GovernorService</code>):</li>
+<li>session totals since streaming started: textures served (<code>tile_mem_*</code>), cache share (<code>chunk_hit</code> / <code>chunk_miss</code>), bytes downloaded, distance and duration;</li>
+<li>climbing/descending from the last minute of altitude;</li>
+<li>heading;</li>
+<li>workers' gauges summed (<code>building_now</code>), maxed (<code>prefetch_horizon_m</code>) or joined (<code>tile_radar</code>);</li>
+<li><code>flight_summary()</code> for the last-flight card, saved to <code>governor/last_flight.json</code> at unmount.</li>
+<li>New metrics:</li>
+<li>prefetch horizon: <code>SpatialPrefetcher._note_horizon()</code>, every 10 s, the distance along the predicted path before the first tile that is neither in memory at target nor in the DDS cache; velocity mode only;</li>
+<li>builds in progress (live tile admission held);</li>
+<li>graphics memory (phase 8's <code>HeldTextures</code>);</li>
+<li>loading progress (the governor's near-read fidelity while X-Plane is not yet connected);</li>
+<li>the tile radar (<code>TileCacher._publish_radar()</code>: the 300 nearest open tiles within 60 nm and their state, every 10 s).</li>
+<li><code>ui/pages/home_page.py</code>:</li>
+<li>status strip; notices (<code>NoticeBar</code>); stopped blocks (one-line readiness, target with guard lights, storage, scenery); starting block; flying block (clickable hero with <code>SparkLine</code>, three <code>GaugeCard</code>s, activity with <code>TileRadar</code>, auto-tuning); last-flight card; footer;</li>
+<li>paused dims (opacity effect) and freezes the numbers;</li>
+<li>the old setters stay as the compatibility API: the task and failure cards became a badge on Scenery library and a <code>scenery_task_failed</code> notice.</li>
+<li>Optional extras:</li>
+<li>tray summary: <code>general.hide</code> was a setting without an implementation; it now minimizes to a tray icon while streaming, with the summary as its tooltip ("!" in front while a warning notice waits), and the window title carries the summary too;</li>
+<li>compact mode, which also hides the navigation rail;</li>
+<li>the tile radar.</li>
+<li>Accessibility: every gauge, the hero, the radar and the last-flight card have a full sentence as their accessible description; state is shown by symbol and text as well as colour (●, ◐, ❚❚, ■, ◆, ✓, !); blocks are added in reading order.</li>
+<li>Not done:</li>
+<li>"Open map with blurry spots" (the map has no layer for them yet; the card opens the map);</li>
+<li>the horizon on SimBrief routes;</li>
+<li>the tray icon's colour by state (the tooltip carries it).</li>
+</ul>
+<h3 id="follow-ups-from-the-orthostreamxp-comparison">Follow-ups from the OrthoStreamXP comparison</h3>
+<p>A review against OSXP's streaming and tuning code found three gaps, now closed:</p>
+<ul>
+<li><strong>Live tile admission only for detailed builds.</strong> Every DDS read used to take one of the <code>live_tile_admission</code> slots for the whole read, waits included. While a flight loads, near reads may wait 60 s, so 16 of them could hold every slot and leave header chunks and far reads to time out into the fallback texture. <code>read_pattern.needs_build_slot()</code> (called through <code>Tile.needs_live_slot()</code> in <code>autoortho_fuse.read</code>) lets the DDS header, the header chunk and its FUSE pieces, and base-level reads skip the gate; <code>live_admission_skipped</code> counts them. With <code>read_classifier</code> off every read is admitted, as before. This is AutoOrtho's version of OSXP's weighted build gate: the slots still bound detailed builds, and reads that take no build memory don't queue for them.</li>
+<li><strong>Waits raised on evidence.</strong> <code>getortho.LateArrivals</code> watches the chunks a near or middle read gave up on and counts how long they took from the start of the read, in <code>wait_bands.LATE_BUCKETS_S</code> (<code>late_flight_b*</code>, <code>late_start_b*</code>). <code>Governor.wait_evidence()</code> raises <code>band_max_wait_seconds</code> (or <code>near_wait_seconds</code> while starting) only when at least 20 (5 while starting) such reads were seen and 80 % (90 %) of them arrived within the lever's maximum, and never beyond that time (OSXP's <code>Tuner</code> rules). When most took longer, the new state <code>slow_imagery</code> lengthens prefetch lookahead instead. Without evidence the state falls through to <code>behind</code>.</li>
+<li><strong>Applied Advise suggestions are learned, not pinned.</strong> <strong>Apply</strong> publishes the value, records it in <code>LearnedProfiles.put_applied()</code> (the <code>applied</code> part of the profile entry, kept when Auto saves its levers) and leaves the setting unpinned, so the governor may move it again and <strong>Reset learned settings</strong> clears it (OSXP's tuned store). <code>LearnedProfiles.warm_start()</code> gives Advise flights the applied values and Auto flights the applied values overlaid with what Auto settled on. The Tuning page marks these values <em>Learned</em>.</li>
+</ul>
+<p>Still open: persisting the fitted paging <code>k</code> (low value: it is refitted after 200 reads).</p>
+<h3 id="behind-the-aircraft-by-evidence">Behind the aircraft, by evidence</h3>
+<p>Implemented from <a href="../governor-behind-detection-plan/">governor-behind-detection-plan.md</a>; the blind <code>behind</code> fallback (lookahead and radius raised on low fidelity alone) is gone.</p>
+<ul>
+<li><code>autoortho/prefetch_ledger.py</code>: <code>PrefetchLedger</code> per worker (<code>getortho.tile_ledger</code>), keyed by <code>(row, col, file zoom)</code> without the maptype, bounded (8192 entries, 20 min TTL). <code>classify_miss()</code> returns never / evicted / coarse / late / done; <code>never_kind()</code> splits a never-queued miss into paused, turn (track changed &gt; 30° in 60 s), wide (&gt; 0.8 × the prefetch radius off the track) or inside, in that order, so each miss counts once.</li>
+<li>Hooks (<code>getortho.py</code>, <code>prefetch.py</code>):</li>
+<li><code>_prefetch_tile(source=…)</code> notes the queue (velocity, simbrief, paging, ter, dsf) after it submitted chunks or found nothing left to submit, and notes the level done when every chunk in its range was already in. A <code>max_chunks</code> cut no longer returns early, so a truncated submission is noted too;</li>
+<li><code>PrefetchCoordinator(on_publish=…, on_complete=…)</code> covers every coordinator source (velocity, SimBrief and DSF with the bounded pipeline), not only DSF;</li>
+<li><code>_on_tile_complete_callback</code> (all mipmap-0 chunks in) marks full detail done; eviction passes the tile's <code>real_from()</code> so a tile completed without the tracker still counts as <code>evicted</code>;</li>
+<li><code>SpatialPrefetcher._note_pause()</code> records skipped cycles (RAM brake, live building or live pressure, runtime gate). A pause within 60 s explains a never-queued miss (the plan said one prefetch interval; a near tile would have been queued tens of seconds before its read);</li>
+<li><code>Tile._note_near_miss()</code> on a blurry near read bumps <code>near_miss_&lt;kind&gt;</code> (and <code>near_miss_paused_&lt;reason&gt;</code>), skipped while starting, without a position and below the prefetcher's 25 m/s.</li>
+<li>Governor: eight <code>near_miss_*</code> sample fields plus the pause reasons; <code>Window.miss_counts</code>. Below <code>FIDELITY_LOW</code> with no wait verdict, <code>miss_state()</code> needs <code>MIN_MISSES</code> (10) and one cause behind 50 % of them; states <code>behind_wide</code> (radius), <code>behind_short</code> (lookahead), <code>paging_coarse</code> (<code>streaming.paging_lead_seconds</code>, new lever 30-180 s), <code>prefetch_late</code> (lead, then <code>prefetch_max_chunks</code>, new lever 64-2048; none while the line is full), <code>memory_evicted</code> (memory cache, only under 80 % of the RAM limit), <code>prefetch_paused</code> (no move) and <code>unexplained</code> (no move). The two no-move states set a notice after five minutes of recurring.</li>
+<li>Keep/revert for the miss states uses that cause's share of <strong>near reads</strong> rather than of misses, so a change that cut every cause is not judged worse.</li>
+<li><code>Sample.starting</code> is recorded, so <code>replay()</code> judges each sample as the live governor did (old recordings: unchanged).</li>
+<li>Report: <em>Blurry moments by cause</em> by phase (<code>diagnostics._render_miss_causes</code>); <code>summary()</code> has <code>misses</code> and <code>misses_by_phase</code>, the timeline the window's miss counts.</li>
+<li>The thresholds (<code>MIN_MISSES</code>, <code>MISS_DOMINANT_SHARE</code>, <code>WIDE_SHARE</code>) are the plan's starting values. The governor still ships in Advise, so the reports from the first flights can set them before Auto acts on them.</li>
+</ul>
+<h3 id="tuner-completion">Tuner completion</h3>
+<p>A review of the automatic configuration found it reactive only (no starting
+point from the target or the line), two bugs, and loose spots. Changes:</p>
+<ul>
+<li><strong>Tuning plan</strong> (<code>tuning_plan.py</code>, applied in <code>AOConfig._apply_hardware_baseline</code>
+  after the hardware baseline and before the limits, source <code>planned</code>):
+  <code>target_cost</code>'s busiest-phase need against the last connection test of the
+  provider (capped by the bandwidth limit) sets prefetch chunks per cycle,
+  prefetch radius, lookahead and paging lead, both waits (only raised) and
+  predictive build memory (only raised). The download ceiling
+  (<code>provider_origin_max_concurrency</code>) is sized from min(line, bandwidth
+  limit) with the test's per-request speed. Every planned value lies inside
+  the governor's lever range. Same switch as the baseline
+  (<code>[tuning] hardware_baseline</code>). Workers load the config themselves and
+  compute the same plan; <code>start_governor</code> calls <code>recompute_automatic</code> so the
+  parent matches them.</li>
+<li><strong>Bug: concurrency 0.</strong> <code>provider_origin_max_concurrency = 0</code> means "the
+  provider's ceiling", but the governor stepped from the number 0, so a
+  "raise" clamped to the 64 floor and cut the ceiling from 320 to 64.
+  <code>governor.lever_state()</code> now turns 0 into the lever's maximum and keeps
+  automatic values inside the lever ranges (corrections are published at
+  start).</li>
+<li><strong>Bug: degradation was never published.</strong> <code>_note_limited</code> lowered
+  prefetch levers in <code>values</code> only, so workers never saw it while the
+  learned profile stored it. Each step is now a <code>Decision</code> (state
+  <code>unreachable</code>, outcome <code>kept</code>, not judged), published in Auto and listed
+  in Advise; headroom eases it back once the scenery is sharp.</li>
+<li><strong>CPU.</strong> The service samples AutoOrtho's process tree
+  (<code>ProcessTreeCpu</code>, share of the PC) and the governor compares it with the
+  share the CPU-core limit allows (<code>ao_cpu_budget_percent</code>); the whole-PC
+  90 % still counts as "no CPU to give". Headroom uses AutoOrtho's share.</li>
+<li><strong>Network.</strong> Samples carry the broker's summed ceilings. A saturated queue
+  raises the ceiling only when the adaptive limit sits at it
+  (<code>network_room</code>); below it the server sets the pace (<code>network_paced</code>,
+  narrows prefetch). <code>network_full</code> and <code>network_paced</code> act only below 98 %
+  sharp.</li>
+<li><strong>Keep or revert.</strong> Judged from 10 s with 60+ near reads, else at 20 s;
+  waits up to 60 s for near reads in the same flight phase, then keeps.
+  Fidelity counts as worse only when it fell by more than 2 points and two
+  standard errors of the difference. A kept change is not eased back by
+  headroom for 120 s.</li>
+<li><strong>Convergence.</strong> One extra step's worth while under 85 % sharp (on top of
+  the doubled steps while starting); the plan supplies the starting point.</li>
+<li><strong>Mid-flight changes.</strong> <code>AOMount.sync_governor()</code> (after Apply of limits
+  and after live Expert edits) rebuilds levers, ranges, pins and bounds via
+  <code>Governor.reconfigure()</code>; values whose automatic value the new limits
+  changed are adopted, tuned values are clamped into the new ranges, a
+  pending verdict is dropped, and in Auto the governor's values are
+  published again.</li>
+<li><strong>Learning</strong> stores only levers that settled away from their baseline, so
+  later plan improvements are not masked by stored copies of old defaults.</li>
+<li><strong>Build slots.</strong> <code>live_builder_concurrency</code> was start-only and only sized
+  the DDS buffer pool (capped by <code>buffer_pool_size</code>, default 10) and the
+  decoder pool; the streaming builder pool ignored it (fixed 4). Raising
+  <code>live_tile_admission</code> past those pools only queued tiles at them, which
+  the governor could not see. Now both pools are resizable
+  (<code>DDSBufferPool.resize</code>, <code>StreamingBuilderPool.resize</code>) and follow
+  background + live builders (<code>AoDDS.build_slot_count</code>) unless the user set
+  their size; DDS buffers stay within a quarter of the RAM limit. Live
+  builds count build-slot acquisitions, waits (&gt; 10 ms) and timeouts
+  (<code>getortho.note_build_slot</code>); a build-wait share over 20 % is the
+  <code>build_slots</code> state (checked before the admission rule), which raises the
+  new <code>Live builders</code> lever (ceiling: cores + 2, and the 8K buffers a
+  quarter of the RAM limit holds). The decoder pool is sized for 48
+  builders (decoders are created on demand). Also fixed: a buffer handed to
+  a waiter just as its wait timed out was leaked.</li>
+<li><strong>Plan in flight reports.</strong> The flight summary's <code>plan</code> holds the target,
+  need, line, ratio and, per planned setting, the planned and settled values
+  (<code>AOMount._settled_plan</code>); the report renders it as a <em>Tuning plan</em> table.
+  Many reports side by side show which plan rule is off and by how much.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
+      
+    
+  </body>
+</html>

@@ -1,0 +1,1669 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+      
+        <link rel="prev" href="../../windows-native-diagnostics/">
+      
+      
+        <link rel="next" href="../settings-refactor-proposal/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
+    
+    
+      
+        <title>Plan: detecting "behind the aircraft" from prefetch misses - AutoOrtho Continued</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#plan-detecting-behind-the-aircraft-from-prefetch-misses" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="AutoOrtho Continued" class="md-header__button md-logo" aria-label="AutoOrtho Continued" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            AutoOrtho Continued
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Plan: detecting "behind the aircraft" from prefetch misses
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/ProgrammingDinosaur/autoortho4xplane" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Instructions
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../config/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Configuration
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../details/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Approach
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../faq/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  FAQ and Troubleshooting
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../info/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Info Attributions and Other Projects
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../macos-stability/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  macOS shutdown and native pipeline stability
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../native-crash-diagnostics/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Native crash diagnostics
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../performance/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Performance Tuning Guide
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../scenery/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Scenery Setup
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../../windows-native-diagnostics/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Windows native crash diagnostics
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="./" class="md-tabs__link">
+          
+  
+  
+  Developer
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="AutoOrtho Continued" class="md-nav__button md-logo" aria-label="AutoOrtho Continued" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    AutoOrtho Continued
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/ProgrammingDinosaur/autoortho4xplane" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Instructions
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../details/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Approach
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../faq/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    FAQ and Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../info/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Info Attributions and Other Projects
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../macos-stability/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    macOS shutdown and native pipeline stability
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../native-crash-diagnostics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Native crash diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance Tuning Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../scenery/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scenery Setup
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../windows-native-diagnostics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Windows native crash diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_11" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_11" id="__nav_11_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Developer
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_11_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_11">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Developer
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plan: detecting "behind the aircraft" from prefetch misses
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plan: detecting "behind the aircraft" from prefetch misses
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-problem" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Problem
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-goal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Goal
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-where-prefetch-queues-tiles-today" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Where prefetch queues tiles today
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-design" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Design
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Design">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#41-prefetch-ledger-per-worker-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.1 Prefetch ledger (per worker process)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#42-hooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.2 Hooks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#43-governor" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.3 Governor
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#44-transparency" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.4 Transparency
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-work-plan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Work plan
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-risks-and-decisions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Risks and decisions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-done-when" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Done when
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings-refactor-proposal/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings refactor proposal: Target, Limits, Governor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-problem" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Problem
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-goal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Goal
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-where-prefetch-queues-tiles-today" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Where prefetch queues tiles today
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-design" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Design
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Design">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#41-prefetch-ledger-per-worker-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.1 Prefetch ledger (per worker process)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#42-hooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.2 Hooks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#43-governor" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.3 Governor
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#44-transparency" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.4 Transparency
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-work-plan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Work plan
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-risks-and-decisions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Risks and decisions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-done-when" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Done when
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="plan-detecting-behind-the-aircraft-from-prefetch-misses">Plan: detecting "behind the aircraft" from prefetch misses</h1>
+<p>Status: implemented (steps 1-5); thresholds are the starting values below until flight reports set them. See the proposal's implementation notes for where the code differs from this plan.
+Related: <a href="../settings-refactor-proposal/">settings-refactor-proposal.md</a> §4.4 (the <em>Behind the aircraft</em> row of the bottleneck classifier) and its phases 5-6 notes</p>
+<hr />
+<h2 id="1-problem">1. Problem</h2>
+<p>The governor's <code>behind</code> state is a fallback today. <code>Governor.classify()</code>
+returns it when fewer than 95 % of near reads are sharp and nothing else
+explains it: the network is not saturated, the CPU is not the limit, and
+the late-arrival evidence (<code>wait_evidence()</code>) does not ask for a longer
+wait. In that state the governor lengthens prefetch lookahead and widens the
+radius.</p>
+<p>That move is a guess. Your proposal's §4.4 defines the state by evidence
+("near reads hit tiles that prefetch never queued, line and CPU have room"),
+but nothing records which tiles prefetch queued. So the governor can't tell
+apart four cases that need different fixes:</p>
+<table>
+<thead>
+<tr>
+<th>What happened to the tile X-Plane read blurry</th>
+<th>Real cause</th>
+<th>Right move</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>No prefetch path ever queued it</td>
+<td>The corridor was too short or too narrow, or prefetch was paused</td>
+<td>Longer lookahead or a wider radius, or find the pause</td>
+</tr>
+<tr>
+<td>It was queued, but not finished when X-Plane read it</td>
+<td>Prefetch started too late, or had too little capacity</td>
+<td>A longer paging lead, or the existing network/compute rules</td>
+</tr>
+<tr>
+<td>It was queued only to a coarser level than X-Plane wanted</td>
+<td>The paging model under-estimated the detail</td>
+<td>A longer paging lead, or report a k mismatch</td>
+</tr>
+<tr>
+<td>It was finished, then dropped from memory before the read</td>
+<td>Memory cache too small</td>
+<td>A bigger memory cache, if RAM allows</td>
+</tr>
+</tbody>
+</table>
+<p>Widening prefetch only helps in the first case. In the other three it adds
+downloads that compete with X-Plane's own reads.</p>
+<h2 id="2-goal">2. Goal</h2>
+<ul>
+<li>Classify every blurry near read in flight by what prefetch had done for
+  that tile beforehand.</li>
+<li>Base the <code>behind</code> state on that classification, and give each cause its
+  own move.</li>
+<li>Without evidence, move nothing: today's blind prefetch increase goes away.</li>
+<li>Ship the measurement and the flight-report table first, with no governor
+  rule, so the thresholds come from real flights (as Advise did).</li>
+</ul>
+<p>Out of scope: changing how the prefetcher chooses tiles. This plan only
+measures and tunes the existing knobs.</p>
+<h2 id="3-where-prefetch-queues-tiles-today">3. Where prefetch queues tiles today</h2>
+<p>Every path ends in one of two places, so two hooks cover them all:</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Code</th>
+<th>Ends in</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Velocity corridor</td>
+<td><code>SpatialPrefetcher._do_velocity_prefetch_cycle()</code></td>
+<td><code>_prefetch_tile()</code></td>
+</tr>
+<tr>
+<td>SimBrief route / waypoints</td>
+<td><code>_prefetch_along_flight_plan*()</code>, <code>_prefetch_waypoint_area()</code></td>
+<td><code>_prefetch_tile()</code></td>
+</tr>
+<tr>
+<td>Paging warm (coarse levels)</td>
+<td><code>SpatialPrefetcher.paging_split()</code></td>
+<td><code>_prefetch_tile(first_mip=…)</code></td>
+</tr>
+<tr>
+<td><code>.ter</code> load-ahead</td>
+<td><code>load_ahead_warm()</code></td>
+<td><code>_prefetch_tile(first_mip=…)</code></td>
+</tr>
+<tr>
+<td>DSF prefetch, paging-coarse tiles</td>
+<td><code>prefetch_dsf()</code> (the camera branch)</td>
+<td><code>_prefetch_tile(first_mip=…)</code></td>
+</tr>
+<tr>
+<td>DSF prefetch, corridor tiles</td>
+<td><code>prefetch_dsf()</code></td>
+<td><code>PrefetchCoordinator.publish()</code></td>
+</tr>
+<tr>
+<td><code>prefetch_tiles()</code> fallback</td>
+<td><code>SpatialPrefetcher.prefetch_tiles()</code></td>
+<td><code>_prefetch_tile()</code></td>
+</tr>
+</tbody>
+</table>
+<p>When a tile is done:</p>
+<ul>
+<li><code>PrefetchCoordinator._finish_candidate(candidate, CandidateState.COMPLETE)</code> (prefetch.py)</li>
+<li><code>BackgroundDDSBuilder</code> storing a predictive DDS (<code>dynamic_dds_cache.store</code>)</li>
+<li>the chunks queued by <code>_prefetch_tile()</code> arriving: <code>TileCompletionTracker</code> already watches these for predictive DDS</li>
+</ul>
+<p>When a tile leaves memory: <code>TileCacher</code> eviction (it already records
+<code>_recently_evicted[idx] = now</code>, getortho.py near line 17952).</p>
+<p>When X-Plane reads a tile blurry: <code>Tile._read_dds_bytes_budgeted()</code>, in the
+branch that bumps <code>near_reads_standin</code> (getortho.py).</p>
+<h2 id="4-design">4. Design</h2>
+<h3 id="41-prefetch-ledger-per-worker-process">4.1 Prefetch ledger (per worker process)</h3>
+<p>Each mount worker runs its own prefetcher and serves its own reads, so the
+ledger stays in the worker and no cross-process channel is needed.</p>
+<p>New module <code>autoortho/prefetch_ledger.py</code>. It must be pure: no getortho
+import, and the clock is injected, so tests run without a tile cacher.</p>
+<pre><code class="language-python">@dataclass
+class LedgerEntry:
+    first_queued: float            # monotonic time of the first queue
+    finest_mip: int                # finest level any path queued (0 = full)
+    sources: frozenset[str]        # &quot;velocity&quot;, &quot;simbrief&quot;, &quot;paging&quot;, &quot;ter&quot;, &quot;dsf&quot;
+    done_at: Optional[float] = None
+    done_mip: Optional[int] = None # finest level known complete
+    evicted_at: Optional[float] = None
+
+class PrefetchLedger:
+    MAX_ENTRIES = 8192             # ~100 B each: under 1 MB
+    TTL_S = 1200.0                 # 20 min, as the graphics memory meter
+
+    def note_queued(self, key, mip, source, now): ...
+    def note_done(self, key, mip, now): ...
+    def note_evicted(self, key, now): ...
+    def classify_miss(self, key, wanted_mip, now) -&gt; str: ...
+</code></pre>
+<ul>
+<li><strong>Key:</strong> <code>(row, col, zoom)</code>, without the maptype. DSF prefetch may rewrite
+  the maptype (<code>maptype_override</code>) while reads use the resolved one, so a
+  key that includes it would split one tile into two entries. Different
+  maptypes for one tile in one session are rare, and merging them only
+  makes a miss look covered.</li>
+<li><strong>Bounded:</strong> an <code>OrderedDict</code> used as an LRU, with entries older than
+  <code>TTL_S</code> dropped on access. One lock, held only for dictionary work.</li>
+<li><code>note_queued</code> keeps the <strong>finest</strong> <code>mip</code> and the earliest time, and adds
+  the source.</li>
+<li><code>note_done</code> sets <code>done_at</code> and <code>done_mip</code>; <code>note_evicted</code> sets
+  <code>evicted_at</code>.</li>
+</ul>
+<p><code>classify_miss(key, wanted_mip, now)</code> returns, checking in this order:</p>
+<ol>
+<li><code>"never"</code>: no entry, or the first queue was less than <code>MIN_LEAD_S</code>
+   (2 s) before the read. A queue that came that late is a reaction to
+   X-Plane, not foresight.</li>
+<li><code>"evicted"</code>: <code>done_mip &lt;= wanted_mip</code> and <code>evicted_at &gt; done_at</code>.</li>
+<li><code>"coarse"</code>: <code>finest_mip &gt; wanted_mip</code> (only a coarser level was queued).</li>
+<li><code>"late"</code>: queued at <code>finest_mip &lt;= wanted_mip</code>, but not done
+   (<code>done_at is None</code> or <code>done_mip &gt; wanted_mip</code>).</li>
+<li><code>"done"</code>: complete at the wanted level and not evicted. The read was
+   blurry for another reason (a failed chunk, or a level marked as missing
+   colour). Counted, not acted on.</li>
+</ol>
+<h3 id="42-hooks">4.2 Hooks</h3>
+<p>All hooks are best effort: wrapped in <code>try</code>/<code>except</code> and logged at debug
+level, like <code>_note_wanted_level()</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Hook</th>
+<th>Call</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SpatialPrefetcher._prefetch_tile()</code>, after it submitted at least one chunk or found the tile complete</td>
+<td><code>ledger.note_queued((row, col, zoom), first_mip, source, now)</code>. <code>source</code> is a new keyword argument, passed by each caller from the table in §3 (default <code>"velocity"</code>).</td>
+</tr>
+<tr>
+<td><code>prefetch_dsf()</code>, after <code>prefetch_coordinator.publish()</code> returned <code>created</code> or the key was already known</td>
+<td><code>ledger.note_queued(key, 0, "dsf", now)</code></td>
+</tr>
+<tr>
+<td><code>PrefetchCoordinator._finish_candidate(…, COMPLETE)</code></td>
+<td>a new optional <code>on_complete(key)</code> callback set by getortho, which calls <code>ledger.note_done(key, 0, now)</code></td>
+</tr>
+<tr>
+<td><code>TileCompletionTracker</code>, when all of a tile's queued chunks are ready</td>
+<td><code>ledger.note_done(key, first_mip_of_that_submission, now)</code></td>
+</tr>
+<tr>
+<td><code>TileCacher</code> eviction (<code>_recently_evicted[idx] = now</code>)</td>
+<td><code>ledger.note_evicted(key, now)</code></td>
+</tr>
+<tr>
+<td><code>Tile._read_dds_bytes_budgeted()</code>, near band, not real, <strong>not starting</strong>, X-Plane connected</td>
+<td><code>kind = ledger.classify_miss(key, wanted, now)</code>, then <code>bump(f"near_miss_{kind}")</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Geometry for "never" misses.</strong> A tile prefetch never queued either lay
+outside the corridor (fix: radius) or inside it while prefetch did not run
+(fix: find the pause). To tell which, the read hook also computes the
+tile's <strong>cross-track offset</strong> from the aircraft track at the time of the
+read, using <code>current_camera()</code> and <code>paging_model.bearing_deg()</code> /
+<code>ground_distance_m()</code>, which already exist:</p>
+<ul>
+<li><code>|cross_track| &gt; 0.8 × prefetch_radius</code> → <code>near_miss_never_wide</code></li>
+<li>otherwise → <code>near_miss_never_inside</code></li>
+</ul>
+<p><code>never_inside</code> while prefetch was paused points at the pauses: the RAM brake
+(<code>ram_brake_activations</code>), live pressure
+(<code>LivePressureController</code>), <code>prefetch_during_live_reads = False</code>, or the
+runtime gate (<code>is_prefetch_runtime_allowed()</code>). Also bump
+<code>near_miss_never_paused</code> when any of these was active in the last
+<code>prefetch_interval</code> seconds. <code>SpatialPrefetcher</code> records the time of its
+last skipped cycle as <code>self._last_skip_at</code>.</p>
+<p><strong>Turns.</strong> In a turn, tiles on the outside of the turn are never in a
+straight-ahead corridor. The read hook runs in the worker, so the ledger
+keeps its own small deque of <code>(time, track_deg)</code> from <code>current_camera()</code>
+(its fourth field), appended at most once a second. When the track changed
+by more than 30° in the last 60 s, count the miss as
+<code>near_miss_never_turn</code> instead of <code>wide</code>. A wider radius is the wrong fix
+for a turn; SimBrief prefetch already covers planned turns.</p>
+<h3 id="43-governor">4.3 Governor</h3>
+<p>New <code>Sample</code> fields (cumulative counters, all workers summed, read like
+<code>near_reads_standin</code>):</p>
+<pre><code>near_miss_never_wide, near_miss_never_inside, near_miss_never_paused,
+near_miss_never_turn, near_miss_coarse, near_miss_late,
+near_miss_evicted, near_miss_done
+</code></pre>
+<p><code>Window</code> gets their deltas over the 30 s window.</p>
+<p>Classification replaces today's <code>return "behind"</code> fallback. It runs only
+when fidelity is under <code>FIDELITY_LOW</code> and <code>wait_evidence()</code> did not return
+<code>"wait"</code> or <code>"too_slow"</code>:</p>
+<pre><code class="language-python">misses = w.miss_counts            # dict kind -&gt; count in the window
+total = sum(misses.values())
+if total &lt; MIN_MISSES:            # 10 in 30 s
+    return &quot;ok&quot;                   # no evidence: move nothing
+kind, count = max(misses.items(), key=lambda kv: kv[1])
+if count &lt; 0.5 * total:
+    return &quot;ok&quot;                   # no single cause
+return {
+    &quot;never_wide&quot;: &quot;behind_wide&quot;,
+    &quot;never_inside&quot;: &quot;behind_short&quot;,
+    &quot;never_paused&quot;: &quot;prefetch_paused&quot;,
+    &quot;never_turn&quot;: &quot;ok&quot;,           # turns: nothing to tune
+    &quot;coarse&quot;: &quot;paging_coarse&quot;,
+    &quot;late&quot;: &quot;prefetch_late&quot;,
+    &quot;evicted&quot;: &quot;memory_evicted&quot;,
+    &quot;done&quot;: &quot;ok&quot;,
+}[kind]
+</code></pre>
+<p>Moves (<code>_PLAN</code>):</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Move</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>behind_wide</code></td>
+<td><code>prefetch_radius_nm</code> +1 step</td>
+<td></td>
+</tr>
+<tr>
+<td><code>behind_short</code></td>
+<td><code>prefetch_lookahead</code> +1 step</td>
+<td>Inside the corridor yet never queued: usually the corridor ended too early for the speed</td>
+</tr>
+<tr>
+<td><code>prefetch_paused</code></td>
+<td>none</td>
+<td>Notice naming the pause ("prefetch paused by low memory 40 % of the last 5 minutes"). The RAM brake is the right owner.</td>
+</tr>
+<tr>
+<td><code>paging_coarse</code></td>
+<td>new lever <code>streaming.paging_lead_seconds</code> +1 step</td>
+<td>Already read at call time through <code>streaming_options</code>, so it is live with no engine change. Range 30-180 s, step 15 s.</td>
+</tr>
+<tr>
+<td><code>prefetch_late</code></td>
+<td><code>streaming.paging_lead_seconds</code> +1, then <code>autoortho.prefetch_max_chunks</code> +1</td>
+<td>Starts prefetch earlier first, then lets it do more per cycle. Skipped when the network is saturated (already a network state).</td>
+</tr>
+<tr>
+<td><code>memory_evicted</code></td>
+<td><code>cache.cache_mem_limit</code> +1</td>
+<td>Only when not in the <code>memory</code> state and RSS is under 80 % of <code>ram_gb</code></td>
+</tr>
+</tbody>
+</table>
+<p>Keep/revert metric for these states: the share of near misses of that kind
+(lower is better). <code>_metric()</code> returns <code>-share</code> for them.</p>
+<p>Headroom easing (<code>state == "headroom"</code>) already brings
+<code>prefetch_lookahead</code>, <code>prefetch_radius_nm</code> and the new lever back toward
+baseline, so no new decay code is needed.</p>
+<p><code>levers_for()</code> gains:</p>
+<pre><code class="language-python">LeverSpec(&quot;streaming.paging_lead_seconds&quot;, &quot;Prefetch lead time&quot;,
+          15, 30, 180, unit=&quot;s&quot;, group=&quot;prefetch&quot;),
+LeverSpec(&quot;autoortho.prefetch_max_chunks&quot;, &quot;Prefetch chunks per cycle&quot;,
+          64, 128, 2048, group=&quot;prefetch&quot;),
+</code></pre>
+<p>Both are already handled live: <code>prefetch_max_chunks</code> has a
+<code>live_settings</code> hook (<code>_on_live_prefetch</code>), and <code>paging_lead_seconds</code> is
+read at call time. Add <code>paging_lead_seconds</code> to the registry with
+<code>owner="governed"</code>, <code>live=True</code>.</p>
+<p><code>STATE_TEXT</code> and the unreachable notice's "limiting" map gain the new states
+in plain words: "Prefetch corridor too narrow", "Prefetch starts too late",
+"Prefetch asks for too little detail", "Prefetch paused", "Memory cache
+too small". <code>home_snapshot.BOTTLENECK_GAUGE</code> maps <code>memory_evicted</code> to
+<code>computer</code> and the others to no gauge, since they are prefetch rather than
+a resource.</p>
+<h3 id="44-transparency">4.4 Transparency</h3>
+<ul>
+<li><strong>Flight report</strong> (<code>diagnostics._render_flight</code>): a <em>Blurry moments by
+  cause</em> table with the share of each miss kind, by phase. It ships in
+  step 1, before any governor rule.</li>
+<li><strong>Tuning page:</strong> the decision reason gives the evidence, for example
+  "prefetch corridor too narrow: 14 of 18 blurry tiles lay 6-9 nm off the
+  track".</li>
+<li><strong>Home:</strong> no new block. A <code>prefetch_paused</code> notice reaches Home only when
+  it repeats (§13.5: raw counters stay off Home).</li>
+</ul>
+<h2 id="5-work-plan">5. Work plan</h2>
+<p>Each step can ship on its own.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Content</th>
+<th>Files</th>
+<th>Tests</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1. Ledger</td>
+<td><code>PrefetchLedger</code>, <code>LedgerEntry</code>, <code>classify_miss()</code></td>
+<td>new <code>prefetch_ledger.py</code></td>
+<td>new <code>tests/test_prefetch_ledger.py</code>: queue → read (<code>never</code> / <code>late</code> / <code>coarse</code> / <code>done</code>), done → evict → read (<code>evicted</code>), finest-mip merge, the LRU bound, TTL expiry, <code>MIN_LEAD_S</code></td>
+</tr>
+<tr>
+<td>2. Hooks</td>
+<td>the <code>source</code> argument on <code>_prefetch_tile()</code> and its callers; DSF publish; coordinator <code>on_complete</code>; completion tracker; eviction; read-side <code>classify_miss</code> + geometry + turn + pause tagging</td>
+<td><code>getortho.py</code>, <code>prefetch.py</code></td>
+<td>extend <code>tests/test_paging_prefetch.py</code> and <code>tests/test_load_ahead.py</code> (each path records its source and mip); a tile read test like <code>test_late_arrivals.py::test_tile_watches_…</code> for the miss counters; coordinator test for <code>on_complete</code></td>
+</tr>
+<tr>
+<td>3. Report</td>
+<td><em>Blurry moments by cause</em> in the flight report; counters in the timeline JSON</td>
+<td><code>diagnostics.py</code>, <code>governor.py</code> (summary)</td>
+<td><code>tests/test_tuning_ui.py::test_report_renders_flight_verdict</code> extended</td>
+</tr>
+<tr>
+<td>—</td>
+<td><strong>Fly 5-10 flights with step 3, read the reports, set <code>MIN_MISSES</code>, the 50 % dominance share and the 0.8 × radius threshold from them</strong></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>4. Governor rules</td>
+<td><code>Sample</code>/<code>Window</code> fields; new states and moves; <code>paging_lead_seconds</code> and <code>prefetch_max_chunks</code> levers; <code>_metric</code> for the new states; remove the blind <code>behind</code> fallback</td>
+<td><code>governor.py</code>, <code>settings_registry.py</code>, <code>aoconfig.py</code> (template comment), <code>home_snapshot.py</code></td>
+<td><code>tests/test_governor.py</code>: one classifier case per kind, no move without evidence, keep/revert on the miss share, and a replay test over a recorded <code>samples-*.jsonl</code> from step 3</td>
+</tr>
+<tr>
+<td>5. Docs</td>
+<td><code>docs/config.md</code> governor section; proposal implementation notes</td>
+<td>docs</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>Rough size: step 1 about 150 lines plus tests. Step 2 is the risky one,
+since <code>_prefetch_tile()</code> has seven callers; about 120 lines. Step 4 is about
+120 lines in <code>governor.py</code>.</p>
+<h2 id="6-risks-and-decisions">6. Risks and decisions</h2>
+<ul>
+<li><strong>The starting phase.</strong> While X-Plane loads an area, every near read is a
+  "never" miss, because prefetch can't know where a flight starts. Starting
+  is excluded with the same <code>flight_is_starting()</code> the wait bands use, plus
+  the jump rule in <code>wait_bands.StartTracker</code>.</li>
+<li><strong>Teleports and replays.</strong> Same as starting: the jump detection covers
+  them.</li>
+<li><strong>Lock contention.</strong> <code>note_queued</code> runs once per tile submission (at most
+  a few hundred per prefetch cycle), and <code>classify_miss</code> once per blurry
+  near read. One dictionary lookup under a lock: negligible next to the
+  chunk work around it.</li>
+<li><strong>Key mismatch between prefetch and reads.</strong> Prefetch uses the <code>.ter</code> zoom
+  (<code>zoom</code> in <code>_prefetch_tile(row, col, zoom)</code>), and reads use
+  <code>tilename_zoom</code>. Both are the file's zoom, but step 2's tests must assert
+  that one tile gives the same key on both sides, including a DSF tile with
+  <code>maptype_override</code>.</li>
+<li><strong>Several workers.</strong> Each worker's ledger sees only its own prefetches and
+  reads. A tile belongs to one scenery package, so to one worker. The
+  governor sums the counters, as it already does for <code>near_reads_*</code>.</li>
+<li><strong>Paging k.</strong> <code>paging_coarse</code> often means k is wrong rather than the lead
+  too short. Once the fitted k is persisted (the deferred "keep the measured
+  paging k" item), a coarse miss share that stays high after the lead
+  reached its maximum should become a notice suggesting a k check.</li>
+<li><strong>Behaviour change.</strong> Removing the blind <code>behind</code> fallback means a low
+  fidelity with no evidence moves nothing. That is intended, but
+  <code>_note_limited()</code> only runs for states with moves, so the unreachable
+  notice would no longer fire in that case. Add a separate state,
+  <code>unexplained</code>, for fidelity under <code>FIDELITY_LOW</code> with no dominant miss
+  cause. It has no moves; after <code>UNREACHABLE_AFTER_S</code> it sets the notice
+  "Scenery was often blurry and AutoOrtho could not tell why; the flight
+  report lists the blurry tiles by cause". The classifier above returns
+  <code>unexplained</code> instead of <code>ok</code> in its two "no evidence" branches whenever
+  fidelity is low.</li>
+</ul>
+<h2 id="7-done-when">7. Done when</h2>
+<ul>
+<li>The flight report shows blurry near reads by cause for every flight.</li>
+<li>The governor's <code>behind_*</code>, <code>paging_coarse</code>, <code>prefetch_late</code> and
+  <code>memory_evicted</code> decisions cite the miss evidence in their reason, and
+  replay tests over recorded flights reproduce them.</li>
+<li>No prefetch lever moves without at least <code>MIN_MISSES</code> classified misses
+  in the window.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.a5f9d56c.min.js"></script>
+      
+    
+  </body>
+</html>
