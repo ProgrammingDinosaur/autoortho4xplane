@@ -25,7 +25,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:
     from autoortho.dds_manifest import (
@@ -54,6 +54,40 @@ except ImportError:
     _HAS_ZSTD = False
 
 log = logging.getLogger(__name__)
+
+DDS_HEADER_BYTES = 128
+
+
+class _SizeShim:
+    """The two tile fields ``_is_stale`` reads, for checks without a Tile."""
+
+    class _DDS:
+        def __init__(self, total_size):
+            self.total_size = total_size
+
+    def __init__(self, max_zoom, total_size):
+        self.max_zoom = max_zoom
+        self.dds = self._DDS(total_size)
+
+
+def mm0_row_layout(width: int, height: int, fmt) -> Tuple[int, int, int]:
+    """(start, row_bytes, rows) of mipmap 0's 256-pixel rows in a DDS file."""
+    block = 16 if str(fmt).upper() in ("BC3", "DXT5") else 8
+    length = max(1, (width * height) >> 4) * block
+    rows = max(1, (height + 255) // 256)
+    return DDS_HEADER_BYTES, length // rows, rows
+
+
+def _rows_match(raw: bytes, manifests, width: int, height: int, fmt) -> bool:
+    """Every mipmap-0 row of ``raw`` matches its row manifest."""
+    start, row_bytes, rows = mm0_row_layout(width, height, fmt)
+    if set(manifests) != set(range(rows)):
+        return False
+    for row in range(rows):
+        begin = start + row * row_bytes
+        if not manifests[row].validate_data(raw[begin:begin + row_bytes]):
+            return False
+    return True
 
 
 def _writes_allowed_default() -> bool:
@@ -242,6 +276,15 @@ class DynamicDDSCache:
         if self._compression == "zstd" and not _HAS_ZSTD:
             log.warning("zstandard not installed - DDS cache compression disabled")
             self._compression = "none"
+        # Direct reads (see open_direct): finished textures are served from
+        # their cache file, which must be stored uncompressed.
+        self.serve_from_disk = self._serve_from_disk_setting()
+        if self.serve_from_disk:
+            self._compression = "none"
+        # Entries open for direct reads: key -> number of open handles.
+        # Eviction skips them (guarded by self._lock).
+        self._pins: Dict[str, int] = {}
+        self._promoting: set = set()
 
         if self._enabled:
             os.makedirs(self._dds_root, exist_ok=True)
@@ -1283,6 +1326,165 @@ class DynamicDDSCache:
                 self._partial_row_condition.wait(remaining)
         return True
 
+    # ------------------------------------------------------------------
+    # Direct reads: finished textures served from their cache file
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _serve_from_disk_setting() -> bool:
+        try:
+            from autoortho.aoconfig import CFG
+        except ImportError:
+            from aoconfig import CFG  # type: ignore[no-redef]
+        value = getattr(getattr(CFG, "pydds", None), "serve_from_disk", True)
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    def open_direct(self, row: int, col: int, maptype: str,
+                    tilename_zoom: int, max_zoom: int,
+                    expected_size: int) -> Optional[dict]:
+        """The cache entry of a texture that can be served as a plain file.
+
+        Returns ``None`` unless the entry is at ``max_zoom``, not stale,
+        uncompressed, complete and exact in mipmap 0, populated at every
+        level and exactly ``expected_size`` bytes. A compressed entry that is
+        otherwise servable is rewritten uncompressed in the background, so a
+        later open can be direct.
+
+        The returned entry is pinned (skipped by eviction) until
+        :meth:`unpin` is called with its ``key``.
+        """
+        if not (self._enabled and self.serve_from_disk):
+            return None
+        tile_id = f"{row}_{col}_{maptype}_{tilename_zoom}"
+        try:
+            dds_path, ddm_path = self._paths_for(
+                row, col, maptype, tilename_zoom, max_zoom
+            )
+            meta = self._read_ddm(ddm_path)
+            if meta is None or meta.get("max_zl") != max_zoom:
+                return None
+            shim = _SizeShim(max_zoom, expected_size)
+            if self._is_stale(meta, shim, dds_path):
+                return None
+            if not self._mm0_cache_complete(meta):
+                return None
+            mm_count = int(meta.get("mm", 0) or 0)
+            populated = meta.get("populated_mipmaps")
+            if populated is not None and not set(range(mm_count)) <= set(populated):
+                return None
+            if meta.get("disk_compression", "none") != "none":
+                self._schedule_promote(tile_id, max_zoom, dds_path, ddm_path,
+                                       expected_size)
+                self._bump("dds_direct_compressed_skip")
+                return None
+            stat = os.stat(dds_path)
+            if stat.st_size != expected_size:
+                return None
+            manifests = manifests_from_dict(meta["mm0_manifest"], tile_id=tile_id)
+        except (OSError, KeyError, TypeError, ValueError):
+            return None
+        except Exception as exc:
+            log.debug(f"DDS direct open failed for {tile_id}: {exc}")
+            return None
+
+        key = self._tile_key(tile_id, max_zoom)
+        with self._lock:
+            self._pins[key] = self._pins.get(key, 0) + 1
+            if key in self._entries:
+                old = self._entries[key]
+                self._entries[key] = (dds_path, ddm_path, old[2], time.time())
+                self._entries.move_to_end(key)
+            else:
+                size = self._entry_disk_size(dds_path, ddm_path)
+                self._entries[key] = (dds_path, ddm_path, size, time.time())
+                self._current_size += size
+            self._hits += 1
+        return {
+            "key": key,
+            "tile_id": tile_id,
+            "max_zoom": max_zoom,
+            "dds_path": dds_path,
+            "size": expected_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "width": int(meta.get("w", 0) or 0),
+            "height": int(meta.get("h", 0) or 0),
+            "fmt": meta.get("fmt"),
+            "manifests": manifests,
+        }
+
+    def unpin(self, key: str) -> None:
+        """Release one direct-read pin taken by :meth:`open_direct`."""
+        with self._lock:
+            count = self._pins.get(key, 0) - 1
+            if count > 0:
+                self._pins[key] = count
+            else:
+                self._pins.pop(key, None)
+
+    def is_pinned(self, key: str) -> bool:
+        with self._lock:
+            return key in self._pins
+
+    def _schedule_promote(self, tile_id, max_zoom, dds_path, ddm_path,
+                          expected_size) -> None:
+        key = self._tile_key(tile_id, max_zoom)
+        with self._lock:
+            if key in self._promoting:
+                return
+            self._promoting.add(key)
+        if not self._submit_maintenance(
+            self._promote_uncompressed, key, dds_path, ddm_path, expected_size
+        ):
+            with self._lock:
+                self._promoting.discard(key)
+
+    def _promote_uncompressed(self, key, dds_path, ddm_path,
+                              expected_size) -> bool:
+        """Rewrite a zstd entry uncompressed so it can be read directly."""
+        try:
+            if not writes_allowed():
+                return False
+            with self._tile_file_lock(ddm_path):
+                meta = self._read_ddm(ddm_path)
+                if meta is None or meta.get("disk_compression") != "zstd":
+                    return False
+                with open(dds_path, "rb") as f:
+                    raw = self._decompress_dds(f.read(), meta)
+                if len(raw) != expected_size:
+                    return False
+                tile_id = (
+                    f"{int(meta['tile_row'])}_{int(meta['tile_col'])}_"
+                    f"{meta['map']}_{int(meta['zl'])}"
+                )
+                manifests = manifests_from_dict(meta["mm0_manifest"],
+                                                tile_id=tile_id)
+                if not _rows_match(raw, manifests, int(meta.get("w", 0)),
+                                   int(meta.get("h", 0)), meta.get("fmt")):
+                    return False
+                tmp = dds_path + f".tmp.{os.getpid()}.{threading.get_ident()}"
+                with open(tmp, "wb") as f:
+                    f.write(raw)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, dds_path)
+                meta["disk_compression"] = "none"
+                self._write_ddm(ddm_path, meta)
+            self._record_store(key, dds_path, ddm_path, count_store=False)
+            self._bump("dds_direct_promoted")
+            return True
+        except Exception as exc:
+            log.debug(f"DDS cache promote failed for {key}: {exc}")
+            try:
+                os.remove(dds_path + f".tmp.{os.getpid()}.{threading.get_ident()}")
+            except OSError:
+                pass
+            return False
+        finally:
+            with self._lock:
+                self._promoting.discard(key)
+
     def contains(self, tile_id: str, max_zoom: int, tile) -> bool:
         """Check if a COMPLETE tile exists in the cache.
 
@@ -2250,12 +2452,21 @@ class DynamicDDSCache:
         to_delete = []
 
         with self._lock:
+            # Entries open for direct reads are kept: on Windows their delete
+            # would fail and orphan the file, elsewhere it wastes the work.
+            skipped = []
             while freed < bytes_to_free and self._entries:
-                key, (dds_path, ddm_path, size, _) = self._entries.popitem(last=False)
+                key, entry = self._entries.popitem(last=False)
+                if key in self._pins:
+                    skipped.append((key, entry))
+                    continue
+                dds_path, ddm_path, size, _ = entry
                 self._current_size -= size
                 freed += size
                 self._evictions += 1
                 to_delete.append((dds_path, ddm_path))
+            for key, entry in skipped:
+                self._entries[key] = entry
 
         # Delete files outside the lock
         for dds_path, ddm_path in to_delete:

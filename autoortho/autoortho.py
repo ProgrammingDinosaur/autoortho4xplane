@@ -388,6 +388,7 @@ class AOMount:
             stats_addr=None,
             stats_auth=None,
             log_addr=None,
+            mounts=None,
     ):
         self._start_performance_diagnostics()
         log.info(f"AutoOrtho:  root: {root}  mountpoint: {mountpoint}")
@@ -408,12 +409,14 @@ class AOMount:
             log_addr=log_addr,
             loglevel=loglevel,
             extra_env=worker_env,
+            mounts=mounts,
         )
         self.mount_workers.append(handle)
         if self._performance_profiler is not None:
             self._performance_profiler.register_process(
                 handle.pid,
-                f"mount-worker:{volname}",
+                "mount-worker:shared" if mounts and len(mounts) > 1
+                else f"mount-worker:{volname}",
             )
         # Backward-compatible process list used by maptype/custom-map reload code.
         self.mac_os_procs.append(handle.process)
@@ -1309,6 +1312,38 @@ class AOMount:
             self.log_addr,
         )
 
+    def _shared_worker_enabled(self):
+        """One worker for every mount ([fuse] shared_worker, not on macOS)."""
+        if system_type == "darwin":
+            return False
+        value = getattr(getattr(self.cfg, "fuse", None), "shared_worker", True)
+        if isinstance(value, str):
+            value = value.strip().lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    def _launch_shared_worker(self, sceneries, threading_enabled=True):
+        """Serve every scenery mount from one worker process."""
+        nothreads = not threading_enabled
+        mounts = []
+        for scenery in sceneries:
+            root = os.path.expanduser(scenery.get('root'))
+            mountpoint = os.path.expanduser(scenery.get('mount'))
+            volname = os.path.basename(os.path.normpath(mountpoint)) or mountpoint
+            mounts.append((root, mountpoint, volname))
+            self._active_mountpoints.append(mountpoint)
+        log.info("Serving %d mounts from one shared worker", len(mounts))
+        first = mounts[0]
+        return self.launch_mount_worker(
+            first[0],
+            first[1],
+            first[2],
+            nothreads,
+            self.stats_addr,
+            self.stats_auth,
+            self.log_addr,
+            mounts=mounts,
+        )
+
     def _monitor_mount_workers(self):
         healthy = True
         while self.mounts_running:
@@ -1379,14 +1414,24 @@ class AOMount:
         self._active_mountpoints = []
         self.mount_workers = []
         self.mac_os_procs = []
-        self._worker_cpu_share_count = max(1, len(self.cfg.scenery_mounts))
+        shared = (
+            self._shared_worker_enabled() and len(self.cfg.scenery_mounts) > 1
+        )
+        self._worker_cpu_share_count = (
+            1 if shared else max(1, len(self.cfg.scenery_mounts))
+        )
         try:
-            for scenery in self.cfg.scenery_mounts:
-                self._launch_scenery_worker(
-                    scenery.get('root'),
-                    scenery.get('mount'),
-                    self.cfg.fuse.threading,
+            if shared:
+                self._launch_shared_worker(
+                    self.cfg.scenery_mounts, self.cfg.fuse.threading
                 )
+            else:
+                for scenery in self.cfg.scenery_mounts:
+                    self._launch_scenery_worker(
+                        scenery.get('root'),
+                        scenery.get('mount'),
+                        self.cfg.fuse.threading,
+                    )
         except Exception:
             log.exception("Failed to launch scenery mount workers")
             self.unmount_sceneries(force=True)

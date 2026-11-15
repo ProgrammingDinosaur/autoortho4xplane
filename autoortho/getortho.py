@@ -85,6 +85,11 @@ except ImportError:
     import texture_plan
     import wait_bands
 
+try:
+    from autoortho import disk_texture
+except ImportError:
+    import disk_texture
+
 # Photo textures X-Plane holds (finest level read in the last 20 minutes):
 # the graphics memory estimate auto-tuning watches for the texture cap.
 held_textures = texture_plan.HeldTextures()
@@ -1558,10 +1563,45 @@ try:
     )
 except (TypeError, ValueError):
     _live_tile_admission_limit = 16
+
+
+def _live_build_memory_bytes(cache_mem_gb=None):
+    """Byte budget of live builds admitted at once.
+
+    ``[autoortho] live_build_memory_mb``; 0 (default) derives it from
+    ``[cache] cache_mem_limit``: a quarter of it, between 256 MB and 2 GB.
+    """
+    try:
+        explicit = float(getattr(CFG.autoortho, "live_build_memory_mb", 0) or 0)
+    except (TypeError, ValueError):
+        explicit = 0
+    if explicit > 0:
+        return int(explicit * 1048576)
+    try:
+        if cache_mem_gb is None:
+            cache_mem_gb = float(getattr(CFG.cache, "cache_mem_limit", 4))
+        derived = int(float(cache_mem_gb) * 1024 ** 3 / 4)
+    except (TypeError, ValueError):
+        derived = 1024 ** 3
+    return max(256 * 1048576, min(2 * 1024 ** 3, derived))
+
+
+def live_build_weight(width, height, mip):
+    """Memory a live build of level ``mip`` holds while it runs.
+
+    The RGBA image plus its BC data and resize buffers: about 4.5 bytes per
+    pixel (75 MB for a 4096 px level, 1.2 MB for 512 px).
+    """
+    w = max(1, int(width) >> int(mip))
+    h = max(1, int(height) >> int(mip))
+    return w * h * 9 // 2
+
+
 # Resizable so the governor can widen or narrow live admission while
-# streaming (live_settings.py).
+# streaming (live_settings.py), and weighted by each build's memory.
 _live_tile_admission = ResizableGate(
-    _live_tile_admission_limit
+    _live_tile_admission_limit,
+    byte_budget=_live_build_memory_bytes(),
 )
 
 _read_ahead_executor = None
@@ -1620,14 +1660,20 @@ def _live_read_end():
     live_pressure_controller.live_read_end()
 
 
-def acquire_live_tile_slot(timeout: float) -> bool:
-    """Bound complete live tile work before expensive tile state is created."""
+def acquire_live_tile_slot(timeout: float, weight: int = 0) -> bool:
+    """Bound complete live tile work before expensive tile state is created.
+
+    ``weight`` is the memory the build will hold (:func:`live_build_weight`);
+    pass the same value to :func:`release_live_tile_slot`.
+    """
     started = time.monotonic()
-    acquired = _live_tile_admission.acquire(blocking=False)
+    acquired = _live_tile_admission.acquire(blocking=False, weight=weight)
     if not acquired:
         # The governor's compute signal: live tiles queueing for admission.
         bump("live_admission_waits")
-        acquired = _live_tile_admission.acquire(timeout=max(0.0, timeout))
+        acquired = _live_tile_admission.acquire(
+            timeout=max(0.0, timeout), weight=weight
+        )
     waited_ms = (time.monotonic() - started) * 1000.0
     record_stage(
         "tile.admission_wait",
@@ -1639,9 +1685,9 @@ def acquire_live_tile_slot(timeout: float) -> bool:
     return acquired
 
 
-def release_live_tile_slot() -> None:
+def release_live_tile_slot(weight: int = 0) -> None:
     try:
-        _live_tile_admission.release()
+        _live_tile_admission.release(weight=weight)
     except ValueError:
         log.error("Live tile admission released without a matching acquire")
 
@@ -2072,6 +2118,7 @@ def _on_live_predictive_memory(value):
 def _on_live_cache_limit(value):
     try:
         TileCacher.cache_mem_lim = int(float(value) * 1024 ** 3)
+        _live_tile_admission.set_byte_budget(_live_build_memory_bytes(value))
     except (TypeError, ValueError):
         pass
 
@@ -7192,6 +7239,115 @@ def note_texture_requested(row, col, zoom):
     """FUSE hook: X-Plane opened a texture."""
     if terrain_load_ahead is not None:
         terrain_load_ahead.note_texture_request(row, col, zoom)
+
+
+def note_texture_wanted(tile_id, row, col, tilename_zoom, width, mip):
+    """X-Plane wants level ``mip`` of a texture now: evidence for the paging model.
+
+    ``width`` is the texture's level-0 width in pixels.
+    """
+    try:
+        held_textures.note(tile_id, max(1, int(width) >> int(mip)))
+    except Exception:  # statistics only
+        pass
+    camera = current_camera()
+    if camera is None:
+        return
+    try:
+        distance, _lat, _lon, size_m = tile_distance_m(
+            row, col, tilename_zoom, camera
+        )
+        get_paging_model().note_read(mip, distance, size_m, int(width))
+    except Exception as exc:  # statistics only
+        log.debug(f"Paging sample for {tile_id} failed: {exc}")
+
+
+def _expected_dds_size(width, height):
+    """Size of a DDS of ``width`` x ``height`` in the configured format."""
+    block = 16 if str(CFG.pydds.format).upper() in ("BC3", "DXT5") else 8
+    size = 128
+    w, h = int(width), int(height)
+    while w >= 1 and h >= 1:
+        size += max(1, (w * h) >> 4) * block
+        w >>= 1
+        h >>= 1
+    return size
+
+
+def _tile_dimensions(tilename_zoom, max_zoom, width=16, height=16):
+    """Pixel size of a tile's DDS, as ``Tile.__init__`` derives it."""
+    diff = int(tilename_zoom) - int(max_zoom)
+    if diff >= 0:
+        cols, rows = width >> diff, height >> diff
+    else:
+        cols, rows = width << (-diff), height << (-diff)
+    return max(1, cols) * 256, max(1, rows) * 256
+
+
+def open_disk_texture(tile_cacher, row, col, map_type, zoom):
+    """A :class:`disk_texture.DiskTexture` for this texture, or None.
+
+    Only when the DDS cache holds its finished, exact DDS at the tile's
+    current target zoom ([pydds] serve_from_disk). A texture X-Plane already
+    has open as a live tile stays live, so one texture is never served two
+    ways at once.
+    """
+    cache = dynamic_dds_cache
+    if cache is None or not getattr(cache, "serve_from_disk", False):
+        return None
+    if is_shutdown_requested():
+        return None
+    try:
+        maptype = tile_cacher._resolve_maptype(row, col, map_type, zoom)
+        tile_id = f"{row}_{col}_{maptype}_{zoom}"
+        with tile_cacher.tc_lock:
+            live = tile_cacher.tiles.get(tile_id)
+            if live is not None and live.refs > 0:
+                return None
+        max_zoom = tile_cacher._get_target_zoom_level(zoom, row=row, col=col)
+        width, height = _tile_dimensions(zoom, max_zoom)
+        entry = cache.open_direct(
+            row, col, maptype, zoom, max_zoom,
+            _expected_dds_size(width, height),
+        )
+        if entry is None:
+            return None
+        if entry["width"] != width or entry["height"] != height:
+            cache.unpin(entry["key"])
+            return None
+
+        dxt_format = CFG.pydds.format
+        block_bytes = colour_table.block_bytes(dxt_format)
+
+        def recolour(data, offset):
+            try:
+                table = season_colour_table(row, col, zoom)
+            except Exception as exc:
+                log.debug(f"Season lookup for {tile_id} failed: {exc}")
+                return data
+            if table is None:
+                return data
+            return colour_table.apply(data, offset, block_bytes, table)
+
+        def note_wanted(mip, _level_width):
+            note_texture_wanted(tile_id, row, col, zoom, width, mip)
+
+        texture = disk_texture.DiskTexture(
+            entry,
+            unpin=cache.unpin,
+            invalidate=cache.invalidate,
+            recolour=recolour,
+            note_wanted=note_wanted,
+            metric=bump,
+        )
+    except disk_texture.DiskTextureFailed as exc:
+        log.debug(f"Direct read unavailable for {row}_{col}_{zoom}: {exc}")
+        return None
+    except Exception as exc:
+        log.debug(f"Direct read open failed for {row}_{col}_{zoom}: {exc}")
+        return None
+    bump("dds_direct_opens")
+    return texture
 
 
 def _start_terrain_load_ahead():
@@ -14144,25 +14300,39 @@ class Tile(object):
             bump("live_admission_skipped")
         return needed
 
+    def live_slot_weight(self, offset, length):
+        """Memory the live build of this read holds (for admission).
+
+        Weighted by the read's first level (its largest): the whole level
+        for a read of all of it, otherwise the share of its 256-pixel rows
+        the read covers (rows are built as they are read).
+        """
+        dds = self.dds
+        if dds is None or not dds.mipmap_list:
+            return 0
+        try:
+            start = max(int(offset), dds.mipmap_list[0].startpos)
+            mip = self.find_mipmap_pos(start)
+            mm = dds.mipmap_list[mip]
+            full = live_build_weight(dds.width, dds.height, mip)
+            covered = min(int(offset) + int(length), mm.endpos) - start
+            if covered >= mm.length:
+                return full
+            rows = max(1, math.ceil((max(4, int(dds.height) >> mip)) / 256))
+            row_bytes = max(1, math.ceil(mm.length / rows))
+            first = (start - mm.startpos) // row_bytes
+            last = (start + max(1, covered) - 1 - mm.startpos) // row_bytes
+            return min(full, math.ceil(full * (last - first + 1) / rows))
+        except Exception:
+            return 0
+
     def _note_wanted_level(self, mip):
         """X-Plane wants ``mip`` of this tile now: evidence for the paging model."""
         self._last_wanted_mip = mip
-        try:
-            held_textures.note(self.id, max(1, int(self.dds.width) >> int(mip)))
-        except Exception:  # statistics only
-            pass
-        camera = current_camera()
-        if camera is None:
-            return
-        try:
-            distance, _lat, _lon, size_m = tile_distance_m(
-                self.row, self.col, self.tilename_zoom, camera
-            )
-            get_paging_model().note_read(
-                mip, distance, size_m, int(self.dds.width)
-            )
-        except Exception as exc:  # statistics only
-            log.debug(f"Paging sample for {self.id} failed: {exc}")
+        note_texture_wanted(
+            self.id, getattr(self, "row", None), getattr(self, "col", None),
+            getattr(self, "tilename_zoom", None), int(self.dds.width), mip,
+        )
 
     def _read_unsealed(self, offset, length):
         """Bytes served as they are now, without sealing any mipmap-0 row."""
@@ -18111,6 +18281,81 @@ class TileCacher(object):
         # Floor: never set target below 0
         return max(0, my_target)
 
+    @staticmethod
+    def _close_evicted(batch) -> int:
+        """Close tiles already removed from ``self.tiles`` (outside tc_lock)."""
+        closed = 0
+        for tile_id, t in batch:
+            try:
+                # Release external references BEFORE close() so the
+                # tile object can be garbage-collected once close()
+                # drops the last internal references.
+                # TileCompletionTracker may hold a strong ref to
+                # the tile, preventing GC for up to 10 minutes.
+                if tile_completion_tracker is not None:
+                    try:
+                        tile_completion_tracker.stop_tracking(tile_id)
+                    except Exception:
+                        pass
+                _ledger_evicted(t)
+                t.close()
+            except Exception:
+                pass
+            finally:
+                t = None
+            closed += 1
+        return closed
+
+    # Tiles checked per cleaner pass for a finished DDS on disk.
+    _DISK_BACKED_SCAN = 256
+
+    def _drop_disk_backed(self) -> int:
+        """Drop closed tiles whose finished DDS is in the disk cache.
+
+        With direct reads on ([pydds] serve_from_disk), every later open of
+        such a texture is served from its cache file, so keeping the tile in
+        memory only costs RAM.
+        """
+        cache = dynamic_dds_cache
+        if cache is None or not getattr(cache, "serve_from_disk", False):
+            return 0
+        with self.tc_lock:
+            candidates = [
+                (idx, t) for idx, t in self.tiles.items()
+                if t.refs <= 0
+                and (
+                    getattr(t, "_dds_persisted", False)
+                    or getattr(t, "_dds_persistence_accepted", False)
+                )
+                and not getattr(t, "_dds_needs_healing", False)
+            ][: self._DISK_BACKED_SCAN]
+        on_disk = []
+        for idx, t in candidates:
+            try:
+                # The same check a direct open makes: dropping a tile whose
+                # entry cannot be read directly would force a rebuild.
+                entry = cache.open_direct(
+                    t.row, t.col, t.maptype, t.tilename_zoom, t.max_zoom,
+                    t.dds.total_size,
+                )
+                if entry is not None:
+                    cache.unpin(entry["key"])
+                    on_disk.append(idx)
+            except Exception:
+                continue
+        if not on_disk:
+            return 0
+        batch = []
+        with self.tc_lock:
+            for idx in on_disk:
+                t = self.tiles.get(idx)
+                if t is not None and t.refs <= 0:
+                    batch.append((idx, self.tiles.pop(idx)))
+        dropped = self._close_evicted(batch)
+        if dropped:
+            bump("tiles_dropped_disk_backed", dropped)
+        return dropped
+
     def _evict_batch(self, max_to_evict: int) -> int:
         """
         Evict tiles with minimal lock holding time.
@@ -18154,30 +18399,10 @@ class TileCacher(object):
             
             if not batch:
                 break
-            
+
             # PHASE 2: Close tiles OUTSIDE lock (slow I/O operations)
             # This is safe because tiles are already removed from self.tiles
-            for tile_id, t in batch:
-                try:
-                    # Release external references BEFORE close() so the
-                    # tile object can be garbage-collected once close()
-                    # drops the last internal references.
-                    # TileCompletionTracker may hold a strong ref to
-                    # the tile, preventing GC for up to 10 minutes.
-                    if tile_completion_tracker is not None:
-                        try:
-                            tile_completion_tracker.stop_tracking(
-                                tile_id
-                            )
-                        except Exception:
-                            pass
-                    _ledger_evicted(t)
-                    t.close()
-                except Exception:
-                    pass
-                finally:
-                    t = None
-                evicted += 1
+            evicted += self._close_evicted(batch)
 
         # Prompt garbage collection after large eviction batches.
         # DDS buffers are multi-MB objects; Python's generational GC may
@@ -18229,6 +18454,15 @@ class TileCacher(object):
             if not self.enable_cache:
                 self._clean_stop.wait(poll_interval)
                 continue
+
+            # Finished textures are served from disk: their closed tiles go
+            # first, before any memory pressure builds up.
+            try:
+                if self._drop_disk_backed() >= 8:
+                    _release_memory_to_os()
+                    cur_mem = _get_process_mem_bytes(process)
+            except Exception as exc:
+                log.debug(f"Disk-backed tile drop failed: {exc}")
 
             # Use aggregated memory across all workers when available; otherwise local RSS
             # Also check for staleness to avoid using outdated stats

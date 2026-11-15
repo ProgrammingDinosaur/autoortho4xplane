@@ -126,12 +126,12 @@ def _load_fuse(monkeypatch, acquired):
     stub.is_shutdown_requested = lambda: False
     stub.begin_shutdown = lambda *a, **k: None
 
-    def acquire(timeout):
+    def acquire(timeout, weight=0):
         acquired.append(timeout)
         return True
 
     stub.acquire_live_tile_slot = acquire
-    stub.release_live_tile_slot = lambda: acquired.append("released")
+    stub.release_live_tile_slot = lambda weight=0: acquired.append("released")
     monkeypatch.setitem(sys.modules, "getortho", stub)
     monkeypatch.setitem(sys.modules, "autoortho.getortho", stub)
 
@@ -192,3 +192,134 @@ def test_fuse_read_takes_a_slot_only_when_needed(monkeypatch, tmp_path, needs, s
     assert fake.reads == [(0, CHUNK)]
     assert len([a for a in acquired if a != "released"]) == slots
     assert acquired.count("released") == slots
+
+
+# ------------------------------------------------------------ weighted gate
+
+
+def test_gate_admits_by_memory_within_the_count_limit():
+    from autoortho.live_settings import ResizableGate
+
+    gate = ResizableGate(8, byte_budget=100)
+    assert gate.acquire(blocking=False, weight=60)
+    assert not gate.acquire(blocking=False, weight=50)  # over the budget
+    assert gate.acquire(blocking=False, weight=40)
+    assert gate.weight_held == 100
+    gate.release(weight=60)
+    assert gate.acquire(blocking=False, weight=50)
+    assert gate.held == 2
+
+
+def test_gate_admits_an_oversized_request_alone():
+    from autoortho.live_settings import ResizableGate
+
+    gate = ResizableGate(4, byte_budget=100)
+    assert gate.acquire(blocking=False, weight=500)
+    assert not gate.acquire(blocking=False, weight=1)
+    gate.release(weight=500)
+    assert gate.acquire(blocking=False, weight=1)
+
+
+def test_gate_serves_waiters_in_order():
+    import threading
+    import time
+    from autoortho.live_settings import ResizableGate
+
+    gate = ResizableGate(8, byte_budget=100)
+    assert gate.acquire(weight=80)
+    order = []
+
+    def heavy():
+        assert gate.acquire(timeout=5, weight=90)
+        order.append("heavy")
+
+    waiter = threading.Thread(target=heavy)
+    waiter.start()
+    time.sleep(0.1)
+    # A light request would fit, but the heavy waiter came first.
+    assert not gate.acquire(blocking=False, weight=10)
+    gate.release(weight=80)
+    waiter.join(5)
+    assert order == ["heavy"]
+
+
+def test_gate_without_budget_counts_only():
+    from autoortho.live_settings import ResizableGate
+
+    gate = ResizableGate(2)
+    assert gate.acquire(blocking=False, weight=10 ** 9)
+    assert gate.acquire(blocking=False, weight=10 ** 9)
+    assert not gate.acquire(blocking=False)
+
+
+def test_read_weight_follows_the_rows_it_builds(tile):
+    mm0 = tile.dds.mipmap_list[0]
+    full = getortho.live_build_weight(tile.dds.width, tile.dds.height, 0)
+    assert tile.live_slot_weight(mm0.startpos, mm0.length) == full
+    rows = tile.dds.height // 256
+    one_row = tile.live_slot_weight(mm0.startpos, 1024)
+    assert one_row == -(-full // rows)
+    mm2 = tile.dds.mipmap_list[2]
+    assert tile.live_slot_weight(mm2.startpos, mm2.length) == full // 16
+
+
+def test_build_memory_budget_is_derived_from_the_cache_limit(monkeypatch):
+    monkeypatch.setattr(getortho.CFG.autoortho, "live_build_memory_mb", 0, raising=False)
+    assert getortho._live_build_memory_bytes(4) == 1024 ** 3
+    assert getortho._live_build_memory_bytes(0.5) == 256 * 1048576
+    assert getortho._live_build_memory_bytes(64) == 2 * 1024 ** 3
+    monkeypatch.setattr(getortho.CFG.autoortho, "live_build_memory_mb", 300, raising=False)
+    assert getortho._live_build_memory_bytes(4) == 300 * 1048576
+
+
+# ------------------------------------------------------------ direct reads
+
+
+def test_fuse_serves_a_finished_texture_from_disk_then_falls_back(monkeypatch, tmp_path):
+    acquired = []
+    module = _load_fuse(monkeypatch, acquired)
+    failed = module.disk_texture.DiskTextureFailed
+    stub = module.getortho
+
+    class FakeTexture:
+        size = 11184952
+
+        def __init__(self):
+            self.reads = 0
+            self.closed = False
+
+        def read(self, offset, length):
+            self.reads += 1
+            if self.reads > 1:
+                raise failed("checksum")
+            return b"d" * length
+
+        def close(self):
+            self.closed = True
+
+    texture = FakeTexture()
+    stub.note_texture_requested = lambda *a: None
+    stub.open_disk_texture = lambda *a: texture
+    stub.bump = lambda *a, **k: None
+    root = tmp_path / "scenery"
+    root.mkdir()
+    ao = module.AutoOrtho(str(root), cache_dir=str(tmp_path / "cache"))
+    live = _FakeTile(False)
+    opened, closed = [], []
+    ao.tc = types.SimpleNamespace(
+        _get_tile=lambda *args: live,
+        _open_tile=lambda *args: opened.append(args) or live,
+        _close_tile=lambda *args: closed.append(args),
+    )
+    path = "/textures/24832_12416_BI16.dds"
+
+    fh = ao.open(path, 0)
+    assert fh >= 1 << 32
+    assert ao.read(path, 100, 0, fh) == b"d" * 100
+    assert opened == []  # no tile in memory
+    # The file fails a check: the rest of this open is served live.
+    assert ao.read(path, 100, 200, fh) == b"\0" * 100
+    assert len(opened) == 1 and live.reads == [(200, 100)]
+    ao.release(path, fh)
+    assert texture.closed
+    assert len(closed) == 1

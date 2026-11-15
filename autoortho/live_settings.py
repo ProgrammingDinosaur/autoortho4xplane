@@ -18,6 +18,7 @@ hold permits.
 
 from __future__ import annotations
 
+import collections
 import logging
 import threading
 import time
@@ -31,17 +32,27 @@ POLL_EVERY_S = 1.5
 
 
 class ResizableGate:
-    """A bounded semaphore whose limit can change.
+    """A bounded semaphore whose limit can change, optionally weighted.
 
     Shrinking never takes permits away from holders: new acquirers wait until
     enough holders have released to get under the new limit. Releasing more
     than acquired raises ``ValueError``, like ``BoundedSemaphore``.
+
+    With a ``byte_budget``, each acquire may carry a ``weight`` (the memory
+    its work will hold): it is admitted while the count is under the limit
+    and the weights held stay within the budget. A request heavier than the
+    whole budget is admitted when nothing else holds the gate, so nothing
+    starves. Waiters are served in arrival order, so a heavy request is not
+    overtaken forever by a stream of light ones.
     """
 
-    def __init__(self, limit: int):
+    def __init__(self, limit: int, byte_budget: int = 0):
         self._cond = threading.Condition()
         self._limit = max(1, int(limit))
         self._held = 0
+        self._budget = max(0, int(byte_budget))
+        self._weight = 0
+        self._queue = collections.deque()
 
     @property
     def limit(self) -> int:
@@ -53,35 +64,76 @@ class ResizableGate:
         with self._cond:
             return self._held
 
-    def acquire(self, blocking: bool = True, timeout: Optional[float] = None) -> bool:
+    @property
+    def byte_budget(self) -> int:
         with self._cond:
+            return self._budget
+
+    @property
+    def weight_held(self) -> int:
+        with self._cond:
+            return self._weight
+
+    def _fits(self, weight: int) -> bool:
+        if self._held >= self._limit:
+            return False
+        if self._budget <= 0 or weight <= 0 or self._held == 0:
+            return True
+        return self._weight + weight <= self._budget
+
+    def _take(self, weight: int) -> None:
+        self._held += 1
+        self._weight += weight
+
+    def acquire(
+        self,
+        blocking: bool = True,
+        timeout: Optional[float] = None,
+        weight: int = 0,
+    ) -> bool:
+        weight = max(0, int(weight))
+        with self._cond:
+            if not self._queue and self._fits(weight):
+                self._take(weight)
+                return True
             if not blocking:
-                if self._held < self._limit:
-                    self._held += 1
-                    return True
                 return False
             deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-            while self._held >= self._limit:
-                if deadline is None:
-                    self._cond.wait()
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return False
-                    self._cond.wait(remaining)
-            self._held += 1
-            return True
+            ticket = object()
+            self._queue.append(ticket)
+            try:
+                while not (self._queue[0] is ticket and self._fits(weight)):
+                    if deadline is None:
+                        self._cond.wait()
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return False
+                        self._cond.wait(remaining)
+                self._take(weight)
+                return True
+            finally:
+                self._queue.remove(ticket)
+                # The next waiter may fit now (or became the head).
+                self._cond.notify_all()
 
-    def release(self) -> None:
+    def release(self, weight: int = 0) -> None:
+        weight = max(0, int(weight))
         with self._cond:
             if self._held <= 0:
                 raise ValueError("ResizableGate released too many times")
             self._held -= 1
-            self._cond.notify()
+            self._weight = max(0, self._weight - weight)
+            self._cond.notify_all()
 
     def resize(self, limit: int) -> None:
         with self._cond:
             self._limit = max(1, int(limit))
+            self._cond.notify_all()
+
+    def set_byte_budget(self, byte_budget: int) -> None:
+        with self._cond:
+            self._budget = max(0, int(byte_budget))
             self._cond.notify_all()
 
     def __enter__(self):

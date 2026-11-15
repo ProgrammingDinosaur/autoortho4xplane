@@ -293,6 +293,10 @@ live_builder_concurrency = 8
 # End-to-end live tile requests admitted before allocating composition state.
 # Keep this high enough to saturate downloads while bounding ZL17 working memory.
 live_tile_admission = 16
+# Memory live builds may hold at once, in MB: each read is weighted by the
+# level it builds (75MB for a 4096px level, 300MB for 8192px). 0 = a quarter
+# of [cache] cache_mem_limit, between 256MB and 2GB.
+live_build_memory_mb = 0
 # Maximum retained RGBA fallback imagery per tile. ZL17 mipmap 0 alone is
 # 256MB and is therefore composed, compressed, and released instead of cached.
 tile_image_cache_mb = 96
@@ -522,9 +526,14 @@ real_from_index = True
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
-# Disk compression for cached DDS files (none or zstd)
-# zstd reduces cache disk usage by 30-60% with ~2-5ms added read latency
-# none stores raw DDS data (fastest reads, largest disk usage)
+# Serve finished textures straight from the DDS cache file, without loading
+# them into AutoOrtho's memory (the OS file cache holds them instead).
+# Needs uncompressed cache files: while on, dds_compression is ignored and
+# compressed entries are rewritten uncompressed the first time they are used.
+serve_from_disk = True
+# Disk compression for cached DDS files (none or zstd), used only when
+# serve_from_disk is off. zstd saves about 10% on BC1 photo textures and
+# costs ~40ms of CPU per write and ~10ms per read.
 dds_compression = zstd
 # Zstd compression level (1-19, default 3)
 # Higher = smaller files, slower writes (reads are always fast)
@@ -545,6 +554,10 @@ storage_safety_margin_gb = 2
 [fuse]
 # Enable or disable multi-threading when using FUSE
 threading = True
+# Serve every scenery mount from one worker process (one tile cache, one
+# memory limit, one download pool). Windows and Linux only: macOS always
+# uses one worker per mount.
+shared_worker = True
 # NOTE: build_timeout (FUSE lock timeout) is calculated dynamically from the
 # tile budget (the longest [streaming] wait). Formula: that budget +
 # fallback_timeout (if enabled) + 15s.

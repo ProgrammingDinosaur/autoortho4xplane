@@ -2068,10 +2068,12 @@ class ConfigUI(QMainWindow):
         except Exception:
             cores = None
         home = (governor_snapshot or {}).get("home") or {}
-        mounted = len([
-            handle for handle in getattr(self, "mount_workers", [])
+        # A shared worker serves several mounts.
+        mounted = sum(
+            len(getattr(handle, "mounts", ()) or ()) or 1
+            for handle in getattr(self, "mount_workers", [])
             if handle.process.poll() is None
-        ]) or len(getattr(self.cfg, "scenery_mounts", []) or [])
+        ) or len(getattr(self.cfg, "scenery_mounts", []) or [])
         snapshot = home_snapshot_module.build(
             runtime=runtime,
             governor=governor_snapshot,
@@ -2753,11 +2755,10 @@ class ConfigUI(QMainWindow):
         self.home_page.set_xplane_state(
             "Connected" if xplane_connected else "Disconnected"
         )
-        mounted_count = len(
-            [
-                handle for handle in getattr(self, "mount_workers", [])
-                if handle.process.poll() is None
-            ]
+        mounted_count = sum(
+            len(getattr(handle, "mounts", ()) or ()) or 1
+            for handle in getattr(self, "mount_workers", [])
+            if handle.process.poll() is None
         )
         self.home_page.set_mounted_scenery(
             f"{mounted_count} active",

@@ -1,5 +1,6 @@
 import argparse
 import gc
+import json
 import logging
 import logging.handlers
 import os
@@ -305,6 +306,101 @@ def _shutdown_getortho():
         log.error("Error stopping getortho worker subsystems: %s", exc)
 
 
+def _poison_mount(mountpoint):
+    """Ask one of this process's own FUSE loops to exit (see _getattr_poison)."""
+    try:
+        os.lstat(os.path.join(mountpoint, ".poison"))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log.debug("Poison trigger for %s failed: %s", mountpoint, exc)
+
+
+def _serve_shared(mounts, nothreads, runtime):
+    """Serve every mount from this process, each FUSE loop on its own thread.
+
+    All mounts share one TileCacher: one memory limit, one prefetcher, one
+    DDS builder. If one mount fails while the others run, the others are
+    unmounted too and the worker exits with an error, as a per-mount worker
+    failure did before (the parent then fails all mounts).
+    """
+    FUSE, AutoOrtho, fuse_option_profiles_by_os, mount_systemtype = runtime
+    try:
+        from autoortho import getortho
+    except ImportError:
+        import getortho
+
+    tile_cacher = getortho.TileCacher(".cache")
+    failures = []
+    mounted = {}
+    lock = threading.Lock()
+    ended_early = threading.Event()
+
+    def serve(root, mountpoint, volname):
+        _clear_root_poison(root)
+        try:
+            with setupmount(mountpoint, mount_systemtype) as mp:
+                path = os.path.abspath(mp)
+                ao = AutoOrtho(root, use_ns=True, tile_cacher=tile_cacher)
+                with lock:
+                    if ended_early.is_set():
+                        return  # another mount already failed
+                    mounted[mountpoint] = path
+                log.info("Starting FUSE mount %s", mountpoint)
+                FUSE(ao, path, **fuse_option_profiles_by_os(nothreads, volname))
+            log.info("FUSE: Exiting mount %s", mountpoint)
+        except BaseException as exc:  # one mount failing fails the worker
+            log.error("FUSE mount %s failed: %s", mountpoint, exc)
+            with lock:
+                failures.append((mountpoint, exc))
+        finally:
+            with lock:
+                mounted.pop(mountpoint, None)
+                if not _worker_stopping.is_set():
+                    # A mount ended on its own (unmounted or failed): the
+                    # others go too, so the parent sees the worker exit.
+                    ended_early.set()
+
+    threads = [
+        threading.Thread(
+            target=serve, args=spec, name=f"AO-FUSE-{spec[2] or index}",
+            daemon=False,
+        )
+        for index, spec in enumerate(mounts)
+    ]
+    for thread in threads:
+        thread.start()
+
+    def poison_remaining():
+        with lock:
+            remaining = list(mounted.values())
+        for path in remaining:
+            _poison_mount(path)
+
+    try:
+        while any(thread.is_alive() for thread in threads):
+            for thread in threads:
+                thread.join(0.5)
+            if ended_early.is_set():
+                # Repeated: a mount may still be starting when the first
+                # poison is sent, and a poison before FUSE serves the path
+                # does nothing.
+                poison_remaining()
+    except BaseException:
+        # A signal (SystemExit) reaches the main thread only: unmount the
+        # FUSE threads too, or they keep the process alive.
+        ended_early.set()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and any(t.is_alive() for t in threads):
+            poison_remaining()
+            for thread in threads:
+                thread.join(0.2)
+        raise
+    if failures:
+        mountpoint, exc = failures[0]
+        raise RuntimeError(f"FUSE mount {mountpoint} failed: {exc}") from exc
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -312,13 +408,28 @@ def main():
     parser.add_argument("--nothreads", action="store_true")
     parser.add_argument("--volname")
     parser.add_argument(
+        "--mounts-json",
+        help="Every (root, mountpoint, volname) to serve from this process.",
+    )
+    parser.add_argument(
         "--loglevel",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default="DEBUG",
     )
     args, unknown = parser.parse_known_args()
 
-    mount_name = args.volname or os.path.basename(os.path.abspath(args.mountpoint))
+    mounts = None
+    if args.mounts_json:
+        mounts = [tuple(str(part) for part in spec) for spec in json.loads(args.mounts_json)]
+    shared = bool(mounts) and len(mounts) > 1
+    if shared and system_type == "darwin":
+        # macFUSE cannot run several mounts from one process through the
+        # Python FUSE binding; the parent never asks for this on macOS.
+        parser.error("--mounts-json with several mounts is not supported on macOS")
+
+    mount_name = "shared" if shared else (
+        args.volname or os.path.basename(os.path.abspath(args.mountpoint))
+    )
     configure_worker_logging(mount_name, args.loglevel)
     try:
         try:
@@ -332,9 +443,13 @@ def main():
     _install_signal_handlers()
     _start_reload_poll_thread()
 
-    log.info("MOUNT: %s", args.mountpoint)
-    _clear_root_poison(args.root)
-    FUSE, AutoOrtho, fuse_option_profiles_by_os, mount_systemtype = _runtime_for_platform()
+    if shared:
+        log.info("MOUNT (shared worker): %s", ", ".join(m[1] for m in mounts))
+    else:
+        log.info("MOUNT: %s", args.mountpoint)
+        _clear_root_poison(args.root)
+    runtime = _runtime_for_platform()
+    FUSE, AutoOrtho, fuse_option_profiles_by_os, mount_systemtype = runtime
     if sys.platform != "win32":
         if __package__:
             from .posix_crash import capture_worker_images
@@ -355,15 +470,19 @@ def main():
         except Exception:
             pass
 
-        with setupmount(args.mountpoint, mount_systemtype) as mountpoint:
-            ao = AutoOrtho(args.root, use_ns=True)
-            _start_control_thread(os.path.abspath(mountpoint))
-            FUSE(
-                ao,
-                os.path.abspath(mountpoint),
-                **additional_args,
-            )
-        log.info("FUSE: Exiting mount %s", args.mountpoint)
+        if shared:
+            _start_control_thread(os.path.abspath(os.path.expanduser(mounts[0][1])))
+            _serve_shared(mounts, args.nothreads, runtime)
+        else:
+            with setupmount(args.mountpoint, mount_systemtype) as mountpoint:
+                ao = AutoOrtho(args.root, use_ns=True)
+                _start_control_thread(os.path.abspath(mountpoint))
+                FUSE(
+                    ao,
+                    os.path.abspath(mountpoint),
+                    **additional_args,
+                )
+            log.info("FUSE: Exiting mount %s", args.mountpoint)
     except SystemExit:
         raise
     except Exception as exc:

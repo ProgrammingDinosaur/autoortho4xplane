@@ -56,6 +56,11 @@ except ImportError:
     import getortho
 
 try:
+    from autoortho import disk_texture
+except ImportError:
+    import disk_texture
+
+try:
     from autoortho.diagnostics import profile_span, record_stage
 except ImportError:
     from diagnostics import profile_span, record_stage
@@ -750,6 +755,21 @@ class DSFPrefetchScheduler:
                     )
 
 
+class _DirectHandle:
+    """One X-Plane open of a texture served from its cache file.
+
+    ``live`` turns on when the file failed a read: the rest of this open is
+    served by a live tile (holding a tile reference until release).
+    """
+
+    __slots__ = ("texture", "live", "lock")
+
+    def __init__(self, texture):
+        self.texture = texture
+        self.live = False
+        self.lock = threading.Lock()
+
+
 class AutoOrtho(Operations):
 
     open_paths = []
@@ -782,7 +802,8 @@ class AutoOrtho(Operations):
         self.cache_dir = cache_dir
 
         getortho.clear_shutdown_request()
-        self.tc = getortho.TileCacher(cache_dir)
+        # Shared workers pass one TileCacher to every mount they serve.
+        self.tc = kwargs.get("tile_cacher") or getortho.TileCacher(cache_dir)
         
         # Register terrain index for this scenery
         # This indexes .ter files to discover actual tile zoom levels
@@ -831,6 +852,12 @@ class AutoOrtho(Operations):
         # Track redirected DSF file handles: fh -> redirect_path
         # Used when time exclusion redirects DSF reads to global scenery
         self._redirected_dsf_fhs = {}
+
+        # Textures served from their cache file: fh -> _DirectHandle. Their
+        # handles start above any OS file descriptor; live DDS opens use 0.
+        self._direct = {}
+        self._direct_lock = threading.Lock()
+        self._direct_fh = itertools.count(1 << 32)
 
         self.use_ns = kwargs.get("use_ns", False)
         
@@ -1441,6 +1468,15 @@ class AutoOrtho(Operations):
 
             tile_id = f"{row}_{col}_{maptype}_{zoom}"
             getortho.note_texture_requested(row, col, zoom)
+            # A finished texture is served from its cache file, with no
+            # tile in memory (see disk_texture.py).
+            direct = getortho.open_disk_texture(self.tc, row, col, maptype, zoom)
+            if direct is not None:
+                fh = next(self._direct_fh)
+                with self._direct_lock:
+                    self._direct[fh] = _DirectHandle(direct)
+                self._set_dds_size_cached(row, col, maptype, zoom, direct.size)
+                return fh
             with profile_span(
                 "fuse.dds_open",
                 tile_id=tile_id,
@@ -1471,6 +1507,19 @@ class AutoOrtho(Operations):
             return os.open(full_path, flags | os.O_BINARY)
         return os.open(full_path, flags)
 
+    def _switch_direct_to_live(self, direct, row, col, maptype, zoom):
+        """Serve the rest of a direct open from a live tile.
+
+        The cache file stays open until release: another read of this open
+        may still be using it.
+        """
+        with direct.lock:
+            if direct.live:
+                return
+            self.tc._open_tile(row, col, maptype, zoom)
+            direct.live = True
+        getortho.bump("dds_direct_fallbacks")
+
     def _create(self, path, mode, fi=None):
         uid, gid, pid = fuse_get_context()
         full_path = self._full_path(path)
@@ -1492,6 +1541,17 @@ class AutoOrtho(Operations):
             if getortho.is_shutdown_requested():
                 log.info(f"Shutdown in progress, returning fallback data for {path}")
                 return _generate_fallback_dds_bytes(offset, length)
+            direct = self._direct.get(fh) if fh else None
+            if direct is not None and not direct.live:
+                try:
+                    return direct.texture.read(offset, length)
+                except disk_texture.DiskTextureFailed as exc:
+                    log.warning(f"Direct read of {path} failed, serving it live: {exc}")
+                    try:
+                        self._switch_direct_to_live(direct, row, col, maptype, zoom)
+                    except Exception as switch_exc:
+                        log.error(f"Could not serve {path} live: {switch_exc}")
+                        return _generate_fallback_dds_bytes(offset, length)
             key = self._tile_key(row, col, maptype, zoom)
             tile_id = f"{row}_{col}_{maptype}_{zoom}"
             request_started = time.monotonic()
@@ -1567,6 +1627,7 @@ class AutoOrtho(Operations):
             )
             read_outcome = "ok"
             admitted = False
+            weight = 0
             lock_held = True
             try:
                 with profile_span(
@@ -1580,8 +1641,11 @@ class AutoOrtho(Operations):
                 # out into the fallback texture instead of the base level.
                 needs_slot = getattr(t, "needs_live_slot", None)
                 if needs_slot is None or needs_slot(offset, length):
+                    slot_weight = getattr(t, "live_slot_weight", None)
+                    weight = slot_weight(offset, length) if slot_weight else 0
                     admitted = getortho.acquire_live_tile_slot(
-                        max(0.0, request_deadline - time.monotonic())
+                        max(0.0, request_deadline - time.monotonic()),
+                        weight=weight,
                     )
                     if not admitted:
                         read_outcome = "fallback"
@@ -1613,7 +1677,7 @@ class AutoOrtho(Operations):
                 return _generate_fallback_dds_bytes(offset, length)
             finally:
                 if admitted:
-                    getortho.release_live_tile_slot()
+                    getortho.release_live_tile_slot(weight=weight)
                 if lock_held:
                     lock.release()
                 record_stage(
@@ -1686,6 +1750,16 @@ class AutoOrtho(Operations):
             col = int(col)
             zoom = int(zoom)
             maptype = self._resolve_dds_maptype(maptype)
+            if fh:
+                with self._direct_lock:
+                    direct = self._direct.pop(fh, None)
+                if direct is not None:
+                    with direct.lock:
+                        direct.texture.close()
+                        live = direct.live
+                    if live:
+                        self.tc._close_tile(row, col, maptype, zoom)
+                    return 0
             self.tc._close_tile(row, col, maptype, zoom)
             return 0
         try:
