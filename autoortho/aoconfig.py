@@ -156,8 +156,8 @@ kept_values =
 # offering to hand these back; a newly pinned one is offered again).
 dismissed_pinned =
 dismissed_update_version =
-# Hide when running
-hide = True
+# Hide the window to the system tray / menu bar while streaming
+hide = False
 # Console/UI log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 console_log_level = INFO
 # File log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
@@ -1681,6 +1681,11 @@ def _migrate_config_revision(cfg, user_config):
             "Config will now store only changed settings; values equal to "
             "their defaults follow future default changes"
         )
+        # general.hide did nothing before 3.2.0, so a saved "hide = True"
+        # from those releases was never a choice. 3.2.0 made it hide the
+        # window to the tray on streaming start, which left Mac users unable
+        # to find the window; it now defaults off.
+        cfg.config.set("general", "hide", "False")
     cfg.config.set("general", "config_revision", str(CONFIG_REVISION))
 
 

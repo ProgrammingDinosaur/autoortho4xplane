@@ -597,6 +597,12 @@ class ConfigUI(QMainWindow):
         self._closing = False
         self._shutdown_in_progress = False
         self._ready_to_close = False
+        if sys.platform == "darwin":
+            # Clicking the Dock icon activates the app but Qt does not show a
+            # hidden window; bring it back the way Mac users expect.
+            app = QApplication.instance()
+            if app is not None:
+                app.applicationStateChanged.connect(self._on_app_state_changed)
         self.runtime_state = RuntimeState.STOPPED
         self.mount_control_worker = None
         self._stop_target_state = RuntimeState.STOPPED
@@ -2129,6 +2135,11 @@ class ConfigUI(QMainWindow):
     def _on_tray_activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger,
                       QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._restore_from_tray()
+
+    def _on_app_state_changed(self, state):
+        if (state == Qt.ApplicationState.ApplicationActive
+                and self._hidden_to_tray and not self.isVisible()):
             self._restore_from_tray()
 
     def _restore_from_tray(self):
@@ -6244,7 +6255,8 @@ class ConfigUI(QMainWindow):
         self.hide_check.setToolTip(
             "Minimize AutoOrtho window to system tray when running.\n"
             "Helps keep desktop clean during long flights.\n"
-            "You can still access it from the system tray."
+            "You can still access it from the system tray (the menu bar on\n"
+            "macOS, or by clicking the Dock icon)."
         )
         general_layout.addWidget(self.hide_check)
 
@@ -10534,6 +10546,11 @@ class ConfigUI(QMainWindow):
                 panel.stop()
             event.accept()
             return
+
+        if self._hidden_to_tray:
+            # A dialog parented to a hidden window can open out of sight
+            # (macOS), leaving the quit stuck behind it.
+            self._restore_from_tray()
 
         if self.runtime_state == RuntimeState.RUNNING:
             reply = QMessageBox.question(

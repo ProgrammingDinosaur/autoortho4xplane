@@ -212,6 +212,28 @@ def test_old_config_gets_new_partial_build_default_once(tmp_path):
     assert reloaded.autoortho.native_partial_allow_incomplete is False
 
 
+def test_hide_window_is_off_by_default_and_for_old_configs(tmp_path):
+    assert aoconfig.AOConfig(str(tmp_path / "fresh")).general.hide is False
+
+    # Before 3.2.0 general.hide did nothing, so a saved True was never chosen.
+    old = tmp_path / "old"
+    old.write_text("[general]\nconfig_revision = 1\nhide = True\n", encoding="utf-8")
+    assert aoconfig.AOConfig(str(old)).general.hide is False
+
+    # 3.2.0 wrote the old default as a comment; it now follows the new one.
+    sparse = tmp_path / "sparse"
+    sparse.write_text("[general]\nconfig_revision = 2\n# hide = True\n", encoding="utf-8")
+    assert aoconfig.AOConfig(str(sparse)).general.hide is False
+
+    # A user who turned it on in 3.2.0 keeps it, across saves too.
+    chosen = tmp_path / "chosen"
+    chosen.write_text("[general]\nconfig_revision = 2\nhide = True\n", encoding="utf-8")
+    cfg = aoconfig.AOConfig(str(chosen))
+    assert cfg.general.hide is True
+    cfg.save()
+    assert aoconfig.AOConfig(str(chosen)).general.hide is True
+
+
 def test_fresh_config_starts_at_current_revision(tmp_path):
     cfg = aoconfig.AOConfig(str(tmp_path / ".autoortho"))
     assert cfg.general.config_revision == aoconfig.CONFIG_REVISION

@@ -374,6 +374,25 @@ def test_minimize_to_tray_while_streaming(qt_app, config_ui, monkeypatch):
     config_ui.hide_check.setChecked(False)
 
 
+def test_app_activation_restores_window_hidden_to_tray(qt_app, config_ui, monkeypatch):
+    """macOS: clicking the Dock icon activates the app; the window comes back."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QSystemTrayIcon
+    from ui.runtime_state import RuntimeState
+
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    config_ui.hide_check.setChecked(True)
+    config_ui.show()
+    config_ui._set_runtime_state(RuntimeState.RUNNING)
+    assert not config_ui.isVisible()
+    config_ui._on_app_state_changed(Qt.ApplicationState.ApplicationInactive)
+    assert not config_ui.isVisible()
+    config_ui._on_app_state_changed(Qt.ApplicationState.ApplicationActive)
+    assert config_ui.isVisible() and not config_ui._hidden_to_tray
+    config_ui._set_runtime_state(RuntimeState.STOPPED)
+    config_ui.hide_check.setChecked(False)
+
+
 # -- pinned settings in Auto mode ---------------------------------------------
 
 
