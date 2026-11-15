@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from ui.pages.settings_page import SettingsPage
 
 
-def test_settings_categories_search_and_presets(qt_app):
+def test_settings_categories_search_and_simple_view(qt_app):
     apply_button = QPushButton("Apply")
     revert_button = QPushButton("Revert")
     restart = QLabel("Restart")
@@ -29,16 +29,27 @@ def test_settings_categories_search_and_presets(qt_app):
         numeric_bindings=[("Exact", slider, 1, "")],
     )
     page.add_category("Pipeline", [QLabel("Buffer pool")])
+    page.add_category("Essentials", [QLabel("Quality target")], essential=True)
 
-    assert page.category_list.count() == 2
+    # The simple view shows only the essential categories.
+    assert page.visible_category_names() == ["Essentials"]
+    seen = []
+    page.show_all_changed.connect(seen.append)
+    page.set_show_all(True)
+    assert seen == [True]
+    assert page.category_list.count() == 3
+
+    # Search looks through every category, whatever the view.
+    page.set_show_all(False)
     page.search_edit.setText("buffer")
     assert page.category_list.count() == 1
     assert page.category_list.item(0).text() == "Pipeline"
+    page.search_edit.clear()
 
-    seen = []
-    page.preset_requested.connect(seen.append)
-    page.preset_combo.setCurrentText("Balanced")
-    assert seen == ["Balanced"]
+    # Asking for a hidden category shows all of them.
+    assert page.select_category("General") is True
+    assert page.show_all is True
+    assert page.category_list.currentItem().text() == "General"
 
 
 def test_search_no_results_shows_empty_state_and_navigation_clears_filter(

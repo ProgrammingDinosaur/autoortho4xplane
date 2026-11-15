@@ -105,9 +105,9 @@ def test_warm_uses_base_level_without_position(monkeypatch):
     monkeypatch.setattr(
         getortho.spatial_prefetcher,
         "_prefetch_tile",
-        lambda row, col, zoom, maptype=None, max_chunks=None, first_mip=0: (
-            calls.append(first_mip) or (1, True)
+        lambda row, col, zoom, maptype=None, max_chunks=None, first_mip=0, source="": (
+            calls.append((first_mip, source)) or (1, True)
         ),
     )
     assert getortho.load_ahead_warm(0, 0, "BI", 16)
-    assert calls == [4]
+    assert calls == [(4, "ter")]

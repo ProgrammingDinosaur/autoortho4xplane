@@ -118,11 +118,13 @@ class DDSBufferPool:
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         
-        # Pre-allocate numpy arrays
-        self._buffers = [
-            np.zeros(buffer_size, dtype=np.uint8)
-            for _ in range(pool_size)
-        ]
+        # Pre-allocate numpy arrays, by id. resize() adds ids and retires
+        # them, so ids are never reused while a caller may hold one.
+        self._buffers = {
+            index: np.zeros(buffer_size, dtype=np.uint8)
+            for index in range(pool_size)
+        }
+        self._next_id = pool_size
         self._available = list(range(pool_size))
         self._in_use = set()
         
@@ -222,6 +224,10 @@ class DDSBufferPool:
         
         # Timeout - remove ourselves from queue if still there
         with self._condition:
+            # A release may have handed us a buffer between the wait timing
+            # out and taking the lock: take it rather than leak it.
+            if buffer_id_holder[0] is not None:
+                return self._buffers[buffer_id_holder[0]], buffer_id_holder[0]
             try:
                 self._waiters = [w for w in self._waiters if w[1] != my_sequence]
                 heapq.heapify(self._waiters)
@@ -243,29 +249,36 @@ class DDSBufferPool:
         Args:
             buffer_id: The buffer ID returned from acquire()
         """
-        import heapq
-        
         with self._condition:
             if buffer_id not in self._in_use:
                 log.warning(f"DDSBufferPool: releasing buffer {buffer_id} that wasn't in use")
                 return
             
             self._in_use.remove(buffer_id)
-            
-            # Check for waiters - give buffer to highest priority (lowest number)
-            while self._waiters:
-                priority, sequence, event, buffer_id_holder = heapq.heappop(self._waiters)
-                
-                # Check if waiter is still waiting (not timed out)
-                if not event.is_set():
-                    # Assign buffer to this waiter
-                    buffer_id_holder[0] = buffer_id
-                    self._in_use.add(buffer_id)
-                    event.set()
-                    return
-            
-            # No waiters - return buffer to available pool
-            self._available.append(buffer_id)
+
+            # Shrunk while this buffer was out: retire it.
+            if len(self._buffers) > self._pool_size:
+                del self._buffers[buffer_id]
+                return
+
+            self._hand_out(buffer_id)
+
+    def _hand_out(self, buffer_id: int) -> None:
+        """Give a free buffer to the best waiter, else make it available.
+
+        Caller holds the lock.
+        """
+        import heapq
+
+        # Highest priority (lowest number) first.
+        while self._waiters:
+            _priority, _sequence, event, buffer_id_holder = heapq.heappop(self._waiters)
+            if not event.is_set():
+                buffer_id_holder[0] = buffer_id
+                self._in_use.add(buffer_id)
+                event.set()
+                return
+        self._available.append(buffer_id)
     
     def try_acquire(self, priority: int = PRIORITY_LIVE) -> Optional[Tuple[np.ndarray, int]]:
         """
@@ -298,6 +311,39 @@ class DDSBufferPool:
                 return self._buffers[buffer_id], buffer_id
             return None
     
+    def resize(self, pool_size: int) -> int:
+        """Change the number of buffers while the pool is in use.
+
+        Growing allocates the new buffers and serves waiters first.
+        Shrinking frees idle buffers at once and retires busy ones as they
+        are released; no holder loses its buffer. Returns the new size.
+        """
+        target = max(1, int(pool_size))
+        with self._condition:
+            missing = target - len(self._buffers)
+            self._pool_size = target
+            while len(self._buffers) > target and self._available:
+                del self._buffers[self._available.pop()]
+        if missing <= 0:
+            return target
+        fresh = [np.zeros(self._buffer_size, dtype=np.uint8) for _ in range(missing)]
+        with self._condition:
+            for buffer in fresh:
+                if len(self._buffers) >= self._pool_size:
+                    break       # shrunk again meanwhile
+                buffer_id = self._next_id
+                self._next_id += 1
+                self._buffers[buffer_id] = buffer
+                self._in_use.add(buffer_id)
+                self._hand_out_new(buffer_id)
+        log.debug(f"DDSBufferPool: resized to {target} buffers")
+        return target
+
+    def _hand_out_new(self, buffer_id: int) -> None:
+        """A new buffer (marked in use) goes to a waiter or the free list."""
+        self._in_use.discard(buffer_id)
+        self._hand_out(buffer_id)
+
     @property
     def buffer_size(self) -> int:
         """Size of each buffer in bytes."""
@@ -1020,10 +1066,46 @@ class StreamingBuilderPool:
             time.sleep(0.001)
     
     def _return_builder(self, handle: c_void_p) -> None:
-        """Return a builder handle to the pool."""
+        """Return a builder handle to the pool (destroyed if it shrank)."""
         with self._lock:
             self._in_use.discard(id(handle))
-            self._available.append(handle)
+            if self._total_created > self._pool_size:
+                self._total_created -= 1
+                destroy = True
+            else:
+                self._available.append(handle)
+                destroy = False
+        if destroy:
+            try:
+                self._lib.aodds_builder_destroy(handle)
+            except Exception:
+                pass
+
+    def resize(self, pool_size: int) -> int:
+        """Change how many builders may exist (they are created on demand).
+
+        Shrinking destroys idle builders at once and busy ones as they are
+        returned. Returns the new size.
+        """
+        target = max(1, int(pool_size))
+        idle = []
+        with self._lock:
+            self._pool_size = target
+            while self._total_created > target and self._available:
+                idle.append(self._available.pop())
+                self._total_created -= 1
+        for handle in idle:
+            try:
+                self._lib.aodds_builder_destroy(handle)
+            except Exception:
+                pass
+        log.debug(f"StreamingBuilderPool: resized to {target}")
+        return target
+
+    @property
+    def pool_size(self) -> int:
+        with self._lock:
+            return self._pool_size
     
     def close(self) -> None:
         """Destroy all builders in the pool."""
@@ -1189,6 +1271,32 @@ _default_builder_pool: Optional[StreamingBuilderPool] = None
 _default_builder_pool_lock = threading.Lock()
 
 
+def build_slot_count(cfg, setting: str, default: int) -> int:
+    """Build slots for a pool: background + live builders, or the user's own.
+
+    ``setting`` ("buffer_pool_size" or "streaming_builder_pool_size") is a
+    fixed size only when the user set it; otherwise the pool follows
+    ``background_builder_workers + live_builder_concurrency``, which the
+    governor moves live (getortho resizes the pools).
+    """
+    ao = cfg.autoortho
+    try:
+        custom = bool(cfg.is_custom("autoortho", setting))
+    except Exception:
+        custom = False
+    if custom:
+        try:
+            return int(getattr(ao, setting))
+        except (TypeError, ValueError):
+            return int(default)
+    try:
+        background = int(float(getattr(ao, "background_builder_workers", 2)))
+        live = int(float(getattr(ao, "live_builder_concurrency", 8)))
+    except (TypeError, ValueError):
+        return int(default)
+    return max(2, min(64, background + live))
+
+
 def _calculate_builder_pool_size() -> int:
     """
     Calculate the streaming builder pool size from config.
@@ -1209,8 +1317,8 @@ def _calculate_builder_pool_size() -> int:
             from autoortho.aoconfig import CFG
         except ImportError:
             from aoconfig import CFG
-        configured_pool_size = int(
-            getattr(CFG.autoortho, "streaming_builder_pool_size", 4)
+        configured_pool_size = build_slot_count(
+            CFG, "streaming_builder_pool_size", default=4
         )
     except Exception:
         # Config not available yet - use defaults

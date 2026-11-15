@@ -7,6 +7,13 @@ from typing import Any, Iterable
 
 
 if __package__ and __package__.startswith("autoortho."):
+    from autoortho import guards, hardware
+    from autoortho import limits as limits_module
+    from autoortho import target_cost
+    from autoortho.ui.dynamic_zoom_editor import PRESETS
+    from autoortho.ui.widgets.connection_test_panel import ConnectionTestPanel
+    from autoortho.ui.widgets.limits_editor import LimitsEditor
+    from autoortho.ui.widgets.target_cost_panel import TargetCostPanel
     from autoortho.ui.service_worker import ServiceWorker
     from autoortho.ui.services.readiness_service import ReadinessService
     from autoortho.ui.readiness import (
@@ -18,6 +25,14 @@ if __package__ and __package__.startswith("autoortho."):
         recursive_directory_usage_bytes,
     )
 else:
+    import guards
+    import hardware
+    import limits as limits_module
+    import target_cost
+    from ui.dynamic_zoom_editor import PRESETS
+    from ui.widgets.connection_test_panel import ConnectionTestPanel
+    from ui.widgets.limits_editor import LimitsEditor
+    from ui.widgets.target_cost_panel import TargetCostPanel
     from ui.service_worker import ServiceWorker
     from ui.services.readiness_service import ReadinessService
     from ui.readiness import (
@@ -32,6 +47,8 @@ else:
 from PySide6.QtCore import QSignalBlocker, QThread, Signal, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
+    QComboBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -40,7 +57,12 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QFileDialog,
+    QCheckBox,
+    QRadioButton,
+    QScrollArea,
+    QSpinBox,
     QTextEdit,
+    QWidget,
     QVBoxLayout,
     QWizard,
     QWizardPage,
@@ -164,12 +186,17 @@ class WelcomePage(_BasePage):
         layout = QVBoxLayout(self)
         label = QLabel(
             "AutoOrtho streams satellite scenery to X-Plane while you fly.\n\n"
-            "Setup verifies X-Plane and FUSE, prepares storage locations, "
-            "and lets you choose scenery regions. Plan for at least 20–30 GB "
-            "per region plus temporary download space."
+            "Setup checks this PC, finds X-Plane, sets up scenery and the "
+            "image cache, then the quality you want and what AutoOrtho may "
+            "use. Plan for at least 20–30 GB per region plus temporary "
+            "download space."
         )
         label.setWordWrap(True)
         layout.addWidget(label)
+        self.checks_label = QLabel()
+        self.checks_label.setWordWrap(True)
+        self.checks_label.setAccessibleName("System checks")
+        layout.addWidget(self.checks_label)
         layout.addStretch(1)
 
     def isComplete(self) -> bool:  # noqa: N802
@@ -245,7 +272,11 @@ class XPlanePage(_BasePage):
 
 class StoragePage(_BasePage):
     def __init__(self, wizard: "SetupWizard"):
-        super().__init__(wizard, "Storage", "Choose scenery and cache folders")
+        super().__init__(
+            wizard,
+            "Image cache",
+            "Where downloaded imagery is kept, and how much of it",
+        )
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.scenery_edit = QLineEdit()
@@ -261,19 +292,53 @@ class StoragePage(_BasePage):
         ):
             edit.setObjectName(f"{key}Edit")
             edit.textChanged.connect(lambda value, field=key: self.wizard_ref.set_value(field, value))
-        self._add_path_row(form, "&Scenery path", self.scenery_edit)
+        # The scenery folder is asked on the Scenery step (it takes this row).
+        self.scenery_row = self._make_path_row("&Scenery path", self.scenery_edit)
         self._add_path_row(form, "&Cache directory", self.cache_edit)
+        self.disk_cache_spin = QSpinBox()
+        self.disk_cache_spin.setRange(0, 2000)
+        self.disk_cache_spin.setSingleStep(5)
+        self.disk_cache_spin.setSuffix(" GB")
+        self.disk_cache_spin.setAccessibleName("Disk cache limit")
+        self.disk_cache_spin.setValue(int(wizard.disk_cache_gb))
+        self.disk_cache_spin.valueChanged.connect(
+            lambda value: setattr(wizard, "disk_cache_gb", int(value))
+        )
+        cache_row = QHBoxLayout()
+        cache_row.addWidget(self.disk_cache_spin)
+        self.suggest_cache_button = QPushButton("Use suggestion")
+        self.suggest_cache_button.clicked.connect(self._use_suggested_cache)
+        cache_row.addWidget(self.suggest_cache_button)
+        cache_row.addStretch(1)
+        form.addRow("Disk cache &limit", cache_row)
+        self.cache_hint_label = QLabel()
+        self.cache_hint_label.setWordWrap(True)
+        self.cache_hint_label.setProperty("textRole", "secondary")
+        form.addRow("", self.cache_hint_label)
+        layout.addLayout(form)
+
+        # The long-term cache and download folders are Expert settings: the
+        # defaults suit almost everyone, so they wait behind a toggle.
+        self.more_folders_button = QPushButton("More folders…")
+        self.more_folders_button.setCheckable(True)
+        self.more_folders_button.setAccessibleName("Show more folders")
+        layout.addWidget(self.more_folders_button)
+        self.more_folders = QWidget()
+        more_form = QFormLayout(self.more_folders)
+        more_form.setContentsMargins(0, 0, 0, 0)
         self._add_path_row(
-            form,
+            more_form,
             "&Long-term cache (optional)",
             self.long_term_edit,
         )
         self._add_path_row(
-            form,
+            more_form,
             "&Temporary download directory",
             self.download_edit,
         )
-        layout.addLayout(form)
+        self.more_folders.setVisible(False)
+        self.more_folders_button.toggled.connect(self.more_folders.setVisible)
+        layout.addWidget(self.more_folders)
 
         self.free_space_label = QLabel()
         self.cache_usage_label = QLabel()
@@ -285,17 +350,47 @@ class StoragePage(_BasePage):
         layout.addWidget(self.cache_usage_label)
         layout.addStretch(1)
         focus_widgets = [
-            self.scenery_edit,
-            self._browse_buttons[0],
             self.cache_edit,
-            self._browse_buttons[1],
+            self._browse_buttons[0],
+            self.disk_cache_spin,
+            self.suggest_cache_button,
+            self.more_folders_button,
             self.long_term_edit,
-            self._browse_buttons[2],
+            self._browse_buttons[1],
             self.download_edit,
-            self._browse_buttons[3],
+            self._browse_buttons[2],
         ]
         for previous, current in zip(focus_widgets, focus_widgets[1:]):
             self.setTabOrder(previous, current)
+
+    def suggested_cache_gb(self) -> int:
+        """A quarter of the cache drive's free space, 10 to 100 GB."""
+        free = free_space_bytes(self.cache_edit.text() or str(Path.home()))
+        if not free:
+            return 30
+        gb = free / 1024 ** 3 * 0.25
+        return int(max(10, min(100, round(gb / 5) * 5)))
+
+    def _use_suggested_cache(self) -> None:
+        self.disk_cache_spin.setValue(self.suggested_cache_gb())
+
+    def refresh_cache_hint(self) -> None:
+        self.cache_hint_label.setText(
+            f"Suggested for this drive: {self.suggested_cache_gb()} GB. "
+            "AutoOrtho removes the oldest imagery beyond the limit."
+        )
+
+    def _make_path_row(self, label, edit):
+        row = QHBoxLayout()
+        label_widget = QLabel(label)
+        label_widget.setBuddy(edit)
+        edit.setAccessibleName(label.replace("&", ""))
+        browse = QPushButton("Browse…")
+        browse.setAccessibleName(f"Browse for {label.replace('&', '')}")
+        browse.clicked.connect(lambda: self._browse(edit))
+        row.addWidget(edit)
+        row.addWidget(browse)
+        return label_widget, row
 
     def _add_path_row(self, form, label, edit) -> None:
         row = QHBoxLayout()
@@ -416,8 +511,16 @@ class DependenciesPage(_BasePage):
 
 class SceneryPage(_BasePage):
     def __init__(self, wizard: "SetupWizard"):
-        super().__init__(wizard, "Scenery", "Choose one or more regions to install")
+        super().__init__(
+            wizard,
+            "Scenery",
+            "Install a region, or point at scenery you already have",
+        )
         layout = QVBoxLayout(self)
+        folder_form = QFormLayout()
+        label_widget, row = wizard.storage_page.scenery_row
+        folder_form.addRow(label_widget, row)
+        layout.addLayout(folder_form)
         self.note_label = QLabel()
         self.note_label.setWordWrap(True)
         layout.addWidget(self.note_label)
@@ -443,6 +546,280 @@ class SceneryPage(_BasePage):
         return True
 
 
+def _preset_steps(name):
+    return [
+        {"altitude_ft": alt, "zoom_level": zoom, "zoom_level_airports": airport}
+        for alt, zoom, airport in PRESETS.get(name, ())
+    ]
+
+
+ADJUSTED = "Adjusted to fit this PC"
+
+
+class QualityPage(_BasePage):
+    """Step 5: the quality target, what it needs here, and the connection."""
+
+    def __init__(self, wizard: "SetupWizard"):
+        super().__init__(
+            wizard,
+            "Quality target",
+            "How sharp the scenery should be, checked against this PC",
+        )
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll)
+        body = QWidget()
+        scroll.setWidget(body)
+        layout = QVBoxLayout(body)
+
+        intro = QLabel(
+            "Pick one zoom level everywhere (Fixed), or one per altitude (By "
+            "altitude), which keeps detail near the ground and saves graphics "
+            "memory and downloads at cruise. Each extra level is four times "
+            "the imagery. You can change this later in Settings > Imagery."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        modes = QHBoxLayout()
+        self.fixed_radio = QRadioButton("Fixed")
+        self.altitude_radio = QRadioButton("By altitude")
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.addButton(self.fixed_radio)
+        self.mode_group.addButton(self.altitude_radio)
+        modes.addWidget(self.fixed_radio)
+        modes.addWidget(self.altitude_radio)
+        modes.addStretch(1)
+        layout.addLayout(modes)
+
+        form = QFormLayout()
+        self.zoom_spin = QSpinBox()
+        self.zoom_spin.setRange(12, 17)
+        self.zoom_spin.setPrefix("ZL")
+        self.airport_spin = QSpinBox()
+        self.airport_spin.setRange(12, 19)
+        self.airport_spin.setPrefix("ZL")
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(list(PRESETS))
+        form.addRow("Scenery zoom level", self.zoom_spin)
+        form.addRow("Airport zoom level", self.airport_spin)
+        form.addRow("Altitude profile", self.preset_combo)
+        self._form = form
+        layout.addLayout(form)
+
+        self.cost_panel = TargetCostPanel()
+        layout.addWidget(self.cost_panel)
+        test_title = QLabel("Connection test")
+        test_title.setStyleSheet("font-weight: bold;")
+        layout.addWidget(test_title)
+        self.connection_panel = ConnectionTestPanel(
+            maptype=lambda: wizard.maptype,
+            max_connections=lambda: wizard.max_connections,
+        )
+        layout.addWidget(self.connection_panel)
+        layout.addStretch(1)
+
+        self._adjusted_steps = None
+        target = wizard.target
+        self.zoom_spin.setValue(int(target.get("max_zoom", 16)))
+        self.airport_spin.setValue(int(target.get("airport_zoom", 18)))
+        dynamic = str(target.get("mode", "fixed")).lower() == "dynamic"
+        steps = target.get("steps") or []
+        if dynamic and steps:
+            def key(items):
+                return sorted(
+                    (int(s["altitude_ft"]), int(s["zoom_level"]),
+                     int(s.get("zoom_level_airports", 18)))
+                    for s in items
+                )
+
+            match = next(
+                (name for name in PRESETS if key(_preset_steps(name)) == key(steps)),
+                None,
+            )
+            if match is None:
+                self._adjusted_steps = list(steps)
+                self.preset_combo.addItem(ADJUSTED)
+                self.preset_combo.setCurrentText(ADJUSTED)
+            else:
+                self.preset_combo.setCurrentText(match)
+        (self.altitude_radio if dynamic else self.fixed_radio).setChecked(True)
+
+        for signal in (
+            self.fixed_radio.toggled,
+            self.zoom_spin.valueChanged,
+            self.airport_spin.valueChanged,
+            self.preset_combo.currentTextChanged,
+        ):
+            signal.connect(lambda *_a: self.update_cost())
+        self.cost_panel.fix_requested.connect(self._apply_fix)
+        self.cost_panel.suggest_requested.connect(self._suggest)
+        self.connection_panel.measured.connect(lambda _r: self.update_cost())
+        self._update_mode_rows()
+        self.update_cost()
+
+    def _set_row_visible(self, field, visible):
+        field.setVisible(visible)
+        label = self._form.labelForField(field)
+        if label is not None:
+            label.setVisible(visible)
+
+    def _update_mode_rows(self):
+        fixed = self.fixed_radio.isChecked()
+        self._set_row_visible(self.zoom_spin, fixed)
+        self._set_row_visible(self.airport_spin, fixed)
+        self._set_row_visible(self.preset_combo, not fixed)
+
+    def target(self):
+        if self.fixed_radio.isChecked():
+            return {
+                "mode": "fixed",
+                "max_zoom": self.zoom_spin.value(),
+                "airport_zoom": self.airport_spin.value(),
+                "steps": [],
+            }
+        name = self.preset_combo.currentText()
+        steps = (
+            list(self._adjusted_steps or [])
+            if name == ADJUSTED
+            else _preset_steps(name)
+        )
+        return {
+            "mode": "dynamic",
+            "max_zoom": self.zoom_spin.value(),
+            "airport_zoom": self.airport_spin.value(),
+            "steps": steps,
+        }
+
+    def update_cost(self):
+        self._update_mode_rows()
+        wizard = self.wizard_ref
+        target = self.target()
+        hw = wizard.hardware
+        results = guards.check_target(
+            target["mode"],
+            target["max_zoom"],
+            target["airport_zoom"],
+            target["steps"],
+            hw,
+            cache_dir=wizard.selected_paths.get("cache_dir") or None,
+            reserve_gb=wizard.reserve_gb,
+            k=wizard.paging_k,
+            fmt=wizard.texture_format,
+            limits=wizard.limits(),
+            connection=self.connection_panel.result,
+        )
+        self.cost_panel.set_results(results, hw.summary() if hw else "")
+
+    def _apply_fix(self, fix):
+        changes = dict(fix.changes)
+        if "autoortho.dynamic_zoom_steps" in changes:
+            self._adjusted_steps = list(changes["autoortho.dynamic_zoom_steps"])
+            if self.preset_combo.findText(ADJUSTED) < 0:
+                self.preset_combo.addItem(ADJUSTED)
+            self.preset_combo.setCurrentText(ADJUSTED)
+        if changes.get("autoortho.max_zoom_mode") == "fixed":
+            self.fixed_radio.setChecked(True)
+        if "autoortho.max_zoom" in changes:
+            self.zoom_spin.setValue(int(changes["autoortho.max_zoom"]))
+        if "autoortho.max_zoom_near_airports" in changes:
+            self.airport_spin.setValue(
+                int(changes["autoortho.max_zoom_near_airports"])
+            )
+        self.update_cost()
+
+    def _suggest(self):
+        wizard = self.wizard_ref
+        fix = guards.suggest_target_for_pc(
+            wizard.hardware,
+            wizard.limits(),
+            self.connection_panel.result,
+            wizard.reserve_gb,
+            k=wizard.paging_k,
+            fmt=wizard.texture_format,
+        )
+        self._apply_fix(fix)
+        self.cost_panel.set_advice(f"Suggested {fix.label}")
+
+
+class LimitsPage(_BasePage):
+    """Step 6: what AutoOrtho may use of this PC."""
+
+    def __init__(self, wizard: "SetupWizard"):
+        super().__init__(
+            wizard,
+            "Limits and ready",
+            "What AutoOrtho may use of this PC, then a last check",
+        )
+        layout = QVBoxLayout(self)
+        self.auto_radio = QRadioButton("Use what's available (recommended)")
+        self.custom_radio = QRadioButton("Set my own limits")
+        group = QButtonGroup(self)
+        group.addButton(self.auto_radio)
+        group.addButton(self.custom_radio)
+        layout.addWidget(self.auto_radio)
+        explain = QLabel(
+            "AutoOrtho works out each limit from this PC and keeps room for "
+            "X-Plane. Set your own to keep resources for other apps."
+        )
+        explain.setWordWrap(True)
+        explain.setProperty("textRole", "secondary")
+        layout.addWidget(explain)
+        layout.addWidget(self.custom_radio)
+        self.editor = LimitsEditor()
+        self.editor.set_hardware(wizard.hardware, wizard.reserve_gb)
+        self.editor.set_values(wizard.limit_values)
+        layout.addWidget(self.editor)
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        ready_title = QLabel("Ready to fly?")
+        ready_title.setStyleSheet("font-weight: bold; margin-top: 8px;")
+        layout.addWidget(ready_title)
+        self.review_summary_label = QLabel()
+        self.review_summary_label.setWordWrap(True)
+        layout.addWidget(self.review_summary_label)
+        self.details = QTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMinimumHeight(120)
+        layout.addWidget(self.details, 1)
+        self.start_now_check = QCheckBox("Start AutoOrtho when setup finishes")
+        self.start_now_check.setChecked(True)
+        layout.addWidget(self.start_now_check)
+
+        custom = any(
+            limits_module.parse(value) is not None
+            for value in wizard.limit_values.values()
+        )
+        (self.custom_radio if custom else self.auto_radio).setChecked(True)
+        self.auto_radio.toggled.connect(self._mode_changed)
+        self.editor.changed.connect(self._changed)
+        self._mode_changed()
+
+    def _mode_changed(self, *_args):
+        auto = self.auto_radio.isChecked()
+        self.editor.setEnabled(not auto)
+        if auto:
+            self.editor.use_all_available()
+        self._changed()
+
+    def isComplete(self) -> bool:  # noqa: N802
+        return self.wizard_ref.readiness.can_finish
+
+    def _changed(self):
+        self.wizard_ref.set_limit_values(self.editor.values())
+        lines = limits_module.describe(self.wizard_ref.limits())
+        self.summary_label.setText(
+            "AutoOrtho will use at most: RAM {ram_gb}, graphics memory "
+            "{vram_gb}, downloads {bandwidth_mbps}, CPU {cpu_cores}.".format(
+                **lines
+            )
+        )
+
+
 class ReviewPage(_BasePage):
     def __init__(self, wizard: "SetupWizard"):
         super().__init__(wizard, "Review", "Confirm the setup state")
@@ -464,8 +841,34 @@ class SetupWizard(QWizard):
         initial_values: Any | None = None,
         scenery_choices: Iterable[Any] = (),
         parent=None,
+        *,
+        target: dict | None = None,
+        limit_values: dict | None = None,
+        hardware_info=None,
+        reserve_gb: float = limits_module.DEFAULT_XPLANE_VRAM_RESERVE_GB,
+        maptype: str = "BI",
+        max_connections: int = 160,
+        paging_k: float = target_cost.DEFAULT_K,
+        texture_format: str = "BC1",
+        disk_cache_gb: int = 30,
     ):
         super().__init__(parent)
+        self.disk_cache_gb = int(disk_cache_gb)
+        self.target = dict(target or {
+            "mode": "fixed", "max_zoom": 16, "airport_zoom": 18, "steps": [],
+        })
+        self.limit_values = {
+            name: limits_module.AUTO for name in limits_module.NAMES
+        }
+        self.limit_values.update(limit_values or {})
+        self.hardware = (
+            hardware_info or hardware.cached() or hardware.basic()
+        )
+        self.reserve_gb = float(reserve_gb)
+        self.maptype = maptype
+        self.max_connections = int(max_connections)
+        self.paging_k = float(paging_k)
+        self.texture_format = texture_format
         self.setWindowTitle("AutoOrtho Setup Wizard")
         self.setOption(QWizard.WizardOption.NoBackButtonOnStartPage, True)
 
@@ -527,6 +930,29 @@ class SetupWizard(QWizard):
         self._values[key] = value
         self._refresh_readiness()
 
+    def set_limit_values(self, values: dict) -> None:
+        self.limit_values = dict(values)
+        page = getattr(self, "quality_page", None)
+        if page is not None:
+            page.update_cost()
+
+    def limits(self):
+        return limits_module.resolve(
+            self.limit_values, self.hardware, self.reserve_gb
+        )
+
+    def selected_target(self) -> dict:
+        return self.quality_page.target()
+
+    def selected_limits(self) -> dict:
+        return dict(self.limit_values)
+
+    def selected_disk_cache_gb(self) -> int:
+        return int(self.disk_cache_gb)
+
+    def start_now(self) -> bool:
+        return self.limits_page.start_now_check.isChecked()
+
     def start_xplane_detection(self, callback) -> None:
         worker = self._xplane_detection_worker
         if worker is not None and worker.isRunning():
@@ -565,15 +991,20 @@ class SetupWizard(QWizard):
         self.storage_page = StoragePage(self)
         self.dependencies_page = DependenciesPage(self)
         self.scenery_page = SceneryPage(self)
-        self.review_page = ReviewPage(self)
+        self.quality_page = QualityPage(self)
+        self.limits_page = LimitsPage(self)
+        # The last step is limits and the final check together.
+        self.review_page = self.limits_page
 
+        # Six steps: checks, X-Plane, scenery, cache, quality, limits/ready.
+        # The dependency check shows on the welcome step.
         for page in (
             self.welcome_page,
             self.xplane_page,
-            self.storage_page,
-            self.dependencies_page,
             self.scenery_page,
-            self.review_page,
+            self.storage_page,
+            self.quality_page,
+            self.limits_page,
         ):
             self.addPage(page)
         self._populate_scenery_choices()
@@ -646,6 +1077,10 @@ class SetupWizard(QWizard):
         self.xplane_page.status_label.setText(self._format_status(self._readiness.checks[0]))
         self.storage_page._refresh_storage_summary()
         self.dependencies_page.summary_label.setText(self._format_status(self._readiness.checks[2]))
+        self.welcome_page.checks_label.setText(
+            self._format_status(self._readiness.checks[2])
+        )
+        self.storage_page.refresh_cache_hint()
         self.scenery_page.note_label.setText(
             "Existing scenery means you can finish without selecting a region."
             if self._readiness.installed_scenery_present
@@ -660,19 +1095,18 @@ class SetupWizard(QWizard):
         self.scenery_page.storage_label.setText(
             "Selected download size: " + format_bytes(selected_bytes)
         )
-        self.review_page.summary_label.setText(
-            "Finish is available."
+        self.limits_page.review_summary_label.setText(
+            "Ready to fly ✓ Finish saves the setup."
             if self._readiness.can_finish
-            else "Finish remains disabled until X-Plane, storage, and dependencies are ready."
+            else "Finish stays disabled until X-Plane, storage, and the file system driver are ready."
         )
-        self.review_page.details.setPlainText(self._render_review_details())
+        self.limits_page.details.setPlainText(self._render_review_details())
         for page in (
             self.welcome_page,
             self.xplane_page,
             self.storage_page,
-            self.dependencies_page,
             self.scenery_page,
-            self.review_page,
+            self.limits_page,
         ):
             page.completeChanged.emit()
         finish_button = self.button(QWizard.WizardButton.FinishButton)
@@ -689,11 +1123,29 @@ class SetupWizard(QWizard):
             if check.fix_action:
                 lines.append(f"  Fix: {check.fix_action}")
         lines.append("")
+        if hasattr(self, "quality_page"):
+            target = self.quality_page.target()
+            if target["mode"] == "fixed":
+                lines.append(
+                    f"Quality target: ZL{target['max_zoom']}, airports "
+                    f"ZL{target['airport_zoom']}"
+                )
+            else:
+                lines.append(
+                    f"Quality target: by altitude "
+                    f"({self.quality_page.preset_combo.currentText()})"
+                )
+            described = limits_module.describe(self.limits())
+            lines.append(
+                "Limits: RAM {ram_gb}, graphics memory {vram_gb}, downloads "
+                "{bandwidth_mbps}, CPU {cpu_cores}".format(**described)
+            )
         lines.append(f"Selected region IDs: {', '.join(self._readiness.selected_region_ids) or 'none'}")
         lines.append(f"Scenery installed: {'yes' if self._readiness.installed_scenery_present else 'no'}")
         return "\n".join(lines)
 
     def done(self, result: int) -> None:
+        self.quality_page.connection_panel.stop()
         self.storage_page.stop_usage_scan()
         self._stop_xplane_detection()
         super().done(result)

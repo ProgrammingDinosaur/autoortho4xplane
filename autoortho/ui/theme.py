@@ -7,8 +7,6 @@ from pathlib import Path
 import sys
 from PySide6.QtCore import QObject
 from PySide6.QtGui import (
-    QAccessible,
-    QAccessibleEvent,
     QColor,
     QFontDatabase,
     QPalette,
@@ -342,24 +340,29 @@ QFrame#statusCard {{
     border-radius: 0;
 }}
 QFrame#statusCard QLabel,
+QFrame#noticeFrame QLabel,
 QFrame#SceneryCard QLabel,
 QFrame#compactHeader QLabel,
 QFrame#updateBanner QLabel {{
     background-color: transparent;
 }}
 QFrame#statusCard[state="success"],
+QFrame#noticeFrame[state="success"],
 QFrame#SceneryCard[state="success"] {{
     border-left: 3px solid {colors.success};
 }}
 QFrame#statusCard[state="warning"],
+QFrame#noticeFrame[state="warning"],
 QFrame#SceneryCard[state="warning"] {{
     border-left: 3px solid {colors.warning};
 }}
 QFrame#statusCard[state="error"],
+QFrame#noticeFrame[state="error"],
 QFrame#SceneryCard[state="error"] {{
     border-left: 3px solid {colors.error};
 }}
 QFrame#statusCard[state="info"],
+QFrame#noticeFrame[state="info"],
 QFrame#SceneryCard[state="info"] {{
     border-left: 3px solid {colors.info};
 }}
@@ -995,16 +998,18 @@ def repolish(widget: QObject | None) -> None:
 
 
 def announce_accessible(widget: QObject | None, description: str = "") -> None:
-    """Publish an assistive-technology alert for important state changes."""
+    """Tell assistive technology about an important state change.
+
+    Do NOT send ``QAccessible.Event.Alert`` here: on Windows Qt maps it to
+    ``EVENT_SYSTEM_ALERT``, and Windows plays the system alert sound for it.
+    That made AutoOrtho chime at startup and when opening pages, as if an
+    error dialog had appeared. ``setAccessibleDescription`` already sends a
+    silent DescriptionChanged event that screen readers pick up.
+    """
     if widget is None:
         return
     if description and hasattr(widget, "setAccessibleDescription"):
         widget.setAccessibleDescription(description)
-    try:
-        event = QAccessibleEvent(widget, QAccessible.Event.Alert)
-        QAccessible.updateAccessibility(event)
-    except Exception:
-        pass
 
 
 __all__ = [

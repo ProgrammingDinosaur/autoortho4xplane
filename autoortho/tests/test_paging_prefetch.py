@@ -89,9 +89,13 @@ def prefetcher(monkeypatch):
     p._tile_cacher = _Cacher()
     calls = []
 
-    def fake_prefetch_tile(row, col, zoom, maptype=None, max_chunks=None, first_mip=0):
+    def fake_prefetch_tile(row, col, zoom, maptype=None, max_chunks=None, first_mip=0,
+                           source="velocity"):
         calls.append((row, col, first_mip))
+        p.sources.append(source)
         return 1, True
+
+    p.sources = []
 
     monkeypatch.setattr(p, "_prefetch_tile", fake_prefetch_tile)
     p.calls = calls
@@ -114,6 +118,7 @@ def test_split_keeps_near_and_warms_far(prefetcher, monkeypatch):
     assert len(prefetcher.calls) == 1
     row, col, first_mip = prefetcher.calls[0]
     assert (row, col) == far[:2] and first_mip >= 2
+    assert prefetcher.sources == ["paging"]
 
 
 def test_split_without_position_changes_nothing(prefetcher, monkeypatch):

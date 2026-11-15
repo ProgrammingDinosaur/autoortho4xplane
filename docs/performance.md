@@ -191,17 +191,20 @@ keys are normalized during the next save so migration messages do not recur.
 only feed the asynchronous dispatch stage (and serve the direct HTTP/1.1
 fallback path). It no longer caps how many downloads can be in flight.
 
-## Quick Start: Performance Presets
+## Quick Start
 
-For most users, the easiest way to configure performance is using the
-**Performance profile** dropdown at the top of Settings:
+For most users, three things on **Settings → Essentials** are all the tuning
+needed:
 
-| Preset | Best For | Trade-off |
-|--------|----------|-----------|
-| **Balanced** | Most users | Good balance of quality and performance |
-| **Quality** | Fast CPUs, fast internet, maximum image quality | May have longer loading times |
-| **Low Bandwidth** | Slower or capped internet connections | Fetches fewer chunks concurrently |
-| **Low Resource** | Systems with limited CPU, RAM, or VRAM | Lower detail and less aggressive background work |
+| Setting | What it does |
+|--------|--------------|
+| **Quality target** | The zoom level you want (fixed, or by altitude). The panel under it shows what it needs from this PC and can suggest a target that fits. |
+| **Limits** | What AutoOrtho may use: RAM, graphics memory, download speed and CPU cores. Auto works them out from the hardware. |
+| **Auto-tuning** | Auto adjusts the engine settings while you fly to reach the target within the limits; Advise only suggests changes. See [Auto-tuning](config.md#auto-tuning). |
+
+The sections below describe the engine settings themselves, for when you
+want to set one by hand (a value you set is kept and never moved by
+auto-tuning).
 
 ---
 
@@ -365,50 +368,52 @@ maptype_override_zoom = 16
 
 ---
 
-### Time Budget System
+### Wait Policy (wait bands)
 
-The Time Budget system controls how long AutoOrtho spends loading each tile before returning a result to X-Plane.
+How long one of X-Plane's texture reads may wait for real imagery depends on
+how near the texture is. This is the only wait policy: it replaced the
+per-chunk `maxwait`, the tile time budget (`tile_time_budget`,
+`use_time_budget`) and the startup extension (`suspend_maxwait`), which old
+config files may still contain and which are now ignored.
 
-#### Enable Time Budget (`use_time_budget`)
-- **Type:** Boolean (True/False)
-- **Default:** True
-- **Config file:** `use_time_budget = True`
+| Band | Which reads | Waits up to |
+|------|-------------|-------------|
+| **Near** | X-Plane wants mipmap 0 or 1: the texture is next to the camera | `band_max_wait_seconds` in flight, `near_wait_seconds` while a flight starts |
+| **Middle** | A reduced level | the same as near |
+| **Far** | The base level (one low-zoom chunk) | `far_wait_seconds`: it gets the best data at hand, and the real data is fetched behind it |
 
-When enabled, AutoOrtho uses a wall-clock time limit for tile requests instead of the legacy per-chunk timeout system. This provides more predictable performance and reduces stuttering.
+#### Wait for Nearby Imagery in Flight (`band_max_wait_seconds`)
+- **Type:** Float (seconds)
+- **Default:** 6
+- **Config file:** `[streaming] band_max_wait_seconds = 6.0`
+- **UI:** Settings → Streaming → "Wait for nearby imagery in flight"
 
-**Recommendation:** Keep enabled unless you experience issues.
+Longer waits give sharper nearby scenery on a slow connection, but X-Plane
+may pause longer on a texture. Each row of chunks may use what is left of
+the read's wait. Auto-tuning (Auto mode) raises it when nearby reads time
+out but the imagery arrives soon after.
 
----
-
-#### Tile Time Budget (`tile_time_budget`)
+#### Wait While a Flight Loads (`near_wait_seconds`)
 - **Type:** Float (seconds)
 - **Default:** 60
-- **Range:** 60 - 600 seconds
-- **Config file:** `tile_time_budget = 60.0`
+- **Config file:** `[streaming] near_wait_seconds = 60.0`
+- **UI:** Settings → Streaming → "Wait while a flight loads"
 
-The maximum wall-clock time for a **complete tile** across every block read and
-mipmap request. A tile receives one shared budget when X-Plane first reads it;
-subsequent reads do not restart the timer.
+While a flight starts (the loading screen and the time parked after it) and
+after a jump to another place, X-Plane does not read those textures again for
+a while, so nearby reads may wait much longer.
 
-| Value | Use Case | Effect |
-|-------|----------|--------|
-| 60 - 120.0s | Fast/smooth experience | Quicker loading, but more partial tiles |
-| 120.0 - 300.0s | Balanced | Good quality with reasonable loading times |
-| 300 - 600.0s | Maximum quality | Complete tiles, but longer loading times |
+#### Tile budget
 
-**How it works:**
-1. X-Plane requests a tile from AutoOrtho (tile enters processing queue)
-2. **Budget timer starts** on the tile's first DDS read
-3. AutoOrtho builds all mipmaps (4 → 3 → 2 → 1 → 0) sharing this budget
-4. After `tile_time_budget` seconds of active processing, AutoOrtho builds the DDS with whatever is complete
-5. Any incomplete areas use the configured `missing_color`
+A tile's budget across all its reads is the longest of the two waits above
+(60 s by default), so no band's wait is cut short. The budget only advances
+while X-Plane is reading the tile; time spent on other tiles between reads
+does not count. When it runs out, the tile is built with whatever has
+arrived and any incomplete areas use the fallbacks below, then
+`missing_color`. Before X-Plane first connects (the first loading screen),
+a tile may take ten times as long, at most 30 minutes.
 
-Queue and resource-pool waits count against the tile-wide deadline so a busy
-system cannot multiply loading time through repeated reads.
-
-**Note:** Each tile covers a large geographic area (approximately 1 square degree of latitude/longitude at zoom 16). Higher budgets allow more time for all chunks to download and process.
-
-**Note:** The effectiveness of this setting will also depend on your configured max zoom level. Higher zoom levels with lower budget times will result in faster loading but lots of missing tiles.
+Both waits apply at once while streaming.
 
 ---
 
@@ -486,7 +491,7 @@ entire tile. Multiple block reads and fallback levels cannot restart it.
 | 120s | Up to 120 seconds | Explicit maximum-quality choice |
 
 **Example calculation:**
-- `tile_time_budget = 60s`
+- tile budget = 60 s (the longest wait, see [Wait Policy](#wait-policy-wait-bands))
 - `fallback_timeout = 30s`
 - **Total worst-case tile time:** 60s + 30s = **90 seconds**
 
@@ -497,24 +502,11 @@ initial imagery is more important than a predictable loading deadline.
 
 ### Startup Loading Behavior
 
-#### Suspend Maxwait (`suspend_maxwait`)
-- **Type:** Boolean (True/False)
-- **Default:** True
-- **Config file:** `suspend_maxwait = True`
-
-When enabled, AutoOrtho extends timeout values during initial scenery loading (before the first flight begins). This allows more time for downloads to complete during the initial load, resulting in fewer missing tiles when the flight starts.
-
-**How it works:**
-- AutoOrtho detects the "loading" phase by tracking if X-Plane has **ever** sent flight data via UDP
-- During initial loading (before first connection), the tile time budget is multiplied by 10×
-- Once the flight begins (X-Plane starts sending position data), normal timeouts resume permanently
-- **Important:** Temporary disconnects (e.g., from stuttering) do NOT re-enable extended timeouts
-
-| Phase | Time Budget Behavior |
-|-------|---------------------|
-| Initial loading (never connected) | `tile_time_budget × 10` |
-| Flying (UDP connected) | `tile_time_budget` (normal) |
-| Temporary disconnect (stutter) | `tile_time_budget` (normal - no penalty) |
+While a flight starts, nearby reads wait up to `near_wait_seconds` (see
+[Wait Policy](#wait-policy-wait-bands)). Before X-Plane has ever sent flight
+data (the first "Reading new scenery files" screen), a tile's budget is ten
+times the normal one. Temporary disconnects (for example from stuttering) do
+not bring the longer budget back.
 
 **Stall Detection:**
 AutoOrtho monitors download progress and will log warnings if downloads appear stalled:
@@ -533,7 +525,7 @@ These warnings help identify server-side throttling vs client-side issues.
 2. Try a different imagery source (GO2, EOX) to rule out server-specific issues
 3. Lower your max zoom level temporarily to reduce download volume
 4. Ensure your file cache is enabled - subsequent flights load much faster
-5. If issues persist, set `suspend_maxwait = False` for stricter timeouts during loading (may result in more missing tiles initially)
+5. If issues persist, lower **Wait while a flight loads** (`near_wait_seconds`) for faster loads (may result in more blurry tiles initially)
 
 ---
 
@@ -671,77 +663,11 @@ How far ahead (in minutes of flight time) to prefetch tiles.
 
 ---
 
-### Per-Chunk Timeout Settings
-
-These settings work **alongside** the tile time budget to control individual chunk download behavior.
-
-#### Per-Chunk Max Wait (`maxwait`)
-- **Type:** Float (seconds)
-- **Default:** 5.0
-- **Range:** 0.1 - 10.0
-- **Config file:** `maxwait = 5.0`
-- **UI:** Settings → Streaming → Loading and Fallbacks → Per-chunk max wait
-
-Maximum time to wait for a **single chunk** to download. This works in combination with the tile time budget:
-
-- **Tile Time Budget:** Total time for the entire tile (all 256 chunks)
-- **Per-Chunk Max Wait:** Maximum time for each individual chunk download
-
-A chunk will stop waiting when **either** limit is reached, whichever comes first. This prevents a single slow chunk from consuming the entire tile budget.
-
-**How it works:**
-```
-For each chunk:
-  wait_time = min(remaining_tile_budget, maxwait)
-  wait for chunk up to wait_time
-```
-
-**Recommended values:**
-| Network Speed | Recommended `maxwait` |
-|--------------|----------------------|
-| Fast (fiber) | 2.0 seconds |
-| Normal (cable/DSL) | 5.0 seconds (default) |
-| Slow/unreliable | 10.0 seconds |
-
-**When time budget is disabled:** This becomes the sole timeout mechanism — each chunk waits up to `maxwait` seconds independently, which can result in much longer total tile times (up to 256 × maxwait for a full tile).
-
-#### Extended Loading at Startup (`suspend_maxwait`)
-- **Type:** Boolean
-- **Default:** True
-- **Config file:** `suspend_maxwait = True`
-- **UI:** Settings → Streaming → Loading and Fallbacks → "Allow extra loading time during startup"
-
-When enabled, AutoOrtho uses significantly longer timeouts during X-Plane's initial scenery load (before the flight starts). This ensures tiles load at full quality before you begin flying.
-
-**Startup behavior when enabled:**
-
-| Setting | Normal Flight | During Startup |
-|---------|--------------|----------------|
-| Tile Time Budget | As configured | **10× the configured value** |
-| Per-Chunk Max Wait | As configured | **20 seconds** |
-
-**Example:** With `tile_time_budget = 60` and `maxwait = 5.0`:
-- During startup: up to 600s tile budget when startup extension is enabled
-- During flight: 60s tile budget, 5s per-chunk wait
-
-**How startup is detected:** AutoOrtho considers you to be in "startup mode" until X-Plane's DataRef connection is established, which happens when the flight becomes active (after the "Reading new scenery files" splash screen).
-
-**Trade-offs:**
-- ✅ Better initial scenery quality (fewer blurry/missing tiles at flight start)
-- ✅ Reduces low-resolution and placeholder tiles
-- ⚠️ May increase initial scenery loading time
-
-> **⚠️ Tip: Long X-Plane Loading Times?**  
-> If you're experiencing significantly longer X-Plane loading times, try setting **"Allow extra loading time during startup"** to **Off**. This option can dramatically increase scenery loading times, especially when combined with higher zoom levels or slower internet connections. Disabling it will use the normal time budgets during startup, resulting in faster loads at the cost of potentially lower initial scenery quality.
-
----
-
 ## Recommended Configurations
 
 ### Stutter-Free Flying (Prioritize Performance)
 ```ini
-use_time_budget = True
-tile_time_budget = 120.0
+band_max_wait_seconds = 4.0
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
@@ -751,8 +677,8 @@ max_zoom_level = 16
 
 ### Maximum Quality (Prioritize Imagery)
 ```ini
-use_time_budget = True
-tile_time_budget = 300
+band_max_wait_seconds = 10.0
+near_wait_seconds = 120.0
 fallback_level = full
 fallback_extends_budget = True
 prefetch_enabled = True
@@ -762,8 +688,7 @@ max_zoom_level = 17
 
 ### Slow Internet Connection
 ```ini
-use_time_budget = True
-tile_time_budget = 180
+band_max_wait_seconds = 8.0
 fallback_level = cache
 fallback_extends_budget = False
 prefetch_enabled = True
@@ -773,8 +698,7 @@ max_zoom_level = 16
 
 ### Weak CPU / Limited System
 ```ini
-use_time_budget = True
-tile_time_budget = 180
+band_max_wait_seconds = 6.0
 fallback_level = none
 fallback_extends_budget = False
 prefetch_enabled = False
@@ -804,7 +728,7 @@ STATS: {'mm_count:0': 12, 'mm_count:1': 26, 'chunk_budget_skipped': 8782, 'chunk
 - Low `chunk_missing_count` = fallbacks working well
 
 **Warning signs:**
-- High `chunk_budget_skipped` = many chunks timing out, increase `tile_time_budget`
+- High `chunk_budget_skipped` = many chunks timing out, raise **Wait for nearby imagery in flight** (`band_max_wait_seconds`)
 - High `chunk_missing_count` = fallbacks not covering gaps, enable more fallbacks
 
 ### Breaking Down Tile Creation Time
@@ -1299,13 +1223,13 @@ DEBUG: Native HTTP client library not available, using Python requests fallback
 
 ### Long X-Plane Loading Times
 
-If X-Plane takes significantly longer to load scenery with AutoOrtho enabled, the most common cause is the **"Allow extra loading time during startup"** setting (`suspend_maxwait`). This option extends timeout values by 10× during initial scenery loading, which can add substantial time to X-Plane's startup.
+If X-Plane takes significantly longer to load scenery with AutoOrtho enabled, the most common cause is the wait while a flight loads (`near_wait_seconds`, 60 s): nearby textures wait that long for real imagery, and before X-Plane first connects a tile may take ten times its normal budget.
 
 **To reduce loading times:**
 
-1. Go to **Settings** → **Performance**
-2. Set **"Allow extra loading time during startup"** to **Off**
-3. This will use normal time budgets during startup, resulting in faster loads
+1. Go to **Settings** → **Streaming**
+2. Lower **"Wait while a flight loads"**, for example to 20 seconds
+3. Nearby textures then wait less during the loading screen, resulting in faster loads
 
 **Note:** X-Plane does not automatically refresh a texture after consuming it.
 Choose the startup budget and fallback policy according to the quality required

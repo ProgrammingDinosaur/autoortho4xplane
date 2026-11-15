@@ -250,6 +250,11 @@ class DatarefTracker(object):
          "Width of X-Plane's window", 0),
         ("sim/graphics/view/field_of_view_deg", "°",
          "Horizontal field of view", 1),
+        # For the governor's protect_sim_fps limit and its paused state.
+        ("sim/operation/misc/frame_rate_period", "s",
+         "Time per frame (smoothed by X-Plane)", 4),
+        ("sim/time/paused", "",
+         "1 while the simulator is paused", 0),
     ]
     # fmt:on
 
@@ -276,6 +281,8 @@ class DatarefTracker(object):
         self.sun_pitch = -999.0  # Sun elevation angle (-90 to +90, -999 = invalid)
         self.window_width = 0.0  # X-Plane window width in px (0 = unknown)
         self.fov_deg = 0.0  # horizontal field of view (0 = unknown)
+        self.frame_period = 0.0  # seconds per frame (0 = unknown)
+        self.paused = False
         self.connected = False
         self.data_valid = False
         self.has_ever_connected = False  # True once first connection established
@@ -401,6 +408,8 @@ class DatarefTracker(object):
                 'local_time_sec': self.local_time_sec,
                 'pressure_alt': self.pressure_alt,
                 'sun_pitch': self.sun_pitch,
+                'frame_period': self.frame_period,
+                'paused': self.paused,
                 'connected': self.connected,
                 'data_valid': self.data_valid,
                 'timestamp': time.time()
@@ -624,6 +633,8 @@ class DatarefTracker(object):
                     sun_pitch = values[7] if len(values) >= 8 else None
                     window_width = values[8] if len(values) >= 9 else None
                     fov_deg = values[9] if len(values) >= 10 else None
+                    frame_period = values[10] if len(values) >= 11 else None
+                    paused = values[11] if len(values) >= 12 else None
 
                     # Validate position data
                     if self._validate_position(lat, lon, alt):
@@ -645,6 +656,11 @@ class DatarefTracker(object):
                             self.window_width = window_width
                         if fov_deg:
                             self.fov_deg = fov_deg
+                        # Missing optional values arrive as -1.
+                        if frame_period is not None and 0 < frame_period < 5:
+                            self.frame_period = frame_period
+                        if paused is not None and paused >= 0:
+                            self.paused = paused > 0.5
                         self.data_valid = True
                         
                         # Feed the flight averager (alt is in meters, convert to feet)

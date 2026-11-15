@@ -65,6 +65,58 @@ def is_header_chunk(mipmaps: Sequence, offset: int, end: int) -> bool:
     )
 
 
+def needs_build_slot(
+    mipmaps: Sequence,
+    offset: int,
+    length: int,
+    base_mip: int,
+) -> bool:
+    """Whether a read may build or wait for a level finer than ``base_mip``.
+
+    Live tile admission bounds the memory of detailed builds. These reads
+    take none of it, so they should not queue behind the near reads that
+    hold every slot while they wait for imagery (up to a minute while a
+    flight loads):
+
+    * the DDS header alone;
+    * the header chunk, and the next FUSE piece of it, which are answered
+      from the base level;
+    * a read whose first wanted level is the base level or coarser (one
+      low-zoom chunk, which never waits long).
+
+    Pure and cursor-free, so it can run before the tile's own classifier.
+    When unsure it answers True, which keeps today's behaviour.
+    """
+    if not mipmaps or length <= 0:
+        return False
+    end = offset + length
+    mm0 = mipmaps[0]
+    if end <= mm0.startpos:
+        return False
+    if is_header_chunk(mipmaps, offset, end):
+        return False
+    if (
+        offset > mm0.startpos
+        and end <= XPLANE_CHUNK
+        and mip_at(mipmaps, end - 1) == 0
+        and (end - mm0.startpos) * 2 < mm0.length
+    ):
+        # A later FUSE piece of the header chunk (macFUSE splits it). X-Plane
+        # reads on into mipmap 0 only from where its 64 KB chunk ended.
+        return False
+    data_start = max(offset, mm0.startpos)
+    first = mip_at(mipmaps, data_start)
+    last = mip_at(mipmaps, end - 1)
+    if data_start == mipmaps[first].startpos:
+        level = first
+    elif last > first:
+        # Starts in the tail of a finer level: the coarser one is wanted.
+        level = first + 1
+    else:
+        level = first
+    return level < base_mip
+
+
 def classify(
     mipmaps: Sequence,
     cursor: ReadCursor,

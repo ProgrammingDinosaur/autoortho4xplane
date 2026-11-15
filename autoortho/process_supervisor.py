@@ -42,6 +42,38 @@ class WorkerHandle:
         return self.process.poll()
 
 
+def apply_openmp_budget(env):
+    """Size OpenMP for one worker: its share of the CPU limit.
+
+    ``AO_CPU_THREAD_LIMIT`` ([limits] cpu_cores, set by the parent) caps the
+    total; without it every CPU counts. Set before the child imports any
+    OpenMP-backed native library.
+    """
+    try:
+        workers = max(1, int(env.get("AO_MOUNT_WORKER_COUNT", "1")))
+    except ValueError:
+        workers = 1
+    try:
+        # [limits] cpu_cores, set by the parent (autoortho.py).
+        cpu_total = int(env.get("AO_CPU_THREAD_LIMIT") or 0)
+    except ValueError:
+        cpu_total = 0
+    if cpu_total <= 0:
+        cpu_total = os.cpu_count() or 1
+    cpu_budget = max(1, cpu_total // workers)
+    # Set BEFORE the child imports any OpenMP-backed native libraries.
+    # Partial builds and warmup use the runtime defaults, not max_threads.
+    env.setdefault("OMP_NUM_THREADS", str(cpu_budget))
+    try:
+        thread_limit = max(1, int(env.get("OMP_THREAD_LIMIT", cpu_budget)))
+    except ValueError:
+        thread_limit = cpu_budget
+    env["OMP_THREAD_LIMIT"] = str(min(cpu_budget, thread_limit))
+    env.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+    env.setdefault("KMP_BLOCKTIME", "0")
+    return env
+
+
 class AOProcessSupervisor:
     """Owns AO-launched mount workers and their process-tree shutdown."""
 
@@ -77,21 +109,7 @@ class AOProcessSupervisor:
         if extra_env:
             env.update({str(key): str(value) for key, value in extra_env.items()})
 
-        try:
-            workers = max(1, int(env.get("AO_MOUNT_WORKER_COUNT", "1")))
-        except ValueError:
-            workers = 1
-        cpu_budget = max(1, (os.cpu_count() or 1) // workers)
-        # Set BEFORE the child imports any OpenMP-backed native libraries.
-        # Partial builds and warmup use the runtime defaults, not max_threads.
-        env.setdefault("OMP_NUM_THREADS", str(cpu_budget))
-        try:
-            thread_limit = max(1, int(env.get("OMP_THREAD_LIMIT", cpu_budget)))
-        except ValueError:
-            thread_limit = cpu_budget
-        env["OMP_THREAD_LIMIT"] = str(min(cpu_budget, thread_limit))
-        env.setdefault("OMP_WAIT_POLICY", "PASSIVE")
-        env.setdefault("KMP_BLOCKTIME", "0")
+        apply_openmp_budget(env)
 
         if _is_frozen():
             cmd = [sys.executable]

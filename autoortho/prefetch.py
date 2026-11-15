@@ -881,8 +881,14 @@ class PrefetchCoordinator:
         max_jpeg_bytes: int = 512 * 1024 * 1024,
         metric: Optional[Callable[[str, int], None]] = None,
         gauge: Optional[Callable[[str, int], None]] = None,
+        on_publish: Optional[Callable[[PrefetchKey, str], None]] = None,
+        on_complete: Optional[Callable[[PrefetchKey], None]] = None,
     ):
         self.tile_cacher = tile_cacher
+        # Prefetch ledger hooks (prefetch_ledger.py): a speculative source
+        # published the key, and a candidate completed. Best effort.
+        self.on_publish = on_publish
+        self.on_complete = on_complete
         self.chunk_getter = chunk_getter
         self.scenery_id = str(scenery_id)
         self.admission_burst = max(1, int(admission_burst))
@@ -1088,7 +1094,18 @@ class PrefetchCoordinator:
                 self._metric("prefetch_candidates_reprioritized")
             self._report_locked()
         self._wake.set()
+        if source != PrefetchSource.LIVE:
+            self._notify(self.on_publish, key, source.value)
         return created
+
+    @staticmethod
+    def _notify(callback, *args) -> None:
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception:  # statistics only
+            pass
 
     def replace_generation(
         self,
@@ -2603,6 +2620,8 @@ class PrefetchCoordinator:
                 if self._candidates.get(candidate.key) is candidate:
                     self._candidates.pop(candidate.key, None)
                 self._retired[candidate.sequence] = candidate
+        if state == CandidateState.COMPLETE:
+            self._notify(self.on_complete, candidate.key)
         if should_release:
             self._release_candidate(candidate)
 

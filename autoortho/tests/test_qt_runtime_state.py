@@ -136,9 +136,6 @@ def test_partial_loading_controls_are_safe_and_persist(config_ui):
     assert float(config_ui.cfg.autoortho.prefetch_quality_grace_sec) == 7.5
     assert int(config_ui.cfg.autoortho.prefetch_admission_burst) == 32
 
-    config_ui._apply_settings_preset("Balanced")
-    assert config_ui.native_partial_allow_incomplete_check.isChecked()
-    assert config_ui.persist_partial_dds_cache_check.isChecked()
 
 
 def test_recommended_prefetch_action_replaces_only_unsafe_values(config_ui):
@@ -273,17 +270,31 @@ def test_settings_schema_renders_and_each_category_is_navigable(
 ):
     page = config_ui.categorized_settings_page
     expected = [
+        "Essentials",
         "General",
         "Setup & Storage",
         "Scenery",
         "Imagery",
+        "Limits",
+        "Auto-Tuning",
         "Streaming",
         "Seasons",
         "Connections & Integrations",
         "Logging & Reports",
         "Advanced",
+        "All Settings (Expert)",
     ]
     expected_groups = {
+        "All Settings (Expert)": set(),
+        "Limits": {"Resource Limits"},
+        "Auto-Tuning": set(),
+        "Essentials": {
+            "Quality Target",
+            "Limits",
+            "Folders and Cache",
+            "Imagery and Look",
+            "Flight Plan and App",
+        },
         "General": {"Startup and Window", "Application Window"},
         "Setup & Storage": {"Paths Configuration", "Cache Settings"},
         "Scenery": {
