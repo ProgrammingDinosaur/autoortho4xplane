@@ -51,7 +51,7 @@ class SectionParser(object):
 
 # Bump when a release changes a default that existing configs must pick up,
 # and add the step to _migrate_config_revision.
-CONFIG_REVISION = 2
+CONFIG_REVISION = 3
 
 # From this revision the file holds only the settings the user changed; every
 # other setting is a commented "# key = default" line. Active lines in such a
@@ -1686,7 +1686,56 @@ def _migrate_config_revision(cfg, user_config):
         # window to the tray on streaming start, which left Mac users unable
         # to find the window; it now defaults off.
         cfg.config.set("general", "hide", "False")
+    if revision < 3:
+        _carry_over_raised_maxwait(cfg, user_config)
     cfg.config.set("general", "config_revision", str(CONFIG_REVISION))
+
+
+# 2.x waited about this many times [autoortho] maxwait for a near read in
+# flight (measured: about 6 s with the 2 s default). The 3.x near wait
+# replaced maxwait, whose value was then ignored.
+_MAXWAIT_TO_BAND_WAIT = 3.0
+_OLD_MAXWAIT_DEFAULT = 2.0
+_BAND_WAIT_RANGE = (6.0, 12.0)  # default up to the governor's maximum
+
+
+def _carry_over_raised_maxwait(cfg, user_config):
+    """Keep a raised 2.x maxwait as a longer in-flight near wait.
+
+    Users who raised maxwait to wait longer for sharp imagery lost that on
+    upgrade, which looks blurrier than 2.x on a slow line. Only raises, only
+    when the file sets no near wait of its own.
+    """
+    try:
+        if user_config.has_option("streaming", "band_max_wait_seconds"):
+            return
+        raw = user_config.get("autoortho", "maxwait", fallback=None)
+        if raw is None:
+            return
+        maxwait = float(raw)
+    except (TypeError, ValueError):
+        return
+    if maxwait <= _OLD_MAXWAIT_DEFAULT:
+        return
+    low, high = _BAND_WAIT_RANGE
+    wanted = max(low, min(high, maxwait * _MAXWAIT_TO_BAND_WAIT))
+    try:
+        current = float(
+            cfg.config.get("streaming", "band_max_wait_seconds", fallback=low)
+        )
+    except (TypeError, ValueError):
+        current = low
+    if wanted <= current:
+        return
+    if not cfg.config.has_section("streaming"):
+        cfg.config.add_section("streaming")
+    cfg.config.set("streaming", "band_max_wait_seconds", f"{wanted:g}")
+    log.info(
+        "Carried over maxwait = %g from an older config as "
+        "streaming.band_max_wait_seconds = %g",
+        maxwait,
+        wanted,
+    )
 
 
 def _file_revision(user_config):

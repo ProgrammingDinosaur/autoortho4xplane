@@ -111,12 +111,14 @@ def test_full_file_from_older_release_becomes_sparse(tmp_path):
     assert _active_lines(text) == [
         f"config_revision = {aoconfig.CONFIG_REVISION}",
         # Engine values set by hand are kept, and Home offers to review them.
-        "kept_values = autoortho.prefetch_interval",
+        "kept_values = autoortho.prefetch_interval,streaming.band_max_wait_seconds",
         "prefetch_interval = 4.0",
+        # The raised maxwait lives on as the near wait (3 x 4 s, capped at 12).
+        "band_max_wait_seconds = 12",
     ]
     assert "max_concurrent_downloads" not in text
     assert "ephemeral_dds_cache_mb" not in text
-    # Wait consolidation retired maxwait: dropped, not kept.
+    # Wait consolidation retired maxwait itself: not written again.
     assert "maxwait" not in text
     assert cfg.source("autoortho", "prefetch_interval") == "custom"
     assert cfg.source("autoortho", "max_zoom") == "default"
@@ -232,6 +234,43 @@ def test_hide_window_is_off_by_default_and_for_old_configs(tmp_path):
     assert cfg.general.hide is True
     cfg.save()
     assert aoconfig.AOConfig(str(chosen)).general.hide is True
+
+
+def test_raised_2x_maxwait_becomes_a_longer_near_wait(tmp_path):
+    def load(name, text):
+        path = tmp_path / name
+        path.write_text(text, encoding="utf-8")
+        return aoconfig.AOConfig(str(path))
+
+    # 2.x waited about 3x maxwait for a near read; carried over, capped at 12.
+    assert load("raised", "[autoortho]\nmaxwait = 3.0\n").streaming.band_max_wait_seconds == 9.0
+    assert load("high", "[autoortho]\nmaxwait = 10\n").streaming.band_max_wait_seconds == 12.0
+
+    # The old default, or a lower value, keeps the 3.x default.
+    assert load("default", "[autoortho]\nmaxwait = 2.0\n").streaming.band_max_wait_seconds == 6.0
+    assert load("low", "[autoortho]\nmaxwait = 1\n").streaming.band_max_wait_seconds == 6.0
+
+    # A near wait set in the file wins.
+    own = load(
+        "own",
+        "[autoortho]\nmaxwait = 4\n[streaming]\nband_max_wait_seconds = 7\n",
+    )
+    assert own.streaming.band_max_wait_seconds == 7.0
+
+    # Runs once: a sparse 3.x file never carried maxwait.
+    assert load(
+        "sparse", "[general]\nconfig_revision = 2\n"
+    ).streaming.band_max_wait_seconds == 6.0
+
+
+def test_carried_over_near_wait_survives_a_save(tmp_path):
+    path = tmp_path / ".autoortho"
+    path.write_text("[autoortho]\nmaxwait = 3\n", encoding="utf-8")
+    cfg = aoconfig.AOConfig(str(path))
+    cfg.save()
+    reloaded = aoconfig.AOConfig(str(path))
+    assert reloaded.streaming.band_max_wait_seconds == 9.0
+    assert reloaded.general.config_revision == aoconfig.CONFIG_REVISION
 
 
 def test_fresh_config_starts_at_current_revision(tmp_path):
