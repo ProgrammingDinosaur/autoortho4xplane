@@ -262,8 +262,14 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
         # - Fallback: + fallback_timeout if enabled (default 30s)
         # - Buffer: + 15s for DDS operations
         # - Safety: + 60s additional buffer for daemon_timeout
-        max_startup_budget = wait_bands.tile_budget_seconds(initial_load=True)
-        
+        # Never below the first-load cap: 3.1.0 used it with default settings
+        # (1875 s timeout), and the 60 s default near wait gave only 675 s.
+        # macFUSE drops the whole mount when one request outlives this.
+        max_startup_budget = max(
+            wait_bands.tile_budget_seconds(initial_load=True),
+            wait_bands.INITIAL_LOAD_CAP_S,
+        )
+
         # Add fallback timeout if enabled
         fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)
         if isinstance(fallback_extends, str):
