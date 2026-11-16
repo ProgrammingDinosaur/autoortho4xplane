@@ -24,7 +24,7 @@ Usage:
 from ctypes import (
     CDLL, POINTER, Structure,
     c_char, c_char_p, c_int32, c_int64, c_uint8, c_uint32,
-    cast
+    cast, string_at
 )
 import logging
 import os
@@ -235,7 +235,9 @@ class CacheResult(Structure):
         """Get data as Python bytes (copies data)."""
         if not self.success or not self.data:
             return b''
-        return bytes(self.data[:self.length])
+        # Slicing a ctypes pointer builds a list of ints first (~0.3 ms per
+        # 15 KB chunk); string_at is one memcpy.
+        return string_at(self.data, self.length)
     
     def get_error(self) -> str:
         """Get error message if failed."""

@@ -23,7 +23,7 @@ Usage:
 from ctypes import (
     CDLL, POINTER, Structure, c_void_p,
     c_char, c_char_p, c_int32, c_uint8, c_uint32, c_double, c_size_t,
-    byref, cast
+    byref, cast, string_at
 )
 import logging
 import os
@@ -1770,7 +1770,7 @@ def build_tile_native(
         raise RuntimeError(f"DDS build failed: {error}")
     
     # Return DDS bytes
-    return bytes(buffer[:request.dds_written])
+    return string_at(buffer, request.dds_written)
 
 
 def build_tile_native_detailed(
@@ -1815,7 +1815,7 @@ def build_tile_native_detailed(
     success = lib.aodds_build_tile(byref(request), pool_handle)
     
     return BuildResult(
-        data=bytes(buffer[:request.dds_written]) if success else b'',
+        data=string_at(buffer, request.dds_written) if success else b'',
         success=bool(success),
         chunks_found=request.stats.chunks_found,
         chunks_decoded=request.stats.chunks_decoded,
@@ -2292,7 +2292,7 @@ def build_from_jpegs(
     if not success:
         raise RuntimeError("Failed to build DDS from JPEGs")
     
-    return bytes(buffer[:bytes_written.value])
+    return string_at(buffer, bytes_written.value)
 
 
 def build_from_jpegs_to_buffer(
