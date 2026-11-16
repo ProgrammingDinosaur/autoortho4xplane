@@ -428,6 +428,56 @@ def test_partial_cache_load_populates_only_persisted_rows(
     }
 
 
+def test_partial_cache_reload_skipped_when_rows_already_held(
+    monkeypatch,
+    tmp_path,
+):
+    # get_bytes calls the loader on every read until the texture is complete;
+    # re-reading and re-hashing rows the tile already holds made each read
+    # slower than the last.
+    tile = getortho.Tile(
+        0,
+        0,
+        "BI",
+        16,
+        cache_dir=str(tmp_path),
+        max_zoom=17,
+    )
+    loads = []
+
+    class Cache:
+        @staticmethod
+        def load_partial_rows(tile_id, max_zoom, current_tile):
+            loads.append(tile_id)
+            return {}
+
+    monkeypatch.setattr(getortho, "dynamic_dds_cache", Cache())
+    monkeypatch.setattr(
+        getortho.CFG.autoortho,
+        "persist_partial_dds_cache",
+        True,
+    )
+    tile._persisted_exact_rows.update({5, 6})
+
+    def metadata(rows):
+        return {
+            "partial_mipmaps": {
+                "0": {
+                    "unit": "chunk_row",
+                    "total": 32,
+                    "row_revisions": {str(row): 1 for row in rows},
+                }
+            }
+        }
+
+    assert not tile._load_partial_dds_rows(metadata([5, 6]))
+    assert loads == []
+
+    # A row persisted elsewhere (not held by this tile) is still loaded.
+    tile._load_partial_dds_rows(metadata([5, 6, 7]))
+    assert loads == [tile.id]
+
+
 def test_partial_v2_accepts_prepared_target_pixels(monkeypatch):
     from autoortho.aopipeline import AoDDS
 

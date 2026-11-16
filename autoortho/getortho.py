@@ -11682,6 +11682,18 @@ class Tile(object):
         total_rows = int(entry.get("total", 0))
         if total_rows <= 0:
             return False
+        # get_bytes calls this on every read until the texture is complete.
+        # Rows this tile persisted itself are already in memory: reloading
+        # them re-read and re-hashed every saved row on each read, so a
+        # texture's reads grew slower as it filled in.
+        referenced = {
+            int(row) for row in (entry.get("row_revisions") or {})
+        }
+        with self._exact_row_lock:
+            already_held = bool(referenced) and referenced <= self._persisted_exact_rows
+        if already_held:
+            bump("partial_dds_reload_skipped")
+            return False
         mm = self.dds.mipmap_list[0]
         bytes_per_chunk_row = mm.length // total_rows
         rows = dynamic_dds_cache.load_partial_rows(
