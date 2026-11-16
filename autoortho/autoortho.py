@@ -1558,6 +1558,65 @@ class AOMount:
         log.info("Unmount complete")
         return True
 
+    def restart_mount_worker(self, handle):
+        """Remount the scenery a dead worker served, in a new worker.
+
+        Detaches what is left of the old mount first (a macFUSE mount whose
+        channel broke stays in the mount table), then starts a worker for the
+        same mounts. Returns the new handle, or None if it could not start.
+        Blocks for up to the unmount timeout: never call it on the UI thread.
+        """
+        mounts = tuple(getattr(handle, "mounts", ()) or ()) or (
+            (handle.root, handle.mountpoint, handle.volname),
+        )
+        log.error(
+            "Mount worker pid %s for %s died (exit code %s); remounting",
+            handle.pid,
+            ", ".join(m[2] or m[1] for m in mounts),
+            handle.process.poll(),
+        )
+        try:
+            self.mount_worker_supervisor.stop_worker(handle, timeout=2.0)
+        except Exception as exc:
+            log.warning("Could not clean up dead worker %s: %s", handle.pid, exc)
+        if handle in self.mount_workers:
+            self.mount_workers.remove(handle)
+        if handle.process in self.mac_os_procs:
+            self.mac_os_procs.remove(handle.process)
+
+        for _root, mountpoint, _volname in mounts:
+            try:
+                if not self.unmount(mountpoint, force=True, wait_timeout=5.0):
+                    log.error("Stale mount still attached at %s; cannot remount", mountpoint)
+                    return None
+                if system_type == "darwin":
+                    cleanup_mountpoint(mountpoint)
+            except Exception as exc:
+                log.error("Could not detach stale mount %s: %s", mountpoint, exc)
+                return None
+
+        if not self.mounts_running:
+            log.info("Streaming stopped while remounting; not restarting worker")
+            return None
+        first = mounts[0]
+        try:
+            new_handle = self.launch_mount_worker(
+                first[0],
+                first[1],
+                first[2],
+                not getattr(getattr(self.cfg, "fuse", None), "threading", True),
+                self.stats_addr,
+                self.stats_auth,
+                self.log_addr,
+                mounts=list(mounts) if len(mounts) > 1 else None,
+            )
+        except Exception:
+            log.exception("Could not restart mount worker for %s", first[1])
+            return None
+        log.info("Remounted %s in worker pid %s",
+                 ", ".join(m[2] or m[1] for m in mounts), new_handle.pid)
+        return new_handle
+
     def domount(self, root, mountpoint, threading=True):
         return self._launch_scenery_worker(root, mountpoint, threading)
 

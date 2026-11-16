@@ -95,6 +95,7 @@ if __package__ and __package__.startswith("autoortho."):
     )
     from autoortho import downloader
     from autoortho.version import __version__
+    from autoortho import worker_restart
 else:
     import utils.resources_rc
     from utils.constants import MAPTYPES, system_type
@@ -172,6 +173,7 @@ else:
     )
     import downloader
     from version import __version__
+    import worker_restart
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -8561,6 +8563,8 @@ class ConfigUI(QMainWindow):
             if success:
                 self._runtime_error_message = ""
                 self._restart_pending = False
+                self._worker_restart_policy().reset()
+                self._worker_restart_failure = None
                 self._set_runtime_state(RuntimeState.RUNNING, message)
                 self.mount_monitor_timer.start()
             else:
@@ -8596,9 +8600,74 @@ class ConfigUI(QMainWindow):
         if self.mount_control_worker is worker:
             self.mount_control_worker = None
 
+    def _worker_restart_policy(self):
+        policy = getattr(self, "_restart_policy", None)
+        if policy is None:
+            policy = worker_restart.RestartPolicy()
+            self._restart_policy = policy
+        return policy
+
+    def _try_restart_dead_workers(self, dead):
+        """Remount regions whose worker died; True if every one is handled.
+
+        The remount runs off the UI thread. A worker that cannot be restarted
+        (too many restarts, or the remount failed) leaves streaming to stop
+        with an error, as before.
+        """
+        restart = getattr(self, "restart_mount_worker", None)
+        if restart is None or getattr(self, "_close_after_stop", False):
+            return False
+        restarting = self.__dict__.setdefault("_restarting_worker_pids", set())
+        policy = self._worker_restart_policy()
+        for handle, _exit_code in dead:
+            if handle.pid in restarting:
+                continue
+            if not policy.allow(handle.mountpoint):
+                log.error(
+                    "Mount worker for %s died %d times in %.0f minutes; "
+                    "not restarting it again",
+                    handle.mountpoint,
+                    policy.max_restarts,
+                    policy.window_seconds / 60.0,
+                )
+                return False
+
+        for handle, exit_code in dead:
+            if handle.pid in restarting:
+                continue
+            restarting.add(handle.pid)
+            self.update_status_bar(
+                f"Scenery mount {handle.volname or handle.mountpoint} stopped "
+                f"(code {exit_code}); remounting…"
+            )
+
+            def run(current=handle):
+                try:
+                    if restart(current) is None:
+                        self._worker_restart_failure = (
+                            f"Mount worker for {current.mountpoint} "
+                            f"(PID {current.pid}) died and could not be remounted."
+                        )
+                finally:
+                    restarting.discard(current.pid)
+
+            threading.Thread(
+                target=run, name="ao-remount", daemon=True
+            ).start()
+        return True
+
     def _check_mount_workers(self):
         if self.runtime_state != RuntimeState.RUNNING:
             return
+        failure = getattr(self, "_worker_restart_failure", None)
+        if failure:
+            self._worker_restart_failure = None
+            log.error("Streaming failed before cleanup: %s", failure)
+            self.mount_monitor_timer.stop()
+            self._runtime_error_message = failure
+            self._start_mount_control("stop", stop_target=RuntimeState.ERROR)
+            return
+        restarting = getattr(self, "_restarting_worker_pids", set())
         handles = list(getattr(self, "mount_workers", []))
         dead = []
         for handle in handles:
@@ -8606,6 +8675,10 @@ class ConfigUI(QMainWindow):
             if exit_code is not None:
                 dead.append((handle, exit_code))
         if handles and not dead:
+            return
+        if not handles and restarting:
+            return  # the replacement worker is starting
+        if dead and self._try_restart_dead_workers(dead):
             return
 
         self.mount_monitor_timer.stop()
