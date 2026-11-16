@@ -262,6 +262,27 @@ def test_unrelated_retries_do_not_consume_broker_timeout_budget(chunk):
     assert chunk.permanent_failure is False
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_queue_timeouts_retry_soon_without_using_timeout_budget(chunk, wrapped):
+    # A request that expired in the broker queue never reached the provider:
+    # it must not count toward the timeout budget that fails a chunk for good.
+    request = _prepare(chunk)
+    for _ in range(getortho.MAX_BROKER_TIMEOUT_ATTEMPTS + 1):
+        error = getortho.BrokerQueueTimeoutError("timed out waiting in broker queue")
+        if wrapped:
+            # The synchronous path re-raises broker timeouts as requests ones.
+            try:
+                raise getortho.requests.exceptions.Timeout(str(error)) from error
+            except getortho.requests.exceptions.Timeout as exc:
+                error = exc
+        outcome = chunk.finish_network_attempt(request, error=error)
+
+        assert outcome.resolved is False
+        assert outcome.requeue_delay == 0.25
+    assert chunk.broker_timeout_count == 0
+    assert chunk.permanent_failure is False
+
+
 def test_unexpected_error_does_not_backoff(chunk):
     request = _prepare(chunk)
     outcome = chunk.finish_network_attempt(request, error=ValueError("weird"))

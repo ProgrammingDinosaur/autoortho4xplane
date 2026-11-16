@@ -620,7 +620,7 @@ def test_queue_timeout_is_reported_separately():
 
     try:
         with pytest.raises(
-            hb.BrokerTimeoutError,
+            hb.BrokerQueueTimeoutError,
             match="broker queue",
         ):
             queued.result(timeout=2.0)
@@ -628,6 +628,55 @@ def test_queue_timeout_is_reported_separately():
         gate.set()
 
     assert first.result(timeout=5.0).status_code == 200
+
+
+def test_live_requests_use_the_shorter_queue_timeout():
+    gate = threading.Event()
+
+    async def handler(request):
+        if request.url.path == "/gate":
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"ok")
+
+    broker = make_broker(
+        handler,
+        max_concurrency=1,
+        queue_timeout=5.0,
+        live_queue_timeout=0.2,
+    )
+    first = broker.submit_async("http://example.test/gate", priority=0)
+    time.sleep(0.05)
+    live = broker.submit_async("http://example.test/live", priority=0)
+    background = broker.submit_async(
+        "http://example.test/background",
+        priority=hb.DEFAULT_LIVE_PRIORITY_THRESHOLD,
+    )
+
+    try:
+        with pytest.raises(hb.BrokerQueueTimeoutError):
+            live.result(timeout=2.0)
+        # Background work keeps the full queue timeout.
+        assert background.done() is False
+    finally:
+        gate.set()
+
+    assert first.result(timeout=5.0).status_code == 200
+    assert background.result(timeout=5.0).status_code == 200
+
+
+def test_live_queue_timeout_never_exceeds_queue_timeout():
+    async def handler(request):  # pragma: no cover - never reached
+        return httpx.Response(200)
+
+    broker = hb.HTTP2Broker(
+        in_process=True,
+        transport=httpx.MockTransport(handler),
+        queue_timeout=5.0,
+        live_queue_timeout=30.0,
+    )
+    assert broker._queue_timeout_for(0) == 5.0
+    assert broker._queue_timeout_for(hb.DEFAULT_LIVE_PRIORITY_THRESHOLD) == 5.0
 
 
 # ---------------------------------------------------------------------------

@@ -192,6 +192,7 @@ try:
         BrokerCancelledError,
         BrokerCapacityError,
         BrokerTimeoutError,
+        BrokerQueueTimeoutError,
         BrokerTransportError,
         BrokerShutdownError,
         BrokerError,
@@ -204,6 +205,7 @@ except ImportError:
             BrokerCancelledError,
             BrokerCapacityError,
             BrokerTimeoutError,
+            BrokerQueueTimeoutError,
             BrokerTransportError,
             BrokerShutdownError,
             BrokerError,
@@ -216,6 +218,9 @@ except ImportError:
             """Placeholder used when the broker package is unavailable."""
 
         class BrokerTimeoutError(BrokerError):
+            """Placeholder used when the broker package is unavailable."""
+
+        class BrokerQueueTimeoutError(BrokerTimeoutError):
             """Placeholder used when the broker package is unavailable."""
 
         class BrokerCancelledError(BrokerError):
@@ -1189,12 +1194,35 @@ def _get_http2_client():
                 queue_timeout=resolve_provider_setting(
                     "provider_queue_timeout"
                 ),
+                live_queue_timeout=_live_queue_timeout_seconds(),
             )
         except Exception as exc:
             _http2_client_failed = True
             log.error("Could not connect to shared HTTP/2 broker: %s", exc)
             return None
         return _http2_client
+
+
+def _live_queue_timeout_seconds():
+    """How long a live request may wait in the broker queue before a retry.
+
+    Twice the in-flight near-read wait (at least 10 s): longer and the read
+    that asked for it has already given up, while a lost request held its
+    chunk for the whole provider queue timeout (60 s by default).
+    """
+    try:
+        near = wait_bands.wait_seconds(wait_bands.NEAR, False)
+    except Exception:
+        near = 6.0
+    return max(10.0, 2.0 * float(near))
+
+
+def _broker_timeout_of(error):
+    """The broker timeout behind ``error`` (raised or wrapped), else None."""
+    for candidate in (error, getattr(error, "__cause__", None)):
+        if isinstance(candidate, BrokerTimeoutError):
+            return candidate
+    return None
 
 
 def _close_http2_client():
@@ -10525,6 +10553,15 @@ class Chunk(object):
         if isinstance(error, (requests.exceptions.ConnectionError,
                               requests.exceptions.Timeout,
                               BrokerTimeoutError)):
+            # A request that never left the broker queue did not reach the
+            # provider (local saturation or a lost request): retry it soon
+            # instead of backing off as for a provider failure.
+            # _profiled_http_get re-raises broker timeouts as requests
+            # Timeouts, so the cause is checked too.
+            if isinstance(_broker_timeout_of(error), BrokerQueueTimeoutError):
+                bump("chunk_broker_queue_timeout")
+                log.warning(f"{self} expired in the broker queue; retrying")
+                return _AttemptOutcome(requeue_delay=0.25)
             if (
                 isinstance(error, BrokerTimeoutError)
             ):

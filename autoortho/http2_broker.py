@@ -150,6 +150,7 @@ __all__ = [
     "BrokerProtocolError",
     "BrokerAuthError",
     "BrokerTimeoutError",
+    "BrokerQueueTimeoutError",
     "BrokerShutdownError",
     "BrokerCancelledError",
     "BrokerCapacityError",
@@ -255,6 +256,14 @@ class BrokerAuthError(BrokerProtocolError):
 
 class BrokerTimeoutError(BrokerError):
     """A request (or the handshake) exceeded its allotted timeout."""
+
+
+class BrokerQueueTimeoutError(BrokerTimeoutError):
+    """A request expired before the broker started it (never reached the provider).
+
+    Local saturation or a lost request, not a provider failure: callers retry
+    it rather than count it against the provider.
+    """
 
 
 class BrokerShutdownError(BrokerError):
@@ -1066,8 +1075,10 @@ class _ClientDispatcher:
                 None,
                 BrokerTimeoutError(
                     "timed out after broker started provider request"
-                    if future.started
-                    else "timed out waiting in broker queue"
+                )
+                if future.started
+                else BrokerQueueTimeoutError(
+                    "timed out waiting in broker queue"
                 ),
             )
 
@@ -3352,6 +3363,7 @@ class HTTP2Broker:
         origin_decrease_factor: float = DEFAULT_ORIGIN_DECREASE_FACTOR,
         origin_cooldown_seconds: float = DEFAULT_ORIGIN_COOLDOWN_SECONDS,
         queue_timeout: float = 60.0,
+        live_queue_timeout: Optional[float] = None,
         transport_trace: bool = False,
         max_bytes_per_second: float = 0.0,
     ):
@@ -3367,6 +3379,14 @@ class HTTP2Broker:
         self._max_response_bytes = max_response_bytes
         self._handshake_timeout = handshake_timeout
         self._queue_timeout = max(0.1, min(600.0, float(queue_timeout)))
+        # Live requests (a read is waiting) expire sooner, so one that never
+        # left the queue is retried instead of holding its chunk for the
+        # whole queue timeout.
+        self._live_queue_timeout = (
+            self._queue_timeout
+            if live_queue_timeout is None
+            else max(0.1, min(self._queue_timeout, float(live_queue_timeout)))
+        )
         self._max_pending = max(1, min(MAX_PENDING_LIMIT, int(max_pending)))
         if reserved_live_slots is None:
             reserved_live_slots = int(
@@ -3552,6 +3572,7 @@ class HTTP2Broker:
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
         queue_timeout: float = 60.0,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        live_queue_timeout: Optional[float] = None,
     ) -> "HTTP2Broker":
         """Attach a client-only handle to an existing broker process."""
         _require_dependencies(require_http2=True)
@@ -3568,6 +3589,7 @@ class HTTP2Broker:
             max_request_bytes=max_request_bytes,
             queue_timeout=queue_timeout,
             max_response_bytes=max_response_bytes,
+            live_queue_timeout=live_queue_timeout,
         )
         broker._token = token
         broker._address = address
@@ -3621,10 +3643,7 @@ class HTTP2Broker:
             "priority": int(priority),
             "timeout": req_timeout.to_dict(),
         }
-        deadline = (
-            time.monotonic()
-            + self._queue_timeout
-        )
+        deadline = time.monotonic() + self._queue_timeout_for(priority)
         return dispatcher.submit(
             envelope,
             priority=int(priority),
@@ -3659,7 +3678,7 @@ class HTTP2Broker:
         # The dispatcher already enforces the same deadline; the extra second
         # only covers scheduling jitter before it settles the future.
         wait_seconds = (
-            self._queue_timeout
+            self._queue_timeout_for(priority)
             + req_timeout.total_seconds()
             + CLIENT_TIMEOUT_GRACE_SECONDS
             + 1.0
@@ -3669,6 +3688,11 @@ class HTTP2Broker:
         except BrokerTimeoutError:
             self.cancel(future.request_id)
             raise
+
+    def _queue_timeout_for(self, priority) -> float:
+        if int(priority) < self._live_priority_threshold:
+            return self._live_queue_timeout
+        return self._queue_timeout
 
     def cancel(self, request_id: str) -> bool:
         """Cancel a previously issued request by id (best effort).
