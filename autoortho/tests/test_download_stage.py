@@ -6,6 +6,7 @@ rules of ``_BrokerDownloadStage`` (bounded outstanding work with slots reserved
 for live requests).  Nothing here touches the network.
 """
 
+import os
 import sys
 import threading
 import time
@@ -99,6 +100,27 @@ def test_begin_network_attempt_honours_cancellation(chunk):
 # ---------------------------------------------------------------------------
 # finish_network_attempt
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("header", ["X-VE-Tile-Info", "x-ve-tile-info"])
+def test_provider_no_tile_answer_fails_chunk_for_good(chunk, header):
+    # Bing's no-imagery answer: HTTP 200, a 1 KB PNG and this header.
+    request = _prepare(chunk)
+    outcome = chunk.finish_network_attempt(
+        request,
+        FakeResponse(
+            200,
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 64,
+            headers={header: "no-tile", "content-type": "image/png"},
+        ),
+    )
+
+    assert outcome.resolved is True
+    assert chunk.permanent_failure is True
+    assert chunk.failure_reason == "no_imagery"
+    assert chunk.data == b""
+    assert chunk.ready.is_set()
+    assert not os.path.exists(chunk.cache_path)
+
 
 def test_successful_response_persists_and_marks_ready(chunk):
     request = _prepare(chunk)

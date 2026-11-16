@@ -1217,6 +1217,19 @@ def _live_queue_timeout_seconds():
     return max(10.0, 2.0 * float(near))
 
 
+def _provider_has_no_imagery(response):
+    """True when the provider said it has no imagery for this tile."""
+    headers = getattr(response, "headers", None) or {}
+    try:
+        items = headers.items()
+    except AttributeError:
+        return False
+    for name, value in items:
+        if str(name).lower() == "x-ve-tile-info":
+            return str(value).strip().lower() == "no-tile"
+    return False
+
+
 def _broker_timeout_of(error):
     """The broker timeout behind ``error`` (raised or wrapped), else None."""
     for candidate in (error, getattr(error, "__cause__", None)):
@@ -10423,6 +10436,20 @@ class Chunk(object):
             data = response.content
         except Exception as err:
             return self._handle_attempt_error(request, err)
+
+        if _provider_has_no_imagery(response):
+            # Bing answers 200 with a 1 KB PNG and "X-VE-Tile-Info: no-tile"
+            # where it has no imagery at this zoom. Asking again never
+            # helps: fail the chunk for good so the lower-zoom fallbacks
+            # fill it and healing does not keep re-requesting it.
+            log.debug(f"Provider has no imagery for {self}")
+            bump('chunk_no_imagery')
+            self.permanent_failure = True
+            self.failure_reason = "no_imagery"
+            self.data = b''
+            self.ready.set()
+            self._notify_ready()
+            return _AttemptOutcome(resolved=True)
 
         if data and _is_jpeg(data[:3]):
             log.debug(f"Data for {self} is JPEG")
