@@ -2162,11 +2162,32 @@ class ConfigUI(QMainWindow):
             if self.isVisible() and not self._hidden_to_tray:
                 self._hidden_to_tray = True
                 self.hide()
+                self._announce_hidden_to_tray(tray)
         elif self.runtime_state in (RuntimeState.STOPPED, RuntimeState.ERROR):
             if self._tray is not None:
                 self._tray.hide()
             if self._hidden_to_tray:
                 self._restore_from_tray()
+
+    _tray_notice_shown = False
+
+    def _announce_hidden_to_tray(self, tray):
+        """Once per launch: the window vanishing reads as a crash otherwise
+        (Windows tucks new tray icons behind the overflow arrow)."""
+        if self._tray_notice_shown:
+            return
+        self._tray_notice_shown = True
+        if sys.platform == "darwin":
+            where = "Click its menu bar icon or the Dock icon to show it."
+        else:
+            where = ("Click its tray icon (under the ^ arrow on the taskbar) "
+                     "to show it.")
+        tray.showMessage(
+            "AutoOrtho is still streaming",
+            f"The window is hidden while streaming. {where}",
+            QSystemTrayIcon.MessageIcon.Information,
+            8000,
+        )
 
     def _update_tray_summary(self, snapshot):
         """The tray tooltip reads like Home's headline; ! when a notice waits."""

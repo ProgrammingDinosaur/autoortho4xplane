@@ -360,11 +360,20 @@ def test_minimize_to_tray_while_streaming(qt_app, config_ui, monkeypatch):
     from ui.runtime_state import RuntimeState
 
     monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    messages = []
+    monkeypatch.setattr(QSystemTrayIcon, "showMessage",
+                        lambda self, title, *rest: messages.append(title))
+    config_ui._tray_notice_shown = False
     config_ui.hide_check.setChecked(True)
     config_ui.show()
     config_ui._set_runtime_state(RuntimeState.RUNNING)
     assert config_ui._tray is not None
     assert config_ui._hidden_to_tray and not config_ui.isVisible()
+    assert messages == ["AutoOrtho is still streaming"]
+    # Only once per launch.
+    config_ui._set_runtime_state(RuntimeState.STOPPED)
+    config_ui._set_runtime_state(RuntimeState.RUNNING)
+    assert len(messages) == 1
     config_ui._tray.setVisible(True)
     snapshot = SimpleNamespace(summary="AutoOrtho · 96 % sharp · 142 Mbit/s · Flying")
     config_ui._update_tray_summary(snapshot)
@@ -381,6 +390,7 @@ def test_app_activation_restores_window_hidden_to_tray(qt_app, config_ui, monkey
     from ui.runtime_state import RuntimeState
 
     monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    monkeypatch.setattr(QSystemTrayIcon, "showMessage", lambda *a: None)
     config_ui.hide_check.setChecked(True)
     config_ui.show()
     config_ui._set_runtime_state(RuntimeState.RUNNING)
