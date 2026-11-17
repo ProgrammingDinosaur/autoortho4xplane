@@ -492,23 +492,6 @@ class StoragePage(_BasePage):
         return not self.wizard_ref.readiness.checks[1].is_blocking
 
 
-class DependenciesPage(_BasePage):
-    def __init__(self, wizard: "SetupWizard"):
-        super().__init__(
-            wizard,
-            "Dependencies",
-            "Virtual drive file system driver (FUSE)",
-        )
-        layout = QVBoxLayout(self)
-        self.summary_label = QLabel()
-        self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label)
-        layout.addStretch(1)
-
-    def isComplete(self) -> bool:  # noqa: N802
-        return self.wizard_ref.readiness.checks[2].is_ready
-
-
 class SceneryPage(_BasePage):
     def __init__(self, wizard: "SetupWizard"):
         super().__init__(
@@ -870,7 +853,20 @@ class SetupWizard(QWizard):
         self.paging_k = float(paging_k)
         self.texture_format = texture_format
         self.setWindowTitle("AutoOrtho Setup Wizard")
+        # On Windows Qt switches QWizard to AeroStyle when it is shown, which
+        # paints the page area with a hard-coded white palette under the dark
+        # theme's light text. ModernStyle follows the application palette.
+        self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
         self.setOption(QWizard.WizardOption.NoBackButtonOnStartPage, True)
+        for which in (
+            QWizard.WizardButton.NextButton,
+            QWizard.WizardButton.FinishButton,
+        ):
+            button = self.button(which)
+            button.setProperty("role", "primary")
+            # The wizard polished its buttons on creation; re-read the role.
+            button.style().unpolish(button)
+            button.style().polish(button)
 
         self._values = _default_paths()
         if initial_values is not None:
@@ -989,7 +985,6 @@ class SetupWizard(QWizard):
         self.welcome_page = WelcomePage(self)
         self.xplane_page = XPlanePage(self)
         self.storage_page = StoragePage(self)
-        self.dependencies_page = DependenciesPage(self)
         self.scenery_page = SceneryPage(self)
         self.quality_page = QualityPage(self)
         self.limits_page = LimitsPage(self)
@@ -1076,7 +1071,6 @@ class SetupWizard(QWizard):
         self._readiness = build_readiness(self._values, self._choices, search_roots=self.xplane_search_roots)
         self.xplane_page.status_label.setText(self._format_status(self._readiness.checks[0]))
         self.storage_page._refresh_storage_summary()
-        self.dependencies_page.summary_label.setText(self._format_status(self._readiness.checks[2]))
         self.welcome_page.checks_label.setText(
             self._format_status(self._readiness.checks[2])
         )
