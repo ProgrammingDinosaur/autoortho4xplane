@@ -9,6 +9,7 @@
 #include "aocache.h"
 #include "internal.h"
 #include <stdio.h>
+#include <time.h>
 #include <turbojpeg.h>
 
 /* Version string */
@@ -100,7 +101,8 @@ AODECODE_API aodecode_pool_t* aodecode_create_pool(int32_t count) {
  * Create a buffer pool with memory limit.
  * 
  * Extended version that sets a memory limit for overflow buffers.
- * When the limit is reached, acquire will block until a buffer is released.
+ * When the limit is reached, acquire waits up to AODECODE_POOL_WAIT_MS for a
+ * buffer to be released, then allocates over the limit.
  */
 AODECODE_API aodecode_pool_t* aodecode_create_pool_ex(int32_t count, int64_t memory_limit) {
     aodecode_pool_t* pool = aodecode_create_pool(count);
@@ -122,26 +124,64 @@ AODECODE_API void aodecode_destroy_pool(aodecode_pool_t* pool) {
     free(pool);
 }
 
+/* How long acquire waits at the memory limit before going over it.
+ *
+ * The limit is back-pressure, not a hard cap. A caller can hold buffers
+ * while it waits (a build decodes all of a tile's chunks before it composes
+ * them), and the threads that would release buffers can be queued behind
+ * that caller elsewhere (the Python build gate). An unbounded wait there
+ * deadlocked the mount worker and froze X-Plane mid-flight. */
+#define AODECODE_POOL_WAIT_MS 500
+
+static int64_t pool_now_ms(void) {
+#ifdef AOPIPELINE_WINDOWS
+    return (int64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#endif
+}
+
+/* Wait on buffer_available for at most ms (pool->lock held). */
+static void pool_wait_ms(aodecode_pool_t* pool, int64_t ms) {
+    if (ms <= 0) return;
+#ifdef AOPIPELINE_WINDOWS
+    SleepConditionVariableCS(&pool->buffer_available, &pool->lock, (DWORD)ms);
+#else
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(ms / 1000);
+    deadline.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_cond_timedwait(&pool->buffer_available, &pool->lock, &deadline);
+#endif
+}
+
 /**
  * Acquire a buffer from the pool.
- * 
+ *
  * Strategy:
  * 1. Try fixed pool first (fastest, no fragmentation)
  * 2. If pool exhausted, try malloc overflow if within memory_limit
- * 3. If limit reached, wait for buffer to be released
- * 4. Safety fallback: malloc if wait fails (shouldn't happen)
+ * 3. If limit reached, wait up to AODECODE_POOL_WAIT_MS for a buffer to be
+ *    released, then allocate over the limit rather than wait forever
  */
 AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
     if (!pool) {
         /* No pool - fallback to malloc */
         return (uint8_t*)malloc(CHUNK_RGBA_BYTES);
     }
-    
+
     uint8_t* buffer = NULL;
     int64_t fixed_pool_size = (int64_t)pool->count * CHUNK_RGBA_BYTES;
-    
+    int64_t wait_until = -1;
+
     AOMUTEX_LOCK(pool->lock);
-    
+
     while (1) {
         /* Step 1: Try fixed pool first (O(1), no fragmentation) */
         if (pool->free_top > 0) {
@@ -166,9 +206,15 @@ AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
             return buffer;
         }
         
-        /* Check if we have room for another overflow buffer */
+        /* Check if we have room for another overflow buffer, or have waited
+         * long enough at the limit (see AODECODE_POOL_WAIT_MS). */
         int64_t current_usage = fixed_pool_size + pool->overflow_allocated;
-        if (current_usage + CHUNK_RGBA_BYTES <= pool->memory_limit) {
+        int64_t now = pool_now_ms();
+        if (wait_until < 0) {
+            wait_until = now + AODECODE_POOL_WAIT_MS;
+        }
+        if (current_usage + CHUNK_RGBA_BYTES <= pool->memory_limit
+            || now >= wait_until) {
             /* Within limit - allocate overflow buffer */
             pool->overflow_allocated += CHUNK_RGBA_BYTES;
             pool->overflow_count++;
@@ -186,9 +232,9 @@ AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
             return buffer;
         }
         
-        /* Step 3: Limit reached - wait for buffer to be released */
+        /* Step 3: Limit reached - wait (bounded) for a buffer to be released */
         pool->waiters_count++;
-        AOCOND_WAIT(pool->buffer_available, pool->lock);
+        pool_wait_ms(pool, wait_until - now);
         pool->waiters_count--;
         /* Loop back to try again after wakeup */
     }

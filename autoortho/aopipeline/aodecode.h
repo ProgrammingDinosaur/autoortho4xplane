@@ -128,7 +128,8 @@ AODECODE_API void aodecode_pool_stats(
  * Create a buffer pool with memory limit.
  * 
  * Extended version that sets a memory limit for overflow buffers.
- * When the limit is reached, acquire will block until a buffer is released.
+ * When the limit is reached, acquire waits up to 500 ms for a buffer to be
+ * released, then allocates over the limit rather than block forever.
  * 
  * @param count         Number of fixed buffers to pre-allocate
  * @param memory_limit  Maximum total memory (0 = unlimited)
