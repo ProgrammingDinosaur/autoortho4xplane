@@ -14204,6 +14204,10 @@ class Tile(object):
         header_chunk = False
         first_needed = 0
         wanted = None
+        # This read's own band and start state for its statistics: the
+        # tile's ``_read_band`` is shared by concurrent reads of the tile.
+        read_band = None
+        read_starting = False
         if streaming_options.flag("read_classifier"):
             with self._lock:
                 header_chunk, wanted, first_needed = read_pattern.classify(
@@ -14239,7 +14243,9 @@ class Tile(object):
                 bump("read_band_inherited_coarser")
                 level = builds_from
             level = min(level, len(self.dds.mipmap_list) - 1)
-            request_budget = self._band_budget(level, request_budget)
+            request_budget, read_band, read_starting = self._band_wait(
+                level, request_budget
+            )
         for mipmap in self.dds.mipmap_list:
             if mipmap.idx < first_needed:
                 continue
@@ -14286,13 +14292,15 @@ class Tile(object):
             real = self.real_from() <= wanted
             bump("reads_wanted_real" if real else "reads_wanted_standin")
             if not real and streaming_options.flag("wait_bands"):
-                self._note_late(wanted, read_started)
-            if getattr(self, "_read_band", None) == wait_bands.NEAR:
+                self._note_late(
+                    wanted, read_started, band=read_band, starting=read_starting
+                )
+            if read_band == wait_bands.NEAR:
                 # Target fidelity (the governor's goal): near reads answered
                 # with real imagery at the target zoom.
                 bump("near_reads_real" if real else "near_reads_standin")
                 if not real:
-                    self._note_near_miss(wanted)
+                    self._note_near_miss(wanted, starting=read_starting)
                 if (
                     real
                     and not getattr(self, "_sharp_noted", False)
@@ -14329,6 +14337,14 @@ class Tile(object):
 
         Never longer than what is left of the tile's own budget.
         """
+        return self._band_wait(mip, tile_budget)[0]
+
+    def _band_wait(self, mip, tile_budget):
+        """``(budget, band, starting)`` of one read (see ``_band_budget``).
+
+        The tile keeps the latest band for download priorities; the read
+        keeps its own for statistics.
+        """
         band = wait_bands.band_of(mip, self.max_mipmap)
         camera = current_camera()
         if camera is not None:
@@ -14350,7 +14366,7 @@ class Tile(object):
         bump(f"read_band_{band}")
         if tile_budget is not None:
             wait = min(wait, tile_budget.remaining)
-        return TimeBudget(wait)
+        return TimeBudget(wait), band, starting
 
     def _mm0_all_exact(self):
         """Mipmap 0 is complete and every row of it is real target imagery."""
@@ -14438,7 +14454,7 @@ class Tile(object):
         self._maybe_persist_complete_dds()
         return True
 
-    def _note_near_miss(self, wanted):
+    def _note_near_miss(self, wanted, starting=None):
         """A near read was blurry in flight: count what prefetch had done for it.
 
         Bumps one ``near_miss_<kind>`` counter (prefetch_ledger.MISS_KINDS)
@@ -14446,7 +14462,9 @@ class Tile(object):
         (prefetch can't know where a flight begins), without a position, and
         below the prefetcher's own minimum speed (it does not run there).
         """
-        if getattr(self, "_read_starting", False):
+        if starting is None:
+            starting = getattr(self, "_read_starting", False)
+        if starting:
             return
         camera = current_camera()
         if camera is None:
@@ -14473,9 +14491,17 @@ class Tile(object):
         except Exception as exc:  # statistics only
             log.debug(f"Near miss note for {self.id} failed: {exc}")
 
-    def _note_late(self, wanted, read_started):
-        """A near or middle read stopped waiting: time its imagery's arrival."""
-        if getattr(self, "_read_band", None) not in (wait_bands.NEAR, wait_bands.MIDDLE):
+    def _note_late(self, wanted, read_started, band=None, starting=None):
+        """A near or middle read stopped waiting: time its imagery's arrival.
+
+        ``band`` and ``starting`` are the read's own (the tile's latest when
+        not given).
+        """
+        if band is None:
+            band = getattr(self, "_read_band", None)
+        if starting is None:
+            starting = bool(getattr(self, "_read_starting", False))
+        if band not in (wait_bands.NEAR, wait_bands.MIDDLE):
             return
         try:
             level = min(int(wanted), int(self.max_mipmap))
@@ -14488,7 +14514,7 @@ class Tile(object):
                 level,
                 grid.materialized(),
                 read_started,
-                bool(getattr(self, "_read_starting", False)),
+                bool(starting),
             )
         except Exception as exc:  # statistics only
             log.debug(f"Late arrival note for {self.id} failed: {exc}")

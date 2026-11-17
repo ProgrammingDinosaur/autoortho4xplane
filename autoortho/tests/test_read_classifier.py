@@ -215,6 +215,31 @@ def test_unplaced_read_keeps_a_finer_inherited_level(tile, monkeypatch):
     assert tile._read_band == getortho.wait_bands.NEAR
 
 
+def test_read_statistics_use_the_reads_own_band(tile, monkeypatch):
+    # A concurrent far read of the same tile moves the tile's latest band
+    # while this near read waits: its statistics still count it as near.
+    _record_budgets(tile, monkeypatch)
+    bumps = []
+    monkeypatch.setattr(getortho, "bump", lambda key, n=1: bumps.append(key))
+
+    def concurrent_far_read(*_args, **_kwargs):
+        tile._read_band = getortho.wait_bands.FAR
+        return True
+
+    monkeypatch.setattr(tile, "get_bytes", concurrent_far_read)
+    monkeypatch.setattr(tile, "get_mipmap", concurrent_far_read)
+    late = []
+    monkeypatch.setattr(
+        tile,
+        "_note_late",
+        lambda wanted, started, band=None, starting=None: late.append(band),
+    )
+    mm1 = tile.dds.mipmap_list[1]
+    tile._read_dds_bytes_budgeted(mm1.startpos, CHUNK, getortho.TimeBudget(600))
+    assert "near_reads_standin" in bumps
+    assert late == [getortho.wait_bands.NEAR]
+
+
 def test_classifier_off_restores_old_behavior(tile, monkeypatch):
     _flag(monkeypatch, "read_classifier", False)
     tile._read_dds_bytes_budgeted(0, CHUNK, getortho.TimeBudget(5))
