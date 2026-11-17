@@ -41,6 +41,8 @@ except ImportError:
 
 import logging
 log = logging.getLogger(__name__)
+# Per-texture layout lines only when AO_TRACE_READS=1 (see getortho.TRACE_READS).
+TRACE_READS = os.environ.get("AO_TRACE_READS") == "1"
 
 # --- BC1/DXT1 fallback block generation for missing_color ---
 # Used when a mipmap databuffer is None to provide a visible fallback instead of garbage
@@ -828,11 +830,10 @@ class DDS(Structure):
         # real MM is the len of our list - 3
         self.smallest_mm = len(self.mipmap_list) - 3
 
-        for m in self.mipmap_list:
-            log.debug(m)
-
-        #log.debug(self.mipmap_list)
-        log.debug(self.pitchOrLinearSize)
+        if TRACE_READS:
+            for m in self.mipmap_list:
+                log.debug(m)
+            log.debug(self.pitchOrLinearSize)
         #print(self.pitchOrLinearSize)
         log.debug(self.mipMapCount)
 

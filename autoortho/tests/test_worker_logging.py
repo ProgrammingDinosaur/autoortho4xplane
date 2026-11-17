@@ -72,3 +72,37 @@ def test_worker_records_reach_parent_through_a_queue(monkeypatch):
             mount_worker._log_listener = None
         root.handlers[:], root.level, root.filters[:] = saved
         server.close()
+
+
+def _configure_without_parent(monkeypatch, tmp_path):
+    import pathlib
+
+    monkeypatch.delenv("AO_LOG_ADDR", raising=False)
+    # The worker writes its own log under ~/.autoortho-data when it has no
+    # parent to send records to; keep that out of the real home directory.
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    mount_worker.configure_worker_logging("z_test", "DEBUG")
+
+
+def test_mfusepy_per_call_debug_is_off_unless_tracing(monkeypatch, tmp_path):
+    # mfusepy logs every errno it returns at DEBUG; X-Plane's library probes
+    # made that most of the log during a scenery load.
+    root = logging.getLogger()
+    fuse_log = logging.getLogger("fuse")
+    saved = (root.handlers[:], root.level, root.filters[:], fuse_log.level)
+    try:
+        monkeypatch.delenv("AO_TRACE_READS", raising=False)
+        _configure_without_parent(monkeypatch, tmp_path)
+        assert not fuse_log.isEnabledFor(logging.DEBUG)
+        assert fuse_log.isEnabledFor(logging.ERROR)
+
+        fuse_log.setLevel(logging.NOTSET)
+        monkeypatch.setenv("AO_TRACE_READS", "1")
+        _configure_without_parent(monkeypatch, tmp_path)
+        assert fuse_log.isEnabledFor(logging.DEBUG)
+    finally:
+        for handler in root.handlers:
+            if handler not in saved[0]:
+                handler.close()
+        root.handlers[:], root.level, root.filters[:] = saved[:3]
+        fuse_log.setLevel(saved[3])

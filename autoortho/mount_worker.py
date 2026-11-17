@@ -80,6 +80,11 @@ def configure_worker_logging(mount_name, loglevel: str):
 
     root = logging.getLogger()
     level = getattr(logging, str(loglevel).upper(), logging.INFO)
+    if os.getenv("AO_TRACE_READS") != "1":
+        # mfusepy logs every errno it returns at DEBUG, and X-Plane probes
+        # thousands of missing library paths while it loads. Its errors and
+        # uncaught exceptions are logged above DEBUG and still get through.
+        logging.getLogger("fuse").setLevel(max(level, logging.INFO))
 
     if addr:
         host, port = addr.split(":")

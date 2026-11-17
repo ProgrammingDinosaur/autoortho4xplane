@@ -10422,7 +10422,8 @@ class Chunk(object):
         schedule it instead of occupying a thread.
         """
 
-        log.debug(f"Getting {self}")
+        if TRACE_READS:
+            log.debug(f"Getting {self}")
 
         # Signal that download has started (not waiting in queue anymore)
         self.download_started.set()
@@ -10475,7 +10476,8 @@ class Chunk(object):
         # download alive longer than the caller is willing to wait.
         _http_timeout = timeout or (5, wait_bands.http_read_timeout_seconds())
 
-        log.debug(f"Requesting {self.url} ..")
+        if TRACE_READS:
+            log.debug(f"Requesting {self.url} ..")
 
         return _NetworkRequest(
             url=url,
@@ -10544,7 +10546,8 @@ class Chunk(object):
             return _AttemptOutcome(resolved=True)
 
         if data and _is_jpeg(data[:3]):
-            log.debug(f"Data for {self} is JPEG")
+            if TRACE_READS:
+                log.debug(f"Data for {self} is JPEG")
             self.data = data
         else:
             log.debug(f"Invalid JPEG for {self} (HTTP {status_code} "
@@ -18935,7 +18938,8 @@ class TileCacher(object):
         map_type = self._resolve_maptype(row, col, map_type, zoom)
         idx = self._to_tile_id(row, col, map_type, zoom)
 
-        log.debug(f"Get_tile: {idx}")
+        if TRACE_READS:
+            log.debug(f"Get_tile: {idx}")
         reopened = False
         with self.tc_lock:
             tile = self.tiles.get(idx)
@@ -19000,7 +19004,8 @@ class TileCacher(object):
             t.refs -= 1
 
             if self.enable_cache: # and not t.should_close():
-                log.debug(f"Cache enabled.  Delay tile close for {tile_id}")
+                if TRACE_READS:
+                    log.debug(f"Cache enabled.  Delay tile close for {tile_id}")
                 if t.refs <= 0:
                     release_completed_sources = t
                     release_live_owner = t

@@ -200,7 +200,10 @@ def tilemeters(lat_deg, zoom):
 
 
 MEMTRACE = False
-# Per-read debug line only when AO_TRACE_READS=1 (see getortho.TRACE_READS).
+# Debug lines written on every FUSE call (getattr, open, read, opendir...)
+# only when AO_TRACE_READS=1 (see getortho.TRACE_READS). X-Plane makes
+# thousands of these calls a second while it loads scenery, which filled the
+# rotated log in seconds and pushed out everything else, startup included.
 TRACE_READS = os.environ.get("AO_TRACE_READS") == "1"
 
 
@@ -1020,7 +1023,8 @@ class AutoOrtho(Operations):
     # ==================
 
     def _access(self, path, mode):
-        log.debug(f"ACCESS: {path}")
+        if TRACE_READS:
+            log.debug(f"ACCESS: {path}")
         #m = re.match(".*/(\d+)[-_](\d+)[-_](\D*)(\d+).dds", path)
         #if m:
         #    log.info(f"ACCESS: Found DDS file {path}: %s " % str(m.groups()))
@@ -1121,7 +1125,8 @@ class AutoOrtho(Operations):
 
 
     def getattr(self, path, fh=None):
-        log.debug(f"GETATTR {path}")
+        if TRACE_READS:
+            log.debug(f"GETATTR {path}")
         
         # Check for DSF time exclusion redirect
         # Instead of hiding DSF files (which breaks X-Plane's indexing),
@@ -1200,8 +1205,9 @@ class AutoOrtho(Operations):
         row, col, maptype, zoom = match.groups()
         maptype = self._resolve_dds_maptype(maptype)
         dds_size = self._get_dds_size_cached(int(row), int(col), maptype, int(zoom))
-        log.debug("GETATTR: Fetch for path: %s", path)
-        
+        if TRACE_READS:
+            log.debug("GETATTR: Fetch for path: %s", path)
+
         attrs = {
             'st_atime': now, 
             'st_ctime': now, 
@@ -1213,7 +1219,8 @@ class AutoOrtho(Operations):
             'st_gid': self.default_gid,
             'st_size': dds_size,
         }
-        log.debug(f"GETATTR: ATTRS: {attrs}")
+        if TRACE_READS:
+            log.debug(f"GETATTR: ATTRS: {attrs}")
         return attrs
 
     def _getattr_poison(self, now):
@@ -1276,11 +1283,13 @@ class AutoOrtho(Operations):
                 self._negative_getattr_cache.move_to_end(cache_key)  # LRU
                 raise FuseOSError(errno.ENOENT)
 
-        log.debug(f"GETATTR FULLPATH {full_path}")
+        if TRACE_READS:
+            log.debug(f"GETATTR FULLPATH {full_path}")
         try:
             st = os.lstat(full_path)
         except OSError as e:
-            log.debug(f"GETATTR: lstat failed for {full_path}: {e}")
+            if TRACE_READS:
+                log.debug(f"GETATTR: lstat failed for {full_path}: {e}")
             if getattr(e, "errno", None) in (errno.ENOENT, errno.ENOTDIR):
                 with self._negative_getattr_cache_lock:
                     # Cache Miss + Missing File: We just found out file does not exist
@@ -1288,7 +1297,8 @@ class AutoOrtho(Operations):
                         self._negative_getattr_cache.popitem(last=False)
                     self._negative_getattr_cache[cache_key] = None
             raise FuseOSError(errno.ENOENT)
-        log.debug(f"GETATTR: Orig stat: {st}")
+        if TRACE_READS:
+            log.debug(f"GETATTR: Orig stat: {st}")
         attrs = {k: getattr(st, k) for k in (
             'st_atime',
             'st_ctime',
@@ -1301,9 +1311,10 @@ class AutoOrtho(Operations):
             'st_ino',
             'st_dev',
         )}
-        log.debug(f"GETATTR: ATTRS: {attrs}")
+        if TRACE_READS:
+            log.debug(f"GETATTR: ATTRS: {attrs}")
         return attrs
-    
+
     def _getattr_redirected_dsf(self, redirect_path):
         """Get attributes for a DSF file redirected to global scenery.
         
@@ -1431,9 +1442,9 @@ class AutoOrtho(Operations):
     #@locked
     def open(self, path, flags):
 
-        log.debug(f"OPEN: {path} {flags}")
         full_path = self._full_path(path)
-        log.debug(f"OPEN: FULLPATH {full_path}")
+        if TRACE_READS:
+            log.debug(f"OPEN: {path} {flags} FULLPATH {full_path}")
 
         # Handle DSF files with time exclusion redirect
         if self.dsf_re.match(path):
@@ -1734,16 +1745,19 @@ class AutoOrtho(Operations):
         return 0
 
     def releasedir(self, path, fh):
-        log.debug(f"RELEASEDIR: {path}")
+        if TRACE_READS:
+            log.debug(f"RELEASEDIR: {path}")
         return 0
-    
+
     def opendir(self, path):
-        log.debug(f"OPENDIR: {path}")
-        return 0 
+        if TRACE_READS:
+            log.debug(f"OPENDIR: {path}")
+        return 0
 
     #@locked
     def release(self, path, fh):
-        log.debug(f"RELEASE: {path}")
+        if TRACE_READS:
+            log.debug(f"RELEASE: {path}")
         
         # Unregister DSF close for time exclusion tracking
         if self.dsf_re.match(path):
@@ -1781,12 +1795,14 @@ class AutoOrtho(Operations):
 
     # X-Plane never writes to files in the FUSE mount
     def _fsync(self, path, fdatasync, fh):
-        log.debug(f"FSYNC: {path}")
+        if TRACE_READS:
+            log.debug(f"FSYNC: {path}")
         return self.flush(path, fh)
 
 
     def close(self, path=None, fh=None):
-        log.debug(f"CLOSE: {path}")
+        if TRACE_READS:
+            log.debug(f"CLOSE: {path}")
         if path is None and fh is None:
             self.shutdown()
         return 0
