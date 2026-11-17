@@ -403,6 +403,26 @@ AODDS_API int32_t aodds_build_partial_mipmap(
 );
 
 /**
+ * aodds_build_partial_mipmap bounded to max_threads OpenMP threads
+ * (0 = OpenMP default), so concurrent partial builds can share the CPU.
+ */
+AODDS_API int32_t aodds_build_partial_mipmap_mt(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunks_width,
+    int32_t chunks_height,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool,
+    int32_t max_threads
+);
+
+/**
  * Build a mipmap chain from JPEG data: starting level + all smaller mipmaps.
  * 
  * This function builds the requested mipmap level AND all smaller mipmaps

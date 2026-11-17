@@ -2650,16 +2650,29 @@ class PartialMipmapResult(NamedTuple):
     error: str = ''
 
 
+def partial_mipmap_supports_threads() -> bool:
+    """Whether the loaded library can bound a partial build's thread count."""
+    try:
+        return hasattr(_load_library(), 'aodds_build_partial_mipmap_mt')
+    except Exception:
+        return False
+
+
 def build_partial_mipmap(
     jpeg_datas: List[Optional[bytes]],
     chunks_width: int,
     chunks_height: int,
     format: str = "BC1",
     missing_color: Tuple[int, int, int] = (66, 77, 55),
-    pool: Optional[c_void_p] = None
+    pool: Optional[c_void_p] = None,
+    max_threads: int = 0,
 ) -> PartialMipmapResult:
     """
     Build a rectangular partial mipmap from JPEG chunks.
+
+    ``max_threads`` bounds the OpenMP team (0 = the library default). It is
+    honoured only by libraries that export ``aodds_build_partial_mipmap_mt``;
+    see ``partial_mipmap_supports_threads``.
     
     Unlike build_single_mipmap() which requires square chunk grids (e.g., 8×8),
     this function supports arbitrary width × height layouts (e.g., 8×1 for
@@ -2756,10 +2769,14 @@ def build_partial_mipmap(
             c_void_p                    # pool
         ]
         lib.aodds_build_partial_mipmap.restype = c_int32
+        if hasattr(lib, 'aodds_build_partial_mipmap_mt'):
+            lib.aodds_build_partial_mipmap_mt.argtypes = (
+                list(lib.aodds_build_partial_mipmap.argtypes) + [c_int32]
+            )
+            lib.aodds_build_partial_mipmap_mt.restype = c_int32
         lib._partial_mipmap_setup_done = True
-    
-    # Call native function
-    success = lib.aodds_build_partial_mipmap(
+
+    args = (
         jpeg_ptrs,
         jpeg_sizes,
         c_int32(chunks_width),
@@ -2771,8 +2788,13 @@ def build_partial_mipmap(
         output_buffer.ctypes.data_as(POINTER(c_uint8)),
         c_uint32(output_size),
         byref(bytes_written),
-        pool_handle
+        pool_handle,
     )
+    # Call native function
+    if max_threads and hasattr(lib, 'aodds_build_partial_mipmap_mt'):
+        success = lib.aodds_build_partial_mipmap_mt(*args, c_int32(max_threads))
+    else:
+        success = lib.aodds_build_partial_mipmap(*args)
     
     elapsed_ms = (time.monotonic() - start_time) * 1000
     
@@ -2806,6 +2828,7 @@ def build_partial_mipmap_v2(
     format: str = "BC1",
     missing_color: Tuple[int, int, int] = (66, 77, 55),
     pool: Optional[c_void_p] = None,
+    max_threads: int = 0,
 ) -> PartialMipmapResult:
     """Build a partial mipmap from JPEGs, prepared pixels, or missing slots.
 
@@ -2838,6 +2861,7 @@ def build_partial_mipmap_v2(
         format=format,
         missing_color=missing_color,
         pool=pool,
+        max_threads=max_threads,
     )
     if not result.success or not result.data or not prepared:
         return result

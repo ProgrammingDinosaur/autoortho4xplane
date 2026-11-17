@@ -517,3 +517,152 @@ def test_partial_v2_accepts_prepared_target_pixels(monkeypatch):
     assert captured["jpeg_datas"][1] is None
     assert captured["jpeg_datas"][2] is None
     assert result.data != b"\x00" * len(result.data)
+
+
+def test_live_row_read_queues_rest_of_level_once(monkeypatch, tmp_path):
+    # X-Plane reads from the level it wants to the end of the file: the rows
+    # after the one being read are queued at once, behind it, and only once.
+    tile = getortho.Tile(0, 0, "BI", 16, cache_dir=str(tmp_path), max_zoom=17)
+    submitted = []
+
+    class Getter:
+        @staticmethod
+        def submit(chunk, *args, **kwargs):
+            submitted.append((chunk.row, chunk.priority, chunk.prefetch))
+            chunk.in_queue = True
+            return True
+
+    monkeypatch.setattr(getortho, "chunk_getter", Getter())
+    monkeypatch.setattr(getortho.Tile, "_warm_fallback_mipmap_chunks", lambda self: None)
+    grid = tile._get_chunk_grid(17)
+    deadline = time.monotonic()  # nothing arrives: return at once
+
+    tile._collect_row_chunk_jpegs(17, 0, 0, deadline=deadline)
+
+    first_row = [s for s in submitted if s[0] == grid.row]
+    ahead = [s for s in submitted if s[0] != grid.row]
+    assert len(first_row) == grid.width
+    assert all(p == getortho.PRIORITY_LIVE for _, p, _ in first_row)
+    assert len(ahead) == grid.width * (grid.height - 1)
+    assert all(p == getortho.PRIORITY_READ_AHEAD and not pf for _, p, pf in ahead)
+
+    submitted.clear()
+    promoted = []
+    Getter.promote = staticmethod(lambda chunk, priority: promoted.append((chunk.row, priority)) or True)
+    tile._collect_row_chunk_jpegs(17, 1, 1, deadline=deadline)
+    assert submitted == []  # already queued
+    # The row now being read is raised from read-ahead to live.
+    assert promoted == [(grid.row + 1, getortho.PRIORITY_LIVE)] * grid.width
+
+
+def test_prefetch_row_reads_do_not_read_ahead(monkeypatch, tmp_path):
+    tile = getortho.Tile(0, 0, "BI", 16, cache_dir=str(tmp_path), max_zoom=17)
+    submitted = []
+
+    class Getter:
+        @staticmethod
+        def submit(chunk, *args, **kwargs):
+            submitted.append(chunk.row)
+            return True
+
+    monkeypatch.setattr(getortho, "chunk_getter", Getter())
+    grid = tile._get_chunk_grid(17)
+    tile._collect_row_chunk_jpegs(
+        17, 0, 0, deadline=time.monotonic(), priority=getortho.PRIORITY_PREFETCH
+    )
+    assert len(submitted) == grid.width
+
+
+def test_chunk_getter_promote_moves_queued_chunk_ahead(monkeypatch, tmp_path):
+    getter = getortho.ChunkGetter.__new__(getortho.ChunkGetter)
+    from autoortho.prefetch import IndexedPriorityQueue
+    getter.live_queue = IndexedPriorityQueue()
+    getter.prefetch_queue = IndexedPriorityQueue()
+    getter._async_stage = None
+    chunks = [getortho.Chunk(i, 0, "BI", 17, cache_dir=str(tmp_path), skip_cache_check=True) for i in range(3)]
+    for chunk, priority in zip(chunks, (getortho.PRIORITY_READ_AHEAD, 30, 10)):
+        chunk.priority = priority
+        getter.live_queue.put_nowait((chunk, (), {}), item_key=chunk.chunk_id, item_priority=priority)
+
+    assert getter.promote(chunks[0], getortho.PRIORITY_LIVE) is True
+    assert chunks[0].priority == getortho.PRIORITY_LIVE
+    assert getter.live_queue.get_nowait()[0] is chunks[0]
+    # Never lowers a chunk's priority.
+    assert getter.promote(chunks[2], 40) is False
+    assert chunks[2].priority == 10
+
+
+def test_partial_build_threads_share_the_budget(monkeypatch):
+    monkeypatch.setattr(getortho, "_native_cpu_budget", lambda: 32)
+    monkeypatch.delenv("AO_PARTIAL_BUILD_THREADS", raising=False)
+    # one 8192 px chunk row: 32 chunks, about eight per thread
+    assert getortho._partial_build_threads(32) == 4
+    assert getortho._partial_build_threads(3) == 1
+    # never more than half the budget, so a second build always fits
+    assert getortho._partial_build_threads(10_000) == 16
+    monkeypatch.setenv("AO_PARTIAL_BUILD_THREADS", "64")
+    assert getortho._partial_build_threads(32) == 32
+
+
+def test_bounded_partial_builds_enter_the_gate_together(monkeypatch):
+    """Four builds of two threads fit an eight-thread budget at once; a
+    reservation of the whole budget used to admit only one."""
+    monkeypatch.setattr(getortho, "_native_cpu_budget", lambda: 8)
+    barrier = threading.Barrier(4, timeout=5)
+    granted = []
+    errors = []
+
+    def build():
+        try:
+            with getortho._native_build_context(threads=2) as threads:
+                granted.append(threads)
+                barrier.wait()
+        except Exception as exc:  # pragma: no cover - reported below
+            errors.append(exc)
+
+    workers = [threading.Thread(target=build) for _ in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(10)
+    assert not errors
+    assert granted == [2, 2, 2, 2]
+
+
+def test_partial_v2_forwards_thread_bound(monkeypatch):
+    from autoortho.aopipeline import AoDDS
+
+    captured = {}
+
+    def build_partial_mipmap(**kwargs):
+        captured.update(kwargs)
+        data = b"\x00" * (64 * 64 * 8)
+        return AoDDS.PartialMipmapResult(
+            success=True, bytes_written=len(data), data=data,
+            pixel_width=256, pixel_height=256, elapsed_ms=0,
+        )
+
+    monkeypatch.setattr(AoDDS, "build_partial_mipmap", build_partial_mipmap)
+    AoDDS.build_partial_mipmap_v2([b"\xff\xd8jpeg"], 1, 1, max_threads=3)
+    assert captured["max_threads"] == 3
+
+
+def test_bounded_native_partial_build_matches_default():
+    import os
+    import pytest
+    from autoortho.aopipeline import AoDDS
+
+    if not AoDDS.partial_mipmap_supports_threads():
+        pytest.skip("native library without aodds_build_partial_mipmap_mt")
+    sample = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "testfiles", "test_tile_small.jpg",
+    )
+    jpeg = open(sample, "rb").read()
+    sources = [jpeg] * 8 + [None] * 4  # 4 x 3 band with a missing row
+    default = AoDDS.build_partial_mipmap(sources, 4, 3)
+    assert default.success
+    for threads in (1, 3):
+        bounded = AoDDS.build_partial_mipmap(sources, 4, 3, max_threads=threads)
+        assert bounded.success
+        assert bounded.data == default.data

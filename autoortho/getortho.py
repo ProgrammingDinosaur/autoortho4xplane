@@ -613,6 +613,9 @@ _tile_queue_initialized = False
 # Priority constants for buffer pool acquisition
 # Import from AoDDS when available, or use local fallbacks
 PRIORITY_LIVE = 0       # Live tiles requested by X-Plane (premium, front of queue)
+# Rows of a level X-Plane has started reading but not reached yet: after every
+# read X-Plane is waiting on (near 0, middle 10+, far 30), before prefetch.
+PRIORITY_READ_AHEAD = 50
 PRIORITY_PREFETCH = 100 # Prefetch/pre-built tiles (low priority, back of queue)
 PRIORITY_BACKGROUND_DDS = PRIORITY_PREFETCH
 PRIORITY_CACHE_REPAIR = 500
@@ -1149,6 +1152,11 @@ def _build_dds_native(cache_dir: str, tile_row: int, tile_col: int,
 
 MEMTRACE = False
 
+# Per-read and per-chunk debug lines (several per 64 KB read) only when
+# AO_TRACE_READS=1. At the default DEBUG level they cost more than the reads
+# themselves once many textures load at once.
+TRACE_READS = os.environ.get("AO_TRACE_READS") == "1"
+
 log = logging.getLogger(__name__)
 
 
@@ -1197,14 +1205,6 @@ def _get_http2_client():
                 ),
                 live_queue_timeout=_live_queue_timeout_seconds(),
             )
-        except Exception as exc:
-            _http2_client_failed = True
-            log.error("Could not connect to shared HTTP/2 broker: %s", exc)
-            return None
-        return _http2_client
-
-
-def _live_queue_timeout_seconds():
             addresses = [a for a in address.split(",") if a]
             if len(addresses) > 1 and MultiBrokerClient is not None:
                 # Several broker processes (provider_broker_processes).
@@ -1215,6 +1215,14 @@ def _live_queue_timeout_seconds():
                 _http2_client = HTTP2Broker.connect(
                     address, token, **client_kwargs
                 )
+        except Exception as exc:
+            _http2_client_failed = True
+            log.error("Could not connect to shared HTTP/2 broker: %s", exc)
+            return None
+        return _http2_client
+
+
+def _live_queue_timeout_seconds():
     """How long a live request may wait in the broker queue before a retry.
 
     Twice the in-flight near-read wait (at least 10 s): longer and the read
@@ -1951,6 +1959,33 @@ def _thread_budget_for(active: int) -> int:
         pass
 
     return max(1, _native_cpu_budget() // max(2, active))
+
+
+def _partial_build_threads_supported(native_dds) -> bool:
+    check = getattr(native_dds, "partial_mipmap_supports_threads", None)
+    try:
+        return bool(check and check())
+    except Exception:
+        return False
+
+
+def _partial_build_threads(chunk_count: int) -> int:
+    """Threads one partial mm0 build reserves.
+
+    A partial build covers a band of rows (32 chunks per 8192 px row), too
+    little work for a full team: reserving the whole CPU let only one band
+    build at a time, so every texture being read at full resolution queued
+    behind the others. About eight chunks per thread keeps one band fast
+    while several textures build side by side.
+    """
+    budget = _native_cpu_budget()
+    override = os.environ.get("AO_PARTIAL_BUILD_THREADS")
+    if override:
+        try:
+            return max(1, min(budget, int(override)))
+        except ValueError:
+            pass
+    return max(1, min(budget // 2 or 1, -(-chunk_count // 8)))
 
 
 class _BackgroundBuildDeferred(Exception):
@@ -3522,6 +3557,20 @@ class _BrokerDownloadStage(object):
             self._retire_deferred(pending)
         return len(removed)
 
+    def promote(self, chunk, priority) -> bool:
+        """Raise one chunk in the deferred queue, or its request at the broker."""
+        key = getattr(chunk, "chunk_id", None) or id(chunk)
+        moved = bool(self._deferred.reprioritize(key, int(priority)))
+        request_id = getattr(chunk, "_broker_request_id", None)
+        if request_id:
+            broker = _get_http2_client()
+            if broker is not None:
+                try:
+                    moved = bool(broker.reprioritize(request_id, int(priority))) or moved
+                except BrokerError:
+                    pass
+        return moved
+
     def reprioritize_deferred(self):
         for pending in self._deferred.items():
             key = getattr(pending.obj, "chunk_id", None) or id(pending.obj)
@@ -3947,6 +3996,38 @@ class ChunkGetter(Getter):
     _queued_chunk_objs = {}
     _queued_chunk_waiters = {}
     _queued_lock = threading.Lock()
+
+    def promote(self, chunk, priority) -> bool:
+        """Raise one queued or in-flight chunk to ``priority`` (lower is sooner).
+
+        A chunk queued ahead of need (read-ahead, prefetch) that a read now
+        waits for must not stay behind other work. Returns True if it moved.
+        """
+        priority = int(priority)
+        if int(getattr(chunk, "priority", priority)) <= priority:
+            return False
+        chunk.priority = priority
+        chunk_id = getattr(chunk, "chunk_id", None)
+        if chunk_id is None:
+            return False
+        moved = False
+        if getattr(chunk, "prefetch", False) and priority < PRIORITY_PREFETCH:
+            chunk.prefetch = False
+            item = self.prefetch_queue.remove(chunk_id)
+            if item is not None:
+                self.live_queue.put_nowait(item, item_key=chunk_id, item_priority=priority)
+                moved = True
+        if not moved:
+            moved = bool(self.live_queue.reprioritize(chunk_id, priority))
+        stage = self._async_stage
+        if stage is not None:
+            try:
+                moved = stage.promote(chunk, priority) or moved
+            except Exception:
+                log.debug("Download stage promotion failed for %s", chunk, exc_info=True)
+        if moved:
+            bump("chunk_promoted")
+        return moved
 
     def reprioritize_queue(self) -> None:
         """Re-key queued work and move promoted prefetch into the live lane."""
@@ -11153,6 +11234,13 @@ class Tile(object):
         self._degraded_provenance_logged = False
         self._persisted_exact_rows = set()
         self._exact_row_enqueue_failed = set()
+        # Zooms whose rest of level was queued on a live read (see
+        # _read_ahead_level).
+        self._read_ahead_zooms = set()
+        # The DDS cache metadata last applied, and its file's stat signature
+        # (see _dds_cache_metadata).
+        self._dds_meta_signature = None
+        self._dds_meta_cached = None
         self._partial_restore_attempted = False
         self._exact_row_states = {}
         self._exact_row_lock = threading.Lock()
@@ -11393,6 +11481,27 @@ class Tile(object):
         self._restore_provenance_from_metadata(metadata)
         self._load_partial_dds_rows(metadata)
         return bool(self._persisted_exact_rows)
+
+    def _dds_cache_metadata(self):
+        """This tile's DDS cache metadata, applied to the tile when it changed.
+
+        X-Plane reads a texture in 64 KB pieces, 683 of them for an 8192 px
+        one, and each used to parse the metadata again and re-apply its
+        provenance and saved rows: Python work under the GIL that made reads
+        crawl with many textures open. The file's stat signature now says
+        whether anything changed since this tile last applied it (its own
+        saves change it too, about once per row).
+        """
+        signature = dynamic_dds_cache.metadata_signature(self.id, self.max_zoom, self)
+        if signature is not None and signature == self._dds_meta_signature:
+            bump("dds_metadata_unchanged")
+            return self._dds_meta_cached
+        meta = dynamic_dds_cache.load_metadata(self.id, self.max_zoom, self)
+        self._restore_provenance_from_metadata(meta or {})
+        self._load_partial_dds_rows(meta)
+        self._dds_meta_signature = signature
+        self._dds_meta_cached = meta
+        return meta
 
     def _restore_provenance_from_metadata(self, metadata):
         try:
@@ -13556,16 +13665,15 @@ class Tile(object):
         if dynamic_dds_cache is not None and not self._prepopulated:
             cache_has_requested_mipmap = True
             try:
-                meta = dynamic_dds_cache.load_metadata(self.id, self.max_zoom, self)
+                meta = self._dds_cache_metadata()
                 populated = meta.get("populated_mipmaps") if meta else None
-                self._restore_provenance_from_metadata(meta or {})
-                self._load_partial_dds_rows(meta)
                 if populated is not None and 0 not in populated:
                     cache_has_requested_mipmap = False
-                    log.debug(
-                        f"GET_BYTES: DDS cache entry for {self.id} is partial "
-                        f"and missing mipmap 0; ignoring partial cache"
-                    )
+                    if TRACE_READS:
+                        log.debug(
+                            f"GET_BYTES: DDS cache entry for {self.id} is partial "
+                            f"and missing mipmap 0; ignoring partial cache"
+                        )
                     bump("dynamic_dds_cache_skip_partial_missing_mm0")
                     self._maybe_promote_partial_cache_to_mm0(requested_mipmap)
                 elif populated is not None and requested_mipmap not in populated:
@@ -13639,7 +13747,8 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════
 
         mipmap = requested_mipmap
-        log.debug(f"Get_bytes for mipmap {mipmap} ...")
+        if TRACE_READS:
+            log.debug(f"Get_bytes for mipmap {mipmap} ...")
         
         # ═══════════════════════════════════════════════════════════════════
         # LIVE AOPIPELINE: Try fast full-tile build when requesting mipmap 0
@@ -13678,11 +13787,12 @@ class Tile(object):
         )
         
         if mipmap == 0:
-            log.debug(f"GET_BYTES_DIAG: mipmap=0 offset={offset} length={length} "
-                     f"reaches_data={request_reaches_mipmap_0_data} "
-                     f"covers_mipmap={request_covers_mipmap_0} "
-                     f"already_attempted={self._aopipeline_attempted} "
-                     f"retrieved={self.dds.mipmap_list[0].retrieved if self.dds and self.dds.mipmap_list else 'N/A'}")
+            if TRACE_READS:
+                log.debug(f"GET_BYTES_DIAG: mipmap=0 offset={offset} length={length} "
+                         f"reaches_data={request_reaches_mipmap_0_data} "
+                         f"covers_mipmap={request_covers_mipmap_0} "
+                         f"already_attempted={self._aopipeline_attempted} "
+                         f"retrieved={self.dds.mipmap_list[0].retrieved if self.dds and self.dds.mipmap_list else 'N/A'}")
         
         if (mipmap == 0 and 
             request_reaches_mipmap_0_data and
@@ -13788,7 +13898,8 @@ class Tile(object):
 
         # Exit if already retrieved
         if self.dds.mipmap_list[mipmap].retrieved:
-            log.debug(f"We already have mipmap {mipmap} for {self}")
+            if TRACE_READS:
+                log.debug(f"We already have mipmap {mipmap} for {self}")
             return True
 
         mm = self.dds.mipmap_list[mipmap]
@@ -13796,10 +13907,12 @@ class Tile(object):
             self.get_mipmap(mipmap, time_budget=time_budget)
             return True
         
-        log.debug(f"Retrieving {length} bytes from mipmap {mipmap} offset {offset}")
+        if TRACE_READS:
+            log.debug(f"Retrieving {length} bytes from mipmap {mipmap} offset {offset}")
 
         mm_offset = max(0, offset - self.dds.mipmap_list[mipmap].startpos)
-        log.debug(f"MM_offset: {mm_offset}  Offset {offset}.  Startpos {self.dds.mipmap_list[mipmap]}")
+        if TRACE_READS:
+            log.debug(f"MM_offset: {mm_offset}  Offset {offset}.  Startpos {self.dds.mipmap_list[mipmap]}")
 
         base_width_px = max(4, int(self.dds.width) >> mipmap)
         base_height_px = max(4, int(self.dds.height) >> mipmap)
@@ -13819,19 +13932,20 @@ class Tile(object):
             endrow,
         )
 
-        log.debug(
-            "Startrow: %s Endrow: %s Composition rows: %s-%s "
-            "Reduction steps: %s bytes_per_chunk_row: %s "
-            "width_px: %s height_px: %s",
-            startrow,
-            endrow,
-            composition_startrow,
-            composition_endrow,
-            reduction_steps,
-            bytes_per_chunk_row,
-            base_width_px,
-            base_height_px,
-        )
+        if TRACE_READS:
+            log.debug(
+                "Startrow: %s Endrow: %s Composition rows: %s-%s "
+                "Reduction steps: %s bytes_per_chunk_row: %s "
+                "width_px: %s height_px: %s",
+                startrow,
+                endrow,
+                composition_startrow,
+                composition_endrow,
+                reduction_steps,
+                bytes_per_chunk_row,
+                base_width_px,
+                base_height_px,
+            )
         bump("partial_rows_requested", endrow - startrow + 1)
         
         # ═══════════════════════════════════════════════════════════════════
@@ -14043,7 +14157,8 @@ class Tile(object):
                 )
 
     def read_dds_bytes(self, offset, length):
-        log.debug(f"READ DDS BYTES: {offset} {length}")
+        if TRACE_READS:
+            log.debug(f"READ DDS BYTES: {offset} {length}")
 
         # Signal that a live tile read is in progress.
         # While any live reads are active, prefetching and background DDS
@@ -14871,7 +14986,8 @@ class Tile(object):
                 chunk_getter.submit(chunk)
                 data_updated = True
             else:
-                log.debug(f"GET_IMG: Chunk {chunk} already ready - reusing for mipmap {mipmap}")
+                if TRACE_READS:
+                    log.debug(f"GET_IMG: Chunk {chunk} already ready - reusing for mipmap {mipmap}")
         if data_updated and mipmap == 0 and self._is_live:
             self._warm_fallback_mipmap_chunks()
 
@@ -14892,9 +15008,11 @@ class Tile(object):
             img_height = 256 * requested_rows
             partial_row_offset = startrow * 256
         
-        log.debug(f"GET_IMG: Using download dimensions {width}x{height} chunks = {img_width}x{img_height} pixels")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Using download dimensions {width}x{height} chunks = {img_width}x{img_height} pixels")
         
-        log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
         
         # === PRE-INITIALIZE BASE LAYER FOR MIPMAP 0 ===
         # When building mipmap 0 (highest detail), instead of starting with a blank 
@@ -15098,8 +15216,9 @@ class Tile(object):
                 deferred_chunks.append((chunk, start_x, start_y))
 
         pass1_ready = len(chunks_with_images)
-        log.debug(f"GET_IMG: Pass 1 (quick): {pass1_ready}/{total_chunks} chunks ready, "
-                 f"{len(deferred_chunks)} deferred")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Pass 1 (quick): {pass1_ready}/{total_chunks} chunks ready, "
+                     f"{len(deferred_chunks)} deferred")
 
         # === PASS 2: POLL DEFERRED CHUNKS (time-capped) ===
         # Poll all deferred chunks, processing any that become ready.
@@ -15174,8 +15293,9 @@ class Tile(object):
                                if id(chunk) not in chunks_with_images]
 
         pass2_ready = len(chunks_with_images) - pass1_ready
-        log.debug(f"GET_IMG: Pass 2 (poll): {pass2_ready} additional chunks, "
-                 f"{len(deferred_chunks)} still deferred")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Pass 2 (poll): {pass2_ready} additional chunks, "
+                     f"{len(deferred_chunks)} still deferred")
 
         # === PASS 3: FALLBACK RESOLUTION ===
         # Apply fallback chain to still-missing chunks: disk cache, mipmap scaling, network
@@ -16873,6 +16993,7 @@ class Tile(object):
         row_chunks = grid.ensure_rows(startrow, endrow)
         # Submit downloads for any chunks not ready
         pending = False
+        promote = getattr(chunk_getter, "promote", None)
         for chunk in row_chunks:
             if priority == PRIORITY_LIVE:
                 _revive_for_request(chunk)
@@ -16882,10 +17003,16 @@ class Tile(object):
                     chunk.priority = priority
                     chunk.prefetch = priority != PRIORITY_LIVE
                     chunk_getter.submit(chunk)
+                elif promote is not None:
+                    # Queued ahead of need (read-ahead, prefetch): this read
+                    # waits for it now.
+                    promote(chunk, priority)
         if pending and priority == PRIORITY_LIVE and zoom == self.max_zoom:
             # The row may miss its deadline: fetch the cheap fallback zoom
             # now so it is cached by then.
             self._warm_fallback_mipmap_chunks()
+        if priority == PRIORITY_LIVE:
+            self._read_ahead_level(grid, endrow)
 
         if deadline is None:
             deadline = self._row_deadline(
@@ -16901,6 +17028,37 @@ class Tile(object):
             for chunk in row_chunks
         ]
         return jpeg_datas, chunks_width, chunks_height
+
+    def _read_ahead_level(self, grid, endrow):
+        """Queue the rest of a level X-Plane started reading, behind its rows.
+
+        X-Plane reads from the start of the level it wants to the end of the
+        file (read_pattern.py), so every later row will be asked for within
+        moments. Fetching them only as each read arrives left a texture's
+        rows downloading one at a time: 32 round trips for the mipmap 0 of an
+        8192 px texture. Queued once per level at PRIORITY_READ_AHEAD: behind
+        every read X-Plane is waiting on, so a near texture's 1,000 chunks never
+        hold up the far textures' few. A read that reaches a row promotes its
+        chunks (ChunkGetter.promote).
+        """
+        if endrow + 1 >= grid.height:
+            return
+        with self._lock:
+            if grid.zoom in self._read_ahead_zooms:
+                return
+            self._read_ahead_zooms.add(grid.zoom)
+        queued = 0
+        for chunk in grid.ensure_rows(endrow + 1, grid.height - 1):
+            if chunk.ready.is_set() or chunk.permanent_failure:
+                continue
+            if getattr(chunk, "in_queue", False) or getattr(chunk, "in_flight", False):
+                continue
+            chunk.priority = PRIORITY_READ_AHEAD
+            chunk.prefetch = False
+            if chunk_getter.submit(chunk):
+                queued += 1
+        if queued:
+            bump("level_read_ahead_chunks", queued)
 
     def _resolve_partial_sources(
         self,
@@ -17221,17 +17379,23 @@ class Tile(object):
                     )
                 return manifest
 
+            bounded = _partial_build_threads_supported(native_dds)
+            # Libraries without the bounded entry point run the OpenMP
+            # default team, so they must reserve the whole budget.
+            reserve = (
+                _partial_build_threads(chunks_width * chunks_height)
+                if bounded else _native_cpu_budget()
+            )
+
             def native_build(sources):
                 with self._source_lease(
                     source
                     for source in sources
                     if isinstance(source, (bytes, bytearray))
                 ), _native_build_context(
-                    threads=_native_cpu_budget(), priority=priority
-                ):
-                    # The partial-build ABI has no max_threads argument.
-                    # Reserve its full OpenMP default (bounded in the worker
-                    # environment).
+                    threads=reserve, priority=priority
+                ) as threads:
+                    extra = {"max_threads": threads} if bounded else {}
                     if (
                         allow_incomplete
                         and hasattr(native_dds, "build_partial_mipmap_v2")
@@ -17242,6 +17406,7 @@ class Tile(object):
                             chunks_height=chunks_height,
                             format=dxt_format,
                             missing_color=missing_color,
+                            **extra,
                         )
                     return native_dds.build_partial_mipmap(
                         jpeg_datas=[
@@ -17253,7 +17418,8 @@ class Tile(object):
                         chunks_width=chunks_width,
                         chunks_height=chunks_height,
                         format=dxt_format,
-                        missing_color=missing_color
+                        missing_color=missing_color,
+                        **extra,
                     )
 
             expected_length = (

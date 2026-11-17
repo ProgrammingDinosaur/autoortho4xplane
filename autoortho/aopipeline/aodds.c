@@ -2331,6 +2331,45 @@ AODDS_API int32_t aodds_build_partial_mipmap(
 }
 
 
+/* Same as aodds_build_partial_mipmap, bounded to max_threads OpenMP threads
+ * (0 = the OpenMP default). The thread count applies to every parallel region
+ * the build runs (decode, compose, compress) and is restored afterwards, so a
+ * caller can run several partial builds at once without each one claiming a
+ * full team of threads. */
+AODDS_API int32_t aodds_build_partial_mipmap_mt(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunks_width,
+    int32_t chunks_height,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool,
+    int32_t max_threads
+) {
+#if AOPIPELINE_HAS_OPENMP
+    int previous = omp_get_max_threads();
+    if (max_threads > 0) {
+        omp_set_num_threads(max_threads);
+    }
+#endif
+    int32_t result = aodds_build_partial_mipmap(
+        jpeg_data, jpeg_sizes, chunks_width, chunks_height, format,
+        missing_r, missing_g, missing_b, output, output_size, bytes_written,
+        pool);
+#if AOPIPELINE_HAS_OPENMP
+    if (max_threads > 0) {
+        omp_set_num_threads(previous);
+    }
+#endif
+    return result;
+}
+
+
 /*============================================================================
  * Build Mipmap Chain: Generate starting mipmap + all smaller mipmaps
  * 

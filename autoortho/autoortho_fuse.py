@@ -200,6 +200,8 @@ def tilemeters(lat_deg, zoom):
 
 
 MEMTRACE = False
+# Per-read debug line only when AO_TRACE_READS=1 (see getortho.TRACE_READS).
+TRACE_READS = os.environ.get("AO_TRACE_READS") == "1"
 
 
 def locked(fn):
@@ -973,12 +975,15 @@ class AutoOrtho(Operations):
         # The first-load budget applies before X-Plane ever connected (must
         # match getortho.py); stutters that briefly drop the connection do
         # not get extended timeouts.
-        initial_load = False
-        try:
-            from datareftrack import dt as datareftracker
-            initial_load = not getattr(datareftracker, 'has_ever_connected', False)
-        except ImportError:
-            pass  # datareftracker not available, use base budget
+        # getortho already imported the tracker under whichever name this
+        # build uses. Importing it again here by its bare name failed in
+        # package and frozen builds, so every read paid a full sys.path
+        # search for a module that never loads.
+        datareftracker = getattr(getortho, "datareftracker", None)
+        initial_load = (
+            datareftracker is not None
+            and not getattr(datareftracker, 'has_ever_connected', False)
+        )
         tile_budget = wait_bands.tile_budget_seconds(initial_load)
         
         # Check if fallback extends the budget
@@ -1536,7 +1541,8 @@ class AutoOrtho(Operations):
     #@profile
     #@lru_cache
     def read(self, path, length, offset, fh):
-        log.debug(f"READ: {path} {offset} {length} {fh}")
+        if TRACE_READS:
+            log.debug(f"READ: {path} {offset} {length} {fh}")
         m = self.dds_re.match(path)
         if m:
             row, col, maptype, zoom = m.groups()

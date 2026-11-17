@@ -2488,3 +2488,42 @@ class TestDirectReads:
             texture.read(128, 4096)
         texture.close()
         assert not os.path.exists(entry["dds_path"])
+
+
+def _volume_supports_sparse(path):
+    import ctypes
+    from ctypes import wintypes
+    root = os.path.splitdrive(os.path.abspath(path))[0] + "\\"
+    flags = wintypes.DWORD()
+    ok = ctypes.windll.kernel32.GetVolumeInformationW(
+        root, None, 0, None, None, ctypes.byref(flags), None, 0
+    )
+    return bool(ok) and bool(flags.value & 0x40)  # FILE_SUPPORTS_SPARSE_FILES
+
+
+def test_dds_skeleton_is_sized_without_writing_the_gap(dds_cache, cache_dir):
+    """The skeleton has its full size and header, reads zeros past the header,
+    and on Windows is sparse rather than 45 MB of written zeros."""
+    import stat
+    path = os.path.join(cache_dir, "skeleton.dds")
+    header = b"DDS " + bytes(range(124))
+    size = 8 * 1024 * 1024
+
+    assert dds_cache._create_dds_skeleton(path, header, size)
+
+    assert os.path.getsize(path) == size
+    with open(path, "rb") as f:
+        assert f.read(128) == header
+        f.seek(size - 4096)
+        assert f.read() == b"\x00" * 4096
+    # A row written deep in the file lands where it should.
+    with open(path, "r+b") as f:
+        f.seek(size - 65536)
+        f.write(b"\xab" * 1024)
+    with open(path, "rb") as f:
+        f.seek(size - 65536)
+        assert f.read(1024) == b"\xab" * 1024
+
+    if os.name == "nt" and _volume_supports_sparse(path):
+        attrs = os.stat(path).st_file_attributes
+        assert attrs & stat.FILE_ATTRIBUTE_SPARSE_FILE

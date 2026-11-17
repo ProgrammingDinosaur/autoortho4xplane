@@ -1,9 +1,11 @@
 import argparse
+import atexit
 import gc
 import json
 import logging
 import logging.handlers
 import os
+import queue
 import signal
 import sys
 import threading
@@ -28,6 +30,7 @@ log = logging.getLogger(__name__)
 
 RELOAD_GENERATION_STAT = "worker_reload_config_generation"
 _worker_stopping = threading.Event()
+_log_listener = None
 
 
 def _start_control_thread(mountpoint):
@@ -67,6 +70,7 @@ def _start_control_thread(mountpoint):
 
 
 def configure_worker_logging(mount_name, loglevel: str):
+    global _log_listener
     addr = os.getenv("AO_LOG_ADDR")
 
     class AddMount(logging.Filter):
@@ -85,9 +89,20 @@ def configure_worker_logging(mount_name, loglevel: str):
                 stream=sys.stdout,
             )
             sh = logging.handlers.SocketHandler(host, int(port))
-            sh.addFilter(AddMount())
+            # FUSE threads hand records to a queue; one thread pickles and
+            # sends them. Sending from the caller made every read thread wait
+            # on the socket handler's lock, and with DEBUG on (the default)
+            # that lock was where full-resolution texture reads spent most
+            # of their time.
+            records = queue.SimpleQueue()
+            qh = logging.handlers.QueueHandler(records)
+            qh.addFilter(AddMount())
+            listener = logging.handlers.QueueListener(records, sh)
+            listener.start()
+            atexit.register(listener.stop)
+            _log_listener = listener
             root.handlers[:] = []
-            root.addHandler(sh)
+            root.addHandler(qh)
             root.setLevel(level)
             root.addFilter(AddMount())
             root.info("Worker logging routed to parent via SocketHandler")

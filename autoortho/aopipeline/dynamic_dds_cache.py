@@ -58,6 +58,55 @@ log = logging.getLogger(__name__)
 DDS_HEADER_BYTES = 128
 
 
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+        wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    _k32.DeviceIoControl.restype = wintypes.BOOL
+    _k32.SetFilePointerEx.argtypes = [
+        wintypes.HANDLE, ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD,
+    ]
+    _k32.SetFilePointerEx.restype = wintypes.BOOL
+    _k32.SetEndOfFile.argtypes = [wintypes.HANDLE]
+    _k32.SetEndOfFile.restype = wintypes.BOOL
+    _FSCTL_SET_SPARSE = 0x000900C4
+    _FILE_BEGIN = 0
+
+
+def _extend_sparse(f, size: int) -> None:
+    """Grow an open file to ``size`` without writing the gap.
+
+    ``truncate()`` is sparse on ext4 and APFS but not on Windows: the C
+    runtime extends a file by writing zeros, so every 8192 px skeleton wrote
+    about 45 MB and took tens of milliseconds. On Windows the file is marked
+    sparse first (where the volume supports it) and its end moved with
+    ``SetEndOfFile``, so unwritten rows cost no disk space and later writes
+    deep in the file do not zero-fill everything before them.
+    """
+    if os.name != "nt":
+        f.truncate(size)
+        return
+    f.flush()
+    handle = wintypes.HANDLE(msvcrt.get_osfhandle(f.fileno()))
+    returned = wintypes.DWORD()
+    # FAT32 and exFAT have no sparse files; the end still moves without
+    # writing, they just zero-fill when a later write lands past it.
+    _k32.DeviceIoControl(handle, _FSCTL_SET_SPARSE, None, 0, None, 0,
+                         ctypes.byref(returned), None)
+    position = ctypes.c_longlong()
+    if (not _k32.SetFilePointerEx(handle, size, ctypes.byref(position), _FILE_BEGIN)
+            or not _k32.SetEndOfFile(handle)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 class _SizeShim:
     """The two tile fields ``_is_stale`` reads, for checks without a Tile."""
 
@@ -1020,6 +1069,23 @@ class DynamicDDSCache:
             self._misses += 1
             return None
 
+    def metadata_signature(self, tile_id: str, max_zoom: int, tile):
+        """(mtime_ns, size) of the tile's DDM file, or None when there is none.
+
+        Lets a reader skip parsing the metadata again while the file has not
+        changed: parsing it, with its row manifests, cost about 1.3 ms per
+        read of a texture being built.
+        """
+        if not self._enabled:
+            return None
+        try:
+            _, ddm_path = self._paths_for(
+                tile.row, tile.col, tile.maptype, tile.tilename_zoom, max_zoom)
+            st = os.stat(ddm_path)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
     @profiled_stage("cache.dds_metadata", tile_arg=1)
     def load_metadata(self, tile_id: str, max_zoom: int, tile) -> Optional[dict]:
         """Read DDM metadata without loading the DDS file.
@@ -1617,9 +1683,8 @@ class DynamicDDSCache:
                              total_size: int) -> bool:
         """Create an empty DDS file with the correct header and total size.
 
-        The file is extended to ``total_size`` via ``truncate()``, which is a
-        metadata-only operation on NTFS/ext4/APFS (sparse allocation -- no
-        physical zero-writes for the unwritten region).
+        The file is extended to ``total_size`` without writing the unwritten
+        region (see ``_extend_sparse``).
 
         Returns True on success.
         """
@@ -1627,7 +1692,7 @@ class DynamicDDSCache:
         try:
             with open(tmp, "wb") as f:
                 f.write(header_bytes)
-                f.truncate(total_size)
+                _extend_sparse(f, total_size)
             os.replace(tmp, dds_path)
             return True
         except Exception:
