@@ -95,6 +95,7 @@ import contextlib
 import math
 import zlib
 import multiprocessing
+import os
 import queue as _queue_module
 import secrets
 import sys
@@ -3207,6 +3208,162 @@ def _server_config(
     }
 
 
+PARENT_WATCHDOG_INTERVAL_SECONDS = 1.0
+PARENT_WATCHDOG_HARD_EXIT_SECONDS = 10.0
+
+
+class _ParentWatchdog:
+    """Shuts a spawned broker down when the process that started it is gone.
+
+    The broker runs as a daemon ``multiprocessing`` child, but daemon children
+    are only reaped by the parent's normal ``atexit`` path. If the parent
+    crashes, is killed, or leaves through ``os._exit``, nothing tells the
+    broker, and it would keep serving an empty ROUTER socket forever.
+
+    Two independent signals are checked, and either one is enough:
+
+    * ``multiprocessing.parent_process().sentinel``: on Windows a handle to the
+      parent process, on POSIX the read end of a pipe whose write end only the
+      parent holds. It becomes ready when the parent exits.
+    * the parent PID itself, through ``psutil.Process.is_running()``, which
+      also compares the creation time so a reused PID is not mistaken for the
+      parent.
+
+    When the parent is gone, ``on_parent_exit`` is called once to start a
+    clean shutdown. If the process is still alive ``hard_exit_after`` seconds
+    later, it is ended with ``os._exit``.
+    """
+
+    def __init__(
+        self,
+        parent_pid: Optional[int],
+        on_parent_exit: Callable[[], None],
+        *,
+        interval: float = PARENT_WATCHDOG_INTERVAL_SECONDS,
+        hard_exit_after: Optional[float] = PARENT_WATCHDOG_HARD_EXIT_SECONDS,
+        sentinel: Any = "auto",
+    ):
+        self._parent_pid = parent_pid
+        self._on_parent_exit = on_parent_exit
+        self._interval = max(0.05, float(interval))
+        self._hard_exit_after = hard_exit_after
+        if sentinel == "auto":
+            parent = multiprocessing.parent_process()
+            sentinel = getattr(parent, "sentinel", None) if parent is not None else None
+        self._sentinel = sentinel
+        self._parent_proc = None
+        self._parent_gone_at_start = False
+        if parent_pid is not None:
+            try:
+                import psutil
+
+                self._parent_proc = psutil.Process(int(parent_pid))
+            except ImportError:
+                pass
+            except Exception as exc:  # psutil.NoSuchProcess and friends
+                if type(exc).__name__ == "NoSuchProcess":
+                    self._parent_gone_at_start = True
+        self._stop = threading.Event()
+        self._triggered = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            self._sentinel is not None
+            or self._parent_proc is not None
+            or self._parent_gone_at_start
+        )
+
+    @property
+    def triggered(self) -> bool:
+        return self._triggered.is_set()
+
+    def start(self) -> "_ParentWatchdog":
+        if not self.enabled:
+            log.debug("Broker parent watchdog disabled: no parent handle or PID")
+            return self
+        self._thread = threading.Thread(
+            target=self._run, name="http2-broker-parent-watchdog", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        """Stop watching. Has no effect once the parent was found gone."""
+        self._stop.set()
+
+    def _sentinel_ready(self, timeout: float) -> bool:
+        if self._sentinel is None:
+            if timeout > 0:
+                self._stop.wait(timeout)
+            return False
+        try:
+            from multiprocessing.connection import wait as _mp_wait
+
+            return bool(_mp_wait([self._sentinel], timeout=timeout))
+        except (OSError, ValueError):
+            # An invalid or closed handle means the parent side went away.
+            return True
+
+    def _pid_alive(self) -> bool:
+        if self._parent_gone_at_start:
+            return False
+        proc = self._parent_proc
+        if proc is None:
+            return True
+        try:
+            if not proc.is_running():
+                return False
+            # A zombie parent on POSIX has exited but not been reaped yet.
+            status = proc.status()
+            return status != "zombie"
+        except Exception as exc:
+            if type(exc).__name__ in ("NoSuchProcess", "ZombieProcess"):
+                return False
+            # AccessDenied and other errors: no proof the parent is gone.
+            return True
+
+    def parent_alive(self, timeout: float = 0.0) -> bool:
+        if self._sentinel_ready(timeout):
+            return False
+        return self._pid_alive()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            if self.parent_alive(self._interval):
+                continue
+            if self._stop.is_set():
+                return
+            log.warning(
+                "Broker parent process %s is gone; shutting the broker down",
+                self._parent_pid,
+            )
+            try:
+                self._on_parent_exit()
+            except Exception:
+                log.debug("Broker parent-exit callback failed", exc_info=True)
+            finally:
+                # Set after the callback so "triggered" means the shutdown
+                # request has been made.
+                self._triggered.set()
+            if self._hard_exit_after is None:
+                return
+            # This thread is a daemon, so it only gets here if the process
+            # is still alive after the grace period.
+            time.sleep(float(self._hard_exit_after))
+            log.warning(
+                "Broker did not exit %.0fs after its parent died; forcing exit",
+                float(self._hard_exit_after),
+            )
+            try:
+                logging.shutdown()
+            except Exception:
+                pass
+            os._exit(0)
+            return
+
+
 def _process_entrypoint(token: str, handshake_queue, config: Dict[str, Any]) -> None:
     """Entrypoint for the spawned broker process. Must stay picklable/top-level."""
     profiler_started = False
@@ -3276,9 +3433,25 @@ async def _serve_process(token: str, handshake_queue, config: Dict[str, Any]) ->
         return
 
     handshake_queue.put(("ok", port))
+    loop = asyncio.get_running_loop()
+
+    def _request_stop() -> None:
+        try:
+            loop.call_soon_threadsafe(server._stop_event.set)
+        except RuntimeError:
+            pass  # loop already closed: the broker is exiting anyway
+
+    watchdog = _ParentWatchdog(
+        config.get("parent_pid"),
+        _request_stop,
+        interval=float(
+            config.get("parent_watchdog_interval", PARENT_WATCHDOG_INTERVAL_SECONDS)
+        ),
+    ).start()
     try:
         await server.run()
     finally:
+        watchdog.stop()
         ctx.destroy(linger=0)
 
 
@@ -3293,9 +3466,11 @@ class _ProcessRuntime:
         self._process: Optional[multiprocessing.process.BaseProcess] = None
 
     def start(self, handshake_timeout: float) -> int:
+        config = dict(self._config)
+        config.setdefault("parent_pid", os.getpid())
         self._process = self._mp_ctx.Process(
             target=_process_entrypoint,
-            args=(self._token, self._queue, self._config),
+            args=(self._token, self._queue, config),
             daemon=True,
             name="http2-broker",
         )
