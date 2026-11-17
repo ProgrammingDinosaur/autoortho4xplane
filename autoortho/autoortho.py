@@ -255,7 +255,13 @@ def diagnose(CFG, mount_timeout=60.0, retry_interval=0.25):
         # Use ignore_cleanup_errors=True to handle race with async cache writes
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
-            ret = c.get()
+            # A provider can raise here (APPLE does when its token server
+            # answers 500); that is a failed provider, not a failed start.
+            try:
+                ret = c.get()
+            except Exception as exc:
+                log.warning(f"    Maptype: {maptype} check raised: {exc}")
+                ret = False
             # Give async cache writer a moment to complete or detect deleted dir
             time.sleep(0.1)
             if ret:
