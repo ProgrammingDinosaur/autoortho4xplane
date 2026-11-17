@@ -59,6 +59,8 @@ zmq_datas, zmq_binaries, zmq_hiddenimports = safe_collect_all('zmq')
 # Shared HTTP/2 broker
 httpx_datas, httpx_binaries, httpx_hiddenimports = safe_collect_all('httpx')
 h2_datas, h2_binaries, h2_hiddenimports = safe_collect_all('h2')
+# libcurl for the download brokers: its compiled _wrapper and bundled CA data
+curl_datas, curl_binaries, curl_hiddenimports = safe_collect_all('curl_cffi')
 
 # Flask dependencies with C extensions
 markupsafe_datas, markupsafe_binaries, markupsafe_hiddenimports = safe_collect_all('markupsafe')
@@ -73,19 +75,19 @@ ui_hiddenimports = collect_submodules('autoortho.ui')
 # Collect all datas/binaries/hiddenimports for native modules
 native_module_datas = (
     psutil_datas + numpy_datas + greenlet_datas + gevent_datas + 
-    zope_datas + msgpack_datas + zmq_datas + httpx_datas + h2_datas +
+    zope_datas + msgpack_datas + zmq_datas + httpx_datas + h2_datas + curl_datas +
     markupsafe_datas + charset_datas
 )
 native_module_binaries = (
     psutil_binaries + numpy_binaries + greenlet_binaries + gevent_binaries + 
     zope_binaries + msgpack_binaries + zmq_binaries + httpx_binaries +
-    h2_binaries + markupsafe_binaries + charset_binaries
+    h2_binaries + curl_binaries + markupsafe_binaries + charset_binaries
 )
 native_module_hiddenimports = (
     psutil_hiddenimports + numpy_hiddenimports + 
     greenlet_hiddenimports + gevent_hiddenimports + zope_hiddenimports +
     msgpack_hiddenimports + zmq_hiddenimports + httpx_hiddenimports +
-    h2_hiddenimports +
+    h2_hiddenimports + curl_hiddenimports +
     markupsafe_hiddenimports + charset_hiddenimports
 )
 

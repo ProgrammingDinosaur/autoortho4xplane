@@ -286,6 +286,8 @@ def test_parent_broker_environment_is_forwarded(monkeypatch):
     mount.cfg = SimpleNamespace(
         autoortho=SimpleNamespace(
             http2_enabled=True,
+            # One broker process: these tests follow its own start and fallback.
+            provider_broker_processes=1,
             max_concurrent_downloads=32,
             http2_max_connections=8,
         )
@@ -328,6 +330,8 @@ def test_parent_retries_broker_in_process_after_spawn_failure(monkeypatch):
     mount.cfg = SimpleNamespace(
         autoortho=SimpleNamespace(
             http2_enabled=True,
+            # One broker process: these tests follow its own start and fallback.
+            provider_broker_processes=1,
             max_concurrent_downloads=32,
             http2_max_connections=8,
         )

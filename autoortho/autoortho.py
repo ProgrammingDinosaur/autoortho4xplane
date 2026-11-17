@@ -77,6 +77,7 @@ except ImportError:
 try:
     from autoortho.http2_broker import (
         HTTP2Broker,
+        BrokerGroup as HTTP2BrokerGroup,
         BrokerError as HTTP2BrokerError,
         BrokerStartupError as HTTP2BrokerStartupError,
     )
@@ -84,11 +85,13 @@ except ImportError:
     try:
         from http2_broker import (
             HTTP2Broker,
+            BrokerGroup as HTTP2BrokerGroup,
             BrokerError as HTTP2BrokerError,
             BrokerStartupError as HTTP2BrokerStartupError,
         )
     except ImportError:
         HTTP2Broker = None
+        HTTP2BrokerGroup = None
         HTTP2BrokerError = Exception
         HTTP2BrokerStartupError = Exception
 
@@ -279,6 +282,24 @@ def diagnose(CFG, mount_timeout=60.0, retry_interval=0.25):
         )
     log.info(" Diagnostics done.  All checks passed")
     return True
+
+
+def _split_broker_kwargs(kwargs, parts):
+    """The broker settings for each of ``parts`` brokers.
+
+    Only the download rate is shared out. Concurrency stays whole in each:
+    requests are routed by URL hash, so at any moment one broker may hold more
+    than its share, and an even split left it queueing while the others idled.
+    The workers' in-flight budget already bounds the total.
+    """
+    out = []
+    for _ in range(parts):
+        part = dict(kwargs)
+        if part.get("max_bytes_per_second"):
+            part["max_bytes_per_second"] = float(part["max_bytes_per_second"]) / parts
+        part["profile_environment"] = dict(kwargs.get("profile_environment") or {})
+        out.append(part)
+    return out
 
 
 class AOMount:
@@ -734,9 +755,22 @@ class AOMount:
         self.start_download_broker()
         self.start_reporter()
 
+    def _broker_process_count(self):
+        """Download broker processes: the setting, or one per 4 CPU threads (1-4)."""
+        try:
+            configured = int(aoconfig.resolve_provider_setting(
+                "provider_broker_processes", self.cfg
+            ))
+        except Exception:
+            configured = 0
+        if configured > 0:
+            return configured
+        return max(1, min(4, (os.cpu_count() or 1) // 4))
+
     def start_download_broker(self):
         if self._download_broker is not None:
             return
+        broker_mode = None
         self._start_performance_diagnostics()
         enabled = getattr(self.cfg.autoortho, "http2_enabled", True)
         if isinstance(enabled, str):
@@ -809,6 +843,9 @@ class AOMount:
                 "queue_timeout": aoconfig.resolve_provider_setting(
                     "provider_queue_timeout", self.cfg
                 ),
+                "http_client": str(
+                    getattr(self.cfg.autoortho, "provider_http_client", "auto") or "auto"
+                ),
             }
             broker_kwargs["origin_initial_concurrency"] = origin_initial
             active_limits = self._resource_limits()
@@ -820,10 +857,28 @@ class AOMount:
                     "Download limit: %.0f Mbit/s",
                     active_limits.bandwidth_mbps,
                 )
-            broker = HTTP2Broker(**broker_kwargs)
+            processes = self._broker_process_count()
+            broker = None
+            if processes > 1 and HTTP2BrokerGroup is not None:
+                group = HTTP2BrokerGroup(
+                    [HTTP2Broker(**part) for part in _split_broker_kwargs(broker_kwargs, processes)]
+                )
+                try:
+                    group.start()
+                    broker = group
+                    broker_mode = f"{processes} processes"
+                except HTTP2BrokerStartupError as group_exc:
+                    log.warning(
+                        "Could not start %d broker processes; using one: %s",
+                        processes,
+                        group_exc,
+                    )
+            if broker is None:
+                broker = HTTP2Broker(**broker_kwargs)
             try:
-                broker.start()
-                broker_mode = "process"
+                if broker_mode is None:
+                    broker.start()
+                    broker_mode = "process"
             except HTTP2BrokerStartupError as process_exc:
                 log.warning(
                     "HTTP/2 broker process startup failed; retrying with "
@@ -838,12 +893,13 @@ class AOMount:
                 broker_mode = "thread"
             self._download_broker = broker
             self._download_broker_env = broker.client_environment()
-            broker_pid = getattr(broker, "pid", None)
-            if broker_pid and self._performance_profiler is not None:
-                self._performance_profiler.register_process(
-                    broker_pid,
-                    "http2-broker",
-                )
+            broker_pids = getattr(broker, "pids", None) or [getattr(broker, "pid", None)]
+            if self._performance_profiler is not None:
+                for index, broker_pid in enumerate(p for p in broker_pids if p):
+                    self._performance_profiler.register_process(
+                        broker_pid,
+                        "http2-broker" if index == 0 else f"http2-broker-{index + 1}",
+                    )
             os.environ.update(self._download_broker_env)
             log.info(
                 "Shared HTTP/2 broker started "

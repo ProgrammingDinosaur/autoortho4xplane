@@ -426,6 +426,14 @@ provider_max_connections = 160
 # Threads used to apply broker responses (cache write, decode hand-off).
 # This is a coordination pool, not a download pool; keep it small.
 download_dispatch_workers = 4
+# Download broker processes. One broker is one Python event loop and tops out
+# near one CPU core (about 200 tiles a second); requests are spread over them
+# by URL. 0 picks one per 4 CPU threads, 1 to 4.
+provider_broker_processes = 0
+# HTTP client of the download brokers: auto (curl when installed, else httpx),
+# curl (libcurl through curl_cffi: HTTP/2 in C, several times the requests per
+# CPU core) or httpx.
+provider_http_client = auto
 # Maximum time a request may wait for broker/provider admission before its
 # network timeout begins. Queue time is deliberately separate from HTTP time.
 provider_queue_timeout = 60.0
@@ -1353,6 +1361,11 @@ PROVIDER_SETTINGS = {
     "download_dispatch_workers": {
         "default": 4,
         "range": (1, 16),
+        "legacy": None,
+    },
+    "provider_broker_processes": {
+        "default": 0,
+        "range": (0, 8),
         "legacy": None,
     },
     "provider_queue_timeout": {

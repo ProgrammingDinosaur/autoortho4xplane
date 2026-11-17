@@ -188,6 +188,7 @@ import psutil
 try:
     from autoortho.http2_broker import (
         HTTP2Broker,
+        MultiBrokerClient,
         RequestTimeout as BrokerRequestTimeout,
         BrokerCancelledError,
         BrokerCapacityError,
@@ -201,6 +202,7 @@ except ImportError:
     try:
         from http2_broker import (
             HTTP2Broker,
+            MultiBrokerClient,
             RequestTimeout as BrokerRequestTimeout,
             BrokerCancelledError,
             BrokerCapacityError,
@@ -212,6 +214,7 @@ except ImportError:
         )
     except ImportError:
         HTTP2Broker = None
+        MultiBrokerClient = None
         BrokerRequestTimeout = None
 
         class BrokerError(Exception):
@@ -1187,9 +1190,7 @@ def _get_http2_client():
         if _http2_client is not None:
             return _http2_client
         try:
-            _http2_client = HTTP2Broker.connect(
-                address,
-                token,
+            client_kwargs = dict(
                 max_pending=resolve_provider_setting("provider_max_in_flight"),
                 queue_timeout=resolve_provider_setting(
                     "provider_queue_timeout"
@@ -1204,6 +1205,16 @@ def _get_http2_client():
 
 
 def _live_queue_timeout_seconds():
+            addresses = [a for a in address.split(",") if a]
+            if len(addresses) > 1 and MultiBrokerClient is not None:
+                # Several broker processes (provider_broker_processes).
+                _http2_client = MultiBrokerClient.connect(
+                    addresses, token.split(","), **client_kwargs
+                )
+            else:
+                _http2_client = HTTP2Broker.connect(
+                    address, token, **client_kwargs
+                )
     """How long a live request may wait in the broker queue before a retry.
 
     Twice the in-flight near-read wait (at least 10 s): longer and the read

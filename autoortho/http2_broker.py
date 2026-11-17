@@ -91,7 +91,9 @@ import collections
 import heapq
 import itertools
 import logging
+import contextlib
 import math
+import zlib
 import multiprocessing
 import queue as _queue_module
 import secrets
@@ -141,6 +143,8 @@ except ImportError:  # pragma: no cover - exercised via BrokerUnavailableError
 
 __all__ = [
     "HTTP2Broker",
+    "BrokerGroup",
+    "MultiBrokerClient",
     "BrokerFuture",
     "BrokerResponse",
     "RequestTimeout",
@@ -1236,6 +1240,8 @@ def _classify_origin_outcome(
     if error is not None:
         if isinstance(error, (BrokerTimeoutError, ResponseTooLargeError)):
             return "throttle" if isinstance(error, BrokerTimeoutError) else "neutral"
+        if isinstance(error, BrokerTransportError):
+            return "throttle"
         if httpx is not None:
             if isinstance(error, httpx.TimeoutException):
                 return "throttle"
@@ -2082,6 +2088,123 @@ def _install_httpcore_stream_reset() -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# HTTP clients
+# ---------------------------------------------------------------------------
+#
+# httpx is pure Python: one broker's event loop spent most of a CPU core on
+# it at about 200 tiles a second. curl_cffi drives libcurl (HTTP/2 in C, a
+# browser's TLS fingerprint): several times the requests per core and a lower
+# time to first byte from tile CDNs. It is used when installed; httpx stays
+# the fallback and the transport tests inject.
+
+HTTP_CLIENTS = ("auto", "curl", "httpx")
+CURL_IMPERSONATE = "chrome"
+
+
+def curl_available() -> bool:
+    try:
+        import curl_cffi.requests  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def resolve_http_client(choice: str, transport: Any = None) -> str:
+    """The client a broker uses: an injected transport means httpx."""
+    if transport is not None:
+        return "httpx"
+    choice = str(choice or "auto").strip().lower()
+    if choice not in HTTP_CLIENTS:
+        choice = "auto"
+    if choice in ("auto", "curl") and curl_available():
+        return "curl"
+    if choice == "curl":
+        log.warning("curl_cffi is not installed; the broker uses httpx")
+    return "httpx"
+
+
+class _CurlResponse:
+    """The parts of an httpx streaming response the broker reads."""
+
+    __slots__ = ("status_code", "headers", "http_version", "history", "_content")
+
+    def __init__(self, status_code, headers, http_version, content):
+        self.status_code = int(status_code)
+        self.headers = headers
+        self.http_version = http_version
+        self.history = ()
+        self._content = content
+
+    async def aiter_bytes(self):
+        if self._content:
+            yield self._content
+
+
+def _curl_http_version(value) -> str:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "HTTP/1.1"
+    if number in (3, 4, 5):
+        return "HTTP/2"
+    if number in (30, 31):
+        return "HTTP/3"
+    return "HTTP/1.1"
+
+
+class _CurlTransport:
+    """One curl_cffi session shared by the broker's request workers."""
+
+    def __init__(self, max_clients: int, max_response_bytes: int):
+        from curl_cffi.requests import AsyncSession
+
+        self._session = AsyncSession(
+            impersonate=CURL_IMPERSONATE,
+            max_clients=max(1, int(max_clients)),
+        )
+        self._max_response_bytes = int(max_response_bytes)
+
+    def stream(self, method, url, headers, timeout):
+        return self._request(method, url, headers, timeout)
+
+    @contextlib.asynccontextmanager
+    async def _request(self, method, url, headers, timeout):
+        from curl_cffi.requests import exceptions as curl_errors
+
+        try:
+            resp = await self._session.request(
+                method,
+                url,
+                headers=dict(headers or {}),
+                timeout=(max(0.1, float(timeout.connect)), max(0.1, float(timeout.read))),
+                allow_redirects=True,
+                max_redirects=8,
+            )
+        except curl_errors.Timeout as exc:
+            raise BrokerTimeoutError(f"curl: {exc}") from exc
+        except (curl_errors.RequestException, curl_errors.CurlError) as exc:
+            raise BrokerTransportError(f"curl: {exc}") from exc
+        content = resp.content or b""
+        if len(content) > self._max_response_bytes:
+            raise ResponseTooLargeError(
+                f"response body exceeded bound of {self._max_response_bytes} bytes"
+            )
+        headers_out = {str(k).lower(): v for k, v in resp.headers.items()}
+        yield _CurlResponse(
+            resp.status_code,
+            headers_out,
+            _curl_http_version(getattr(resp, "http_version", None)),
+            content,
+        )
+
+    async def aclose(self) -> None:
+        try:
+            await self._session.close()
+        except Exception:
+            log.debug("Closing the curl session failed", exc_info=True)
+
+
 def _is_stream_capacity_error(exc: BaseException) -> bool:
     """True when the local HTTP/2 stack had no free stream for the request."""
     current: Optional[BaseException] = exc
@@ -2154,9 +2277,15 @@ class _BrokerCore:
         adaptive: Optional[Dict[str, Any]] = None,
         transport_trace: bool = False,
         max_bytes_per_second: float = 0.0,
+        http_client: str = "auto",
     ):
-        _require_dependencies(require_http2=transport is None)
-        if transport is None and not _install_httpcore_stream_reset():
+        self.http_client = resolve_http_client(http_client, transport)
+        _require_dependencies(require_http2=transport is None and self.http_client == "httpx")
+        if (
+            transport is None
+            and self.http_client == "httpx"
+            and not _install_httpcore_stream_reset()
+        ):
             log.warning(
                 "httpcore internals changed; abandoned HTTP/2 streams will "
                 "not be reset"
@@ -2172,7 +2301,12 @@ class _BrokerCore:
         }
         if transport is not None:
             client_kwargs["transport"] = transport
-        self._client = httpx.AsyncClient(**client_kwargs)
+        self._client = httpx.AsyncClient(**client_kwargs) if self.http_client == "httpx" else None
+        self._curl = (
+            _CurlTransport(max_concurrency, max_response_bytes)
+            if self.http_client == "curl" else None
+        )
+        log.info("Broker HTTP client: %s", self.http_client)
         self._max_response_bytes = max_response_bytes
         self._max_concurrency = max(1, int(max_concurrency))
         self._max_connections = max(1, int(max_connections))
@@ -2273,7 +2407,10 @@ class _BrokerCore:
             )
         self._entries.clear()
         self._backlog.clear()
-        await self._client.aclose()
+        if self._client is not None:
+            await self._client.aclose()
+        if self._curl is not None:
+            await self._curl.aclose()
 
     async def _fail_waiters(
         self, entry: _CoalescedEntry, error_type: str, message: str
@@ -2663,13 +2800,19 @@ class _BrokerCore:
                     extensions = {
                         "trace": self._transport_metrics.trace_callback()
                     }
-                async with self._client.stream(
-                    entry.method,
-                    entry.url,
-                    headers=entry.headers,
-                    timeout=timeout,
-                    extensions=extensions,
-                ) as resp:
+                if self._curl is not None:
+                    stream = self._curl.stream(
+                        entry.method, entry.url, entry.headers, entry.timeout
+                    )
+                else:
+                    stream = self._client.stream(
+                        entry.method,
+                        entry.url,
+                        headers=entry.headers,
+                        timeout=timeout,
+                        extensions=extensions,
+                    )
+                async with stream as resp:
                     headers_received = time.monotonic()
                     observed_versions = [
                         history.http_version
@@ -2872,6 +3015,7 @@ class _RouterServer:
             adaptive=config.get("adaptive"),
             transport_trace=bool(config.get("transport_trace", False)),
             max_bytes_per_second=float(config.get("max_bytes_per_second", 0) or 0),
+            http_client=str(config.get("http_client", "auto")),
         )
 
     async def _send(
@@ -3048,6 +3192,7 @@ def _server_config(
     adaptive=None,
     transport_trace=False,
     max_bytes_per_second=0.0,
+    http_client="auto",
 ) -> Dict[str, Any]:
     return {
         "max_concurrency": max_concurrency,
@@ -3058,6 +3203,7 @@ def _server_config(
         "adaptive": dict(adaptive or {}),
         "transport_trace": bool(transport_trace),
         "max_bytes_per_second": float(max_bytes_per_second or 0),
+        "http_client": str(http_client or "auto"),
     }
 
 
@@ -3366,6 +3512,7 @@ class HTTP2Broker:
         live_queue_timeout: Optional[float] = None,
         transport_trace: bool = False,
         max_bytes_per_second: float = 0.0,
+        http_client: str = "auto",
     ):
         if transport is not None and not in_process:
             raise ValueError("transport injection is only supported with in_process=True")
@@ -3399,6 +3546,7 @@ class HTTP2Broker:
         self._profile_environment = dict(profile_environment or {})
         self._transport_trace = bool(transport_trace)
         self._max_bytes_per_second = max(0.0, float(max_bytes_per_second or 0))
+        self._http_client = str(http_client or "auto")
         self._adaptive = _adaptive_config(
             enabled=adaptive_concurrency,
             initial=min(
@@ -3459,6 +3607,7 @@ class HTTP2Broker:
             adaptive=self._adaptive,
             transport_trace=self._transport_trace,
             max_bytes_per_second=self._max_bytes_per_second,
+            http_client=self._http_client,
         )
 
         if self._in_process:
@@ -3908,3 +4057,237 @@ class HTTP2Broker:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.stop()
+
+# ---------------------------------------------------------------------------
+# Several broker processes
+# ---------------------------------------------------------------------------
+#
+# One broker is one Python event loop running httpx, and it tops out near one
+# CPU core: about 200 tiles a second through AutoOrtho's pipeline (430 for a
+# bare httpx loop) however many requests it is allowed in flight. A busy
+# scenery load needs several times that, so the parent can start several
+# brokers and the workers spread their requests over them. Each URL always
+# goes to the same broker, so identical requests still share one download.
+
+ADDRESS_SEPARATOR = ","
+
+
+class BrokerGroup:
+    """Several broker processes behind the parent's single broker handle."""
+
+    def __init__(self, brokers):
+        self._brokers = list(brokers)
+        if not self._brokers:
+            raise ValueError("a broker group needs at least one broker")
+
+    @property
+    def brokers(self):
+        return tuple(self._brokers)
+
+    def start(self) -> None:
+        started = []
+        try:
+            for broker in self._brokers:
+                broker.start()
+                started.append(broker)
+        except Exception:
+            for broker in started:
+                try:
+                    broker.stop()
+                except Exception:
+                    log.debug("Failed stopping a broker of a group", exc_info=True)
+            raise
+
+    def stop(self, timeout: float = 5.0) -> None:
+        for broker in self._brokers:
+            try:
+                broker.stop(timeout=timeout)
+            except Exception:
+                log.debug("Failed stopping a broker of a group", exc_info=True)
+
+    def client_environment(self) -> Dict[str, str]:
+        envs = [broker.client_environment() for broker in self._brokers]
+        return {
+            "AO_HTTP2_BROKER_ADDR": ADDRESS_SEPARATOR.join(
+                env["AO_HTTP2_BROKER_ADDR"] for env in envs
+            ),
+            "AO_HTTP2_BROKER_TOKEN": ADDRESS_SEPARATOR.join(
+                env["AO_HTTP2_BROKER_TOKEN"] for env in envs
+            ),
+        }
+
+    @property
+    def pid(self) -> Optional[int]:
+        return self._brokers[0].pid
+
+    @property
+    def pids(self) -> List[int]:
+        return [broker.pid for broker in self._brokers if broker.pid]
+
+    def configure(
+        self,
+        *,
+        origin_max_concurrency: Optional[int] = None,
+        max_bytes_per_second: Optional[float] = None,
+    ):
+        """Apply the live levers: the rate is shared out, the ceiling is not.
+
+        Requests are routed by URL hash, so one broker may briefly hold more
+        than its share; each keeps the whole ceiling and the workers' in-flight
+        budget bounds the total.
+        """
+        parts = len(self._brokers)
+        kwargs: Dict[str, Any] = {}
+        if origin_max_concurrency is not None:
+            kwargs["origin_max_concurrency"] = int(origin_max_concurrency)
+        if max_bytes_per_second is not None:
+            rate = float(max_bytes_per_second)
+            kwargs["max_bytes_per_second"] = rate / parts if rate > 0 else 0.0
+        return [broker.configure(**kwargs) for broker in self._brokers]
+
+    def server_stats(self, *, timeout: float = 5.0) -> Dict[str, Any]:
+        """The brokers' counters added up; per-origin rows summed by origin."""
+        merged: Dict[str, Any] = {"origins": {}}
+        for broker in self._brokers:
+            stats = broker.server_stats(timeout=timeout) or {}
+            for key, value in stats.items():
+                if key == "origins":
+                    if isinstance(value, dict):
+                        rows = value.items()
+                    else:
+                        rows = ((row.get("origin", i), row) for i, row in enumerate(value or ()))
+                    for origin, row in rows:
+                        target = merged["origins"].setdefault(origin, {})
+                        for name, number in (row or {}).items():
+                            if isinstance(number, (int, float)) and not isinstance(number, bool):
+                                target[name] = target.get(name, 0) + number
+                            else:
+                                target.setdefault(name, number)
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    merged[key] = merged.get(key, 0) + value
+                else:
+                    merged.setdefault(key, value)
+        merged["brokers"] = len(self._brokers)
+        return merged
+
+    def __enter__(self) -> "BrokerGroup":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.stop()
+
+
+class MultiBrokerClient:
+    """A worker's client for a :class:`BrokerGroup`: one connection per broker.
+
+    Requests are routed by URL. The in-flight budget (``max_pending``) stays
+    the configured total; each broker's client allows all of it, so no single
+    broker refuses work that the total would admit.
+    """
+
+    def __init__(self, clients):
+        self._clients = list(clients)
+        if not self._clients:
+            raise ValueError("a multi-broker client needs at least one client")
+        self._owners: Dict[str, Any] = {}
+        self._owners_lock = threading.Lock()
+
+    @classmethod
+    def connect(cls, addresses, tokens, **kwargs) -> "MultiBrokerClient":
+        if len(addresses) != len(tokens):
+            raise BrokerProtocolError("each broker address needs its token")
+        clients = []
+        try:
+            for address, token in zip(addresses, tokens):
+                clients.append(HTTP2Broker.connect(address, token, **kwargs))
+        except Exception:
+            for client in clients:
+                try:
+                    client.stop()
+                except Exception:
+                    pass
+            raise
+        return cls(clients)
+
+    @property
+    def clients(self):
+        return tuple(self._clients)
+
+    def _client_for(self, url: str):
+        index = zlib.crc32(url.encode("utf-8", "surrogatepass")) % len(self._clients)
+        return self._clients[index]
+
+    def _remember(self, future, client):
+        with self._owners_lock:
+            self._owners[future.request_id] = client
+
+        def forget(done):
+            with self._owners_lock:
+                self._owners.pop(done.request_id, None)
+
+        future.add_done_callback(forget)
+        return future
+
+    def submit_async(self, url: str, headers=None, **kwargs):
+        client = self._client_for(url)
+        return self._remember(client.submit_async(url, headers, **kwargs), client)
+
+    def get(self, url: str, headers=None, *, request_id: Optional[str] = None, **kwargs):
+        client = self._client_for(url)
+        request_id = request_id or uuid.uuid4().hex
+        with self._owners_lock:
+            self._owners[request_id] = client
+        try:
+            return client.get(url, headers, request_id=request_id, **kwargs)
+        finally:
+            with self._owners_lock:
+                self._owners.pop(request_id, None)
+
+    def _owner(self, request_id):
+        with self._owners_lock:
+            return self._owners.get(request_id)
+
+    def cancel(self, request_id: str) -> bool:
+        client = self._owner(request_id)
+        if client is not None:
+            return client.cancel(request_id)
+        return any(c.cancel(request_id) for c in self._clients)
+
+    def reprioritize(self, request_id: str, priority: int) -> bool:
+        client = self._owner(request_id)
+        return bool(client is not None and client.reprioritize(request_id, priority))
+
+    @property
+    def max_pending(self) -> int:
+        return self._clients[0].max_pending
+
+    @property
+    def reserved_live_slots(self) -> int:
+        return self._clients[0].reserved_live_slots
+
+    def pending_count(self) -> int:
+        return sum(client.pending_count() for client in self._clients)
+
+    def stats(self) -> Dict[str, Any]:
+        merged: Dict[str, Any] = {}
+        for client in self._clients:
+            for key, value in (client.stats() or {}).items():
+                if key in ("max_pending", "reserved_live_slots"):
+                    merged[key] = value
+                elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                    merged[key] = merged.get(key, 0) + value
+                else:
+                    merged.setdefault(key, value)
+        merged["brokers"] = len(self._clients)
+        return merged
+
+    def configure(self, **kwargs) -> bool:
+        return all(client.configure(**kwargs) for client in self._clients)
+
+    def stop(self, timeout: float = 5.0) -> None:
+        for client in self._clients:
+            try:
+                client.stop(timeout=timeout)
+            except Exception:
+                log.debug("Failed stopping a broker client", exc_info=True)

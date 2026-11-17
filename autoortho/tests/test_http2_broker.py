@@ -2286,3 +2286,225 @@ def test_httpcore_stream_reset_closes_abandoned_h2_stream():
 
     assert state.open_outbound_streams == 0
     assert 1 not in fake._events
+
+
+# ---------------------------------------------------------------------------
+# Several broker processes (BrokerGroup / MultiBrokerClient)
+# ---------------------------------------------------------------------------
+
+def _group_of_two(handler):
+    brokers = [
+        hb.HTTP2Broker(in_process=True, transport=httpx.MockTransport(handler))
+        for _ in range(2)
+    ]
+    group = hb.BrokerGroup(brokers)
+    group.start()
+    return group
+
+
+def test_group_client_spreads_requests_and_keeps_each_url_on_one_broker():
+    seen = []
+
+    async def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, content=request.url.path.encode())
+
+    group = _group_of_two(handler)
+    try:
+        env = group.client_environment()
+        addresses = env["AO_HTTP2_BROKER_ADDR"].split(",")
+        tokens = env["AO_HTTP2_BROKER_TOKEN"].split(",")
+        assert len(addresses) == len(tokens) == 2
+        client = hb.MultiBrokerClient.connect(addresses, tokens)
+        try:
+            urls = [f"http://example.test/tile/{i}" for i in range(40)]
+            futures = [client.submit_async(u) for u in urls]
+            assert [f.result(timeout=5).content for f in futures] == [
+                f"/tile/{i}".encode() for i in range(40)
+            ]
+            # Each URL has one home broker, and both brokers get work.
+            homes = {u: client._client_for(u) for u in urls}
+            assert all(client._client_for(u) is homes[u] for u in urls)
+            assert len(set(map(id, homes.values()))) == 2
+            assert client.get("http://example.test/one").content == b"/one"
+            assert client.max_pending == client.clients[0].max_pending
+            assert client.stats()["brokers"] == 2
+            # Finished requests are forgotten.
+            assert client._owners == {}
+        finally:
+            client.stop()
+    finally:
+        group.stop()
+
+
+def test_group_client_cancels_on_the_owning_broker():
+    gate = threading.Event()
+
+    async def handler(request):
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
+        return httpx.Response(200, content=b"late")
+
+    group = _group_of_two(handler)
+    try:
+        env = group.client_environment()
+        client = hb.MultiBrokerClient.connect(
+            env["AO_HTTP2_BROKER_ADDR"].split(","),
+            env["AO_HTTP2_BROKER_TOKEN"].split(","),
+        )
+        try:
+            future = client.submit_async("http://example.test/slow")
+            assert client.cancel(future.request_id) is True
+            with pytest.raises(hb.BrokerCancelledError):
+                future.result(timeout=5)
+        finally:
+            gate.set()
+            client.stop()
+    finally:
+        group.stop()
+
+
+def test_group_shares_levers_and_adds_up_server_stats():
+    async def handler(request):
+        return httpx.Response(200, content=b"ok")
+
+    group = _group_of_two(handler)
+    try:
+        configured = []
+        for broker in group.brokers:
+            broker.configure = lambda **kw: configured.append(kw) or True
+        group.configure(origin_max_concurrency=9, max_bytes_per_second=1000.0)
+        assert configured == [
+            {"origin_max_concurrency": 9, "max_bytes_per_second": 500.0},
+        ] * 2
+
+        for index, broker in enumerate(group.brokers):
+            broker.server_stats = lambda timeout=5.0, i=index: {
+                "active_requests": 3 + i,
+                "backlog_depth": 1,
+                "origins": {"https://t.example": {"active": 2, "limit": 10, "ceiling": 10}},
+            }
+        stats = group.server_stats(timeout=1.0)
+        assert stats["active_requests"] == 7
+        assert stats["backlog_depth"] == 2
+        assert stats["origins"]["https://t.example"] == {"active": 4, "limit": 20, "ceiling": 20}
+        assert stats["brokers"] == 2
+    finally:
+        for broker in group.brokers:
+            broker.__dict__.pop("configure", None)
+            broker.__dict__.pop("server_stats", None)
+        group.stop()
+
+
+# ---------------------------------------------------------------------------
+# HTTP client choice (curl_cffi / httpx)
+# ---------------------------------------------------------------------------
+
+def test_injected_transport_always_uses_httpx():
+    assert hb.resolve_http_client("curl", transport=object()) == "httpx"
+
+
+def test_http_client_falls_back_to_httpx_without_curl(monkeypatch):
+    monkeypatch.setattr(hb, "curl_available", lambda: False)
+    assert hb.resolve_http_client("auto") == "httpx"
+    assert hb.resolve_http_client("curl") == "httpx"
+    assert hb.resolve_http_client("httpx") == "httpx"
+    monkeypatch.setattr(hb, "curl_available", lambda: True)
+    assert hb.resolve_http_client("auto") == "curl"
+    assert hb.resolve_http_client("nonsense") == "curl"
+    assert hb.resolve_http_client("httpx") == "httpx"
+
+
+def test_curl_http_version_names():
+    assert hb._curl_http_version(3) == "HTTP/2"
+    assert hb._curl_http_version(2) == "HTTP/1.1"
+    assert hb._curl_http_version(30) == "HTTP/3"
+    assert hb._curl_http_version(None) == "HTTP/1.1"
+
+
+def _curl_transport_with(monkeypatch, behaviour, max_bytes=1024):
+    pytest.importorskip("curl_cffi")
+    transport = hb._CurlTransport(4, max_bytes)
+
+    class Session:
+        async def request(self, *args, **kwargs):
+            return behaviour(*args, **kwargs)
+
+        async def close(self):
+            pass
+
+    transport._session = Session()
+    return transport
+
+
+def _run(coro):
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+def test_curl_transport_returns_httpx_shaped_response(monkeypatch):
+    from types import SimpleNamespace
+
+    seen = {}
+
+    def behaviour(method, url, **kwargs):
+        seen.update(kwargs, method=method, url=url)
+        return SimpleNamespace(
+            status_code=200, http_version=3, content=b"jpeg",
+            headers={"Content-Type": "image/jpeg", "X-VE-Tile-Info": "x"},
+        )
+
+    transport = _curl_transport_with(monkeypatch, behaviour)
+
+    async def go():
+        async with transport.stream("GET", "https://t.example/a", {"User-Agent": "u"},
+                                    hb.RequestTimeout(connect=2, read=3, write=3, pool=3)) as resp:
+            body = b"".join([chunk async for chunk in resp.aiter_bytes()])
+            return resp, body
+
+    resp, body = _run(go())
+    assert (resp.status_code, resp.http_version, body) == (200, "HTTP/2", b"jpeg")
+    assert resp.headers == {"content-type": "image/jpeg", "x-ve-tile-info": "x"}
+    assert seen["timeout"] == (2.0, 3.0) and seen["allow_redirects"] is True
+    assert seen["headers"] == {"User-Agent": "u"}
+
+
+def test_curl_errors_become_broker_errors(monkeypatch):
+    from curl_cffi.requests import exceptions as curl_errors
+
+    def timeout(*a, **k):
+        raise curl_errors.Timeout("slow")
+
+    def reset(*a, **k):
+        raise curl_errors.ConnectionError("reset")
+
+    t = hb.RequestTimeout(connect=1, read=1, write=1, pool=1)
+    for behaviour, expected in ((timeout, hb.BrokerTimeoutError), (reset, hb.BrokerTransportError)):
+        transport = _curl_transport_with(monkeypatch, behaviour)
+
+        async def go():
+            async with transport.stream("GET", "https://t.example/a", {}, t):
+                pass
+
+        with pytest.raises(expected):
+            _run(go())
+    # Both shrink the origin's budget, like httpx timeouts and resets did.
+    assert hb._classify_origin_outcome(error=hb.BrokerTransportError("x")) == "throttle"
+    assert hb._classify_origin_outcome(error=hb.BrokerTimeoutError("x")) == "throttle"
+
+
+def test_curl_transport_bounds_the_body(monkeypatch):
+    from types import SimpleNamespace
+
+    transport = _curl_transport_with(
+        monkeypatch,
+        lambda *a, **k: SimpleNamespace(status_code=200, http_version=3, content=b"x" * 2048, headers={}),
+        max_bytes=1024,
+    )
+
+    async def go():
+        async with transport.stream("GET", "https://t.example/a", {},
+                                    hb.RequestTimeout(connect=1, read=1, write=1, pool=1)):
+            pass
+
+    with pytest.raises(hb.ResponseTooLargeError):
+        _run(go())
