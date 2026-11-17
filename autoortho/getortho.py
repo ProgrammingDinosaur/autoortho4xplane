@@ -14223,9 +14223,21 @@ class Tile(object):
             elif first_needed > 0 and first_needed < len(self.dds.mipmap_list):
                 bump("read_incidental_tails")
         if streaming_options.flag("wait_bands") and not header_chunk:
+            # The finest level this read builds (the loop below builds every
+            # level from here on that the read overlaps).
+            builds_from = max(first_needed, self.find_mipmap_pos(offset))
             level = wanted if wanted is not None else self._last_wanted_mip
             if level is None:
-                level = max(first_needed, self.find_mipmap_pos(offset))
+                level = builds_from
+            elif wanted is None and level > builds_from:
+                # A read the classifier could not place inherits the tile's
+                # last wanted level, which an earlier or concurrent read may
+                # have set to the base level. Waiting by that band built
+                # finer levels on the far read's 0.5 s and marked them done
+                # with coarser imagery, so X-Plane's real read of them moments
+                # later was served that stand-in (seen while a flight loaded).
+                bump("read_band_inherited_coarser")
+                level = builds_from
             level = min(level, len(self.dds.mipmap_list) - 1)
             request_budget = self._band_budget(level, request_budget)
         for mipmap in self.dds.mipmap_list:
