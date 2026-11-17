@@ -407,6 +407,7 @@ def update_decode_pool_stats():
                 'overflow_count',
                 'overflow_bytes',
                 'memory_limit',
+                'over_limit_total',
             ):
                 if name in stats:
                     profile_gauge(f"decode_pool.{name}", stats[name])

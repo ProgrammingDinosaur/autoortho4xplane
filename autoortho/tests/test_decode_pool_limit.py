@@ -67,11 +67,29 @@ def test_acquire_at_the_limit_returns_instead_of_blocking():
         assert result["buffer"], "acquire returned NULL past the limit"
         # It still waits briefly first: the limit is back-pressure.
         assert 0.3 <= result["seconds"] < 3.0, result["seconds"]
+        if hasattr(lib, "aodecode_pool_over_limit_total"):
+            # Counted, so a flight shows when the limit is too low.
+            assert lib.aodecode_pool_over_limit_total(pool) == 1
     finally:
         for buffer in held:
             lib.aodecode_release_buffer(pool, buffer)
         if result.get("buffer"):
             lib.aodecode_release_buffer(pool, result["buffer"])
+        lib.aodecode_destroy_pool(pool)
+
+
+def test_allocations_within_the_limit_are_not_counted_over_it():
+    lib = _library()
+    if not hasattr(lib, "aodecode_pool_over_limit_total"):
+        pytest.skip("library predates the over-limit counter")
+    pool = lib.aodecode_create_pool_ex(1, 3 * CHUNK_RGBA_BYTES)
+    held = [lib.aodecode_acquire_buffer(pool) for _ in range(3)]
+    try:
+        assert all(held)
+        assert lib.aodecode_pool_over_limit_total(pool) == 0
+    finally:
+        for buffer in held:
+            lib.aodecode_release_buffer(pool, buffer)
         lib.aodecode_destroy_pool(pool)
 
 

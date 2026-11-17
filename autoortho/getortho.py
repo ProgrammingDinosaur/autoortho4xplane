@@ -468,6 +468,7 @@ def _get_native_dds():
             # Respect user's compressor preference from config
             use_ispc = CFG.pydds.compressor.upper() == "ISPC"
             AoDDS.set_use_ispc(use_ispc)
+            _sync_decode_memory_limit()
             
             # Check if hybrid function is available (preferred)
             has_hybrid = hasattr(AoDDS, 'build_from_jpegs')
@@ -2246,8 +2247,26 @@ def _on_live_cache_limit(value):
     try:
         TileCacher.cache_mem_lim = int(float(value) * 1024 ** 3)
         _live_tile_admission.set_byte_budget(_live_build_memory_bytes(value))
+        _sync_decode_memory_limit()
     except (TypeError, ValueError):
         pass
+
+
+def _sync_decode_memory_limit():
+    """Match the native decode pool's limit to the live build memory budget.
+
+    Builds hold their decoded chunks until they compose them, so a limit
+    below what live admission lets in made builds wait at the pool, holding
+    buffers and a build gate slot, and then allocate past it anyway.
+    """
+    native = _get_native_dds()
+    setter = getattr(native, "set_decode_build_memory", None)
+    if setter is None:
+        return
+    try:
+        setter(_live_tile_admission.byte_budget)
+    except Exception as exc:
+        log.debug(f"Setting the decode pool's limit failed: {exc}")
 
 
 def _on_live_prefetch(_value):

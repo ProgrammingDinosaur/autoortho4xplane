@@ -48,6 +48,7 @@ struct aodecode_pool {
     int64_t overflow_allocated; /* Bytes currently in overflow buffers */
     int32_t overflow_count;     /* Number of active overflow buffers */
     int32_t waiters_count;      /* Number of threads waiting for buffer */
+    int64_t over_limit_total;   /* Buffers ever allocated past the limit */
     
     /* Synchronization */
     AOMUTEX lock;               /* Mutex for thread safety */
@@ -68,6 +69,7 @@ AODECODE_API aodecode_pool_t* aodecode_create_pool(int32_t count) {
     pool->overflow_allocated = 0;
     pool->overflow_count = 0;
     pool->waiters_count = 0;
+    pool->over_limit_total = 0;
     
     /* Allocate contiguous memory for all buffers */
     pool->memory = (uint8_t*)malloc((size_t)count * CHUNK_RGBA_BYTES);
@@ -213,9 +215,13 @@ AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
         if (wait_until < 0) {
             wait_until = now + AODECODE_POOL_WAIT_MS;
         }
-        if (current_usage + CHUNK_RGBA_BYTES <= pool->memory_limit
-            || now >= wait_until) {
-            /* Within limit - allocate overflow buffer */
+        int within_limit =
+            current_usage + CHUNK_RGBA_BYTES <= pool->memory_limit;
+        if (within_limit || now >= wait_until) {
+            /* Within limit, or waited long enough at it */
+            if (!within_limit) {
+                pool->over_limit_total++;
+            }
             pool->overflow_allocated += CHUNK_RGBA_BYTES;
             pool->overflow_count++;
             AOMUTEX_UNLOCK(pool->lock);
@@ -349,6 +355,22 @@ AODECODE_API int64_t aodecode_pool_get_limit(aodecode_pool_t* pool) {
     AOMUTEX_UNLOCK(pool->lock);
     
     return limit;
+}
+
+/**
+ * Buffers allocated past the memory limit since the pool was created.
+ *
+ * Each one waited AODECODE_POOL_WAIT_MS at the limit first, so a growing
+ * count means the limit is below what concurrent builds hold.
+ */
+AODECODE_API int64_t aodecode_pool_over_limit_total(aodecode_pool_t* pool) {
+    if (!pool) return 0;
+
+    AOMUTEX_LOCK(pool->lock);
+    int64_t total = pool->over_limit_total;
+    AOMUTEX_UNLOCK(pool->lock);
+
+    return total;
 }
 
 /**

@@ -1230,6 +1230,22 @@ def get_default_decode_pool() -> Optional[AoDecode.BufferPool]:
     return _default_decode_pool
 
 
+def set_decode_build_memory(build_bytes: int) -> bool:
+    """Limit the decode pool to its fixed buffers plus ``build_bytes``.
+
+    getortho passes the live build memory budget: a build holds every chunk
+    it decodes until it composes them (1024 buffers, 256 MB, for one 8192 px
+    level), so the 128 MB default was below a single large build and made
+    builds wait at the limit while live admission still had room.
+    """
+    pool = get_default_decode_pool()
+    if not pool:
+        return False
+    fixed = pool.stats().total * 256 * 256 * 4
+    pool.set_memory_limit(fixed + max(0, int(build_bytes)))
+    return True
+
+
 def get_decode_pool_stats() -> Optional[dict]:
     """
     Get statistics from the global decode pool.

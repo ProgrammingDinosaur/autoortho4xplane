@@ -156,6 +156,15 @@ AODECODE_API void aodecode_pool_set_limit(aodecode_pool_t* pool, int64_t memory_
 AODECODE_API int64_t aodecode_pool_get_limit(aodecode_pool_t* pool);
 
 /**
+ * Buffers allocated past the memory limit since the pool was created (each
+ * after waiting at the limit). A growing count means the limit is too low.
+ *
+ * @param pool  Pool handle
+ * @return Count of over-limit allocations
+ */
+AODECODE_API int64_t aodecode_pool_over_limit_total(aodecode_pool_t* pool);
+
+/**
  * Get current memory usage.
  * 
  * @param pool  Pool handle
