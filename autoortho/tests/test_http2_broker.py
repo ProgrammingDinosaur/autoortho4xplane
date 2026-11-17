@@ -1061,8 +1061,14 @@ def test_shutdown_settles_outstanding_futures():
     broker = make_broker(handler, max_pending=8)
     futures = [broker.submit_async(f"http://example.test/{i}") for i in range(4)]
 
-    gate.set()
-    broker.stop(timeout=5.0)
+    # Keep the handlers blocked until stop() returns: opening the gate first
+    # let a request finish with 200 before shutdown on a fast runner.
+    started = time.monotonic()
+    try:
+        broker.stop(timeout=5.0)
+    finally:
+        gate.set()
+    assert time.monotonic() - started < 5.0
 
     for future in futures:
         assert future.done() is True
