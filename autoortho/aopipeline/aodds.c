@@ -4425,6 +4425,31 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     return 1;
 }
 
+/*
+ * Free the OpenMP threads the calling thread keeps for its parallel regions.
+ *
+ * libgomp gives every thread that starts a parallel region its own team of
+ * worker threads and keeps that team until the thread exits. AutoOrtho's
+ * native builds run on many long-lived threads (FUSE readers, build and
+ * prefetch workers), so each one kept a team: the mount worker grew from
+ * about 160 threads to 634 while a flight loaded and stayed near 470.
+ * omp_pause_resource frees only the calling thread's team (libgomp's
+ * gomp_pause_host); the next parallel region on that thread creates a new
+ * one. Returns 1 when the team was freed, 0 when this runtime cannot
+ * (LLVM's libomp pauses its whole runtime instead, so it is left alone).
+ */
+AODDS_API int32_t aodds_release_thread_team(void) {
+#if AOPIPELINE_HAS_OPENMP && defined(__GNUC__) && !defined(__clang__)
+    if (omp_in_parallel()) {
+        return 0;
+    }
+    return omp_pause_resource(omp_pause_soft, omp_get_initial_device()) == 0
+        ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
 AODDS_API const char* aodds_version(void) {
     aodds_init_ispc();
     

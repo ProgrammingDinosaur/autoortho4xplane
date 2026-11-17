@@ -2038,7 +2038,47 @@ class _native_build_context:
             _active_native_builds -= 1
             _active_native_thread_count -= self._threads
             _native_build_condition.notify_all()
+        _settle_native_team(self._threads)
         return False
+
+
+# OpenMP worker threads that calling threads keep (see _settle_native_team).
+_native_team_lock = threading.Lock()
+_native_team_keepers = {}
+_native_team_kept = 0
+
+
+def _settle_native_team(threads):
+    """Free this thread's OpenMP team unless it is one of the few that keep one.
+
+    libgomp keeps a team of worker threads for every thread that ran a
+    parallel region, until that thread exits (on Windows, not even then).
+    Builds run on many long-lived threads, so each kept a team: the mount
+    worker grew from about 160 threads to 634 while a flight loaded and
+    stayed near 470. Threads whose teams fit in one CPU budget keep them,
+    since a new team costs 0.3 to 1 ms a build; every other thread frees its
+    team when its build ends. A keeper's share is never handed on, so the
+    teams of keepers that exit cannot add up either.
+    """
+    global _native_team_kept
+    workers = max(0, int(threads or 1) - 1)
+    ident = threading.get_ident()
+    with _native_team_lock:
+        kept = _native_team_keepers.get(ident)
+        if kept is not None and workers <= kept:
+            return
+        grow = workers - (kept or 0)
+        if _native_team_kept + grow <= _native_cpu_budget():
+            _native_team_keepers[ident] = workers
+            _native_team_kept += grow
+            return
+    native = _get_native_dds()
+    release = getattr(native, "release_thread_team", None)
+    try:
+        if release is not None and release():
+            bump("native_teams_released")
+    except Exception as exc:
+        log.debug(f"Releasing this thread's OpenMP team failed: {exc}")
 
 
 def _defer_background_build_if_live(tile=None):

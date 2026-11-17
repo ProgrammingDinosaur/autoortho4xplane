@@ -2650,6 +2650,30 @@ class PartialMipmapResult(NamedTuple):
     error: str = ''
 
 
+def release_thread_team() -> bool:
+    """Free the OpenMP threads the calling thread keeps between builds.
+
+    libgomp keeps a team of worker threads for every thread that ran a
+    parallel region, until that thread exits; see
+    ``aodds_release_thread_team``. False when the library or its OpenMP
+    runtime cannot (older libraries, LLVM's libomp on macOS).
+    """
+    try:
+        lib = _load_library()
+    except Exception:
+        return False
+    release = getattr(lib, 'aodds_release_thread_team', None)
+    if release is None:
+        return False
+    if release.restype is not c_int32:
+        release.argtypes = []
+        release.restype = c_int32
+    try:
+        return bool(release())
+    except Exception:
+        return False
+
+
 def partial_mipmap_supports_threads() -> bool:
     """Whether the loaded library can bound a partial build's thread count."""
     try:

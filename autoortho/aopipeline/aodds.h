@@ -631,6 +631,13 @@ AODDS_API int32_t aodds_get_use_ispc(void);
 AODDS_API int32_t aodds_using_fallback_compressor(void);
 
 /**
+ * Free the OpenMP worker threads the calling thread keeps between parallel
+ * regions (libgomp keeps one team per calling thread until it exits).
+ * Returns 1 when freed, 0 when the runtime cannot release one thread's team.
+ */
+AODDS_API int32_t aodds_release_thread_team(void);
+
+/**
  * Get version information for the aodds module.
  * 
  * @return Static string with version info (do not free)
