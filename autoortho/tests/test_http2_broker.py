@@ -665,6 +665,34 @@ def test_live_requests_use_the_shorter_queue_timeout():
     assert background.result(timeout=5.0).status_code == 200
 
 
+def test_requests_arriving_as_the_idle_receive_times_out_are_not_lost(
+    monkeypatch,
+):
+    # The server's receive loop wakes on a timer to check for a stop.
+    # Cancelling its pending receive there dropped a request that had just
+    # arrived; the request then sat out the client's queue timeout.
+    monkeypatch.setattr(hb._RouterServer, "_STOP_POLL_SECONDS", 0.002)
+
+    async def handler(request):
+        return httpx.Response(200, content=b"ok")
+
+    # Room for every request, so a lost one shows as a queue timeout.
+    broker = make_broker(handler, queue_timeout=2.0, max_pending=1024)
+    futures = []
+    for index in range(400):
+        futures.append(broker.submit_async(f"http://example.test/t/{index}"))
+        # Gaps around the poll interval, so requests land as it expires.
+        time.sleep(0.001 * (index % 4))
+
+    lost = 0
+    for future in futures:
+        try:
+            assert future.result(timeout=5.0).status_code == 200
+        except hb.BrokerQueueTimeoutError:
+            lost += 1
+    assert lost == 0
+
+
 def test_live_queue_timeout_never_exceeds_queue_timeout():
     async def handler(request):  # pragma: no cover - never reached
         return httpx.Response(200)
