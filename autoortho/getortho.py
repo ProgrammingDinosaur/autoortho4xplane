@@ -17540,9 +17540,21 @@ class Tile(object):
                     return False
                 return True
 
+            def current_dds():
+                # The tile can be closed while the native build runs.
+                dds = self.dds
+                if dds is None or len(dds.mipmap_list) == 0:
+                    log.debug("_try_native_partial_mipmap_build: DDS cleared during build")
+                    bump("native_partial_dds_cleared")
+                    return None
+                return dds
+
             source_manifest = manifest_for(jpeg_datas, fallback_provenance)
             result = native_build(partial_sources)
             if not build_ok(result):
+                return False
+            dds = current_dds()
+            if dds is None:
                 return False
 
             # The native decoder paints a JPEG it cannot decode with missing
@@ -17606,25 +17618,24 @@ class Tile(object):
                 generation=generation,
             )
 
-            # Guard against DDS being cleared during build
-            if self.dds is None or len(self.dds.mipmap_list) == 0:
-                log.debug(f"_try_native_partial_mipmap_build: DDS cleared during build")
+            dds = current_dds()
+            if dds is None:
                 return False
-            
+
             if not coordinator.can_commit_partial(revision):
                 return True
 
             def install_rows(committed):
                 self.ready.clear()
                 try:
-                    mm = self.dds.mipmap_list[mipmap]
-                    sparse = self.dds.ensure_sparse_mipmap(
+                    mm = dds.mipmap_list[mipmap]
+                    sparse = dds.ensure_sparse_mipmap(
                         mipmap,
                         bytes_per_chunk_row,
                         coordinator.total_rows,
                     )
                     for row_result in committed:
-                        self.dds.write_mipmap_at(
+                        dds.write_mipmap_at(
                             mipmap,
                             row_result.manifest.row_index
                             * bytes_per_chunk_row,
