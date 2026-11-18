@@ -51,7 +51,7 @@ class SectionParser(object):
 
 # Bump when a release changes a default that existing configs must pick up,
 # and add the step to _migrate_config_revision.
-CONFIG_REVISION = 2
+CONFIG_REVISION = 3
 
 # From this revision the file holds only the settings the user changed; every
 # other setting is a commented "# key = default" line. Active lines in such a
@@ -156,8 +156,8 @@ kept_values =
 # offering to hand these back; a newly pinned one is offered again).
 dismissed_pinned =
 dismissed_update_version =
-# Hide when running
-hide = True
+# Hide the window to the system tray / menu bar while streaming
+hide = False
 # Console/UI log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 console_log_level = INFO
 # File log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
@@ -293,6 +293,10 @@ live_builder_concurrency = 8
 # End-to-end live tile requests admitted before allocating composition state.
 # Keep this high enough to saturate downloads while bounding ZL17 working memory.
 live_tile_admission = 16
+# Memory live builds may hold at once, in MB: each read is weighted by the
+# level it builds (75MB for a 4096px level, 300MB for 8192px). 0 = a quarter
+# of [cache] cache_mem_limit, between 256MB and 2GB.
+live_build_memory_mb = 0
 # Maximum retained RGBA fallback imagery per tile. ZL17 mipmap 0 alone is
 # 256MB and is therefore composed, compressed, and released instead of cached.
 tile_image_cache_mb = 96
@@ -422,6 +426,14 @@ provider_max_connections = 160
 # Threads used to apply broker responses (cache write, decode hand-off).
 # This is a coordination pool, not a download pool; keep it small.
 download_dispatch_workers = 4
+# Download broker processes. One broker is one Python event loop and tops out
+# near one CPU core (about 200 tiles a second); requests are spread over them
+# by URL. 0 picks one per 4 CPU threads, 1 to 4.
+provider_broker_processes = 0
+# HTTP client of the download brokers: auto (curl when installed, else httpx),
+# curl (libcurl through curl_cffi: HTTP/2 in C, several times the requests per
+# CPU core) or httpx.
+provider_http_client = auto
 # Maximum time a request may wait for broker/provider admission before its
 # network timeout begins. Queue time is deliberately separate from HTTP time.
 provider_queue_timeout = 60.0
@@ -522,9 +534,14 @@ real_from_index = True
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
-# Disk compression for cached DDS files (none or zstd)
-# zstd reduces cache disk usage by 30-60% with ~2-5ms added read latency
-# none stores raw DDS data (fastest reads, largest disk usage)
+# Serve finished textures straight from the DDS cache file, without loading
+# them into AutoOrtho's memory (the OS file cache holds them instead).
+# Needs uncompressed cache files: while on, dds_compression is ignored and
+# compressed entries are rewritten uncompressed the first time they are used.
+serve_from_disk = True
+# Disk compression for cached DDS files (none or zstd), used only when
+# serve_from_disk is off. zstd saves about 10% on BC1 photo textures and
+# costs ~40ms of CPU per write and ~10ms per read.
 dds_compression = zstd
 # Zstd compression level (1-19, default 3)
 # Higher = smaller files, slower writes (reads are always fast)
@@ -545,6 +562,10 @@ storage_safety_margin_gb = 2
 [fuse]
 # Enable or disable multi-threading when using FUSE
 threading = True
+# Serve every scenery mount from one worker process (one tile cache, one
+# memory limit, one download pool). Windows and Linux only: macOS always
+# uses one worker per mount.
+shared_worker = True
 # NOTE: build_timeout (FUSE lock timeout) is calculated dynamically from the
 # tile budget (the longest [streaming] wait). Formula: that budget +
 # fallback_timeout (if enabled) + 15s.
@@ -1342,6 +1363,11 @@ PROVIDER_SETTINGS = {
         "range": (1, 16),
         "legacy": None,
     },
+    "provider_broker_processes": {
+        "default": 0,
+        "range": (0, 8),
+        "legacy": None,
+    },
     "provider_queue_timeout": {
         "type": float,
         "default": 60.0,
@@ -1668,7 +1694,61 @@ def _migrate_config_revision(cfg, user_config):
             "Config will now store only changed settings; values equal to "
             "their defaults follow future default changes"
         )
+        # general.hide did nothing before 3.2.0, so a saved "hide = True"
+        # from those releases was never a choice. 3.2.0 made it hide the
+        # window to the tray on streaming start, which left Mac users unable
+        # to find the window; it now defaults off.
+        cfg.config.set("general", "hide", "False")
+    if revision < 3:
+        _carry_over_raised_maxwait(cfg, user_config)
     cfg.config.set("general", "config_revision", str(CONFIG_REVISION))
+
+
+# 2.x waited about this many times [autoortho] maxwait for a near read in
+# flight (measured: about 6 s with the 2 s default). The 3.x near wait
+# replaced maxwait, whose value was then ignored.
+_MAXWAIT_TO_BAND_WAIT = 3.0
+_OLD_MAXWAIT_DEFAULT = 2.0
+_BAND_WAIT_RANGE = (6.0, 12.0)  # default up to the governor's maximum
+
+
+def _carry_over_raised_maxwait(cfg, user_config):
+    """Keep a raised 2.x maxwait as a longer in-flight near wait.
+
+    Users who raised maxwait to wait longer for sharp imagery lost that on
+    upgrade, which looks blurrier than 2.x on a slow line. Only raises, only
+    when the file sets no near wait of its own.
+    """
+    try:
+        if user_config.has_option("streaming", "band_max_wait_seconds"):
+            return
+        raw = user_config.get("autoortho", "maxwait", fallback=None)
+        if raw is None:
+            return
+        maxwait = float(raw)
+    except (TypeError, ValueError):
+        return
+    if maxwait <= _OLD_MAXWAIT_DEFAULT:
+        return
+    low, high = _BAND_WAIT_RANGE
+    wanted = max(low, min(high, maxwait * _MAXWAIT_TO_BAND_WAIT))
+    try:
+        current = float(
+            cfg.config.get("streaming", "band_max_wait_seconds", fallback=low)
+        )
+    except (TypeError, ValueError):
+        current = low
+    if wanted <= current:
+        return
+    if not cfg.config.has_section("streaming"):
+        cfg.config.add_section("streaming")
+    cfg.config.set("streaming", "band_max_wait_seconds", f"{wanted:g}")
+    log.info(
+        "Carried over maxwait = %g from an older config as "
+        "streaming.band_max_wait_seconds = %g",
+        maxwait,
+        wanted,
+    )
 
 
 def _file_revision(user_config):

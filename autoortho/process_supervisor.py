@@ -8,7 +8,8 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, List, Optional
+import json
+from typing import BinaryIO, List, Optional, Sequence, Tuple
 
 try:
     from autoortho.utils.mount_utils import _is_frozen
@@ -33,6 +34,9 @@ class WorkerHandle:
     shutdown_requested: bool = False
     control_stream: Optional[BinaryIO] = None
     crash_collector: Optional[object] = None
+    # Every (root, mountpoint, volname) this process serves; one entry unless
+    # it is a shared worker.
+    mounts: Tuple[Tuple[str, str, str], ...] = ()
 
     @property
     def pid(self) -> int:
@@ -91,7 +95,14 @@ class AOProcessSupervisor:
         log_addr=None,
         loglevel="INFO",
         extra_env=None,
+        mounts: Optional[Sequence[Tuple[str, str, str]]] = None,
     ) -> WorkerHandle:
+        """Start one mount worker.
+
+        ``mounts`` (a list of (root, mountpoint, volname)) makes it a shared
+        worker serving every mount in one process; ``root``, ``mountpoint``
+        and ``volname`` then name the first of them.
+        """
         env = os.environ.copy()
         env["AO_RUN_MODE"] = "mount_worker"
         env["AO_WORKER_CONTROL_STDIN"] = "1"
@@ -130,10 +141,19 @@ class AOProcessSupervisor:
             cmd += ["--volname", str(volname)]
         if nothreads:
             cmd.append("--nothreads")
+        mount_list = tuple(
+            (os.path.expanduser(r), os.path.expanduser(m), str(v or ""))
+            for r, m, v in (mounts or ())
+        ) or ((os.path.expanduser(root), os.path.expanduser(mountpoint), str(volname or "")),)
+        shared = len(mount_list) > 1
+        if shared:
+            cmd += ["--mounts-json", json.dumps([list(m) for m in mount_list])]
 
         log_dir = Path.home() / ".autoortho-data" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = _safe_worker_log_name(volname or Path(mountpoint).name or "mount")
+        safe_name = "shared" if shared else _safe_worker_log_name(
+            volname or Path(mountpoint).name or "mount"
+        )
         std_file = open(log_dir / f"worker-{safe_name}.log", "ab", buffering=0)
 
         collector = None
@@ -210,6 +230,7 @@ class AOProcessSupervisor:
             stdout_file=std_file,
             control_stream=control_stream,
             crash_collector=collector,
+            mounts=mount_list,
         )
 
         if os.name == "nt":
@@ -218,7 +239,11 @@ class AOProcessSupervisor:
             collector.start(process.pid, std_file)
 
         self.handles.append(handle)
-        log.info("Mount worker for %s started with pid: %s", volname, process.pid)
+        log.info(
+            "Mount worker for %s started with pid: %s",
+            ", ".join(m[2] or m[1] for m in mount_list),
+            process.pid,
+        )
         return handle
 
     def prepare_shutdown(self):

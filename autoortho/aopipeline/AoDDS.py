@@ -23,7 +23,7 @@ Usage:
 from ctypes import (
     CDLL, POINTER, Structure, c_void_p,
     c_char, c_char_p, c_int32, c_uint8, c_uint32, c_double, c_size_t,
-    byref, cast
+    byref, cast, string_at
 )
 import logging
 import os
@@ -1230,6 +1230,22 @@ def get_default_decode_pool() -> Optional[AoDecode.BufferPool]:
     return _default_decode_pool
 
 
+def set_decode_build_memory(build_bytes: int) -> bool:
+    """Limit the decode pool to its fixed buffers plus ``build_bytes``.
+
+    getortho passes the live build memory budget: a build holds every chunk
+    it decodes until it composes them (1024 buffers, 256 MB, for one 8192 px
+    level), so the 128 MB default was below a single large build and made
+    builds wait at the limit while live admission still had room.
+    """
+    pool = get_default_decode_pool()
+    if not pool:
+        return False
+    fixed = pool.stats().total * 256 * 256 * 4
+    pool.set_memory_limit(fixed + max(0, int(build_bytes)))
+    return True
+
+
 def get_decode_pool_stats() -> Optional[dict]:
     """
     Get statistics from the global decode pool.
@@ -1770,7 +1786,7 @@ def build_tile_native(
         raise RuntimeError(f"DDS build failed: {error}")
     
     # Return DDS bytes
-    return bytes(buffer[:request.dds_written])
+    return string_at(buffer, request.dds_written)
 
 
 def build_tile_native_detailed(
@@ -1815,7 +1831,7 @@ def build_tile_native_detailed(
     success = lib.aodds_build_tile(byref(request), pool_handle)
     
     return BuildResult(
-        data=bytes(buffer[:request.dds_written]) if success else b'',
+        data=string_at(buffer, request.dds_written) if success else b'',
         success=bool(success),
         chunks_found=request.stats.chunks_found,
         chunks_decoded=request.stats.chunks_decoded,
@@ -2292,7 +2308,7 @@ def build_from_jpegs(
     if not success:
         raise RuntimeError("Failed to build DDS from JPEGs")
     
-    return bytes(buffer[:bytes_written.value])
+    return string_at(buffer, bytes_written.value)
 
 
 def build_from_jpegs_to_buffer(
@@ -2650,16 +2666,53 @@ class PartialMipmapResult(NamedTuple):
     error: str = ''
 
 
+def release_thread_team() -> bool:
+    """Free the OpenMP threads the calling thread keeps between builds.
+
+    libgomp keeps a team of worker threads for every thread that ran a
+    parallel region, until that thread exits; see
+    ``aodds_release_thread_team``. False when the library or its OpenMP
+    runtime cannot (older libraries, LLVM's libomp on macOS).
+    """
+    try:
+        lib = _load_library()
+    except Exception:
+        return False
+    release = getattr(lib, 'aodds_release_thread_team', None)
+    if release is None:
+        return False
+    if release.restype is not c_int32:
+        release.argtypes = []
+        release.restype = c_int32
+    try:
+        return bool(release())
+    except Exception:
+        return False
+
+
+def partial_mipmap_supports_threads() -> bool:
+    """Whether the loaded library can bound a partial build's thread count."""
+    try:
+        return hasattr(_load_library(), 'aodds_build_partial_mipmap_mt')
+    except Exception:
+        return False
+
+
 def build_partial_mipmap(
     jpeg_datas: List[Optional[bytes]],
     chunks_width: int,
     chunks_height: int,
     format: str = "BC1",
     missing_color: Tuple[int, int, int] = (66, 77, 55),
-    pool: Optional[c_void_p] = None
+    pool: Optional[c_void_p] = None,
+    max_threads: int = 0,
 ) -> PartialMipmapResult:
     """
     Build a rectangular partial mipmap from JPEG chunks.
+
+    ``max_threads`` bounds the OpenMP team (0 = the library default). It is
+    honoured only by libraries that export ``aodds_build_partial_mipmap_mt``;
+    see ``partial_mipmap_supports_threads``.
     
     Unlike build_single_mipmap() which requires square chunk grids (e.g., 8×8),
     this function supports arbitrary width × height layouts (e.g., 8×1 for
@@ -2756,10 +2809,14 @@ def build_partial_mipmap(
             c_void_p                    # pool
         ]
         lib.aodds_build_partial_mipmap.restype = c_int32
+        if hasattr(lib, 'aodds_build_partial_mipmap_mt'):
+            lib.aodds_build_partial_mipmap_mt.argtypes = (
+                list(lib.aodds_build_partial_mipmap.argtypes) + [c_int32]
+            )
+            lib.aodds_build_partial_mipmap_mt.restype = c_int32
         lib._partial_mipmap_setup_done = True
-    
-    # Call native function
-    success = lib.aodds_build_partial_mipmap(
+
+    args = (
         jpeg_ptrs,
         jpeg_sizes,
         c_int32(chunks_width),
@@ -2771,8 +2828,13 @@ def build_partial_mipmap(
         output_buffer.ctypes.data_as(POINTER(c_uint8)),
         c_uint32(output_size),
         byref(bytes_written),
-        pool_handle
+        pool_handle,
     )
+    # Call native function
+    if max_threads and hasattr(lib, 'aodds_build_partial_mipmap_mt'):
+        success = lib.aodds_build_partial_mipmap_mt(*args, c_int32(max_threads))
+    else:
+        success = lib.aodds_build_partial_mipmap(*args)
     
     elapsed_ms = (time.monotonic() - start_time) * 1000
     
@@ -2806,6 +2868,7 @@ def build_partial_mipmap_v2(
     format: str = "BC1",
     missing_color: Tuple[int, int, int] = (66, 77, 55),
     pool: Optional[c_void_p] = None,
+    max_threads: int = 0,
 ) -> PartialMipmapResult:
     """Build a partial mipmap from JPEGs, prepared pixels, or missing slots.
 
@@ -2838,6 +2901,7 @@ def build_partial_mipmap_v2(
         format=format,
         missing_color=missing_color,
         pool=pool,
+        max_threads=max_threads,
     )
     if not result.success or not result.data or not prepared:
         return result

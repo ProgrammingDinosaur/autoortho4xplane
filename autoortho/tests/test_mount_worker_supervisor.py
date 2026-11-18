@@ -286,6 +286,8 @@ def test_parent_broker_environment_is_forwarded(monkeypatch):
     mount.cfg = SimpleNamespace(
         autoortho=SimpleNamespace(
             http2_enabled=True,
+            # One broker process: these tests follow its own start and fallback.
+            provider_broker_processes=1,
             max_concurrent_downloads=32,
             http2_max_connections=8,
         )
@@ -328,6 +330,8 @@ def test_parent_retries_broker_in_process_after_spawn_failure(monkeypatch):
     mount.cfg = SimpleNamespace(
         autoortho=SimpleNamespace(
             http2_enabled=True,
+            # One broker process: these tests follow its own start and fallback.
+            provider_broker_processes=1,
             max_concurrent_downloads=32,
             http2_max_connections=8,
         )
@@ -560,6 +564,53 @@ def test_provider_probe_failure_does_not_fail_healthy_mounts(monkeypatch):
     )
 
     assert autoortho_mod.diagnose(cfg, mount_timeout=0.1) is True
+
+
+def test_provider_probe_error_does_not_abort_start(monkeypatch):
+    import importlib
+
+    autoortho_mod = importlib.import_module("autoortho")
+    cfg = SimpleNamespace(
+        scenery_mounts=[{"root": "/root", "mount": "/mount"}]
+    )
+    monkeypatch.setattr(
+        autoortho_mod.geocoder,
+        "ip",
+        lambda _value: SimpleNamespace(address="test"),
+    )
+    monkeypatch.setattr(
+        autoortho_mod.os.path,
+        "isdir",
+        lambda path: path == "/mount/textures",
+    )
+    monkeypatch.setattr(autoortho_mod, "system_type", "windows")
+    monkeypatch.setattr(
+        autoortho_mod.os.path,
+        "isdir",
+        lambda path: path.replace("\\", "/") == "/mount/textures",
+    )
+    monkeypatch.setattr(autoortho_mod, "MAPTYPES", ["APPLE", "ARC"])
+    monkeypatch.setattr(autoortho_mod.time, "sleep", lambda _seconds: None)
+    checked = []
+
+    class ProviderChunk:
+        def __init__(self, _col, _row, maptype, *_args, **_kwargs):
+            self.maptype = maptype
+
+        def get(self):
+            checked.append(self.maptype)
+            if self.maptype == "APPLE":
+                raise RuntimeError("Failed to retrieve Apple Maps token: 500")
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "getortho",
+        SimpleNamespace(Chunk=ProviderChunk),
+    )
+
+    assert autoortho_mod.diagnose(cfg, mount_timeout=0.1) is True
+    assert checked == ["APPLE", "ARC"]
 
 
 def test_mount_readiness_failure_remains_fatal(monkeypatch):

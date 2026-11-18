@@ -115,6 +115,11 @@ def patch_cfg(monkeypatch):
     monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'compressor', 'ISPC')
     monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression', 'zstd')
     monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'dds_compression_level', 3)
+    # These tests cover the stored-compressed path; direct reads (which
+    # force uncompressed storage) have their own tests in test_disk_texture.
+    monkeypatch.setattr(
+        _mock_cfg_module.CFG.pydds, 'serve_from_disk', False, raising=False
+    )
 
 
 # ============================================================================
@@ -2355,3 +2360,170 @@ class TestHealingRestoresServableEntries:
         served = MockTile()
         served.cache_dir = mock_tile.cache_dir
         assert dds_cache.load(served.id, served.max_zoom, served) is not None
+
+
+# ============================================================================
+# Direct reads: finished textures served from their cache file
+# ============================================================================
+
+class TestDirectReads:
+    """[pydds] serve_from_disk: open_direct, pins, promotion, DiskTexture."""
+
+    @pytest.fixture
+    def direct_cache(self, cache_dir, monkeypatch):
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+        monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'serve_from_disk', True)
+        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=100, enabled=True)
+        yield cache
+        cache.close()
+
+    @staticmethod
+    def _open(cache, tile, size=None):
+        return cache.open_direct(
+            tile.row, tile.col, tile.maptype, tile.tilename_zoom,
+            tile.max_zoom, size if size is not None else tile.dds.total_size,
+        )
+
+    @staticmethod
+    def _texture(cache, entry, **kwargs):
+        from autoortho.disk_texture import DiskTexture
+        return DiskTexture(entry, unpin=cache.unpin,
+                           invalidate=cache.invalidate, **kwargs)
+
+    def test_store_is_uncompressed_and_servable(self, direct_cache, mock_tile, sample_dds_bytes):
+        assert direct_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        entry = self._open(direct_cache, mock_tile)
+        assert entry is not None
+        assert os.path.getsize(entry["dds_path"]) == len(sample_dds_bytes)
+        assert direct_cache.is_pinned(entry["key"])
+        direct_cache.unpin(entry["key"])
+        assert not direct_cache.is_pinned(entry["key"])
+
+    def test_wrong_size_or_zoom_is_not_servable(self, direct_cache, mock_tile, sample_dds_bytes):
+        direct_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        assert self._open(direct_cache, mock_tile, size=len(sample_dds_bytes) + 8) is None
+        assert direct_cache.open_direct(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom + 1, len(sample_dds_bytes),
+        ) is None
+
+    def test_inexact_mipmap_zero_is_not_servable(self, direct_cache, mock_tile, sample_dds_bytes):
+        manifests = _manifest_rows(mock_tile, mock_tile.max_zoom, sample_dds_bytes, fallback=[3])
+        direct_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes,
+                           mock_tile, mm0_manifest=manifests)
+        assert self._open(direct_cache, mock_tile) is None
+
+    def test_compressed_entry_is_promoted(self, cache_dir, mock_tile, sample_dds_bytes, monkeypatch):
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+        old = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=100, enabled=True)
+        assert old.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        old.close()
+        dds_path, _ = old._paths_for(mock_tile.row, mock_tile.col, mock_tile.maptype,
+                                     mock_tile.tilename_zoom, mock_tile.max_zoom)
+        assert os.path.getsize(dds_path) < len(sample_dds_bytes)
+
+        monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'serve_from_disk', True)
+        cache = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=100, enabled=True)
+        try:
+            assert self._open(cache, mock_tile) is None
+            deadline = time.time() + 5
+            entry = None
+            while entry is None and time.time() < deadline:
+                time.sleep(0.05)
+                entry = self._open(cache, mock_tile)
+            assert entry is not None
+            with open(dds_path, "rb") as f:
+                assert f.read() == sample_dds_bytes
+            cache.unpin(entry["key"])
+        finally:
+            cache.close()
+
+    def test_pinned_entries_survive_eviction(self, direct_cache, mock_tile, sample_dds_bytes):
+        direct_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        entry = self._open(direct_cache, mock_tile)
+        assert direct_cache.evict_lru(10 ** 12) == 0
+        assert os.path.exists(entry["dds_path"])
+        direct_cache.unpin(entry["key"])
+        assert direct_cache.evict_lru(10 ** 12) > 0
+        assert not os.path.exists(entry["dds_path"])
+
+    def test_disk_texture_reads_match_the_file(self, direct_cache, mock_tile, sample_dds_bytes):
+        direct_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        wanted = []
+        texture = self._texture(direct_cache, self._open(direct_cache, mock_tile),
+                                note_wanted=lambda mip, width: wanted.append(mip))
+        try:
+            assert texture.size == len(sample_dds_bytes)
+            for offset, length in ((0, 65536), (128, 1 << 20), (5_000_000, 700_000),
+                                   (len(sample_dds_bytes) - 100, 4096)):
+                assert texture.read(offset, length) == sample_dds_bytes[offset:offset + length]
+            assert texture.read(len(sample_dds_bytes), 10) == b""
+            assert wanted, "reads feed the paging model"
+        finally:
+            texture.close()
+        assert not direct_cache.is_pinned(texture.key)
+
+    def test_disk_texture_recolours(self, direct_cache, mock_tile, sample_dds_bytes):
+        direct_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        texture = self._texture(direct_cache, self._open(direct_cache, mock_tile),
+                                recolour=lambda data, offset: b"x" * len(data))
+        try:
+            assert texture.read(1000, 10) == b"x" * 10
+        finally:
+            texture.close()
+
+    def test_corrupt_row_fails_and_invalidates(self, direct_cache, mock_tile, sample_dds_bytes):
+        from autoortho.disk_texture import DiskTextureFailed
+        direct_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        entry = self._open(direct_cache, mock_tile)
+        # Same size, same mtime: only the row checksum can tell.
+        stat = os.stat(entry["dds_path"])
+        with open(entry["dds_path"], "r+b") as f:
+            f.seek(128 + 10)
+            f.write(b"\xff\xff")
+        os.utime(entry["dds_path"], ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        texture = self._texture(direct_cache, entry)
+        assert texture.read(len(sample_dds_bytes) - 64, 64)  # lower levels: no check
+        with pytest.raises(DiskTextureFailed):
+            texture.read(128, 4096)
+        texture.close()
+        assert not os.path.exists(entry["dds_path"])
+
+
+def _volume_supports_sparse(path):
+    import ctypes
+    from ctypes import wintypes
+    root = os.path.splitdrive(os.path.abspath(path))[0] + "\\"
+    flags = wintypes.DWORD()
+    ok = ctypes.windll.kernel32.GetVolumeInformationW(
+        root, None, 0, None, None, ctypes.byref(flags), None, 0
+    )
+    return bool(ok) and bool(flags.value & 0x40)  # FILE_SUPPORTS_SPARSE_FILES
+
+
+def test_dds_skeleton_is_sized_without_writing_the_gap(dds_cache, cache_dir):
+    """The skeleton has its full size and header, reads zeros past the header,
+    and on Windows is sparse rather than 45 MB of written zeros."""
+    import stat
+    path = os.path.join(cache_dir, "skeleton.dds")
+    header = b"DDS " + bytes(range(124))
+    size = 8 * 1024 * 1024
+
+    assert dds_cache._create_dds_skeleton(path, header, size)
+
+    assert os.path.getsize(path) == size
+    with open(path, "rb") as f:
+        assert f.read(128) == header
+        f.seek(size - 4096)
+        assert f.read() == b"\x00" * 4096
+    # A row written deep in the file lands where it should.
+    with open(path, "r+b") as f:
+        f.seek(size - 65536)
+        f.write(b"\xab" * 1024)
+    with open(path, "rb") as f:
+        f.seek(size - 65536)
+        assert f.read(1024) == b"\xab" * 1024
+
+    if os.name == "nt" and _volume_supports_sparse(path):
+        attrs = os.stat(path).st_file_attributes
+        assert attrs & stat.FILE_ATTRIBUTE_SPARSE_FILE

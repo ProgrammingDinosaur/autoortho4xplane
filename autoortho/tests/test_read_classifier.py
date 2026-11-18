@@ -168,6 +168,115 @@ def test_tail_of_finer_level_is_not_built(tile):
     assert 1 not in built
 
 
+def _record_budgets(tile, monkeypatch):
+    budgets = []
+
+    def get_bytes(offset, length, time_budget=None):
+        budgets.append((tile.find_mipmap_pos(offset), time_budget.max_seconds))
+        return True
+
+    def get_mipmap(mipmap=0, time_budget=None):
+        budgets.append((mipmap, time_budget.max_seconds))
+        return True
+
+    monkeypatch.setattr(tile, "get_bytes", get_bytes)
+    monkeypatch.setattr(tile, "get_mipmap", get_mipmap)
+    monkeypatch.setattr(getortho, "current_camera", lambda: None)
+    monkeypatch.setattr(getortho, "flight_is_starting", lambda near_read=False: True)
+    return budgets
+
+
+def test_unplaced_read_does_not_inherit_the_base_levels_short_wait(tile, monkeypatch):
+    # An earlier read of this tile wanted the base level (a far texture).
+    # A later read inside mipmap 1 that the classifier cannot place (it is
+    # not the start of the level and does not continue the last read) used
+    # to wait by that far band: mipmap 1 was built on 0.5 s, filled with
+    # coarser imagery and marked done, so X-Plane got a stand-in.
+    budgets = _record_budgets(tile, monkeypatch)
+    tile._last_wanted_mip = tile.max_mipmap
+    mm1 = tile.dds.mipmap_list[1]
+    offset = mm1.startpos + 3 * CHUNK
+    assert offset + CHUNK <= mm1.endpos
+    tile._read_dds_bytes_budgeted(offset, CHUNK, getortho.TimeBudget(600))
+    level_one = [seconds for level, seconds in budgets if level == 1]
+    assert level_one, budgets
+    far_wait = getortho.wait_bands.wait_seconds(getortho.wait_bands.FAR, True)
+    assert all(seconds > far_wait for seconds in level_one), budgets
+    assert tile._read_band == getortho.wait_bands.NEAR
+
+
+def test_unplaced_read_keeps_a_finer_inherited_level(tile, monkeypatch):
+    # The correction only ever makes a read nearer.
+    budgets = _record_budgets(tile, monkeypatch)
+    tile._last_wanted_mip = 0
+    mm2 = tile.dds.mipmap_list[2]
+    offset = mm2.startpos + CHUNK
+    tile._read_dds_bytes_budgeted(offset, CHUNK, getortho.TimeBudget(600))
+    assert tile._read_band == getortho.wait_bands.NEAR
+
+
+def test_read_statistics_use_the_reads_own_band(tile, monkeypatch):
+    # A concurrent far read of the same tile moves the tile's latest band
+    # while this near read waits: its statistics still count it as near.
+    _record_budgets(tile, monkeypatch)
+    bumps = []
+    monkeypatch.setattr(getortho, "bump", lambda key, n=1: bumps.append(key))
+
+    def concurrent_far_read(*_args, **_kwargs):
+        tile._read_band = getortho.wait_bands.FAR
+        return True
+
+    monkeypatch.setattr(tile, "get_bytes", concurrent_far_read)
+    monkeypatch.setattr(tile, "get_mipmap", concurrent_far_read)
+    late = []
+    monkeypatch.setattr(
+        tile,
+        "_note_late",
+        lambda wanted, started, band=None, starting=None: late.append(band),
+    )
+    mm1 = tile.dds.mipmap_list[1]
+    tile._read_dds_bytes_budgeted(mm1.startpos, CHUNK, getortho.TimeBudget(600))
+    assert "near_reads_standin" in bumps
+    assert late == [getortho.wait_bands.NEAR]
+
+
+def _near_mm0_read(tile, monkeypatch, exact_rows):
+    _record_budgets(tile, monkeypatch)
+    bumps = []
+    monkeypatch.setattr(
+        getortho, "bump_many", lambda counters: bumps.extend(counters)
+    )
+    monkeypatch.setattr(getortho, "bump", lambda key, n=1: bumps.append(key))
+    monkeypatch.setattr(tile, "_note_near_miss", lambda *a, **k: None)
+    monkeypatch.setattr(tile, "_note_late", lambda *a, **k: None)
+    source = (
+        getortho.pydds.MipmapProvenance.EXACT_TARGET
+        if exact_rows
+        else getortho.pydds.MipmapProvenance.LOWER_ZL_CACHE
+    )
+    tile._mm0_provenance.set_row(0, [source] * tile.chunks_per_row)
+    # Row 0 is built: reading it seals nothing (an unbuilt row would be
+    # sealed as missing, replacing this provenance).
+    monkeypatch.setattr(
+        tile, "_read_with_mm0_sealing", lambda offset, length: bytes(length)
+    )
+    tile._read_dds_bytes_budgeted(0, CHUNK, getortho.TimeBudget(5))  # header
+    tile._read_dds_bytes_budgeted(CHUNK, CHUNK, getortho.TimeBudget(600))
+    return bumps
+
+
+def test_streamed_mipmap_zero_read_of_exact_rows_counts_real(tile, monkeypatch):
+    # Mipmap 0 streams row by row: a read whose rows are all exact imagery
+    # is real even though later rows are not built yet.
+    bumps = _near_mm0_read(tile, monkeypatch, exact_rows=True)
+    assert "near_reads_real" in bumps and "near_reads_standin" not in bumps
+
+
+def test_mipmap_zero_read_of_coarser_rows_stays_a_standin(tile, monkeypatch):
+    bumps = _near_mm0_read(tile, monkeypatch, exact_rows=False)
+    assert "near_reads_standin" in bumps and "near_reads_real" not in bumps
+
+
 def test_classifier_off_restores_old_behavior(tile, monkeypatch):
     _flag(monkeypatch, "read_classifier", False)
     tile._read_dds_bytes_budgeted(0, CHUNK, getortho.TimeBudget(5))

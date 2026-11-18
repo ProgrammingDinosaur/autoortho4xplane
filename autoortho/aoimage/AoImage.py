@@ -13,6 +13,9 @@ except ImportError:
 import logging
 log = logging.getLogger(__name__)
 
+# Per-decode breadcrumbs only when AO_TRACE_READS=1 (see getortho.TRACE_READS).
+TRACE_READS = os.environ.get("AO_TRACE_READS") == "1"
+
 class AOImageException(Exception):
     pass
 
@@ -167,7 +170,8 @@ class AoImage(Structure):
             return False
         
         try:
-            log.debug(f"AoImage.paste: Pasting {p_img._width}x{p_img._height} at ({x},{y})")
+            if TRACE_READS:
+                log.debug(f"AoImage.paste: Pasting {p_img._width}x{p_img._height} at ({x},{y})")
             _aoi.aoimage_paste(self, p_img, pos[0], pos[1])
             return True
         except Exception as e:
@@ -278,7 +282,8 @@ def load_from_memory(mem, datalen=None):
     new_img = AoImage()
     try:
         # Breadcrumb: Log BEFORE entering C code (helps debug crashes)
-        log.debug(f"AoImage: Calling C aoimage_from_memory with {datalen} bytes")
+        if TRACE_READS:
+            log.debug(f"AoImage: Calling C aoimage_from_memory with {datalen} bytes")
         
         # Keep strong reference to mem to prevent GC during C call
         mem_ref = mem
@@ -288,7 +293,8 @@ def load_from_memory(mem, datalen=None):
             return None
         
         # Breadcrumb: Made it through C code successfully
-        log.debug(f"AoImage: C call succeeded, created {new_img._width}x{new_img._height} image")
+        if TRACE_READS:
+            log.debug(f"AoImage: C call succeeded, created {new_img._width}x{new_img._height} image")
         return new_img
     except Exception as e:
         log.error(f"AoImage.load_from_memory exception: {e}")

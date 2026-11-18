@@ -672,6 +672,93 @@ def test_worker_exit_starts_error_cleanup(config_ui, monkeypatch, caplog, exit_c
     ]
 
 
+def _dead_worker(pid=2860, mountpoint="/tmp/z_ao_aus_pac"):
+    process = SimpleNamespace(pid=pid, poll=lambda: 1)
+    return SimpleNamespace(
+        process=process, pid=pid, mountpoint=mountpoint, volname="z_ao_aus_pac"
+    )
+
+
+def _wait_for(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_dead_worker_is_remounted_instead_of_stopping(config_ui, monkeypatch):
+    handle = _dead_worker()
+    config_ui.mount_workers = [handle]
+    restarted = []
+
+    def restart(current):
+        restarted.append(current)
+        config_ui.mount_workers = [SimpleNamespace(
+            process=SimpleNamespace(pid=9, poll=lambda: None),
+            pid=9, mountpoint=current.mountpoint,
+        )]
+        return config_ui.mount_workers[0]
+
+    config_ui.restart_mount_worker = restart
+    stops = []
+    monkeypatch.setattr(
+        config_ui, "_start_mount_control",
+        lambda *a, **k: stops.append((a, k)),
+    )
+    config_ui._set_runtime_state(RuntimeState.RUNNING)
+
+    config_ui._check_mount_workers()
+
+    assert _wait_for(lambda: restarted == [handle])
+    assert _wait_for(lambda: not config_ui._restarting_worker_pids)
+    config_ui._check_mount_workers()
+    assert stops == []
+
+
+def test_worker_dying_too_often_stops_streaming(config_ui, monkeypatch):
+    config_ui.restart_mount_worker = lambda current: None
+    policy = config_ui._worker_restart_policy()
+    for _ in range(policy.max_restarts):
+        assert policy.allow("/tmp/z_ao_aus_pac")
+    config_ui.mount_workers = [_dead_worker()]
+    stops = []
+    monkeypatch.setattr(
+        config_ui, "_start_mount_control",
+        lambda *a, **k: stops.append((a, k)),
+    )
+    config_ui._set_runtime_state(RuntimeState.RUNNING)
+
+    config_ui._check_mount_workers()
+
+    assert stops == [(("stop",), {"stop_target": RuntimeState.ERROR})]
+
+
+def test_failed_remount_stops_streaming_on_next_check(config_ui, monkeypatch):
+    handle = _dead_worker()
+    config_ui.mount_workers = [handle]
+
+    def restart(current):
+        config_ui.mount_workers = []
+        return None
+
+    config_ui.restart_mount_worker = restart
+    stops = []
+    monkeypatch.setattr(
+        config_ui, "_start_mount_control",
+        lambda *a, **k: stops.append((a, k)),
+    )
+    config_ui._set_runtime_state(RuntimeState.RUNNING)
+
+    config_ui._check_mount_workers()
+    assert _wait_for(lambda: getattr(config_ui, "_worker_restart_failure", None))
+    config_ui._check_mount_workers()
+
+    assert "could not be remounted" in config_ui._runtime_error_message
+    assert stops == [(("stop",), {"stop_target": RuntimeState.ERROR})]
+
+
 def test_failed_close_stop_clears_pending_quit(config_ui, monkeypatch):
     monkeypatch.setattr(config_ui, "display_error", lambda message: None)
     config_ui._close_after_stop = True

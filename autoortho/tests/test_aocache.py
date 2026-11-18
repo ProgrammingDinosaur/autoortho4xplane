@@ -20,6 +20,24 @@ from typing import List
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def test_cache_result_copies_native_bytes_exactly():
+    # get_bytes used to slice the ctypes pointer, which builds a list of ints
+    # per file; string_at must return the same bytes.
+    import ctypes
+    from aopipeline.AoCache import CacheResult
+
+    payload = bytes(range(256)) * 60
+    buffer = (ctypes.c_uint8 * len(payload)).from_buffer_copy(payload)
+    result = CacheResult()
+    result.data = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_uint8))
+    result.length = len(payload)
+    result.success = 1
+    assert result.get_bytes() == payload
+
+    result.success = 0
+    assert result.get_bytes() == b''
+
+
 # ============================================================================
 # Test Fixtures
 # ============================================================================

@@ -187,6 +187,11 @@ def _setup_signatures(lib):
         POINTER(c_int32), POINTER(c_int64), POINTER(c_int64)
     ]
     lib.aodecode_pool_stats_ex.restype = None
+
+    # Libraries built before the over-limit counter lack it.
+    if hasattr(lib, "aodecode_pool_over_limit_total"):
+        lib.aodecode_pool_over_limit_total.argtypes = [c_void_p]
+        lib.aodecode_pool_over_limit_total.restype = c_int64
     
     # Batch decode
     lib.aodecode_batch.argtypes = [
@@ -371,7 +376,7 @@ class BufferPool:
             self._handle, byref(total), byref(available), byref(acquired),
             byref(overflow_count), byref(overflow_bytes), byref(memory_limit)
         )
-        return {
+        stats = {
             'total': total.value,
             'available': available.value,
             'acquired': acquired.value,
@@ -379,6 +384,11 @@ class BufferPool:
             'overflow_bytes': overflow_bytes.value,
             'memory_limit': memory_limit.value,
         }
+        if hasattr(self._lib, 'aodecode_pool_over_limit_total'):
+            stats['over_limit_total'] = int(
+                self._lib.aodecode_pool_over_limit_total(self._handle)
+            )
+        return stats
     
     def __repr__(self) -> str:
         s = self.stats()

@@ -95,6 +95,7 @@ if __package__ and __package__.startswith("autoortho."):
     )
     from autoortho import downloader
     from autoortho.version import __version__
+    from autoortho import worker_restart
 else:
     import utils.resources_rc
     from utils.constants import MAPTYPES, system_type
@@ -172,6 +173,7 @@ else:
     )
     import downloader
     from version import __version__
+    import worker_restart
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -597,6 +599,12 @@ class ConfigUI(QMainWindow):
         self._closing = False
         self._shutdown_in_progress = False
         self._ready_to_close = False
+        if sys.platform == "darwin":
+            # Clicking the Dock icon activates the app but Qt does not show a
+            # hidden window; bring it back the way Mac users expect.
+            app = QApplication.instance()
+            if app is not None:
+                app.applicationStateChanged.connect(self._on_app_state_changed)
         self.runtime_state = RuntimeState.STOPPED
         self.mount_control_worker = None
         self._stop_target_state = RuntimeState.STOPPED
@@ -2068,10 +2076,12 @@ class ConfigUI(QMainWindow):
         except Exception:
             cores = None
         home = (governor_snapshot or {}).get("home") or {}
-        mounted = len([
-            handle for handle in getattr(self, "mount_workers", [])
+        # A shared worker serves several mounts.
+        mounted = sum(
+            len(getattr(handle, "mounts", ()) or ()) or 1
+            for handle in getattr(self, "mount_workers", [])
             if handle.process.poll() is None
-        ]) or len(getattr(self.cfg, "scenery_mounts", []) or [])
+        ) or len(getattr(self.cfg, "scenery_mounts", []) or [])
         snapshot = home_snapshot_module.build(
             runtime=runtime,
             governor=governor_snapshot,
@@ -2129,6 +2139,11 @@ class ConfigUI(QMainWindow):
                       QSystemTrayIcon.ActivationReason.DoubleClick):
             self._restore_from_tray()
 
+    def _on_app_state_changed(self, state):
+        if (state == Qt.ApplicationState.ApplicationActive
+                and self._hidden_to_tray and not self.isVisible()):
+            self._restore_from_tray()
+
     def _restore_from_tray(self):
         self._hidden_to_tray = False
         self.showNormal()
@@ -2147,11 +2162,32 @@ class ConfigUI(QMainWindow):
             if self.isVisible() and not self._hidden_to_tray:
                 self._hidden_to_tray = True
                 self.hide()
+                self._announce_hidden_to_tray(tray)
         elif self.runtime_state in (RuntimeState.STOPPED, RuntimeState.ERROR):
             if self._tray is not None:
                 self._tray.hide()
             if self._hidden_to_tray:
                 self._restore_from_tray()
+
+    _tray_notice_shown = False
+
+    def _announce_hidden_to_tray(self, tray):
+        """Once per launch: the window vanishing reads as a crash otherwise
+        (Windows tucks new tray icons behind the overflow arrow)."""
+        if self._tray_notice_shown:
+            return
+        self._tray_notice_shown = True
+        if sys.platform == "darwin":
+            where = "Click its menu bar icon or the Dock icon to show it."
+        else:
+            where = ("Click its tray icon (under the ^ arrow on the taskbar) "
+                     "to show it.")
+        tray.showMessage(
+            "AutoOrtho is still streaming",
+            f"The window is hidden while streaming. {where}",
+            QSystemTrayIcon.MessageIcon.Information,
+            8000,
+        )
 
     def _update_tray_summary(self, snapshot):
         """The tray tooltip reads like Home's headline; ! when a notice waits."""
@@ -2753,11 +2789,10 @@ class ConfigUI(QMainWindow):
         self.home_page.set_xplane_state(
             "Connected" if xplane_connected else "Disconnected"
         )
-        mounted_count = len(
-            [
-                handle for handle in getattr(self, "mount_workers", [])
-                if handle.process.poll() is None
-            ]
+        mounted_count = sum(
+            len(getattr(handle, "mounts", ()) or ()) or 1
+            for handle in getattr(self, "mount_workers", [])
+            if handle.process.poll() is None
         )
         self.home_page.set_mounted_scenery(
             f"{mounted_count} active",
@@ -6243,7 +6278,8 @@ class ConfigUI(QMainWindow):
         self.hide_check.setToolTip(
             "Minimize AutoOrtho window to system tray when running.\n"
             "Helps keep desktop clean during long flights.\n"
-            "You can still access it from the system tray."
+            "You can still access it from the system tray (the menu bar on\n"
+            "macOS, or by clicking the Dock icon)."
         )
         general_layout.addWidget(self.hide_check)
 
@@ -8548,6 +8584,8 @@ class ConfigUI(QMainWindow):
             if success:
                 self._runtime_error_message = ""
                 self._restart_pending = False
+                self._worker_restart_policy().reset()
+                self._worker_restart_failure = None
                 self._set_runtime_state(RuntimeState.RUNNING, message)
                 self.mount_monitor_timer.start()
             else:
@@ -8583,9 +8621,74 @@ class ConfigUI(QMainWindow):
         if self.mount_control_worker is worker:
             self.mount_control_worker = None
 
+    def _worker_restart_policy(self):
+        policy = getattr(self, "_restart_policy", None)
+        if policy is None:
+            policy = worker_restart.RestartPolicy()
+            self._restart_policy = policy
+        return policy
+
+    def _try_restart_dead_workers(self, dead):
+        """Remount regions whose worker died; True if every one is handled.
+
+        The remount runs off the UI thread. A worker that cannot be restarted
+        (too many restarts, or the remount failed) leaves streaming to stop
+        with an error, as before.
+        """
+        restart = getattr(self, "restart_mount_worker", None)
+        if restart is None or getattr(self, "_close_after_stop", False):
+            return False
+        restarting = self.__dict__.setdefault("_restarting_worker_pids", set())
+        policy = self._worker_restart_policy()
+        for handle, _exit_code in dead:
+            if handle.pid in restarting:
+                continue
+            if not policy.allow(handle.mountpoint):
+                log.error(
+                    "Mount worker for %s died %d times in %.0f minutes; "
+                    "not restarting it again",
+                    handle.mountpoint,
+                    policy.max_restarts,
+                    policy.window_seconds / 60.0,
+                )
+                return False
+
+        for handle, exit_code in dead:
+            if handle.pid in restarting:
+                continue
+            restarting.add(handle.pid)
+            self.update_status_bar(
+                f"Scenery mount {handle.volname or handle.mountpoint} stopped "
+                f"(code {exit_code}); remounting…"
+            )
+
+            def run(current=handle):
+                try:
+                    if restart(current) is None:
+                        self._worker_restart_failure = (
+                            f"Mount worker for {current.mountpoint} "
+                            f"(PID {current.pid}) died and could not be remounted."
+                        )
+                finally:
+                    restarting.discard(current.pid)
+
+            threading.Thread(
+                target=run, name="ao-remount", daemon=True
+            ).start()
+        return True
+
     def _check_mount_workers(self):
         if self.runtime_state != RuntimeState.RUNNING:
             return
+        failure = getattr(self, "_worker_restart_failure", None)
+        if failure:
+            self._worker_restart_failure = None
+            log.error("Streaming failed before cleanup: %s", failure)
+            self.mount_monitor_timer.stop()
+            self._runtime_error_message = failure
+            self._start_mount_control("stop", stop_target=RuntimeState.ERROR)
+            return
+        restarting = getattr(self, "_restarting_worker_pids", set())
         handles = list(getattr(self, "mount_workers", []))
         dead = []
         for handle in handles:
@@ -8593,6 +8696,10 @@ class ConfigUI(QMainWindow):
             if exit_code is not None:
                 dead.append((handle, exit_code))
         if handles and not dead:
+            return
+        if not handles and restarting:
+            return  # the replacement worker is starting
+        if dead and self._try_restart_dead_workers(dead):
             return
 
         self.mount_monitor_timer.stop()
@@ -10533,6 +10640,11 @@ class ConfigUI(QMainWindow):
                 panel.stop()
             event.accept()
             return
+
+        if self._hidden_to_tray:
+            # A dialog parented to a hidden window can open out of sight
+            # (macOS), leaving the quit stuck behind it.
+            self._restore_from_tray()
 
         if self.runtime_state == RuntimeState.RUNNING:
             reply = QMessageBox.question(

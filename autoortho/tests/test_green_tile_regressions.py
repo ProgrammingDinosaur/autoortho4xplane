@@ -252,6 +252,46 @@ def test_native_partial_build_success_returns_true(
     ) == data
 
 
+def test_native_partial_build_tolerates_the_tile_closing_mid_build(
+    no_dynamic_cache,
+    tmp_path,
+    monkeypatch,
+):
+    # A texture closed while its native build ran raised AttributeError on
+    # the cleared DDS (151 times in one flight) instead of a clean skip.
+    tile = _tile(tmp_path, 16, 16)
+    mm = tile.dds.mipmap_list[0]
+    bytes_per_chunk_row = mm.length // tile.chunks_per_col
+    width = tile.chunks_per_row
+    monkeypatch.setattr(
+        tile,
+        "_collect_row_chunk_jpegs",
+        lambda *args, **kwargs: ([b"jpeg"] * width, width, 1),
+    )
+    data = b"" * bytes_per_chunk_row
+
+    def build_while_closing(**kwargs):
+        tile.dds = None  # what close() does
+        return types.SimpleNamespace(
+            success=True, data=data, bytes_written=len(data),
+            elapsed_ms=1.0, error=None,
+        )
+
+    fake_native = types.SimpleNamespace(build_partial_mipmap=build_while_closing)
+    monkeypatch.setattr(getortho, "_get_native_dds", lambda: fake_native)
+    bumps = []
+    original_bump = getortho.bump
+    monkeypatch.setattr(
+        getortho, "bump", lambda key, n=1: (bumps.append(key), original_bump(key, n))
+    )
+
+    assert not tile._try_native_partial_mipmap_build(
+        0, 0, 0, bytes_per_chunk_row, None
+    )
+    assert "native_partial_dds_cleared" in bumps
+    assert "native_partial_mipmap_exception" not in bumps
+
+
 # ---------------------------------------------------------------------------
 # Rows served missing are rebuilt when the tile is opened again
 # ---------------------------------------------------------------------------

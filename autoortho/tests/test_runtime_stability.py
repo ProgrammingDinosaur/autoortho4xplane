@@ -283,6 +283,17 @@ def test_macos_mount_always_stays_in_foreground(monkeypatch, fuse_module):
     assert fuse_module.fuse_option_profiles_by_os(False, "z_ao")["foreground"] is True
 
 
+def test_macos_daemon_timeout_never_below_first_load_cap(monkeypatch, fuse_module):
+    # 3.1.0 gave macFUSE 1875 s by default; 3.2.0 dropped to 675 s. One request
+    # outliving it makes macFUSE drop the whole mount.
+    monkeypatch.setattr(fuse_module, "system_type", "darwin")
+    monkeypatch.setattr(
+        fuse_module.wait_bands, "tile_budget_seconds", lambda initial_load=False: 600.0
+    )
+    options = fuse_module.fuse_option_profiles_by_os(False, "z_ao")
+    assert options["daemon_timeout"] >= 1875
+
+
 def test_stats_batcher_stop_joins_background_thread(stats):
     batcher = stats.StatsBatcher(flush_interval=30)
     batcher.add("count", 2)

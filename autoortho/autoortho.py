@@ -77,6 +77,7 @@ except ImportError:
 try:
     from autoortho.http2_broker import (
         HTTP2Broker,
+        BrokerGroup as HTTP2BrokerGroup,
         BrokerError as HTTP2BrokerError,
         BrokerStartupError as HTTP2BrokerStartupError,
     )
@@ -84,11 +85,13 @@ except ImportError:
     try:
         from http2_broker import (
             HTTP2Broker,
+            BrokerGroup as HTTP2BrokerGroup,
             BrokerError as HTTP2BrokerError,
             BrokerStartupError as HTTP2BrokerStartupError,
         )
     except ImportError:
         HTTP2Broker = None
+        HTTP2BrokerGroup = None
         HTTP2BrokerError = Exception
         HTTP2BrokerStartupError = Exception
 
@@ -252,7 +255,13 @@ def diagnose(CFG, mount_timeout=60.0, retry_interval=0.25):
         # Use ignore_cleanup_errors=True to handle race with async cache writes
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
             c = getortho.Chunk(2176, 3232, maptype, 13, cache_dir=tmpdir)
-            ret = c.get()
+            # A provider can raise here (APPLE does when its token server
+            # answers 500); that is a failed provider, not a failed start.
+            try:
+                ret = c.get()
+            except Exception as exc:
+                log.warning(f"    Maptype: {maptype} check raised: {exc}")
+                ret = False
             # Give async cache writer a moment to complete or detect deleted dir
             time.sleep(0.1)
             if ret:
@@ -279,6 +288,24 @@ def diagnose(CFG, mount_timeout=60.0, retry_interval=0.25):
         )
     log.info(" Diagnostics done.  All checks passed")
     return True
+
+
+def _split_broker_kwargs(kwargs, parts):
+    """The broker settings for each of ``parts`` brokers.
+
+    Only the download rate is shared out. Concurrency stays whole in each:
+    requests are routed by URL hash, so at any moment one broker may hold more
+    than its share, and an even split left it queueing while the others idled.
+    The workers' in-flight budget already bounds the total.
+    """
+    out = []
+    for _ in range(parts):
+        part = dict(kwargs)
+        if part.get("max_bytes_per_second"):
+            part["max_bytes_per_second"] = float(part["max_bytes_per_second"]) / parts
+        part["profile_environment"] = dict(kwargs.get("profile_environment") or {})
+        out.append(part)
+    return out
 
 
 class AOMount:
@@ -388,6 +415,7 @@ class AOMount:
             stats_addr=None,
             stats_auth=None,
             log_addr=None,
+            mounts=None,
     ):
         self._start_performance_diagnostics()
         log.info(f"AutoOrtho:  root: {root}  mountpoint: {mountpoint}")
@@ -408,12 +436,14 @@ class AOMount:
             log_addr=log_addr,
             loglevel=loglevel,
             extra_env=worker_env,
+            mounts=mounts,
         )
         self.mount_workers.append(handle)
         if self._performance_profiler is not None:
             self._performance_profiler.register_process(
                 handle.pid,
-                f"mount-worker:{volname}",
+                "mount-worker:shared" if mounts and len(mounts) > 1
+                else f"mount-worker:{volname}",
             )
         # Backward-compatible process list used by maptype/custom-map reload code.
         self.mac_os_procs.append(handle.process)
@@ -731,9 +761,22 @@ class AOMount:
         self.start_download_broker()
         self.start_reporter()
 
+    def _broker_process_count(self):
+        """Download broker processes: the setting, or one per 4 CPU threads (1-4)."""
+        try:
+            configured = int(aoconfig.resolve_provider_setting(
+                "provider_broker_processes", self.cfg
+            ))
+        except Exception:
+            configured = 0
+        if configured > 0:
+            return configured
+        return max(1, min(4, (os.cpu_count() or 1) // 4))
+
     def start_download_broker(self):
         if self._download_broker is not None:
             return
+        broker_mode = None
         self._start_performance_diagnostics()
         enabled = getattr(self.cfg.autoortho, "http2_enabled", True)
         if isinstance(enabled, str):
@@ -806,6 +849,9 @@ class AOMount:
                 "queue_timeout": aoconfig.resolve_provider_setting(
                     "provider_queue_timeout", self.cfg
                 ),
+                "http_client": str(
+                    getattr(self.cfg.autoortho, "provider_http_client", "auto") or "auto"
+                ),
             }
             broker_kwargs["origin_initial_concurrency"] = origin_initial
             active_limits = self._resource_limits()
@@ -817,10 +863,28 @@ class AOMount:
                     "Download limit: %.0f Mbit/s",
                     active_limits.bandwidth_mbps,
                 )
-            broker = HTTP2Broker(**broker_kwargs)
+            processes = self._broker_process_count()
+            broker = None
+            if processes > 1 and HTTP2BrokerGroup is not None:
+                group = HTTP2BrokerGroup(
+                    [HTTP2Broker(**part) for part in _split_broker_kwargs(broker_kwargs, processes)]
+                )
+                try:
+                    group.start()
+                    broker = group
+                    broker_mode = f"{processes} processes"
+                except HTTP2BrokerStartupError as group_exc:
+                    log.warning(
+                        "Could not start %d broker processes; using one: %s",
+                        processes,
+                        group_exc,
+                    )
+            if broker is None:
+                broker = HTTP2Broker(**broker_kwargs)
             try:
-                broker.start()
-                broker_mode = "process"
+                if broker_mode is None:
+                    broker.start()
+                    broker_mode = "process"
             except HTTP2BrokerStartupError as process_exc:
                 log.warning(
                     "HTTP/2 broker process startup failed; retrying with "
@@ -835,12 +899,13 @@ class AOMount:
                 broker_mode = "thread"
             self._download_broker = broker
             self._download_broker_env = broker.client_environment()
-            broker_pid = getattr(broker, "pid", None)
-            if broker_pid and self._performance_profiler is not None:
-                self._performance_profiler.register_process(
-                    broker_pid,
-                    "http2-broker",
-                )
+            broker_pids = getattr(broker, "pids", None) or [getattr(broker, "pid", None)]
+            if self._performance_profiler is not None:
+                for index, broker_pid in enumerate(p for p in broker_pids if p):
+                    self._performance_profiler.register_process(
+                        broker_pid,
+                        "http2-broker" if index == 0 else f"http2-broker-{index + 1}",
+                    )
             os.environ.update(self._download_broker_env)
             log.info(
                 "Shared HTTP/2 broker started "
@@ -1309,6 +1374,38 @@ class AOMount:
             self.log_addr,
         )
 
+    def _shared_worker_enabled(self):
+        """One worker for every mount ([fuse] shared_worker, not on macOS)."""
+        if system_type == "darwin":
+            return False
+        value = getattr(getattr(self.cfg, "fuse", None), "shared_worker", True)
+        if isinstance(value, str):
+            value = value.strip().lower() in ("true", "1", "yes", "on")
+        return bool(value)
+
+    def _launch_shared_worker(self, sceneries, threading_enabled=True):
+        """Serve every scenery mount from one worker process."""
+        nothreads = not threading_enabled
+        mounts = []
+        for scenery in sceneries:
+            root = os.path.expanduser(scenery.get('root'))
+            mountpoint = os.path.expanduser(scenery.get('mount'))
+            volname = os.path.basename(os.path.normpath(mountpoint)) or mountpoint
+            mounts.append((root, mountpoint, volname))
+            self._active_mountpoints.append(mountpoint)
+        log.info("Serving %d mounts from one shared worker", len(mounts))
+        first = mounts[0]
+        return self.launch_mount_worker(
+            first[0],
+            first[1],
+            first[2],
+            nothreads,
+            self.stats_addr,
+            self.stats_auth,
+            self.log_addr,
+            mounts=mounts,
+        )
+
     def _monitor_mount_workers(self):
         healthy = True
         while self.mounts_running:
@@ -1379,14 +1476,24 @@ class AOMount:
         self._active_mountpoints = []
         self.mount_workers = []
         self.mac_os_procs = []
-        self._worker_cpu_share_count = max(1, len(self.cfg.scenery_mounts))
+        shared = (
+            self._shared_worker_enabled() and len(self.cfg.scenery_mounts) > 1
+        )
+        self._worker_cpu_share_count = (
+            1 if shared else max(1, len(self.cfg.scenery_mounts))
+        )
         try:
-            for scenery in self.cfg.scenery_mounts:
-                self._launch_scenery_worker(
-                    scenery.get('root'),
-                    scenery.get('mount'),
-                    self.cfg.fuse.threading,
+            if shared:
+                self._launch_shared_worker(
+                    self.cfg.scenery_mounts, self.cfg.fuse.threading
                 )
+            else:
+                for scenery in self.cfg.scenery_mounts:
+                    self._launch_scenery_worker(
+                        scenery.get('root'),
+                        scenery.get('mount'),
+                        self.cfg.fuse.threading,
+                    )
         except Exception:
             log.exception("Failed to launch scenery mount workers")
             self.unmount_sceneries(force=True)
@@ -1512,6 +1619,65 @@ class AOMount:
         self._active_mountpoints = []
         log.info("Unmount complete")
         return True
+
+    def restart_mount_worker(self, handle):
+        """Remount the scenery a dead worker served, in a new worker.
+
+        Detaches what is left of the old mount first (a macFUSE mount whose
+        channel broke stays in the mount table), then starts a worker for the
+        same mounts. Returns the new handle, or None if it could not start.
+        Blocks for up to the unmount timeout: never call it on the UI thread.
+        """
+        mounts = tuple(getattr(handle, "mounts", ()) or ()) or (
+            (handle.root, handle.mountpoint, handle.volname),
+        )
+        log.error(
+            "Mount worker pid %s for %s died (exit code %s); remounting",
+            handle.pid,
+            ", ".join(m[2] or m[1] for m in mounts),
+            handle.process.poll(),
+        )
+        try:
+            self.mount_worker_supervisor.stop_worker(handle, timeout=2.0)
+        except Exception as exc:
+            log.warning("Could not clean up dead worker %s: %s", handle.pid, exc)
+        if handle in self.mount_workers:
+            self.mount_workers.remove(handle)
+        if handle.process in self.mac_os_procs:
+            self.mac_os_procs.remove(handle.process)
+
+        for _root, mountpoint, _volname in mounts:
+            try:
+                if not self.unmount(mountpoint, force=True, wait_timeout=5.0):
+                    log.error("Stale mount still attached at %s; cannot remount", mountpoint)
+                    return None
+                if system_type == "darwin":
+                    cleanup_mountpoint(mountpoint)
+            except Exception as exc:
+                log.error("Could not detach stale mount %s: %s", mountpoint, exc)
+                return None
+
+        if not self.mounts_running:
+            log.info("Streaming stopped while remounting; not restarting worker")
+            return None
+        first = mounts[0]
+        try:
+            new_handle = self.launch_mount_worker(
+                first[0],
+                first[1],
+                first[2],
+                not getattr(getattr(self.cfg, "fuse", None), "threading", True),
+                self.stats_addr,
+                self.stats_auth,
+                self.log_addr,
+                mounts=list(mounts) if len(mounts) > 1 else None,
+            )
+        except Exception:
+            log.exception("Could not restart mount worker for %s", first[1])
+            return None
+        log.info("Remounted %s in worker pid %s",
+                 ", ".join(m[2] or m[1] for m in mounts), new_handle.pid)
+        return new_handle
 
     def domount(self, root, mountpoint, threading=True):
         return self._launch_scenery_worker(root, mountpoint, threading)
