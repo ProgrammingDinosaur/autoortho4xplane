@@ -371,7 +371,9 @@ def _batch_read_cache_files(paths: list) -> dict:
     # Try native batch read first (OpenMP parallel, fastest)
     if native is not None:
         try:
-            with _native_build_context() as threads:
+            # About two files a thread: a read of a few files needs no team
+            # half the CPU wide (see _settle_native_team).
+            with _native_build_context(cap=-(-len(paths) // 2)) as threads:
                 results = native.batch_read_cache(paths, max_threads=threads, validate_jpeg=True)
             output = {}
             for path, (data, success) in zip(paths, results):
@@ -1996,9 +1998,12 @@ class _BackgroundBuildDeferred(Exception):
 class _native_build_context:
     """``__enter__`` returns the per-build OpenMP thread budget under the same lock
     that increments the active-build counter, so each build sees itself in the count."""
-    def __init__(self, threads=None, *, priority=PRIORITY_LIVE):
+    def __init__(self, threads=None, *, priority=PRIORITY_LIVE, cap=None):
         self._requested_threads = threads
         self._priority = priority
+        # An upper bound on the threads granted that, unlike ``threads``,
+        # never makes the build wait for them.
+        self._cap = cap
 
     def __enter__(self):
         global _active_native_builds, _active_native_thread_count, _peak_native_thread_count
@@ -2025,6 +2030,8 @@ class _native_build_context:
                     self._requested_threads or _thread_budget_for(_active_native_builds),
                     budget - _active_native_thread_count,
                 )
+                if self._cap:
+                    self._threads = max(1, min(self._threads, int(self._cap)))
                 _active_native_thread_count += self._threads
                 if _active_native_thread_count > _peak_native_thread_count:
                     _peak_native_thread_count = _active_native_thread_count
@@ -2056,23 +2063,30 @@ def _settle_native_team(threads):
     parallel region, until that thread exits (on Windows, not even then).
     Builds run on many long-lived threads, so each kept a team: the mount
     worker grew from about 160 threads to 634 while a flight loaded and
-    stayed near 470. Threads whose teams fit in one CPU budget keep them,
-    since a new team costs 0.3 to 1 ms a build; every other thread frees its
-    team when its build ends. A keeper's share is never handed on, so the
-    teams of keepers that exit cannot add up either.
+    stayed near 470. Threads keep teams of up to a quarter of the CPU budget,
+    since a new team costs 0.3 to 1 ms a build, until the kept teams add up
+    to one budget; every other thread frees its team when its build ends.
+    The cap keeps one wide build from taking the whole share. A keeper's
+    share is handed on only when its team is freed: the teams of keepers
+    that exit are not freed on Windows.
     """
     global _native_team_kept
     workers = max(0, int(threads or 1) - 1)
     ident = threading.get_ident()
+    budget = _native_cpu_budget()
     with _native_team_lock:
         kept = _native_team_keepers.get(ident)
         if kept is not None and workers <= kept:
             return
         grow = workers - (kept or 0)
-        if _native_team_kept + grow <= _native_cpu_budget():
+        if workers <= max(1, budget // 4) and _native_team_kept + grow <= budget:
             _native_team_keepers[ident] = workers
             _native_team_kept += grow
             return
+        if kept is not None:
+            # Freed below, so its share can go to another thread.
+            del _native_team_keepers[ident]
+            _native_team_kept -= kept
     native = _get_native_dds()
     release = getattr(native, "release_thread_team", None)
     try:
