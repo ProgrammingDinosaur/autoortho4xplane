@@ -119,3 +119,51 @@ def test_released_buffer_wakes_a_waiting_acquire():
         if result.get("buffer"):
             lib.aodecode_release_buffer(pool, result["buffer"])
         lib.aodecode_destroy_pool(pool)
+
+
+def _overflow_count(lib, pool):
+    from ctypes import byref, c_int32, c_int64
+
+    total, available, acquired, count = (c_int32() for _ in range(4))
+    overflow_bytes, limit = c_int64(), c_int64()
+    lib.aodecode_pool_stats_ex(
+        pool, byref(total), byref(available), byref(acquired),
+        byref(count), byref(overflow_bytes), byref(limit),
+    )
+    return count.value, overflow_bytes.value
+
+
+def test_freed_overflow_images_leave_the_pool_count():
+    # Decoded images in overflow buffers were freed straight to the heap, so
+    # the pool kept counting them: in a flight the count grew by 768 with each
+    # streaming build until the pool looked full for good.
+    from ctypes import POINTER, byref, c_uint8, cast
+
+    from aopipeline import AoDecode
+
+    lib = _library()
+    jpeg_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "testfiles",
+        "test_tile_small.jpg",
+    )
+    with open(jpeg_path, "rb") as handle:
+        jpeg = handle.read()
+    data = (c_uint8 * len(jpeg)).from_buffer_copy(jpeg)
+    pool = lib.aodecode_create_pool_ex(2, 0)
+    images = []
+    try:
+        for _ in range(5):  # two fixed buffers, three overflow
+            image = AoDecode.DecodedImage()
+            assert lib.aodecode_single(
+                cast(data, POINTER(c_uint8)), len(jpeg), byref(image), pool
+            )
+            images.append(image)
+        assert _overflow_count(lib, pool)[0] == 3
+    finally:
+        for image in images:
+            lib.aodecode_free_image(byref(image), pool)
+    try:
+        assert _overflow_count(lib, pool) == (0, 0)
+    finally:
+        lib.aodecode_destroy_pool(pool)

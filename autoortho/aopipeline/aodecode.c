@@ -684,13 +684,11 @@ static int decode_jpeg_internal(
     int from_pool = 0;
     
     if (pool && width == CHUNK_SIZE && height == CHUNK_SIZE) {
-        /* Standard chunk size - try to use pool */
+        /* Standard chunk size - use the pool. Its overflow buffers must go
+         * back through aodecode_release_buffer too: freeing one directly
+         * leaves it counted, and the count fills the pool's memory limit. */
         buffer = aodecode_acquire_buffer(pool);
-        /* Check if it's actually from the pool */
-        if (pool->memory && buffer >= pool->memory && 
-            buffer < pool->memory + ((size_t)pool->count * CHUNK_RGBA_BYTES)) {
-            from_pool = 1;
-        }
+        from_pool = (buffer != NULL);
     } else {
         /* Non-standard size - must malloc */
         buffer = (uint8_t*)malloc((size_t)width * height * 4);

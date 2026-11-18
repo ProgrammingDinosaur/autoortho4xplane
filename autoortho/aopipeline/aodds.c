@@ -3946,8 +3946,10 @@ AODDS_API int32_t aodds_builder_add_fallback_image(
     
     /* Allocate and copy image data */
     uint8_t* data = NULL;
+    int from_pool = 0;
     if (builder->pool) {
         data = aodecode_acquire_buffer(builder->pool);
+        from_pool = (data != NULL);
     }
     if (!data) {
         data = (uint8_t*)malloc(CHUNK_BUFFER_SIZE);
@@ -3965,8 +3967,8 @@ AODDS_API int32_t aodds_builder_add_fallback_image(
     builder->chunks[chunk_index].height = height;
     builder->chunks[chunk_index].stride = width * 4;
     builder->chunks[chunk_index].channels = 4;
-    builder->chunks[chunk_index].from_pool = (builder->pool != NULL);
-    
+    builder->chunks[chunk_index].from_pool = from_pool;
+
     builder->chunk_status[chunk_index] = CHUNK_STATUS_FALLBACK;
     builder->status.chunks_received++;
     builder->status.chunks_fallback++;
