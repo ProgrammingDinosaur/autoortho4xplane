@@ -14958,7 +14958,8 @@ class Tile(object):
         
         if time_budget is not None:
             # Use the provided per-request budget
-            log.debug(f"GET_IMG: Using provided budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
+            if TRACE_READS:
+                log.debug(f"GET_IMG: Using provided budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
         else:
             # Fallback: create budget if caller didn't provide one (internal
             # calls, tests). The tile budget from the wait bands, longer only
@@ -14994,11 +14995,14 @@ class Tile(object):
 
         # Get effective zoom  
         zoom = min((self.max_zoom - mipmap), self.max_zoom)
-        log.debug(f"GET_IMG: Default tile zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Default tile zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(zoom, min_zoom)
-        log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")        
+        if TRACE_READS:
+            log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")
         
-        log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
         
         # Do we already have this img?
         with self._lock:
@@ -15015,7 +15019,8 @@ class Tile(object):
             if cached is not None:
                 return cached
 
-        log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
         with self._lock:
             already_retrieved = mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved
         if already_retrieved:
@@ -15057,7 +15062,8 @@ class Tile(object):
             if 0 <= local_index < len(composed_sources):
                 composed_sources[local_index] = int(source)
             
-        log.debug(f"GET_IMG: Chunk indices - start: {startchunk}, end: {endchunk}, chunks_per_row: {chunks_per_row}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Chunk indices - start: {startchunk}, end: {endchunk}, chunks_per_row: {chunks_per_row}")
 
 
         # TODO: For further optimization, this wait could be moved to callers of get_img.
@@ -15071,16 +15077,20 @@ class Tile(object):
                 startchunk,
                 endchunk if endchunk is not None else grid.logical_length,
             )
-        log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(self.chunks[zoom])} for zoom {zoom}")
+        if TRACE_READS:
+            log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(self.chunks[zoom])} for zoom {zoom}")
 
-        log.debug(f"GET_IMG: {self} : Retrieve mipmap for ZOOM: {zoom} MIPMAP: {mipmap}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: {self} : Retrieve mipmap for ZOOM: {zoom} MIPMAP: {mipmap}")
         data_updated = False
-        log.debug(f"GET_IMG: {self} submitting chunks for zoom {zoom}.")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: {self} submitting chunks for zoom {zoom}.")
         for chunk in chunks:
             if self._is_live:
                 _revive_for_request(chunk)
             if not chunk.ready.is_set():
-                log.debug(f"GET_IMG: Submitting chunk {chunk} for zoom {zoom}")
+                if TRACE_READS:
+                    log.debug(f"GET_IMG: Submitting chunk {chunk} for zoom {zoom}")
                 # INVERTED: Lower detail (higher mipmap) = lower priority number (more urgent)
                 # This ensures lower-detail tiles load first, minimizing missing tiles
                 base_priority = self.max_mipmap - mipmap
@@ -15270,7 +15280,8 @@ class Tile(object):
                 composed_sources
             )
 
-        log.debug(f"GET_IMG: Will use image {new_im}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Will use image {new_im}")
 
         # Check if we have any chunks to process
         if len(chunks) == 0:
@@ -15638,7 +15649,8 @@ class Tile(object):
                     f"Fallback budget: {fallback_budget.elapsed:.2f}s/{fallback_timeout:.1f}s "
                     f"(exhausted={fallback_budget.exhausted})")
         else:
-            log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
+            if TRACE_READS:
+                log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
 
         # OPTIMIZATION: In-place desaturation when image isn't cached
         # Only copy when image was saved to cache AND needs desaturation
@@ -17591,7 +17603,7 @@ class Tile(object):
                 result.data,
                 chunks_width,
                 chunks_height,
-                self.dds.blocksize,
+                dds.blocksize,
                 missing_color,
                 [
                     index
@@ -17685,16 +17697,17 @@ class Tile(object):
 
             build_succeeded = True
             build_time = time.monotonic() - build_start
-            log.debug(
-                "_try_native_partial_mipmap_build: SUCCESS rows %d-%d "
-                "(%d bytes at offset %d, %.1fms native, %.1fms total)",
-                startrow,
-                endrow,
-                result.bytes_written,
-                startrow * bytes_per_chunk_row,
-                result.elapsed_ms,
-                build_time * 1000,
-            )
+            if TRACE_READS:
+                log.debug(
+                    "_try_native_partial_mipmap_build: SUCCESS rows %d-%d "
+                    "(%d bytes at offset %d, %.1fms native, %.1fms total)",
+                    startrow,
+                    endrow,
+                    result.bytes_written,
+                    startrow * bytes_per_chunk_row,
+                    result.elapsed_ms,
+                    build_time * 1000,
+                )
             return True
         except Exception as e:
             log.debug(

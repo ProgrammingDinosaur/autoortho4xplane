@@ -1164,7 +1164,8 @@ class DDS(Structure):
                 return None
         
         # Breadcrumb: Log before entering C code
-        log.debug(f"DDS.compress: Compressing {width}x{height} RGBA ({expected_size} bytes) to {self.dxt_format}")
+        if TRACE_READS:
+            log.debug(f"DDS.compress: Compressing {width}x{height} RGBA ({expected_size} bytes) to {self.dxt_format}")
 
         #outdata = b'\x00'*dxt_size
         
@@ -1196,9 +1197,11 @@ class DDS(Structure):
             
             # CRITICAL FIX #3: Add error handling for C calls
             try:
-                log.debug("DDS.compress: Calling CompressBlocksBC3")
+                if TRACE_READS:
+                    log.debug("DDS.compress: Calling CompressBlocksBC3")
                 _ispc.CompressBlocksBC3(s, outdata)
-                log.debug("DDS.compress: CompressBlocksBC3 succeeded")
+                if TRACE_READS:
+                    log.debug("DDS.compress: CompressBlocksBC3 succeeded")
                 result = True
             except Exception as e:
                 log.error(f"DDS.compress: CompressBlocksBC3 failed: {e}")
@@ -1228,9 +1231,11 @@ class DDS(Structure):
             
             # CRITICAL FIX #3: Add error handling for C calls
             try:
-                log.debug("DDS.compress: Calling CompressBlocksBC1")
+                if TRACE_READS:
+                    log.debug("DDS.compress: Calling CompressBlocksBC1")
                 _ispc.CompressBlocksBC1(s, outdata)
-                log.debug("DDS.compress: CompressBlocksBC1 succeeded")
+                if TRACE_READS:
+                    log.debug("DDS.compress: CompressBlocksBC1 succeeded")
                 result = True
             except Exception as e:
                 log.error(f"DDS.compress: CompressBlocksBC1 failed: {e}")
@@ -1254,7 +1259,8 @@ class DDS(Structure):
 
             # CRITICAL FIX #3: Add error handling for STB calls
             try:
-                log.debug("DDS.compress: Calling STB compress_pixels")
+                if TRACE_READS:
+                    log.debug("DDS.compress: Calling STB compress_pixels")
                 result = _stb.compress_pixels(
                         outdata,
                         c_char_p(data),
@@ -1262,7 +1268,8 @@ class DDS(Structure):
                         c_uint64(height), 
                         c_bool(use_alpha))
                 if result:
-                    log.debug("DDS.compress: STB compress_pixels succeeded")
+                    if TRACE_READS:
+                        log.debug("DDS.compress: STB compress_pixels succeeded")
                 else:
                     log.error("DDS.compress: STB compress_pixels returned False")
                     return None
