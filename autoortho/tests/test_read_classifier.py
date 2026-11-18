@@ -240,6 +240,43 @@ def test_read_statistics_use_the_reads_own_band(tile, monkeypatch):
     assert late == [getortho.wait_bands.NEAR]
 
 
+def _near_mm0_read(tile, monkeypatch, exact_rows):
+    _record_budgets(tile, monkeypatch)
+    bumps = []
+    monkeypatch.setattr(
+        getortho, "bump_many", lambda counters: bumps.extend(counters)
+    )
+    monkeypatch.setattr(getortho, "bump", lambda key, n=1: bumps.append(key))
+    monkeypatch.setattr(tile, "_note_near_miss", lambda *a, **k: None)
+    monkeypatch.setattr(tile, "_note_late", lambda *a, **k: None)
+    source = (
+        getortho.pydds.MipmapProvenance.EXACT_TARGET
+        if exact_rows
+        else getortho.pydds.MipmapProvenance.LOWER_ZL_CACHE
+    )
+    tile._mm0_provenance.set_row(0, [source] * tile.chunks_per_row)
+    # Row 0 is built: reading it seals nothing (an unbuilt row would be
+    # sealed as missing, replacing this provenance).
+    monkeypatch.setattr(
+        tile, "_read_with_mm0_sealing", lambda offset, length: bytes(length)
+    )
+    tile._read_dds_bytes_budgeted(0, CHUNK, getortho.TimeBudget(5))  # header
+    tile._read_dds_bytes_budgeted(CHUNK, CHUNK, getortho.TimeBudget(600))
+    return bumps
+
+
+def test_streamed_mipmap_zero_read_of_exact_rows_counts_real(tile, monkeypatch):
+    # Mipmap 0 streams row by row: a read whose rows are all exact imagery
+    # is real even though later rows are not built yet.
+    bumps = _near_mm0_read(tile, monkeypatch, exact_rows=True)
+    assert "near_reads_real" in bumps and "near_reads_standin" not in bumps
+
+
+def test_mipmap_zero_read_of_coarser_rows_stays_a_standin(tile, monkeypatch):
+    bumps = _near_mm0_read(tile, monkeypatch, exact_rows=False)
+    assert "near_reads_standin" in bumps and "near_reads_real" not in bumps
+
+
 def test_classifier_off_restores_old_behavior(tile, monkeypatch):
     _flag(monkeypatch, "read_classifier", False)
     tile._read_dds_bytes_budgeted(0, CHUNK, getortho.TimeBudget(5))

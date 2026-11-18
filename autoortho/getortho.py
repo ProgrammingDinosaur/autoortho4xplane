@@ -14341,14 +14341,19 @@ class Tile(object):
             needed_start = max(
                 offset, self.dds.mipmap_list[first_needed].startpos
             )
+        mm0_served_exact = None
         if first_needed < len(self.dds.mipmap_list) and needed_start < offset + len(data):
-            self._record_mipmap_provenance(
+            mm0_served_exact = self._record_mipmap_provenance(
                 needed_start, offset + len(data) - needed_start
             )
         if wanted is not None:
             # OrthoStreamXP's quality measure: the share of X-Plane's reads
             # answered with real imagery at the level it wanted.
             real = self.real_from() <= wanted
+            if not real and wanted == 0 and mm0_served_exact:
+                # Mipmap 0 streams row by row, so real_from() counts it only
+                # once every row is exact; this read's own rows were.
+                real = True
             bump("reads_wanted_real" if real else "reads_wanted_standin")
             if not real and streaming_options.flag("wait_bands"):
                 self._note_late(
@@ -14745,8 +14750,14 @@ class Tile(object):
         return data
 
     def _record_mipmap_provenance(self, offset, length):
+        """Count where the served bytes came from.
+
+        Returns whether the mipmap 0 bytes in the range were all exact target
+        imagery, or None when the range has none.
+        """
         if self.dds is None or not self.dds.mipmap_list or length <= 0:
-            return
+            return None
+        served_exact = None
         requested_mipmap = self.find_mipmap_pos(offset)
         counters = {f"requested_mipmap:{requested_mipmap}": 1}
         if not self._effective_target_reported:
@@ -14781,6 +14792,7 @@ class Tile(object):
                 pydds.MipmapProvenance.MISSING_COLOR, 0
             )
             unknown = max(0, overlap_length - exact - lower - missing)
+            served_exact = exact >= overlap_length
             counters.update(
                 {
                     "mm0_served_exact_bytes": exact,
@@ -14819,6 +14831,7 @@ class Tile(object):
                     unknown,
                 )
         bump_many(counters)
+        return served_exact
 
     def _get_or_create_tile_time_budget(self):
         """The tile's budget across its reads (wait_bands.tile_budget_seconds)."""
