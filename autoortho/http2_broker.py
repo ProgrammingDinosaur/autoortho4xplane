@@ -3002,11 +3002,15 @@ class _BrokerCore:
 class _RouterServer:
     """Binds/owns the ROUTER socket and dispatches decoded messages to `_BrokerCore`."""
 
+    # How often the receive loop looks at the stop flag while idle.
+    _STOP_POLL_SECONDS = 0.5
+
     def __init__(self, *, router, token: str, config: Dict[str, Any], transport: Any = None):
         self._router = router
         self._token = token
         self._max_request_bytes = int(config.get("max_request_bytes", DEFAULT_MAX_REQUEST_BYTES))
         self._stop_event = asyncio.Event()
+        self._handlers = set()
         self._core = _BrokerCore(
             max_concurrency=config.get("max_concurrency", DEFAULT_MAX_CONCURRENCY),
             max_connections=config.get("max_connections", DEFAULT_MAX_CONNECTIONS),
@@ -3041,12 +3045,21 @@ class _RouterServer:
 
     async def run(self) -> None:
         await self._core.start()
+        # One receive stays pending across the idle stop checks. Cancelling
+        # it on a timeout (asyncio.wait_for) dropped any message zmq had
+        # already handed to it: a lost REQUEST left its chunk waiting out the
+        # client's queue timeout (12 s for a live read) before a retry.
+        recv = None
         try:
             while not self._stop_event.is_set():
-                try:
-                    frames = await asyncio.wait_for(self._router.recv_multipart(), timeout=0.5)
-                except asyncio.TimeoutError:
+                if recv is None:
+                    recv = asyncio.ensure_future(self._router.recv_multipart())
+                done, _pending = await asyncio.wait(
+                    {recv}, timeout=self._STOP_POLL_SECONDS
+                )
+                if not done:
                     continue
+                frames, recv = recv.result(), None
                 if len(frames) != 2:
                     log.warning(
                         "Dropping broker message with %d frames (expected 2)",
@@ -3054,8 +3067,14 @@ class _RouterServer:
                     )
                     continue
                 identity, raw = frames
-                asyncio.create_task(self._handle_message(identity, raw))
+                # The loop holds tasks only weakly: keep each handler alive
+                # until it finishes.
+                task = asyncio.create_task(self._handle_message(identity, raw))
+                self._handlers.add(task)
+                task.add_done_callback(self._handlers.discard)
         finally:
+            if recv is not None:
+                recv.cancel()
             await self._core.stop()
             self._router.close(0)
 
