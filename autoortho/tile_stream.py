@@ -76,6 +76,74 @@ def dsf_rel(lat: int, lon: int) -> str:
     folder = f"{lat // 10 * 10:+03d}{lon // 10 * 10:+04d}"
     return f"{DSF_DIR}/{folder}/{lat:+03d}{lon:+04d}.dsf"
 
+
+DSF_NAME_RE = re.compile(r"^([+-]\d{2})([+-]\d{3})\.dsf$")
+MASK_NAME_RE = re.compile(r"^(\d+)_(\d+)_ZL(\d+)\.png$")
+
+
+def dsf_cell(name: str) -> Optional[Tuple[int, int]]:
+    """(lat, lon) of a DSF file name such as ``+39-009.dsf``."""
+    m = DSF_NAME_RE.match(name)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def mask_cell(name: str) -> Optional[Tuple[int, int]]:
+    """The 1x1 degree tile a water mask (``<row>_<col>_ZL<z>.png``) belongs to.
+
+    A mask covers one 16x16 block of web-mercator tiles; its centre decides
+    the tile. Blocks that straddle a degree line are also used by the
+    neighbouring DSF, which fetches the mask again if it is missing.
+    """
+    m = MASK_NAME_RE.match(name)
+    if not m:
+        return None
+    row, col, zoom = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    lat, lon, _ = ter_geometry(row, col, zoom)
+    return math.floor(lat), math.floor(lon)
+
+
+# Tiles the user chose to keep for offline flying. Eviction skips them and
+# they don't count toward the disk limit.
+PIN_NAME = "pinned_tiles.json"
+
+
+def read_pins(root: str) -> set:
+    """Pinned (lat, lon) tiles of one streaming package."""
+    try:
+        with open(os.path.join(root, PIN_NAME), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    pins = set()
+    for name in data.get("tiles", []) if isinstance(data, dict) else []:
+        cell = dsf_cell(f"{name}.dsf")
+        if cell:
+            pins.add(cell)
+    return pins
+
+
+def write_pins(root: str, pins: Iterable[Tuple[int, int]]) -> None:
+    names = sorted(f"{lat:+03d}{lon:+04d}" for lat, lon in set(pins))
+    path = os.path.join(root, PIN_NAME)
+    if not names:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    with open(path + ".part", "w", encoding="utf-8") as fh:
+        json.dump({"tiles": names}, fh, indent=1)
+    os.replace(path + ".part", path)
+
+
+def stored_file_cell(name: str) -> Optional[Tuple[int, int]]:
+    """The tile a stored DSF or water mask belongs to, by file name."""
+    if name.endswith(".dsf"):
+        return dsf_cell(name)
+    if name.endswith(".png"):
+        return mask_cell(name)
+    return None
+
 # Bytes read past the fixed local header so the name and extra field come in
 # the same request as the data. Longer extra fields cost a second request.
 _LOCAL_HEADER_SLACK = 512
@@ -860,15 +928,8 @@ class StreamPackage:
             if os.path.exists(local):
                 return
             data = fetch_member(self.remote, self.index, self.index.lookup(rel))
-            os.makedirs(os.path.dirname(local), exist_ok=True)
-            with open(tmp, "wb") as fh:
-                fh.write(data)
-            with self._replace_lock:
-                stored = not os.path.exists(local)
-                if stored:
-                    os.replace(tmp, local)
-            if not stored:  # the other download of this file finished first
-                return
+            if not self._store(local, tmp, data):
+                return  # the other download of this file finished first
             self._failed.pop(rel, None)
             self._failed_open.pop(rel, None)
             self.stats["prefetched" if background else "fetched"] += 1
@@ -894,6 +955,80 @@ class StreamPackage:
             except OSError:
                 pass
             self._fetch_done(rel, event, background)
+
+    def _store(self, local: str, tmp: str, data: bytes) -> bool:
+        """Write ``data`` to ``local`` atomically unless it appeared meanwhile."""
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        with self._replace_lock:
+            if os.path.exists(local):
+                return False
+            os.replace(tmp, local)
+        return True
+
+    # -- keeping tiles for offline use ----------------------------------
+    def fetch_now(self, rel: str) -> int:
+        """Download ``rel`` on this thread. Returns the bytes stored (0 if it
+        was already on disk or isn't in the index). Raises on failure."""
+        local = self.local_path(rel)
+        if os.path.exists(local) or self.entry(rel) is None:
+            return 0
+        tmp = f"{local}.part{threading.get_ident()}"
+        try:
+            data = fetch_member(self.remote, self.index, self.index.lookup(rel))
+            if not self._store(local, tmp, data):
+                return 0
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+        self._account(len(data))
+        return len(data)
+
+    def tile_masks(self, lat: int, lon: int) -> List[str]:
+        """Water masks the stored DSF of a tile needs (package-relative)."""
+        local = self.local_path(dsf_rel(lat, lon))
+        try:
+            with open(local, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return []
+        if data.startswith(SEVENZIP_MAGIC):
+            data = unpack_7z_dsf(local) or b""
+        return self.mask_rels(dsf_terrain_names(data) or [])
+
+    def mask_rels(self, names: Iterable[str]) -> List[str]:
+        """Water masks named by the overlay .ter files in a terrain list."""
+        out = []
+        for name in names:
+            if not name.startswith("terrain/") or "_overlay" not in name:
+                continue
+            ter = self.ter_bytes(name.split("/", 1)[1])
+            if ter:
+                out.extend(border_textures(ter))
+        return out
+
+    def download_tile(self, lat: int, lon: int,
+                      cancelled: Callable[[], bool] = lambda: False) -> Tuple[int, int]:
+        """Fetch a tile's DSF and water masks now. Returns (bytes, files)
+        downloaded; a tile the index doesn't have returns (0, 0)."""
+        rel = dsf_rel(lat, lon)
+        if self.entry(rel) is None:
+            return 0, 0
+        got = self.fetch_now(rel)
+        total, files = got, int(got > 0)
+        for mask in self.tile_masks(lat, lon):
+            if cancelled():
+                break
+            if self.entry(mask) is None:
+                continue
+            got = self.fetch_now(mask)
+            total += got
+            files += got > 0
+        return total, files
 
     # -- disk budget ----------------------------------------------------
     def touch(self, local: str) -> None:
@@ -944,11 +1079,18 @@ class StreamPackage:
             pass
 
     def evict(self) -> int:
-        """Delete least recently used files until under the disk limit."""
+        """Delete least recently used files until under the disk limit.
+
+        Files of pinned tiles are never deleted and don't count toward the
+        limit.
+        """
         if not self.disk_limit:
             return 0
+        pins = read_pins(self.root)
         stats = {}
         for e in self._stored_files():
+            if pins and stored_file_cell(e.name) in pins:
+                continue
             try:
                 stats[e.path] = e.stat()
             except OSError:
@@ -1014,13 +1156,8 @@ class StreamPackage:
                 self.on_terrain(tiles)
             except Exception as exc:
                 log.debug("Tile stream: terrain callback failed: %s", exc)
-        for name in names:
-            if not name.startswith("terrain/") or "_overlay" not in name:
-                continue
-            ter = self.ter_bytes(name.split("/", 1)[1])
-            if ter:
-                for tex in border_textures(ter):
-                    self.prefetch(tex, self.MASK_URGENT if urgent else self.MASK_AHEAD)
+        for tex in self.mask_rels(names):
+            self.prefetch(tex, self.MASK_URGENT if urgent else self.MASK_AHEAD)
 
     # -- terrain --------------------------------------------------------
     def ter_bytes(self, name: str) -> Optional[bytes]:

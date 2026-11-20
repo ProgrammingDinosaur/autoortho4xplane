@@ -1103,9 +1103,18 @@ class ConfigUI(QMainWindow):
             [m for m in MAPTYPES if m not in ("Use tile default", "Custom Map")],
             scenery_path=lambda: self.cfg.ao_scenery_path,
             discover=discover_dsf_tiles,
+            cache_paths=lambda: (
+                self.cfg.ao_scenery_path,
+                self.cfg.paths.cache_dir,
+                self.cfg.xplane_custom_scenery_path,
+            ),
+            task_manager=self.task_manager,
         )
         self.custom_map_editor.cellsChanged.connect(
             self._on_custom_map_changed
+        )
+        self.custom_map_editor.cacheChanged.connect(
+            self._refresh_stream_panel
         )
         self.flight_plan_page = FlightPlanPage(
             self.simbrief_group, self.custom_map_editor
@@ -2786,7 +2795,7 @@ class ConfigUI(QMainWindow):
             ),
         )
         self.shell.set_xplane_state(xplane_connected)
-        self.scenery_library_page.set_runtime_locked(
+        self._set_runtime_locked(
             xplane_connected
             or self.runtime_state
             not in (RuntimeState.STOPPED, RuntimeState.ERROR)
@@ -7504,6 +7513,14 @@ class ConfigUI(QMainWindow):
 
     # -- Scenery streaming ------------------------------------------------
 
+    def _set_runtime_locked(self, locked):
+        """Streaming settings and cache changes wait until AutoOrtho and
+        X-Plane are stopped."""
+        self.scenery_library_page.set_runtime_locked(locked)
+        editor = getattr(self, "custom_map_editor", None)
+        if editor is not None:
+            editor.set_runtime_locked(locked)
+
     def _run_stream_job(self, operation, on_done):
         """Run a streaming setup job off the UI thread."""
         worker = ServiceWorker(lambda cancel_event: operation(), self)
@@ -8697,7 +8714,7 @@ class ConfigUI(QMainWindow):
                 self.runtime_state,
                 action_enabled=action_enabled,
             )
-            self.scenery_library_page.set_runtime_locked(
+            self._set_runtime_locked(
                 self.runtime_state != RuntimeState.STOPPED
                 and self.runtime_state != RuntimeState.ERROR
             )

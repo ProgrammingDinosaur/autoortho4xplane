@@ -88,6 +88,8 @@ stored tiles grow past the disk limit, AutoOrtho removes the tiles you
 haven't used for the longest time, down to 90% of the limit.
 
 - Tiles used in the last two hours are never removed.
+- Tiles you [keep for offline flying](#keeping-tiles-for-offline-flying)
+  are never removed and don't count toward the limit.
 - Overlays get a quarter of the limit on top of it. With a 20 GB limit,
   overlays can use another 5 GB.
 - The panel shows how many tiles are stored and how much space they use.
@@ -129,6 +131,63 @@ and keeps the streamed overlays above the AutoOrtho base meshes. The first
 time it changes the file, it keeps your original as
 `scenery_packs.ini.ao_backup`.
 
+### Seeing and managing stored tiles on the map
+
+**Flight Plan & Map** has a map with two views. Switch with the buttons
+above the map:
+
+- **Imagery Sources:** the Custom Map editor, which picks the imagery source
+  per tile.
+- **Cache:** what AutoOrtho has stored for each 1x1 degree tile.
+
+In the Cache view, tiles are coloured by what's stored: **Streamed
+scenery** (base mesh, overlays and water masks), **Imagery** (cached
+satellite imagery), or **Both**. Choose **Colour by: Size** to colour them
+by how much space they use instead. A white outline marks tiles kept for
+offline flying. Hover over a tile to see its sizes, imagery zoom levels and
+sources, and when it was last used. The line under the map shows the
+totals.
+
+To select tiles, click one or drag a box. Hold Ctrl or Shift to add to the
+selection, or to remove a tile you click. Press Esc to clear it. **More**
+has **Select Stored Tiles in View** and **Zoom to Stored Tiles**.
+
+Deleting tiles and keeping them offline only work while AutoOrtho and
+X-Plane are stopped, like the streaming settings. You can look at the map at
+any time.
+
+#### Deleting stored tiles
+
+Select tiles, then choose **Delete** > **Streamed Scenery**, **Imagery** or
+**Both**. AutoOrtho shows how much it's about to delete and asks first.
+
+- Deleted streamed scenery is downloaded again the next time you fly there,
+  so you need an internet connection then. Deleting it also stops keeping
+  the tile for offline flying.
+- Deleted imagery is downloaded again when X-Plane needs it.
+- Installed regions aren't affected. Only streamed tiles and cached imagery
+  are deleted.
+
+#### Keeping tiles for offline flying
+
+Select tiles, then click **Keep Offline**. AutoOrtho shows how much
+streamed scenery it will download, then downloads each tile's DSF and water
+masks (and overlays, if you stream them) right away. Progress shows in the
+**Activity** panel, where you can cancel it. Kept tiles are never removed
+to make room.
+
+The confirmation also estimates how much space the imagery for those tiles
+would take at ZL16, ZL17 and ZL18. Keep Offline doesn't download imagery. To
+fly a kept area offline with satellite imagery, fly it once with a
+connection so its imagery is cached, and make sure the imagery cache limit
+in **Settings** is large enough to hold it.
+
+To stop keeping tiles, select them and choose **Keep Offline** >
+**Stop Keeping**. Their files stay on disk until the disk limit needs the
+space.
+
+Tiles with no streamed scenery, such as open water, are skipped.
+
 ### Turning it off
 
 Untick **Stream scenery you haven't installed**. AutoOrtho asks before
@@ -138,8 +197,8 @@ deleting the tiles streamed so far. Installed regions aren't affected.
 
 - **Scenery Patches** (Seasons, Terrain reflectivity) are applied only to
   installed regions, not to streamed tiles yet.
-- You can't keep a streamed area for offline flying. To fly an area
-  offline, install its region.
+- **Keep Offline** keeps only the streamed scenery. Imagery isn't
+  downloaded ahead of time; it's cached as you fly.
 - The setup wizard doesn't offer streaming yet. Turn it on in the Scenery
   Library after setup.
 

@@ -20,6 +20,8 @@ requests and have no bandwidth limit, so streaming needs no paid hosting.
 | Streamed tiles visible to the imagery pipeline | `TerrainTileLookup.add_virtual_tiles` in `autoortho/getortho.py` |
 | `scenery_packs.ini` ordering at mount time | `tile_stream.ensure_all_pack_orders`, called from `AOMount.mount_sceneries` |
 | Scenery Library panel | `autoortho/ui/widgets/stream_panel.py`, handlers in `autoortho/ui/main_window.py` (`_on_stream_*`) |
+| Cache view (scan, delete, pin, keep offline) | `autoortho/cache_inventory.py` |
+| Cache view UI | `autoortho/ui/widgets/cache_map_panel.py` on the shared `MapCanvas` in `autoortho/ui/widgets/custom_map_editor.py` |
 | Index builder | `scripts/build_tile_index.py` |
 | Repackager for solid archives | `scripts/repack_scenery.py` |
 
@@ -86,6 +88,76 @@ dropped or stalled connection is retried up to 3 times.
 After fetches, and at most once a minute, the least recently used tiles are
 removed until the package is under 90% of its limit. Files used in the last
 two hours are kept. Use is tracked by file mtime (touched on open).
+
+Pinned tiles (kept for offline flying) are listed in `pinned_tiles.json` in
+each package (`{"tiles": ["+47-123", ...]}`; `read_pins`/`write_pins`).
+`evict` skips their DSFs and masks and leaves them out of the total, so
+pinned tiles don't count toward the limit. A mask belongs to the tile that
+holds its centre (`mask_cell`). The pins live in their own file rather than
+the marker because `_create_package` rewrites the marker.
+
+## Cache view
+
+The map on **Flight Plan & Map** has a Cache view (`CachePanel`) that shows,
+deletes and pins what is stored per 1x1 degree tile. The file work is in
+`cache_inventory.py`, which has no Qt dependency:
+
+- `scan(ao_scenery_dir, cache_dir)` builds a `CacheInventory` of
+  `CellUsage` per tile with `os.scandir` only. On Windows the directory
+  entries carry size and mtime, so about 200k chunk files take about 1.2 s.
+  The UI runs it on a thread and drops results from older scans.
+  - Streamed mesh: DSFs (`dsf_cell`) and masks (`mask_cell`) of every
+    package with a marker, plus the pins.
+  - Chunk JPEGs in `cache_dir`: the name is `<col>_<row>_<zoom>_<maptype>.jpg`
+    (column first, see `Chunk.chunk_id` in `getortho.py`). A chunk belongs
+    to the tile holding its centre. Row and column halves are memoised.
+  - Built textures: `dds_cache/<10 degree band>/<1 degree tile>/<maptype>/`;
+    the tile folder name is the tile, and the zoom comes from `_z<zl>.dds`.
+  - The long-term cache (`long_term_cache_dir`) isn't scanned.
+- `delete_cells(..., mesh, imagery)` removes only files AutoOrtho names
+  itself: DSFs and masks inside marked packages, chunk files matching the
+  chunk naming, and the tiles' `dds_cache` folders (empty band folders go
+  too). Deleting a tile's mesh also unpins it. A mask on a degree line may
+  also be used by the neighbouring DSF; that DSF fetches it again on its
+  next open (`note_local_dsf`).
+- `keep_offline(...)` creates a `StreamPackage` per package (with the same
+  `hidden` set the mount uses, so installed tiles aren't fetched), pins the
+  tiles its index has, and calls `StreamPackage.download_tile` for each:
+  `fetch_now` (synchronous fetch) of the DSF, then of the masks its terrain
+  list names (`tile_masks` / `mask_rels`). A throttled host stops the run;
+  what was fetched stays pinned. Progress goes to the Activity panel as a
+  `TaskType.CACHE` task, cancellable between files.
+- `mesh_download_estimate` sums the index sizes of DSFs not on disk yet, and
+  `estimate_imagery` counts web-mercator tiles per tile and zoom
+  (`chunks_in_cell`) times the average chunk size already in the cache
+  (16 KB if there's none). Both feed the Keep Offline confirmation.
+
+Deleting and keeping are locked while AutoOrtho or X-Plane runs:
+`MainWindow._set_runtime_locked` passes the same flag to the stream panel
+and to `CustomMapEditor.set_runtime_locked`. After a change the panel
+rescans and emits `cacheChanged`, which refreshes the stream panel's usage.
+
+### Next step: pre-caching imagery
+
+Keep Offline downloads only the mesh. Pre-caching imagery is the larger
+half (a 1x1 degree tile at 40°N is about 0.6 GB at ZL16, 2.6 GB at ZL17 and
+10 GB at ZL18 with Bing), and needs:
+
+1. The exact chunk set rather than a box: after the DSF is stored, its
+   terrain list (`terrain_tiles`) names every texture as (row, col,
+   maptype, zoom); each texture is 16x16 chunks at that zoom. Water-only
+   textures can be skipped. This also gives a precise size estimate per ZL
+   once the mesh is on disk.
+2. A downloader that reuses the imagery pipeline's providers and rate
+   limits (`getortho` chunk fetch and the broker), writes to `cache_dir`
+   with the normal naming, skips files already there, and reports to the
+   Activity panel with a byte total.
+3. Protection from cache cleanup: the imagery cache limit
+   (`CacheCleanupWorker`, `disk_budget_manager`) would delete pinned
+   imagery. It needs the pins (per tile) and to leave those chunks out of
+   its budget, the same way `evict` does for the mesh.
+4. A UI choice of zoom levels (capped at the scenery's own ZL) with the
+   estimate shown per ZL before starting.
 
 ## Building and publishing indexes
 

@@ -40,8 +40,10 @@ The application is organized around five primary destinations:
 - **Scenery Library** — scenery search, filters, installation, updates,
   package details, and [scenery streaming](scenery.md#streaming-scenery-instead-of-installing-regions)
   (fly without installing regions).
-- **Flight Plan & Map** — SimBrief controls, loaded-flight details, and the
-  local Custom Map Editor.
+- **Flight Plan & Map** — SimBrief controls, loaded-flight details, and a map
+  with two views: the Custom Map editor and the
+  [Cache view](scenery.md#seeing-and-managing-stored-tiles-on-the-map) of
+  what AutoOrtho has stored per tile.
 - **Settings** — Essentials first, every setting with **Show all settings**,
   search, exact numeric inputs, and Apply/Revert.
 - **Diagnostics** — health checks, searchable logs, export actions, and
