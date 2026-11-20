@@ -121,6 +121,38 @@ def test_build_readiness_allows_established_setup(tmp_path, monkeypatch):
     assert readiness.can_finish is True
 
 
+def test_build_readiness_allows_streaming_without_regions(tmp_path, monkeypatch):
+    xplane = tmp_path / "X-Plane 12"
+    (xplane / "Custom Scenery").mkdir(parents=True)
+    values = {
+        "xplane_path": str(xplane),
+        "scenery_path": str(tmp_path / "scenery"),
+        "cache_dir": str(tmp_path / "cache"),
+        "download_dir": str(tmp_path / "download"),
+        "webui_port": "5847",
+        "xplane_udp_port": "49000",
+    }
+    monkeypatch.setattr(
+        "ui.readiness._check_dependencies",
+        lambda: ReadinessCheck(
+            id="setup-dependencies",
+            title="FUSE dependencies",
+            status=ReadinessStatus.SUCCESS,
+            message="ready",
+            fix_action="",
+        ),
+    )
+
+    without = build_readiness(values, scenery_choices=[])
+    streaming = build_readiness(values, scenery_choices=[], streaming=True)
+
+    assert without.can_finish is False
+    assert "streaming" in without.by_id("setup-scenery").fix_action
+    assert streaming.by_id("setup-scenery").status == ReadinessStatus.SUCCESS
+    assert streaming.installed_scenery_present is False
+    assert streaming.can_finish is True
+
+
 def test_selected_scenery_blocks_when_storage_is_insufficient(
     tmp_path,
     monkeypatch,
