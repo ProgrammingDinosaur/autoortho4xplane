@@ -62,6 +62,7 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.widgets.scenery_patches import SceneryPatchesWidget
     from autoortho.ui.shell import ApplicationShell
     from autoortho.ui.pages.scenery_page import SceneryLibraryPage
+    from autoortho import tile_stream
     from autoortho.ui.pages.settings_page import SettingsPage
     from autoortho.ui.pages.expert_settings_page import ExpertSettingsPage
     from autoortho.ui.widgets.target_cost_panel import TargetCostPanel
@@ -139,6 +140,7 @@ else:
     from ui.widgets.scenery_patches import SceneryPatchesWidget
     from ui.shell import ApplicationShell
     from ui.pages.scenery_page import SceneryLibraryPage
+    import tile_stream
     from ui.pages.settings_page import SettingsPage
     from ui.pages.expert_settings_page import ExpertSettingsPage
     from ui.widgets.target_cost_panel import TargetCostPanel
@@ -1081,6 +1083,12 @@ class ConfigUI(QMainWindow):
         self.scenery_library_page.settings_requested.connect(
             lambda: self.navigate_to("settings", "Setup & Storage")
         )
+        stream_panel = self.scenery_library_page.stream_panel
+        stream_panel.enable_requested.connect(self._on_stream_enable)
+        stream_panel.disable_requested.connect(self._on_stream_disable)
+        stream_panel.limit_changed.connect(self._on_stream_limit)
+        self._stream_workers = []
+        QTimer.singleShot(0, self._refresh_stream_panel)
         self.shell.add_page(
             self.scenery_library_page,
             key="scenery-library",
@@ -7490,6 +7498,120 @@ class ConfigUI(QMainWindow):
             if reply == QMessageBox.StandardButton.Yes:
                 self.on_restore_default_dsfs(region_id)
             return
+
+    # -- Scenery streaming ------------------------------------------------
+
+    def _run_stream_job(self, operation, on_done):
+        """Run a streaming setup job off the UI thread."""
+        worker = ServiceWorker(lambda cancel_event: operation(), self)
+        self._stream_workers.append(worker)
+
+        def finished(result, current=worker):
+            if current in self._stream_workers:
+                self._stream_workers.remove(current)
+            on_done(result)
+
+        worker.completed.connect(finished)
+        worker.start()
+        return worker
+
+    def _refresh_stream_panel(self):
+        scenery_dir = self.cfg.ao_scenery_path
+
+        def read_state():
+            packages = tile_stream.stream_packages(scenery_dir)
+            usage, count = tile_stream.stream_usage(scenery_dir)
+            return packages, usage, count
+
+        def show(result):
+            if isinstance(result, Exception):
+                log.warning(f"Could not read streaming state: {result}")
+                return
+            self.scenery_library_page.stream_panel.set_state(*result)
+
+        self._run_stream_job(read_state, show)
+
+    def _after_stream_change(self):
+        """New or removed streaming folders become mounts on the next start."""
+        try:
+            self.cfg.refresh_derived_paths(create_missing=False)
+        except Exception as exc:
+            log.warning(f"Could not refresh scenery mounts: {exc}")
+        try:
+            tile_stream.ensure_all_pack_orders(
+                self.cfg.ao_scenery_path, self.cfg.xplane_custom_scenery_path
+            )
+        except Exception as exc:
+            log.warning(f"Could not order streaming packages: {exc}")
+        self._refresh_stream_panel()
+
+    def _on_stream_enable(self, source, overlays, limit_gb):
+        scenery_dir = self.cfg.ao_scenery_path
+        if not scenery_dir:
+            self.display_error("Set the scenery folder before turning on streaming.")
+            return
+        task_id = "scenery-stream"
+        self.task_manager.create_task(
+            task_id,
+            TaskType.SCENERY_INSTALL,
+            "Turn on scenery streaming",
+            package=tile_stream.SOURCES.get(source, {}).get("label", source),
+            stage="Downloading tile index",
+        )
+        panel = self.scenery_library_page.stream_panel
+        panel.set_busy(True, "Downloading the tile index…")
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.task_manager.fail_task(task_id, str(result))
+                self.display_error(f"Could not turn on scenery streaming:\n{result}")
+                panel.set_busy(False)
+                self._refresh_stream_panel()
+                return
+            self.task_manager.complete_task(task_id)
+            self.update_status_bar(
+                "Scenery streaming is on. It takes effect the next time AutoOrtho starts."
+            )
+            self._after_stream_change()
+
+        os.makedirs(scenery_dir, exist_ok=True)
+        self._run_stream_job(
+            lambda: tile_stream.enable_streaming(
+                scenery_dir, source, overlays=overlays, disk_limit_gb=limit_gb
+            ),
+            done,
+        )
+
+    def _on_stream_disable(self):
+        scenery_dir = self.cfg.ao_scenery_path
+        usage, count = tile_stream.stream_usage(scenery_dir)
+        reply = QMessageBox.question(
+            self,
+            "Turn off scenery streaming?",
+            "Turn off streaming and delete the streamed tiles "
+            f"({count:,} tiles, {usage / 1e9:.1f} GB)?\n\n"
+            "Downloaded scenery packages are not affected.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        panel = self.scenery_library_page.stream_panel
+        panel.set_busy(True, "Removing streamed tiles…")
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.display_error(f"Could not turn off scenery streaming:\n{result}")
+            self._after_stream_change()
+
+        self._run_stream_job(lambda: tile_stream.disable_streaming(scenery_dir), done)
+
+    def _on_stream_limit(self, limit_gb):
+        try:
+            tile_stream.update_stream_settings(self.cfg.ao_scenery_path, limit_gb)
+        except Exception as exc:
+            self.display_error(f"Could not change the streaming disk limit:\n{exc}")
+        self._refresh_stream_panel()
 
     def on_delete_scenery(self, region_id):
         """Handle scenery deletion"""

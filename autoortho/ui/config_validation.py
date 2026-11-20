@@ -204,7 +204,8 @@ def validate_configuration(
             ValidationIssue(
                 "scenery",
                 ValidationSeverity.ERROR,
-                "Install at least one scenery region before starting streaming.",
+                "Install a scenery region or turn on scenery streaming "
+                "(Scenery Library) before starting.",
             )
         )
 

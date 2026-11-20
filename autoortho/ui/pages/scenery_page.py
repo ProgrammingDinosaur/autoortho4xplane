@@ -29,6 +29,7 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.readiness import format_bytes
     from autoortho.ui.task_models import TaskState
     from autoortho.ui.theme import THEME, repolish
+    from autoortho.ui.widgets.stream_panel import StreamPanel
 else:
     from ui.models.scenery_model import (
         SceneryFilterProxyModel,
@@ -37,6 +38,7 @@ else:
     from ui.readiness import format_bytes
     from ui.task_models import TaskState
     from ui.theme import THEME, repolish
+    from ui.widgets.stream_panel import StreamPanel
 
 
 @dataclass(frozen=True)
@@ -366,6 +368,9 @@ class SceneryLibraryPage(QWidget):
         title_row.addWidget(settings)
         root.addLayout(title_row)
 
+        self.stream_panel = StreamPanel()
+        root.addWidget(self.stream_panel)
+
         toolbar = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search scenery…")
@@ -497,6 +502,7 @@ class SceneryLibraryPage(QWidget):
 
     def set_runtime_locked(self, locked: bool) -> None:
         locked = bool(locked)
+        self.stream_panel.set_runtime_locked(locked)
         if locked == self.runtime_locked:
             return
         self.runtime_locked = locked

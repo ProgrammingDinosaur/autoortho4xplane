@@ -54,6 +54,11 @@ except ImportError:
     )
 
 try:
+    from autoortho import tile_stream
+except ImportError:
+    import tile_stream
+
+try:
     from autoortho.utils.constants import MAPTYPES, system_type
 except ImportError:
     from utils.constants import MAPTYPES, system_type
@@ -1467,6 +1472,15 @@ class AOMount:
                 cleanup_stale_mount_folders(custom_scenery_path)
         except Exception as e:
             log.warning(f"Failed to cleanup stale mount folders: {e}")
+
+        # Streamed overlays must sit above streamed orthos.
+        try:
+            if custom_scenery_path:
+                tile_stream.ensure_all_pack_orders(
+                    self.cfg.ao_scenery_path, custom_scenery_path
+                )
+        except Exception as e:
+            log.warning(f"Could not order streaming packages in scenery_packs.ini: {e}")
 
         if not self.cfg.scenery_mounts:
             log.warning(f"No installed sceneries detected.  Exiting.")

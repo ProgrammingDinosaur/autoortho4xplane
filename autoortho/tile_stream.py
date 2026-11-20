@@ -1,0 +1,1162 @@
+"""Stream scenery tiles from published release zips, one file at a time.
+
+A scenery package normally has to be downloaded and unpacked in full before
+it can be used. A streaming package is an empty folder under
+``z_autoortho/scenery`` holding an ``ao_stream.json`` marker. Its FUSE mount
+lists every DSF in a tile index, and fetches a DSF (and the water masks it
+needs) the first time X-Plane opens it, using HTTP Range requests against the
+original release zips. Each file inside a zip is compressed on its own, so
+one file can be read without the rest of the archive.
+
+``.ter`` files are not fetched at all: every one in the published packages
+follows one of three templates whose values come from the file name
+(:func:`synthesize_ter`). The index carries the few that do not match.
+
+The index is a gzipped JSON file written by ``scripts/build_tile_index.py``.
+"""
+
+from __future__ import annotations
+
+import gzip
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+import re
+import struct
+import threading
+import time
+import zlib
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
+
+import requests
+
+log = logging.getLogger(__name__)
+
+INDEX_FORMAT = 1
+MARKER_NAME = "ao_stream.json"
+INDEX_NAME = "tile_index.json.gz"
+DSF_DIR = "Earth nav data"
+
+# Where published tile indexes live. Each source is a set of release zips
+# plus an index built from them by scripts/build_tile_index.py.
+INDEX_BASE_URL = (
+    "https://github.com/ProgrammingDinosaur/autoortho4xplane/releases/download/tile-index/"
+)
+SOURCES = OrderedDict([
+    ("xp11", {
+        "label": "XP11 legacy set (kubilus1/autoortho-scenery)",
+        "available": True,
+        "ortho_index": INDEX_BASE_URL + "tile_index_xp11.json.gz",
+        "overlay_index": INDEX_BASE_URL + "overlay_index_xp11.json.gz",
+    }),
+    ("xp12", {
+        "label": "XP12 set (ProgrammingDinosaur/autoortho-scenery-xp12)",
+        "available": False,  # waiting on the repackaged release zips
+        "ortho_index": INDEX_BASE_URL + "tile_index_xp12.json.gz",
+        "overlay_index": None,  # base mesh only; pair with simHeaven
+    }),
+])
+ORTHO_PACKAGE = "z_ao_stream_{source}"
+OVERLAY_PACKAGE = "yAO_stream_{source}_overlays"
+LEGACY_OVERLAY_FOLDER = "yAutoOrtho_Overlays"
+
+
+def dsf_rel(lat: int, lon: int) -> str:
+    """Package-relative path of the DSF for a 1x1 degree tile."""
+    folder = f"{lat // 10 * 10:+03d}{lon // 10 * 10:+04d}"
+    return f"{DSF_DIR}/{folder}/{lat:+03d}{lon:+04d}.dsf"
+
+# Bytes read past the fixed local header so the name and extra field come in
+# the same request as the data. Longer extra fields cost a second request.
+_LOCAL_HEADER_SLACK = 512
+_LOCAL_HEADER = struct.Struct("<IHHHHHIIIHH")
+_LOCAL_HEADER_SIG = 0x04034B50
+
+# Index entry fields: [asset, header_offset, compressed_size, size, method, crc]
+_ENTRY_ASSET, _ENTRY_OFFSET, _ENTRY_CSIZE, _ENTRY_SIZE, _ENTRY_METHOD, _ENTRY_CRC = range(6)
+
+EARTH_RADIUS = 6378137.0
+
+
+# ---------------------------------------------------------------------------
+# .ter synthesis
+# ---------------------------------------------------------------------------
+
+TER_NAME_RE = re.compile(
+    r"^(?P<row>\d+)_(?P<col>\d+)_(?P<maptype>[A-Za-z]+?)(?P<zoom>\d{2})"
+    r"(?P<kind>_water_overlay|_sea_overlay|_water|_sea)?\.ter$"
+)
+
+# Defaults match the kubilus1/autoortho-scenery XP11 packages; an index can
+# override any of them under "ter". XP12 builds from Ortho4XP 1.40 use
+# decal=None, mask_zl=16, decal_on_sea=True and add "_water"/"_sea" files.
+DEFAULT_TER_PARAMS = {
+    "decal": "lib/g10/decals/maquify_2_green_key.dcl",
+    "decal_on_sea": False,   # Ortho4XP 1.30 decorated land only; 1.40 sea too
+    "land_shadow": True,     # False writes NO_SHADOW on land (terrain_casts_shadows)
+    "mask_zl": 14,
+    "mask_name": "{row}_{col}_ZL{zoom}.png",
+}
+
+
+def ter_geometry(row: int, col: int, zoom: int) -> Tuple[float, float, int]:
+    """Centre and approximate width in metres of a 16x16 texture block.
+
+    Same arithmetic as Ortho4XP's ``gtile_to_wgs84`` and
+    ``webmercator_pixel_size`` so the printed values match its files.
+    """
+    rat_x = (col + 8) / (2 ** (zoom - 1)) - 1
+    rat_y = 1 - (row + 8) / (2 ** (zoom - 1))
+    lon = rat_x * 180
+    lat = 360 / math.pi * math.atan(math.exp(math.pi * rat_y)) - 90
+    pixel = 2 * math.pi * EARTH_RADIUS * math.cos(math.pi * lat / 180) / (2 ** (zoom + 8))
+    return lat, lon, int(pixel * 4096)
+
+
+def synthesize_ter(
+    name: str,
+    params: Optional[dict] = None,
+    exceptions: Optional[Dict[str, str]] = None,
+    roughness: Optional[float] = None,
+) -> Optional[bytes]:
+    """Return the contents of ``terrain/<name>``, or None if it can't be made."""
+    text = None
+    if exceptions:
+        text = exceptions.get(name)
+    if text is None:
+        m = TER_NAME_RE.match(name)
+        if not m:
+            return None
+        p = dict(DEFAULT_TER_PARAMS)
+        if params:
+            p.update(params)
+        row, col, zoom = int(m["row"]), int(m["col"]), int(m["zoom"])
+        maptype, kind = m["maptype"], m["kind"] or ""
+        lat, lon, size = ter_geometry(row, col, zoom)
+        base = f"{row}_{col}_{maptype}{zoom}"
+        center = f"{lat:.5f} {lon:.5f} {size}"
+        # Same branches as Ortho4XP's create_terrain_file.
+        tri_type = 1 if kind.startswith("_water") else 2 if kind.startswith("_sea") else 0
+        overlay = kind.endswith("_overlay")
+        lines = ["A", "800", "TERRAIN", "", f"LOAD_CENTER {center} 4096",
+                 f"BASE_TEX_NOWRAP ../textures/{base}.dds"]
+        if tri_type and not overlay:  # XP12 water
+            lines.append("WATER_COLOR_MASK")
+        elif tri_type == 1:
+            lines.append("BORDER_TEX ../textures/water_transition.png")
+        elif tri_type == 2:
+            mask_px = 4096 // 2 ** (zoom - int(p["mask_zl"]))
+            mask_name = _mask_name(p, row, col, maptype, zoom)
+            lines += [f"LOAD_CENTER_BORDER {center} {mask_px}",
+                      f"BORDER_TEX ../textures/{mask_name}"]
+        if p.get("decal") and (tri_type == 0 or (tri_type == 2 and p.get("decal_on_sea"))):
+            lines.append(f"DECAL_LIB {p['decal']}")
+        lines.append("WET" if tri_type else "NO_ALPHA")
+        if tri_type or not p.get("land_shadow", True):
+            lines.append("NO_SHADOW")
+        text = "\n".join(lines) + "\n"
+    if roughness is not None:
+        text = re.sub(r"(?m)^SUPER_ROUGHNESS .*\n?", "", text)
+        if not text.endswith("\n"):
+            text += "\n"
+        text += f"SUPER_ROUGHNESS {roughness}\n"
+    return text.encode("ascii")
+
+
+def _mask_name(params: dict, row: int, col: int, maptype: str, zoom: int) -> str:
+    template = params.get("mask_name_by_zoom", {}).get(str(zoom), params["mask_name"])
+    return template.format(row=row, col=col, maptype=maptype, zoom=zoom)
+
+
+def border_textures(ter_bytes: bytes) -> List[str]:
+    """Texture files named by BORDER_TEX lines, relative to the package."""
+    out = []
+    for line in ter_bytes.decode("ascii", "replace").splitlines():
+        if line.startswith("BORDER_TEX "):
+            ref = line.split(None, 1)[1].strip()
+            if ref.startswith("../"):
+                ref = ref[3:]
+            out.append(ref)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# DSF terrain list
+# ---------------------------------------------------------------------------
+
+def dsf_terrain_names(data: bytes) -> Optional[List[str]]:
+    """Terrain definitions listed in an uncompressed DSF, or None.
+
+    Reads the TERT table inside the DEFN atom (atom ids are stored
+    byte-reversed). 7z-compressed DSFs return None.
+    """
+    if len(data) < 12 or data[:8] != b"XPLNEDSF":
+        return None
+    end = len(data) - 16  # trailing MD5
+    pos = 12
+    while pos + 8 <= end:
+        atom_id = data[pos:pos + 4]
+        length = struct.unpack_from("<I", data, pos + 4)[0]
+        if length < 8:
+            return None
+        if atom_id == b"NFED":
+            sub = pos + 8
+            sub_end = min(pos + length, end)
+            while sub + 8 <= sub_end:
+                sub_id = data[sub:sub + 4]
+                sub_len = struct.unpack_from("<I", data, sub + 4)[0]
+                if sub_len < 8:
+                    return None
+                if sub_id == b"TRET":
+                    table = data[sub + 8:sub + sub_len]
+                    return [n.decode("utf-8", "replace") for n in table.split(b"\0") if n]
+                sub += sub_len
+            return []
+        pos += length
+    return None
+
+
+SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
+
+
+def unpack_7z_dsf(path: str) -> Optional[bytes]:
+    """The DSF inside a 7z-compressed DSF file, using the bundled 7-Zip."""
+    try:
+        try:
+            from autoortho.utils.sevenzip import SevenZipFile
+        except ImportError:
+            from utils.sevenzip import SevenZipFile
+        with SevenZipFile(path) as archive:
+            names = archive.getnames()
+            return archive.extract_to_bytes(names[0]) if names else None
+    except Exception as exc:
+        log.debug("Tile stream: could not unpack %s: %s", path, exc)
+        return None
+
+
+def terrain_tiles(names: Iterable[str]) -> List[Tuple[int, int, str, int]]:
+    """(row, col, maptype, zoom) for each ortho .ter in a DSF terrain list."""
+    tiles = set()
+    for name in names:
+        base = name.rsplit("/", 1)[-1]
+        m = TER_NAME_RE.match(base)
+        if m:
+            tiles.add((int(m["row"]), int(m["col"]), m["maptype"], int(m["zoom"])))
+    return sorted(tiles)
+
+
+# ---------------------------------------------------------------------------
+# Index
+# ---------------------------------------------------------------------------
+
+class TileIndex:
+    """Where each streamable file lives inside the published zips."""
+
+    def __init__(self, data: dict):
+        if data.get("format") != INDEX_FORMAT:
+            raise ValueError(f"Unsupported tile index format {data.get('format')!r}")
+        self.name = data.get("name", "")
+        self.variant = data.get("variant", "")
+        self.built = data.get("built", 0)
+        self.assets: List[dict] = data["assets"]
+        self.files: Dict[str, list] = data["files"]
+        ter = data.get("ter", {})
+        self.ter_params: dict = ter.get("params", {})
+        self.ter_exceptions: Dict[str, str] = ter.get("exceptions", {})
+        self._dsf_dirs: Dict[str, List[str]] = {}
+        for rel in self.files:
+            if rel.startswith(DSF_DIR + "/") and rel.endswith(".dsf"):
+                _, folder, fname = rel.split("/")
+                self._dsf_dirs.setdefault(folder, []).append(fname)
+
+    @classmethod
+    def load(cls, path: str) -> "TileIndex":
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8") as fh:
+            return cls(json.load(fh))
+
+    def lookup(self, rel: str) -> Optional[list]:
+        return self.files.get(rel)
+
+    def dsf_folders(self) -> List[str]:
+        return sorted(self._dsf_dirs)
+
+    def dsf_names(self, folder: str) -> List[str]:
+        return sorted(self._dsf_dirs.get(folder, ()))
+
+    def asset_url(self, asset: int) -> str:
+        return self.assets[asset]["url"]
+
+
+# ---------------------------------------------------------------------------
+# Remote access
+# ---------------------------------------------------------------------------
+
+class ThrottledError(Exception):
+    """The host refused us; stop asking for a while."""
+
+
+class RemoteAssets:
+    """Range reads against release assets, with signed-URL reuse and backoff.
+
+    A GitHub download link answers with a redirect to a signed storage URL
+    that stays valid for about an hour. Only that first step touches
+    github.com, so the signed URL is kept and reused for every later read of
+    the same asset until shortly before it expires.
+    """
+
+    SIGNED_URL_MARGIN = 120.0
+    DEFAULT_SIGNED_TTL = 600.0
+    MIN_COOLDOWN = 60.0
+    MAX_COOLDOWN = 900.0
+
+    def __init__(self, session: Optional[requests.Session] = None,
+                 timeout: float = 30.0, clock: Callable[[], float] = time.time):
+        self.session = session or requests.Session()
+        self.session.headers.setdefault("User-Agent", "autoortho-tile-stream")
+        self.timeout = timeout
+        self._clock = clock
+        self._signed: Dict[str, Tuple[str, float]] = {}
+        self._lock = threading.Lock()
+        self._cooldown_until = 0.0
+        self._cooldown = self.MIN_COOLDOWN
+        self.stats = {"resolves": 0, "ranges": 0, "bytes": 0, "throttled": 0}
+
+    # -- backoff --------------------------------------------------------
+    def in_cooldown(self) -> bool:
+        return self._clock() < self._cooldown_until
+
+    def _throttle(self, response) -> None:
+        retry_after = None
+        try:
+            retry_after = float(response.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            pass
+        with self._lock:
+            wait = max(retry_after or 0.0, self._cooldown)
+            self._cooldown_until = self._clock() + wait
+            self._cooldown = min(self._cooldown * 2, self.MAX_COOLDOWN)
+            self.stats["throttled"] += 1
+        log.warning("Tile stream: host returned %s, pausing fetches for %.0fs",
+                    response.status_code, wait)
+
+    def _ok(self) -> None:
+        self._cooldown = self.MIN_COOLDOWN
+
+    # -- signed URLs ----------------------------------------------------
+    def _resolve(self, url: str) -> str:
+        now = self._clock()
+        with self._lock:
+            cached = self._signed.get(url)
+        if cached and cached[1] > now:
+            return cached[0]
+        r = self.session.get(url, headers={"Range": "bytes=0-0"},
+                             allow_redirects=False, timeout=self.timeout)
+        self.stats["resolves"] += 1
+        if r.status_code in (301, 302, 303, 307, 308):
+            signed = r.headers["Location"]
+            expires = _signed_expiry(signed, now) or now + self.DEFAULT_SIGNED_TTL
+        elif r.status_code in (200, 206):
+            signed, expires = url, now + 86400.0  # host serves ranges directly
+        elif r.status_code in (403, 429) or r.status_code >= 500:
+            self._throttle(r)
+            raise ThrottledError(f"{r.status_code} resolving {url}")
+        else:
+            raise IOError(f"HTTP {r.status_code} resolving {url}")
+        with self._lock:
+            self._signed[url] = (signed, expires - self.SIGNED_URL_MARGIN)
+        return signed
+
+    def read_range(self, url: str, start: int, end: int) -> bytes:
+        """Bytes ``start`` to ``end`` inclusive."""
+        if self.in_cooldown():
+            raise ThrottledError("cooling down")
+        for attempt in (0, 1):
+            signed = self._resolve(url)
+            r = self.session.get(signed, headers={"Range": f"bytes={start}-{end}"},
+                                 timeout=self.timeout)
+            if r.status_code == 206:
+                self._ok()
+                self.stats["ranges"] += 1
+                self.stats["bytes"] += len(r.content)
+                return r.content
+            if r.status_code == 200 and start == 0:
+                self._ok()
+                return r.content[:end + 1]
+            if r.status_code in (401, 403) and attempt == 0 and signed != url:
+                with self._lock:  # signed URL expired early; get a new one
+                    self._signed.pop(url, None)
+                continue
+            if r.status_code in (403, 429) or r.status_code >= 500:
+                self._throttle(r)
+                raise ThrottledError(f"{r.status_code} reading {url}")
+            raise IOError(f"HTTP {r.status_code} reading {url} [{start}-{end}]")
+        raise IOError(f"Could not read {url}")
+
+
+def _signed_expiry(url: str, now: float) -> Optional[float]:
+    """Expiry time of a signed storage URL, if it says."""
+    q = parse_qs(urlparse(url).query)
+    if "se" in q:  # Azure SAS
+        try:
+            return datetime.strptime(q["se"][0], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return None
+    if "X-Amz-Expires" in q:  # S3
+        try:
+            return now + float(q["X-Amz-Expires"][0])
+        except ValueError:
+            return None
+    return None
+
+
+def extract_member(raw: bytes, entry: list) -> Tuple[Optional[bytes], int]:
+    """Decode one zip member from bytes starting at its local header.
+
+    Returns (data, needed): data is None when ``raw`` is too short, and
+    ``needed`` is then the total length required.
+    """
+    if len(raw) < _LOCAL_HEADER.size:
+        return None, _LOCAL_HEADER.size + _LOCAL_HEADER_SLACK + entry[_ENTRY_CSIZE]
+    fields = _LOCAL_HEADER.unpack_from(raw, 0)
+    if fields[0] != _LOCAL_HEADER_SIG:
+        raise IOError("Bad zip local header")
+    name_len, extra_len = fields[9], fields[10]
+    start = _LOCAL_HEADER.size + name_len + extra_len
+    stop = start + entry[_ENTRY_CSIZE]
+    if len(raw) < stop:
+        return None, stop
+    payload = raw[start:stop]
+    method = entry[_ENTRY_METHOD]
+    if method == 0:
+        data = payload
+    elif method == 8:
+        data = zlib.decompress(payload, -15)
+    else:
+        raise IOError(f"Unsupported zip compression method {method}")
+    if len(data) != entry[_ENTRY_SIZE]:
+        raise IOError(f"Size mismatch: {len(data)} != {entry[_ENTRY_SIZE]}")
+    if zlib.crc32(data) & 0xFFFFFFFF != entry[_ENTRY_CRC]:
+        raise IOError("CRC mismatch")
+    return data, stop
+
+
+def asset_read(remote: RemoteAssets, asset: dict, start: int, end: int) -> bytes:
+    """Bytes ``start``..``end`` of an asset, which may be split into parts.
+
+    Overlay zips are published as raw byte splits (``.zip.00``, ``.zip.01``
+    ...) because of GitHub's 2 GiB file limit; offsets run across them.
+    """
+    parts = asset.get("parts")
+    if not parts:
+        return remote.read_range(asset["url"], start, end)
+    out = []
+    base = 0
+    for part in parts:
+        p_start, p_end = base, base + part["size"] - 1
+        if end >= p_start and start <= p_end:
+            lo, hi = max(start, p_start), min(end, p_end)
+            out.append(remote.read_range(part["url"], lo - base, hi - base))
+        base += part["size"]
+        if base > end:
+            break
+    return b"".join(out)
+
+
+def fetch_member(remote: RemoteAssets, index: TileIndex, entry: list) -> bytes:
+    """Download and decode one file from its release zip."""
+    asset = index.assets[entry[_ENTRY_ASSET]]
+    offset = entry[_ENTRY_OFFSET]
+    want = _LOCAL_HEADER.size + _LOCAL_HEADER_SLACK + entry[_ENTRY_CSIZE]
+    if asset.get("size"):
+        want = min(want, asset["size"] - offset)
+    raw = asset_read(remote, asset, offset, offset + want - 1)
+    data, needed = extract_member(raw, entry)
+    if data is None:
+        raw += asset_read(remote, asset, offset + len(raw), offset + needed - 1)
+        data, _ = extract_member(raw, entry)
+        if data is None:
+            raise IOError("Short read from release asset")
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Package runtime
+# ---------------------------------------------------------------------------
+
+def read_marker(root: str) -> Optional[dict]:
+    path = os.path.join(root, MARKER_NAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        log.error("Tile stream: unreadable %s: %s", path, exc)
+        return None
+
+
+class StreamPackage:
+    """Runtime for one streaming scenery folder.
+
+    Fetched files are written into the package folder itself, so once a tile
+    has been fetched every other part of AutoOrtho sees an ordinary file.
+
+    Two queues keep a tile X-Plane is waiting for ahead of prefetches: opens
+    go to the foreground pool, neighbour tiles and water masks to the
+    background one. The folder is kept under ``disk_limit_gb`` by deleting the
+    least recently used files.
+    """
+
+    PROTECT_SECONDS = 2 * 3600   # never evict files used in the last two hours
+    EVICT_INTERVAL = 60.0
+    MAX_BACKGROUND = 32
+
+    def __init__(self, root: str, marker: dict, index: Optional[TileIndex] = None,
+                 remote: Optional[RemoteAssets] = None,
+                 on_terrain: Optional[Callable[[List[Tuple[int, int, str, int]]], None]] = None,
+                 hidden: Optional[Iterable[str]] = None):
+        self.root = os.path.abspath(root)
+        self.marker = marker
+        self.kind = marker.get("kind", "ortho")
+        self.index = index or TileIndex.load(self._index_path(marker))
+        self.remote = remote or RemoteAssets(timeout=float(marker.get("http_timeout", 30)))
+        self.open_timeout = float(marker.get("open_timeout", 30))
+        self.roughness = marker.get("roughness")
+        self.prefetch_ring = int(marker.get("prefetch_ring", 1))
+        limit_gb = marker.get("disk_limit_gb")
+        self.disk_limit = int(float(limit_gb) * 1e9) if limit_gb else 0
+        self.on_terrain = on_terrain
+        self.hidden = set(hidden or ())
+        self._pool = ThreadPoolExecutor(max_workers=int(marker.get("workers", 3)),
+                                        thread_name_prefix="tile-stream")
+        self._bg_pool = ThreadPoolExecutor(max_workers=int(marker.get("prefetch_workers", 2)),
+                                           thread_name_prefix="tile-prefetch")
+        self._inflight: Dict[str, threading.Event] = {}
+        self._inflight_lock = threading.Lock()
+        self._rel_locks: Dict[str, threading.Lock] = {}
+        self._background_pending = 0
+        self._failed: Dict[str, float] = {}
+        self._noted: set = set()
+        self._ter_cache: Dict[str, bytes] = {}
+        self._ter_lock = threading.Lock()
+        self._usage: Optional[int] = None
+        self._usage_lock = threading.Lock()
+        self._last_evict = 0.0
+        self.stats = {"fetched": 0, "prefetched": 0, "evicted": 0, "failed": 0}
+        for sub in (DSF_DIR, "terrain", "textures"):
+            os.makedirs(os.path.join(self.root, sub), exist_ok=True)
+        for folder in self.index.dsf_folders():
+            os.makedirs(os.path.join(self.root, DSF_DIR, folder), exist_ok=True)
+        log.info("Tile stream: %s ready with %d DSFs (%s, %s, %s), %d hidden, limit %s",
+                 os.path.basename(self.root), sum(len(self.index.dsf_names(f))
+                 for f in self.index.dsf_folders()), self.index.name,
+                 self.index.variant, self.kind, len(self.hidden),
+                 f"{self.disk_limit/1e9:.0f} GB" if self.disk_limit else "none")
+
+    def _index_path(self, marker: dict) -> str:
+        path = marker.get("index", INDEX_NAME)
+        if not os.path.isabs(path):
+            path = os.path.join(self.root, path)
+        return path
+
+    def shutdown(self) -> None:
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        self._bg_pool.shutdown(wait=False, cancel_futures=True)
+
+    # -- listing --------------------------------------------------------
+    def dsf_names(self, folder: str) -> List[str]:
+        return [n for n in self.index.dsf_names(folder)
+                if f"{DSF_DIR}/{folder}/{n}" not in self.hidden]
+
+    def entry(self, rel: str) -> Optional[list]:
+        if rel in self.hidden:
+            return None
+        return self.index.lookup(rel)
+
+    def remote_size(self, rel: str) -> Optional[int]:
+        e = self.entry(rel)
+        return e[_ENTRY_SIZE] if e else None
+
+    def recently_failed(self, rel: str, window: float = 300.0) -> bool:
+        t = self._failed.get(rel)
+        return t is not None and time.time() - t < window
+
+    def unavailable(self, rel: str) -> bool:
+        """True if a fetch now would not be tried (throttled or just failed)."""
+        return self.remote.in_cooldown() or self.recently_failed(rel)
+
+    def local_path(self, rel: str) -> str:
+        return os.path.join(self.root, *rel.split("/"))
+
+    # -- fetching -------------------------------------------------------
+    def ensure_local(self, rel: str, timeout: Optional[float] = None) -> Optional[str]:
+        """Path to ``rel`` on disk, fetching it first if needed."""
+        local = self.local_path(rel)
+        if os.path.exists(local):
+            return local
+        if self.entry(rel) is None or self.unavailable(rel):
+            return None
+        event = self._start_fetch(rel, background=False)
+        event.wait(self.open_timeout if timeout is None else timeout)
+        return local if os.path.exists(local) else None
+
+    def prefetch(self, rel: str) -> bool:
+        """Fetch ``rel`` in the background if it isn't on disk yet."""
+        if (os.path.exists(self.local_path(rel)) or self.entry(rel) is None
+                or self.unavailable(rel)):
+            return False
+        if self._background_pending >= self.MAX_BACKGROUND:
+            return False
+        self._start_fetch(rel, background=True)
+        return True
+
+    def prefetch_neighbors(self, rel: str) -> int:
+        """Queue the DSFs around ``rel``; X-Plane loads them next.
+
+        Opening a tile at the edge of the loaded area means the aircraft is
+        heading that way, so the ring around it also covers the tiles ahead.
+        """
+        m = re.search(r"([+-]\d{2})([+-]\d{3})\.dsf$", rel)
+        if not m or self.prefetch_ring <= 0:
+            return 0
+        lat0, lon0 = int(m.group(1)), int(m.group(2))
+        queued = 0
+        ring = self.prefetch_ring
+        for dlat in range(-ring, ring + 1):
+            for dlon in range(-ring, ring + 1):
+                if dlat == 0 and dlon == 0:
+                    continue
+                lat, lon = lat0 + dlat, (lon0 + dlon + 180) % 360 - 180
+                if not -90 <= lat < 90:
+                    continue
+                queued += self.prefetch(dsf_rel(lat, lon))
+        return queued
+
+    def _start_fetch(self, rel: str, background: bool) -> threading.Event:
+        with self._inflight_lock:
+            event = self._inflight.get(rel)
+            fresh = event is None
+            if fresh:
+                event = threading.Event()
+                self._inflight[rel] = event
+                self._rel_locks.setdefault(rel, threading.Lock())
+                if background:
+                    self._background_pending += 1
+        if not fresh and background:
+            return event
+        # A foreground request for a tile already queued as a prefetch also
+        # goes to the foreground pool; whichever runs second finds the file.
+        pool = self._bg_pool if background else self._pool
+        try:
+            pool.submit(self._fetch, rel, event, background)
+        except RuntimeError:  # pool shut down
+            with self._inflight_lock:
+                if background:
+                    self._background_pending -= 1
+            event.set()
+        return event
+
+    def _fetch(self, rel: str, event: threading.Event, counted: bool = False) -> None:
+        started = time.monotonic()
+        local = self.local_path(rel)
+        lock = self._rel_locks.get(rel) or threading.Lock()
+        try:
+            with lock:
+                if os.path.exists(local):
+                    return
+                data = fetch_member(self.remote, self.index, self.index.lookup(rel))
+                tmp = f"{local}.part{threading.get_ident()}"
+                os.makedirs(os.path.dirname(local), exist_ok=True)
+                with open(tmp, "wb") as fh:
+                    fh.write(data)
+                os.replace(tmp, local)
+            self._failed.pop(rel, None)
+            self.stats["prefetched" if counted else "fetched"] += 1
+            log.info("Tile stream: %s %s (%.1f MB) in %.2fs",
+                     "prefetched" if counted else "fetched", rel,
+                     len(data) / 1e6, time.monotonic() - started)
+            self._account(len(data))
+            if rel.endswith(".dsf"):
+                self._after_dsf(data, local)
+        except ThrottledError as exc:
+            self._failed[rel] = time.time()
+            self.stats["failed"] += 1
+            log.info("Tile stream: %s not fetched: %s", rel, exc)
+        except Exception as exc:
+            self._failed[rel] = time.time()
+            self.stats["failed"] += 1
+            log.warning("Tile stream: fetching %s failed: %s", rel, exc)
+        finally:
+            with self._inflight_lock:
+                if self._inflight.get(rel) is event:
+                    self._inflight.pop(rel, None)
+                if counted:
+                    self._background_pending -= 1
+            event.set()
+
+    # -- disk budget ----------------------------------------------------
+    def touch(self, local: str) -> None:
+        """Mark a file as recently used (eviction goes by modification time)."""
+        try:
+            os.utime(local, None)
+        except OSError:
+            pass
+
+    def _stored_files(self) -> List[os.DirEntry]:
+        out = []
+        dsf_root = os.path.join(self.root, DSF_DIR)
+        try:
+            dirs = [os.path.join(dsf_root, d) for d in os.listdir(dsf_root)]
+        except OSError:
+            dirs = []
+        for sub in dirs + [os.path.join(self.root, "textures")]:
+            try:
+                for e in os.scandir(sub):
+                    if e.is_file() and e.name.endswith((".dsf", ".png")):
+                        out.append(e)
+            except OSError:
+                continue
+        return out
+
+    def usage(self) -> Tuple[int, int]:
+        """(bytes, DSF count) stored in the package folder."""
+        files = self._stored_files()
+        total = sum(e.stat().st_size for e in files)
+        with self._usage_lock:
+            self._usage = total
+        return total, sum(1 for e in files if e.name.endswith(".dsf"))
+
+    def _account(self, added: int) -> None:
+        if not self.disk_limit:
+            return
+        with self._usage_lock:
+            if self._usage is not None:
+                self._usage += added
+            over = self._usage is None or self._usage > self.disk_limit
+            due = time.monotonic() - self._last_evict > self.EVICT_INTERVAL
+            if not (over and due):
+                return
+            self._last_evict = time.monotonic()
+        try:
+            self._bg_pool.submit(self.evict)
+        except RuntimeError:
+            pass
+
+    def evict(self) -> int:
+        """Delete least recently used files until under the disk limit."""
+        if not self.disk_limit:
+            return 0
+        stats = {}
+        for e in self._stored_files():
+            try:
+                stats[e.path] = e.stat()
+            except OSError:
+                continue
+        total = sum(st.st_size for st in stats.values())
+        removed = 0
+        if total > self.disk_limit:
+            cutoff = time.time() - self.PROTECT_SECONDS
+            for path, st in sorted(stats.items(), key=lambda kv: kv[1].st_mtime):
+                if total <= self.disk_limit * 0.9 or st.st_mtime >= cutoff:
+                    break  # under budget, or everything left was used recently
+                try:
+                    os.remove(path)
+                except OSError:
+                    continue
+                total -= st.st_size
+                removed += 1
+        with self._usage_lock:
+            self._usage = total
+        self.stats["evicted"] += removed
+        if removed:
+            log.info("Tile stream: removed %d least recently used files, %.1f GB stored",
+                     removed, total / 1e9)
+        return removed
+
+    def note_local_dsf(self, local_path: str) -> None:
+        """Read the terrain list of a DSF fetched in an earlier session."""
+        key = os.path.normcase(local_path)
+        with self._inflight_lock:
+            if key in self._noted:
+                return
+            self._noted.add(key)
+
+        def work():
+            try:
+                with open(local_path, "rb") as fh:
+                    self._after_dsf(fh.read(), local_path)
+            except OSError as exc:
+                log.debug("Tile stream: could not read %s: %s", local_path, exc)
+        try:
+            self._bg_pool.submit(work)
+        except RuntimeError:
+            pass
+
+    def _after_dsf(self, data: bytes, path: Optional[str] = None) -> None:
+        """Queue the tile's water masks and report its textures."""
+        if data.startswith(SEVENZIP_MAGIC) and path:
+            data = unpack_7z_dsf(path) or b""
+        names = dsf_terrain_names(data)
+        if names is None:
+            return
+        self.note_terrain(names)
+
+    def note_terrain(self, names: List[str]) -> None:
+        tiles = terrain_tiles(names)
+        if tiles and self.on_terrain:
+            try:
+                self.on_terrain(tiles)
+            except Exception as exc:
+                log.debug("Tile stream: terrain callback failed: %s", exc)
+        for name in names:
+            if not name.startswith("terrain/") or "_overlay" not in name:
+                continue
+            ter = self.ter_bytes(name.split("/", 1)[1])
+            if ter:
+                for tex in border_textures(ter):
+                    self.prefetch(tex)
+
+    # -- terrain --------------------------------------------------------
+    def ter_bytes(self, name: str) -> Optional[bytes]:
+        with self._ter_lock:
+            cached = self._ter_cache.get(name)
+        if cached is not None:
+            return cached
+        data = synthesize_ter(name, self.index.ter_params,
+                              self.index.ter_exceptions, self.roughness)
+        if data is not None:
+            with self._ter_lock:
+                if len(self._ter_cache) > 50000:
+                    self._ter_cache.clear()
+                self._ter_cache[name] = data
+        return data
+
+
+def installed_dsfs(scenery_dir: str, exclude: str) -> set:
+    """DSFs present in the other packages beside a streaming one."""
+    found = set()
+    exclude = os.path.normcase(os.path.abspath(exclude))
+    try:
+        packages = list(os.scandir(scenery_dir))
+    except OSError:
+        return found
+    for pkg in packages:
+        if not pkg.is_dir() or os.path.normcase(os.path.abspath(pkg.path)) == exclude:
+            continue
+        if os.path.isfile(os.path.join(pkg.path, MARKER_NAME)):
+            continue
+        dsf_root = os.path.join(pkg.path, DSF_DIR)
+        try:
+            folders = list(os.scandir(dsf_root))
+        except OSError:
+            continue
+        for folder in folders:
+            if not folder.is_dir():
+                continue
+            try:
+                for f in os.scandir(folder.path):
+                    if f.name.endswith(".dsf"):
+                        found.add(f"{DSF_DIR}/{folder.name}/{f.name}")
+            except OSError:
+                continue
+    return found
+
+
+def overlay_hidden_dsfs(custom_scenery_dir: str) -> set:
+    """Overlay DSFs already installed by the classic overlay download."""
+    found = set()
+    dsf_root = os.path.join(custom_scenery_dir, LEGACY_OVERLAY_FOLDER, DSF_DIR)
+    try:
+        folders = list(os.scandir(dsf_root))
+    except OSError:
+        return found
+    for folder in folders:
+        if folder.is_dir():
+            try:
+                found.update(f"{DSF_DIR}/{folder.name}/{f.name}"
+                             for f in os.scandir(folder.path) if f.name.endswith(".dsf"))
+            except OSError:
+                continue
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Empty overlay DSF
+# ---------------------------------------------------------------------------
+
+def _atom(atom_id: str, payload: bytes) -> bytes:
+    return atom_id[::-1].encode("ascii") + struct.pack("<I", len(payload) + 8) + payload
+
+
+def _string_table(strings: Iterable[str]) -> bytes:
+    return b"".join(s.encode("utf-8") + b"\0" for s in strings)
+
+
+def empty_overlay_dsf(lat: int, lon: int) -> bytes:
+    """A valid overlay DSF with nothing in it.
+
+    Served in place of an overlay tile that can't be fetched: X-Plane has
+    already seen the tile listed, and a missing file would be a load error,
+    while Global Scenery can't stand in for an overlay.
+    """
+    props = ["sim/west", str(lon), "sim/east", str(lon + 1),
+             "sim/south", str(lat), "sim/north", str(lat + 1),
+             "sim/overlay", "1", "sim/creation_agent", "AutoOrtho"]
+    body = (
+        _atom("HEAD", _atom("PROP", _string_table(props)))
+        + _atom("DEFN", _atom("TERT", b"") + _atom("OBJT", b"")
+                + _atom("POLY", b"") + _atom("NETW", b"") + _atom("DEMN", b""))
+        + _atom("GEOD", b"")
+        + _atom("CMDS", b"")
+    )
+    data = b"XPLNEDSF" + struct.pack("<I", 1) + body
+    return data + hashlib.md5(data).digest()
+
+
+# ---------------------------------------------------------------------------
+# Setting packages up
+# ---------------------------------------------------------------------------
+
+def _parse_index_bytes(data: bytes) -> dict:
+    with gzip.GzipFile(fileobj=io.BytesIO(data)) as fh:
+        parsed = json.load(fh)
+    TileIndex(parsed)  # validates the format
+    return parsed
+
+
+def download_index(url: str, dest: str, session: Optional[requests.Session] = None,
+                   timeout: float = 60.0) -> dict:
+    """Fetch a published index to ``dest`` (atomically) and return its summary."""
+    session = session or requests.Session()
+    r = session.get(url, timeout=timeout, headers={"User-Agent": "autoortho-tile-stream"})
+    if r.status_code != 200:
+        raise IOError(f"HTTP {r.status_code} downloading {url}")
+    parsed = _parse_index_bytes(r.content)
+    with open(dest + ".part", "wb") as fh:
+        fh.write(r.content)
+    os.replace(dest + ".part", dest)
+    return {"name": parsed.get("name"), "built": parsed.get("built"),
+            "dsfs": sum(1 for f in parsed["files"] if f.endswith(".dsf")),
+            "last_modified": r.headers.get("Last-Modified", "")}
+
+
+def write_marker(root: str, marker: dict) -> None:
+    path = os.path.join(root, MARKER_NAME)
+    with open(path + ".part", "w", encoding="utf-8") as fh:
+        json.dump(marker, fh, indent=2)
+    os.replace(path + ".part", path)
+
+
+def refresh_index(root: str, marker: dict, max_age_days: float = 7.0,
+                  session: Optional[requests.Session] = None) -> bool:
+    """Replace a package's index if the published one changed. Best effort.
+
+    The new index is used from the next mount on.
+    """
+    url = marker.get("index_url")
+    if not url:
+        return False
+    path = os.path.join(root, marker.get("index", INDEX_NAME))
+    try:
+        if time.time() - os.path.getmtime(path) < max_age_days * 86400:
+            return False
+    except OSError:
+        pass
+    session = session or requests.Session()
+    headers = {"User-Agent": "autoortho-tile-stream"}
+    if marker.get("index_last_modified"):
+        headers["If-Modified-Since"] = marker["index_last_modified"]
+    try:
+        r = session.get(url, timeout=60, headers=headers)
+        if r.status_code == 304:
+            os.utime(path, None)
+            return False
+        if r.status_code != 200:
+            return False
+        _parse_index_bytes(r.content)
+        with open(path + ".part", "wb") as fh:
+            fh.write(r.content)
+        os.replace(path + ".part", path)
+        write_marker(root, dict(marker, index_last_modified=r.headers.get("Last-Modified", "")))
+        log.info("Tile stream: updated index for %s", os.path.basename(root))
+        return True
+    except Exception as exc:
+        log.info("Tile stream: index refresh for %s skipped: %s", os.path.basename(root), exc)
+        return False
+
+
+def stream_packages(ao_scenery_dir: str) -> Dict[str, dict]:
+    """Streaming packages under z_autoortho/scenery: folder name -> marker."""
+    out = {}
+    try:
+        entries = sorted(os.scandir(ao_scenery_dir), key=lambda e: e.name)
+    except OSError:
+        return out
+    for e in entries:
+        if e.is_dir():
+            marker = read_marker(e.path)
+            if marker is not None:
+                out[e.name] = marker
+    return out
+
+
+def enable_streaming(ao_scenery_dir: str, source: str, overlays: bool = True,
+                     disk_limit_gb: float = 20.0, roughness: Optional[float] = None,
+                     session: Optional[requests.Session] = None) -> List[str]:
+    """Create the streaming package(s) for a source and fetch their indexes.
+
+    Returns the folder names set up. Overlays get a quarter of the disk
+    limit (their tiles are smaller).
+    """
+    spec = SOURCES.get(source)
+    if not spec or not spec.get("available"):
+        raise ValueError(f"Scenery source {source!r} is not available yet")
+    wanted = [(ORTHO_PACKAGE.format(source=source), "ortho", spec["ortho_index"],
+               float(disk_limit_gb))]
+    if overlays and spec.get("overlay_index"):
+        wanted.append((OVERLAY_PACKAGE.format(source=source), "overlay",
+                       spec["overlay_index"], max(1.0, float(disk_limit_gb) / 4)))
+    created = []
+    for name, kind, url, limit in wanted:
+        root = os.path.join(ao_scenery_dir, name)
+        is_new = not os.path.isdir(root)
+        os.makedirs(root, exist_ok=True)
+        try:
+            info = download_index(url, os.path.join(root, INDEX_NAME), session=session)
+        except Exception:
+            if is_new:  # don't leave an empty folder that would be mounted
+                import shutil
+                shutil.rmtree(root, ignore_errors=True)
+            raise
+        marker = {"source": source, "kind": kind, "index": INDEX_NAME,
+                  "index_url": url, "index_last_modified": info["last_modified"],
+                  "disk_limit_gb": limit}
+        if roughness is not None and kind == "ortho":
+            marker["roughness"] = roughness
+        write_marker(root, marker)
+        created.append(name)
+    if not overlays:
+        _remove_package(ao_scenery_dir, OVERLAY_PACKAGE.format(source=source))
+    return created
+
+
+def update_stream_settings(ao_scenery_dir: str, disk_limit_gb: float) -> None:
+    """Apply a new disk limit to existing streaming packages."""
+    for name, marker in stream_packages(ao_scenery_dir).items():
+        limit = float(disk_limit_gb)
+        if marker.get("kind") == "overlay":
+            limit = max(1.0, limit / 4)
+        write_marker(os.path.join(ao_scenery_dir, name), dict(marker, disk_limit_gb=limit))
+
+
+def _remove_package(ao_scenery_dir: str, name: str) -> bool:
+    import shutil
+    root = os.path.join(ao_scenery_dir, name)
+    if not os.path.isfile(os.path.join(root, MARKER_NAME)):
+        return False  # never delete a folder this module didn't create
+    shutil.rmtree(root, ignore_errors=True)
+    return True
+
+
+def disable_streaming(ao_scenery_dir: str, source: Optional[str] = None) -> List[str]:
+    """Delete streaming packages (all, or one source's) and their tiles."""
+    removed = []
+    for name, marker in stream_packages(ao_scenery_dir).items():
+        if source is None or marker.get("source") == source:
+            if _remove_package(ao_scenery_dir, name):
+                removed.append(name)
+    return removed
+
+
+def stream_usage(ao_scenery_dir: str) -> Tuple[int, int]:
+    """(bytes, DSF count) stored by all streaming packages."""
+    total = count = 0
+    for name in stream_packages(ao_scenery_dir):
+        dsf_root = os.path.join(ao_scenery_dir, name, DSF_DIR)
+        dirs = []
+        try:
+            dirs = [e.path for e in os.scandir(dsf_root) if e.is_dir()]
+        except OSError:
+            pass
+        for d in dirs + [os.path.join(ao_scenery_dir, name, "textures")]:
+            try:
+                for f in os.scandir(d):
+                    if f.is_file() and f.name.endswith((".dsf", ".png")):
+                        total += f.stat().st_size
+                        count += f.name.endswith(".dsf")
+            except OSError:
+                continue
+    return total, count
+
+
+def ensure_pack_order(custom_scenery_dir: str, ortho_name: str,
+                      overlay_name: Optional[str]) -> bool:
+    """Keep streamed overlays directly above AutoOrtho orthos in scenery_packs.ini.
+
+    A missing ortho entry is added at the bottom (lowest priority); the
+    overlay goes right below the classic yAutoOrtho_Overlays entry if there
+    is one, else right above the first AutoOrtho ortho entry. Returns True if
+    the file changed. The original is kept once as scenery_packs.ini.ao_backup.
+    """
+    ini = os.path.join(custom_scenery_dir, "scenery_packs.ini")
+    if not os.path.isfile(ini):
+        return False
+    with open(ini, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines()
+    original = list(lines)
+
+    def entry(name):
+        return f"SCENERY_PACK Custom Scenery/{name}/"
+
+    def find(name):
+        for i, line in enumerate(lines):
+            if line.rstrip("/").endswith(f"Custom Scenery/{name}"):
+                return i
+        return None
+
+    if find(ortho_name) is None:
+        lines.append(entry(ortho_name))
+    if overlay_name:
+        idx = find(overlay_name)
+        line = lines.pop(idx) if idx is not None else entry(overlay_name)
+        legacy = find(LEGACY_OVERLAY_FOLDER)
+        anchors = [i for i, text in enumerate(lines)
+                   if re.search(r"Custom Scenery/z_ao_[^/]*/?$", text)]
+        if legacy is not None:
+            lines.insert(legacy + 1, line)
+        elif anchors:
+            lines.insert(anchors[0], line)
+        else:
+            lines.append(line)
+    if lines == original:
+        return False
+    backup = ini + ".ao_backup"
+    if not os.path.exists(backup):
+        with open(backup, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(original) + "\n")
+    with open(ini + ".part", "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(ini + ".part", ini)
+    return True
+
+
+def ensure_all_pack_orders(ao_scenery_dir: str, custom_scenery_dir: str) -> bool:
+    """Run ensure_pack_order for every source that has streaming packages."""
+    changed = False
+    packages = stream_packages(ao_scenery_dir)
+    for source in {m.get("source") for m in packages.values()}:
+        ortho = ORTHO_PACKAGE.format(source=source)
+        overlay = OVERLAY_PACKAGE.format(source=source)
+        if ortho in packages:
+            changed |= ensure_pack_order(custom_scenery_dir, ortho,
+                                         overlay if overlay in packages else None)
+    return changed

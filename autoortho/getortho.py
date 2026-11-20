@@ -5133,6 +5133,9 @@ class TerrainTileLookup:
         self._highzoom_index: Dict[Tuple[int, int], List[Tuple[int, int, str, int]]] = {}
         self._highzoom_count = 0
         self._index_lock = threading.Lock()
+        # Tiles known from streamed DSFs, which have no .ter files on disk.
+        self._virtual: set = set()
+        self._virtual_highzoom: Dict[Tuple[int, int], List[Tuple[int, int, str, int]]] = {}
         self._index_ready = threading.Event()
         self._index_cancel = threading.Event()
         self._index_error = None
@@ -5177,7 +5180,7 @@ class TerrainTileLookup:
         Returns:
             List of (row, col, maptype, zoom) tuples for tiles that exist.
         """
-        if not self._folder_exists:
+        if not self._folder_exists and not self._virtual:
             return []
         
         results = []
@@ -5211,9 +5214,11 @@ class TerrainTileLookup:
         """
         cache_key = (row, col, maptype, zoom)
         self._lookups += 1
-        
+
         # Check cache first
         with self._cache_lock:
+            if cache_key in self._virtual:
+                return True
             if cache_key in self._cache:
                 self._cache_hits += 1
                 return self._cache[cache_key]
@@ -5242,6 +5247,34 @@ class TerrainTileLookup:
         """Check if a specific tile exists."""
         return self._tile_exists(row, col, maptype, zoom)
 
+    def add_virtual_tiles(self, tiles) -> None:
+        """Record textures used by a streamed DSF.
+
+        Streaming packages generate their .ter files on demand, so there is
+        nothing on disk to find; the DSF's terrain list stands in for them.
+        """
+        new_highzoom = []
+        with self._cache_lock:
+            for tile in tiles:
+                key = (int(tile[0]), int(tile[1]), str(tile[2]), int(tile[3]))
+                if key in self._virtual:
+                    continue
+                self._virtual.add(key)
+                row_val, col_val, maptype, zoom = key
+                if (
+                    zoom in (18, 19)
+                    and maptype.upper() not in ("ZL", "")
+                    and row_val % self.TILE_GRID_STEP == 0
+                    and col_val % self.TILE_GRID_STEP == 0
+                ):
+                    new_highzoom.append(key)
+        if new_highzoom:
+            with self._index_lock:
+                for key in new_highzoom:
+                    lat, lon = self._tile_to_latlon(key[0], key[1], key[3])
+                    bucket = (int(math.floor(lat)), int(math.floor(lon)))
+                    self._virtual_highzoom.setdefault(bucket, []).append(key)
+
     def get_tiles_for_bounds(
         self,
         lat_min: float,
@@ -5253,7 +5286,7 @@ class TerrainTileLookup:
         tile_zooms=(16, 18),
     ) -> List[Tuple[int, int, str, int]]:
         """Return terrain tiles intersecting geographic bounds."""
-        if not self._folder_exists:
+        if not self._folder_exists and not self._virtual:
             return []
         maptypes = (
             [maptype_filter]
@@ -5486,10 +5519,13 @@ class TerrainTileLookup:
         Returns:
             List of (row, col, maptype, zoom) tuples for matching tiles
         """
-        if not self._index_ready.is_set():
-            return []
         with self._index_lock:
-            highzoom_index = self._highzoom_index
+            highzoom_index = self._highzoom_index if self._index_ready.is_set() else {}
+            if self._virtual_highzoom:
+                merged = {k: list(v) for k, v in highzoom_index.items()}
+                for key, entries in self._virtual_highzoom.items():
+                    merged.setdefault(key, []).extend(entries)
+                highzoom_index = merged
         if not highzoom_index:
             return []
 
