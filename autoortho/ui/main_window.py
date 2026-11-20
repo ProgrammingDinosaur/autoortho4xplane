@@ -62,7 +62,7 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.widgets.scenery_patches import SceneryPatchesWidget
     from autoortho.ui.shell import ApplicationShell
     from autoortho.ui.pages.scenery_page import SceneryLibraryPage
-    from autoortho import tile_stream
+    from autoortho import region_adopt, tile_stream
     from autoortho.ui.pages.settings_page import SettingsPage
     from autoortho.ui.pages.expert_settings_page import ExpertSettingsPage
     from autoortho.ui.widgets.target_cost_panel import TargetCostPanel
@@ -140,6 +140,7 @@ else:
     from ui.widgets.scenery_patches import SceneryPatchesWidget
     from ui.shell import ApplicationShell
     from ui.pages.scenery_page import SceneryLibraryPage
+    import region_adopt
     import tile_stream
     from ui.pages.settings_page import SettingsPage
     from ui.pages.expert_settings_page import ExpertSettingsPage
@@ -558,6 +559,7 @@ class ConfigUI(QMainWindow):
     hardware_detected = Signal()
     # Home's snapshot, once a second (home_snapshot.build).
     home_snapshot_ready = Signal(object)
+    _adopt_progress = Signal(str, int, int)   # region, files done, total
 
     def __init__(self, cfg, *args, **kwargs):
         super().__init__()
@@ -1007,14 +1009,6 @@ class ConfigUI(QMainWindow):
             self.categorized_settings_page.search_edit,
             self.categorized_settings_page.show_all_check,
         )
-        self.setTabOrder(
-            self.scenery_library_page.search_edit,
-            self.scenery_library_page.status_filter,
-        )
-        self.setTabOrder(
-            self.scenery_library_page.status_filter,
-            self.scenery_library_page.region_filter,
-        )
 
     def _install_keyboard_shortcuts(self):
         self._ui_shortcuts = []
@@ -1053,6 +1047,7 @@ class ConfigUI(QMainWindow):
         )
         self.home_page.notice_bar.dismissed.connect(self._dismiss_notice)
         self.home_snapshot_ready.connect(self.home_page.set_snapshot)
+        self._adopt_progress.connect(self._on_adopt_progress)
         self.home_page.primary_action_requested.connect(self.on_run)
         self.home_page.tuning_requested.connect(
             lambda: self.navigate_to("settings", "Auto-Tuning")
@@ -1071,18 +1066,15 @@ class ConfigUI(QMainWindow):
         self._after_flight = False
 
         self.scenery_library_page = SceneryLibraryPage()
-        self.scenery_library_page.install_requested.connect(
-            self.on_install_scenery
-        )
         self.scenery_library_page.uninstall_requested.connect(
             self.on_delete_scenery
         )
         self.scenery_library_page.options_requested.connect(
             self._open_scenery_options_for_region
         )
-        self.scenery_library_page.settings_requested.connect(
-            lambda: self.navigate_to("settings", "Setup & Storage")
-        )
+        self.scenery_library_page.adopt_requested.connect(self._on_adopt_regions)
+        self._region_check_running = False
+        self._region_check_again = False
         stream_panel = self.scenery_library_page.stream_panel
         stream_panel.enable_requested.connect(self._on_stream_enable)
         stream_panel.disable_requested.connect(self._on_stream_disable)
@@ -2736,6 +2728,7 @@ class ConfigUI(QMainWindow):
             self.diagnostics_page.refresh_reports()
         elif page == "scenery-library":
             self._refresh_phase3_task_views()
+            self._refresh_region_checks()
 
     def _refresh_phase3_task_views(self):
         if not self.phase3_active:
@@ -3527,6 +3520,9 @@ class ConfigUI(QMainWindow):
         selected_streaming = getattr(wizard, "selected_streaming", None)
         streaming = selected_streaming() if callable(selected_streaming) else None
         if streaming:
+            self.scenery_library_page.stream_panel.fetch_check.setChecked(
+                bool(streaming.get("fetch_missing", True))
+            )
             self._on_stream_enable(
                 streaming["source"],
                 streaming["overlays"],
@@ -7000,6 +6996,7 @@ class ConfigUI(QMainWindow):
                 self.dl.regions.values(),
                 self.task_manager.tasks.values(),
             )
+            self._refresh_region_checks()
 
     def on_restore_default_dsfs(self, region_id):
         """Handle restoring default DSFs"""
@@ -7584,6 +7581,8 @@ class ConfigUI(QMainWindow):
             self.cfg.refresh_derived_paths(create_missing=False)
         except Exception as exc:
             log.warning(f"Could not refresh scenery mounts: {exc}")
+        # Whether installed regions can move depends on the scenery set.
+        self._refresh_region_checks()
         try:
             tile_stream.ensure_all_pack_orders(
                 self.cfg.ao_scenery_path, self.cfg.xplane_custom_scenery_path
@@ -7666,6 +7665,103 @@ class ConfigUI(QMainWindow):
             package=self._stream_source_label(source),
             on_success=on_success,
         )
+
+    def _refresh_region_checks(self):
+        """Check in the background which installed regions can move into the
+        AutoOrtho scenery (lists and stats their files, ~10 s cold)."""
+        page = self.scenery_library_page
+        if self._region_check_running:
+            self._region_check_again = True
+            return
+        scenery_dir = self.cfg.ao_scenery_path
+        if not scenery_dir or not region_adopt.installed_regions(scenery_dir):
+            page.set_adopt_checks([])
+            return
+        self._region_check_running = True
+        page.set_adopt_checks(None)
+
+        def checks():
+            try:
+                return region_adopt.check_regions(scenery_dir)
+            except ValueError:  # no scenery set chosen
+                return [region_adopt.RegionCheck(
+                    name=name, region_id=name[len(region_adopt.REGION_PREFIX):],
+                    reason="Choose a scenery set above to move it.")
+                    for name in region_adopt.installed_regions(scenery_dir)]
+
+        def show(result):
+            self._region_check_running = False
+            if isinstance(result, Exception):
+                log.warning(f"Could not check the installed regions: {result}")
+                result = []
+            page.set_adopt_checks(result)
+            if self._region_check_again:
+                self._region_check_again = False
+                self._refresh_region_checks()
+
+        self._run_stream_job(checks, show)
+
+    def _on_adopt_regions(self):
+        page = self.scenery_library_page
+        movable = page.movable_regions
+        if not movable:
+            return
+        tiles = sum(len(c.tiles) for c in movable)
+        size = sum(c.size for c in movable)
+        names = ", ".join(sorted(c.region_id for c in movable))
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Move Installed Regions")
+        box.setText(f"Move {len(movable)} installed region"
+                    f"{'s' if len(movable) != 1 else ''} into AutoOrtho scenery?")
+        box.setInformativeText(
+            f"{names}: {tiles:,} tiles, {format_bytes(size)}. The files are moved, "
+            "not downloaded again, and the tiles show on the map as downloaded. "
+            "Their Seasons and terrain reflectivity patches are kept. The "
+            "region folders are removed afterwards.")
+        move = box.addButton("Move", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        if box.clickedButton() is not move:
+            return
+        scenery_dir = self.cfg.ao_scenery_path
+        custom = self.cfg.xplane_custom_scenery_path
+        folders = [c.name for c in movable]
+        task_id = "scenery-adopt"
+        self.task_manager.create_task(
+            task_id, TaskType.SCENERY_INSTALL, "Move installed regions",
+            package=names, stage="Moving files")
+        page.adopt_button.setEnabled(False)
+
+        def progress(region, done, total):
+            self._adopt_progress.emit(str(region), int(done), int(total))
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.task_manager.fail_task(task_id, str(result))
+                self.display_error(f"Could not move the installed regions:\n{result}")
+            elif result.errors:
+                self.task_manager.fail_task(task_id, "; ".join(result.errors))
+            else:
+                self.task_manager.complete_task(task_id, stage=str(result).capitalize())
+            if not isinstance(result, Exception):
+                self.update_status_bar(f"Installed regions: {result}.")
+            self._after_stream_change()
+            self.refresh_scenery_list()
+            self._refresh_region_checks()
+            editor = getattr(self, "custom_map_editor", None)
+            if editor is not None and editor.cache_panel is not None:
+                editor.cache_panel.refresh()
+
+        self._run_stream_job(
+            lambda: region_adopt.adopt_regions(
+                scenery_dir, folders, custom_scenery_dir=custom, progress=progress),
+            done)
+
+    def _on_adopt_progress(self, region, done, total):
+        self.task_manager.update_task(
+            "scenery-adopt", progress=100.0 * done / max(1, total),
+            stage=f"Moving {region}: {done:,} of {total:,} files")
 
     def _streamed_bytes(self):
         state = self.scenery_library_page.stream_panel.state

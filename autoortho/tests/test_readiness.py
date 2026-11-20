@@ -147,7 +147,7 @@ def test_build_readiness_allows_streaming_without_regions(tmp_path, monkeypatch)
     streaming = build_readiness(values, scenery_choices=[], streaming=True)
 
     assert without.can_finish is False
-    assert "streaming" in without.by_id("setup-scenery").fix_action
+    assert "AutoOrtho scenery" in without.by_id("setup-scenery").fix_action
     assert streaming.by_id("setup-scenery").status == ReadinessStatus.SUCCESS
     assert streaming.installed_scenery_present is False
     assert streaming.can_finish is True

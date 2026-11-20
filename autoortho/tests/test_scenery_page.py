@@ -5,11 +5,8 @@ from types import SimpleNamespace
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pytest
-from PySide6.QtWidgets import QApplication
-
-from ui.models.scenery_model import SceneryListModel
-from ui.pages.scenery_page import SceneryLibraryPage
+from region_adopt import RegionCheck  # noqa: E402
+from ui.pages.scenery_page import SceneryLibraryPage  # noqa: E402
 
 
 def _region(region_id, latest, installed=None, size=1024):
@@ -41,95 +38,75 @@ def _region(region_id, latest, installed=None, size=1024):
     )
 
 
-def test_scenery_library_filters_and_prioritizes(qt_app):
-    page = SceneryLibraryPage()
-    page.set_regions(
-        [
-            _region("na", "2.0", installed="1.0"),
-            _region("eu", "1.0"),
-            _region("sa", "1.0", installed="1.0"),
-        ]
-    )
-
-    def visible_ids():
-        return [
-            page.proxy_model.data(
-                page.proxy_model.index(row, 0),
-                SceneryListModel.RegionIdRole,
-            )
-            for row in range(page.proxy_model.rowCount())
-        ]
-
-    assert visible_ids() == [
-        "na",
-        "sa",
-        "eu",
-    ]
-
-    page.status_filter.setCurrentText("Updates")
-    assert visible_ids() == ["na"]
-
-    page.status_filter.setCurrentText("All")
-    page.search_edit.setText("EU")
-    assert visible_ids() == ["eu"]
+def _check(region_id, reason="", tiles=2, size=2 * 1024 ** 3):
+    return RegionCheck(name=f"z_ao_{region_id}", region_id=region_id,
+                       dsfs=tiles, known=tiles, size=size,
+                       tiles=[(i, i) for i in range(tiles)], reason=reason)
 
 
-def test_scenery_card_actions_emit_region(qt_app):
+def test_only_installed_regions_are_listed(qt_app):
     page = SceneryLibraryPage()
     page.set_regions([_region("eu", "1.0")])
-    seen = []
-    page.install_requested.connect(seen.append)
+    assert page.cards == [] and page.regions_group.isHidden()
 
-    page._request_primary_action("eu")
-
-    assert seen == ["eu"]
-
-
-def test_update_uses_installed_patch_status_and_hides_patch_action(qt_app):
-    page = SceneryLibraryPage()
-    page.set_regions([_region("na", "2.0", installed="1.0")])
-
-    item = page.model.item(0)
-    assert item.seasons_status == "Applied"
-    assert item.roughness_status == "Partial"
-    assert item.update_available is True
+    page.set_regions([_region("na", "2.0", installed="1.0"), _region("eu", "1.0"),
+                      _region("sa", "1.0", installed="1.0")])
+    assert [c.item.region_id for c in page.cards] == ["na", "sa"]
+    assert not page.regions_group.isHidden()
 
 
-def test_open_details_refresh_after_patch_and_reinstallation(qt_app):
-    page = SceneryLibraryPage()
-    region = _region("na", "1.0", installed="1.0")
-    region.local_rel.seasons_apply_status.value = "not_applied"
-    region.local_rel.roughness_apply_status.value = "not_applied"
-    page.set_regions([region])
-    page.list_view.setCurrentIndex(page.proxy_model.index(0, 0))
-    assert "Terrain reflectivity: Not applied" in page.details_label.text()
-
-    region.local_rel.seasons_apply_status.value = "applied"
-    region.local_rel.roughness_apply_status.value = "applied"
-    page.set_regions([region])
-
-    assert "Seasons: Applied" in page.details_label.text()
-    assert "Terrain reflectivity: Applied (0.8)" in page.details_label.text()
-    assert page.list_view.currentIndex().data(SceneryListModel.RegionIdRole) == "na"
-
-    # A fresh installation resets the patches without requiring reselection.
-    region.local_rel.seasons_apply_status.value = "not_applied"
-    region.local_rel.roughness_apply_status.value = "not_applied"
-    region.local_rel.roughness_value = None
-    page.set_regions([region])
-
-    assert "Seasons: Not applied" in page.details_label.text()
-    assert "Terrain reflectivity: Not applied" in page.details_label.text()
-
-
-def test_removed_region_clears_open_details(qt_app):
+def test_card_shows_patches_and_emits_actions(qt_app):
     page = SceneryLibraryPage()
     page.set_regions([_region("na", "1.0", installed="1.0")])
-    page.show_details("na")
+    seen = []
+    page.uninstall_requested.connect(lambda r: seen.append(("remove", r)))
+    page.options_requested.connect(lambda r: seen.append(("options", r)))
+    (card,) = page.cards
+    assert card.item.seasons_status == "Applied"
+    assert card.item.roughness_status == "Partial"
+    card.options_button.click()
+    card.remove_button.click()
+    assert seen == [("options", "na"), ("remove", "na")]
 
+
+def test_adopt_checks_enable_moving_and_explain_the_rest(qt_app):
+    page = SceneryLibraryPage()
+    page.set_regions([_region("eur", "1.0", installed="1.0"),
+                      _region("afr", "1.0", installed="1.0")])
+    page.set_adopt_checks(None)
+    assert "Checking" in page.adopt_label.text() and not page.adopt_button.isEnabled()
+
+    page.set_adopt_checks([_check("eur"), _check("afr", reason="It is part of the XP11 set.")])
+    assert page.adopt_button.isEnabled()
+    assert "1 of 2 regions can move (2 tiles, 2.0 GB)" in page.adopt_label.text()
+    texts = {c.item.region_id: c.check_label.text() for c in page.cards}
+    assert texts == {"eur": "Can move into AutoOrtho scenery.",
+                     "afr": "It is part of the XP11 set."}
+    seen = []
+    page.adopt_requested.connect(lambda: seen.append(True))
+    page.adopt_button.click()
+    assert seen == [True]
+    assert [c.region_id for c in page.movable_regions] == ["eur"]
+
+    page.set_adopt_checks([_check("eur", reason="x"), _check("afr", reason="y")])
+    assert not page.adopt_button.isEnabled()
+    assert "None of the installed regions" in page.adopt_label.text()
+
+
+def test_running_locks_region_actions(qt_app):
+    page = SceneryLibraryPage()
+    page.set_regions([_region("eur", "1.0", installed="1.0")])
+    page.set_adopt_checks([_check("eur")])
+    page.set_runtime_locked(True)
+    assert not page.adopt_button.isEnabled()
+    assert not page.cards[0].remove_button.isEnabled()
+    assert not page.stream_panel.enable_check.isEnabled()
+    page.set_runtime_locked(False)
+    assert page.adopt_button.isEnabled() and page.cards[0].remove_button.isEnabled()
+
+
+def test_removed_region_disappears(qt_app):
+    page = SceneryLibraryPage()
+    page.set_regions([_region("na", "1.0", installed="1.0")])
     page.set_regions([])
-
-    assert "Select a scenery package" in page.details_label.text()
-    assert page.options_button.isHidden()
-    assert page.uninstall_button.isHidden()
-    assert not page.options_button.property("regionId")
+    assert page.cards == [] and page.regions_group.isHidden()

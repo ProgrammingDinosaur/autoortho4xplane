@@ -548,7 +548,7 @@ class SceneryPage(_BasePage):
         super().__init__(
             wizard,
             "Scenery",
-            "Stream scenery, install regions, or point at scenery you already have",
+            "Choose the AutoOrtho scenery set, or point at scenery you already have",
         )
         # Streaming already set up in the chosen scenery folder (summary dict).
         self._existing_stream: dict | None = None
@@ -578,22 +578,34 @@ class SceneryPage(_BasePage):
         self.storage_label.setWordWrap(True)
         layout.addWidget(self.storage_label)
         layout.addStretch(1)
+        # Regions are downloaded on the map now; the old installer list stays
+        # only so the readiness checks keep counting installed regions.
+        for widget in (regions_label, self.list_widget, self.storage_label):
+            widget.hide()
 
     def _build_stream_box(self) -> QGroupBox:
         """Streaming choice: the same settings as the Scenery Library panel."""
-        box = QGroupBox("Stream scenery")
+        box = QGroupBox("AutoOrtho scenery")
         layout = QVBoxLayout(box)
-        self.stream_check = QCheckBox("Stream scenery you &haven't installed")
+        self.stream_check = QCheckBox("Use AutoOrtho &scenery")
+        self.stream_check.setChecked(True)
         self.stream_check.setToolTip(
-            "Fly anywhere without installing regions first."
+            "Download tiles on the map, or as X-Plane needs them, instead of "
+            "installing whole regions."
         )
         layout.addWidget(self.stream_check)
         layout.addWidget(_secondary(
-            "Each tile downloads the first time X-Plane needs it, so you can "
-            "fly without installing a region. Regions you install are always "
-            "used first, so you can also install the ones you fly most and "
-            "stream the rest."
+            "After setup, download the tiles or whole regions you fly on the "
+            "map (Flight Plan & Map, Scenery & Cache), or just fly: tiles "
+            "download the first time X-Plane needs them."
         ))
+        self.stream_fetch_check = QCheckBox("&Download tiles while flying")
+        self.stream_fetch_check.setChecked(True)
+        self.stream_fetch_check.setToolTip(
+            "Off: only tiles you download on the map are used; elsewhere "
+            "X-Plane shows its default scenery."
+        )
+        layout.addWidget(self.stream_fetch_check)
 
         row = QHBoxLayout()
         source_label = QLabel("Scenery s&et")
@@ -622,8 +634,9 @@ class SceneryPage(_BasePage):
         self.stream_limit_spin.setSuffix(" GB")
         self.stream_limit_spin.setValue(20)
         self.stream_limit_spin.setToolTip(
-            "Tiles you haven't used for a while are removed above this size. "
-            "Overlays get a quarter of it on top."
+            "Tiles downloaded while flying that you haven't used for a while "
+            "are removed above this size. Tiles you download on the map don't "
+            "count. Overlays get a quarter of it on top."
         )
         limit_label.setBuddy(self.stream_limit_spin)
         row.addWidget(source_label)
@@ -685,7 +698,8 @@ class SceneryPage(_BasePage):
         editable = not wizard.streaming_locked and not existing
         has_overlays = self._source_has_overlays()
         self.stream_check.setEnabled(editable)
-        for widget in (self.stream_source_combo, self.stream_limit_spin):
+        for widget in (self.stream_source_combo, self.stream_limit_spin,
+                       self.stream_fetch_check):
             widget.setEnabled(editable and self.stream_check.isChecked())
         self.stream_overlays_check.setEnabled(
             editable and self.stream_check.isChecked() and has_overlays
@@ -699,15 +713,15 @@ class SceneryPage(_BasePage):
         )
         if existing:
             message = (
-                "Streaming is already on for this scenery folder. Change its "
-                "settings in the Scenery Library."
+                "AutoOrtho scenery is already set up in this scenery folder. "
+                "Change its settings in the Scenery Library."
             )
         elif wizard.streaming_locked:
             message = LOCKED_HELP
         elif self.stream_check.isChecked():
             message = (
                 "Finish downloads the tile index (up to about 30 MB) and sets up "
-                "streaming."
+                "AutoOrtho scenery."
             )
         else:
             message = ""
@@ -1146,6 +1160,7 @@ class SetupWizard(QWizard):
                 and page._source_has_overlays()
             ),
             "disk_limit_gb": int(page.stream_limit_spin.value()),
+            "fetch_missing": page.stream_fetch_check.isChecked(),
         }
 
     def set_value(self, key: str, value: str) -> None:
@@ -1310,15 +1325,15 @@ class SetupWizard(QWizard):
             self._format_status(self._readiness.checks[2])
         )
         self.storage_page.refresh_cache_hint()
-        if self._readiness.installed_scenery_present:
-            note = "Existing scenery means you can finish without selecting a region."
-        elif self.streaming_chosen():
+        if self.streaming_chosen():
             note = (
-                "Streaming covers every tile you haven't installed, so you can "
-                "finish without selecting a region."
+                "AutoOrtho scenery covers every tile you haven't installed, so "
+                "you can finish without selecting a region."
             )
+        elif self._readiness.installed_scenery_present:
+            note = "Existing scenery means you can finish without selecting a region."
         else:
-            note = "Select at least one region, or turn on streaming, to enable Finish."
+            note = "Turn on AutoOrtho scenery to enable Finish."
         self.scenery_page.note_label.setText(note)
         self.scenery_page.status_label.setText(self._format_status(self._readiness.checks[3]))
         selected_bytes = sum(
