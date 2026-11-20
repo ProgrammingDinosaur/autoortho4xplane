@@ -62,7 +62,7 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.widgets.scenery_patches import SceneryPatchesWidget
     from autoortho.ui.shell import ApplicationShell
     from autoortho.ui.pages.scenery_page import SceneryLibraryPage
-    from autoortho import region_adopt, tile_stream
+    from autoortho import region_adopt, stream_seasons, tile_stream
     from autoortho.ui.pages.settings_page import SettingsPage
     from autoortho.ui.pages.expert_settings_page import ExpertSettingsPage
     from autoortho.ui.widgets.target_cost_panel import TargetCostPanel
@@ -141,6 +141,7 @@ else:
     from ui.shell import ApplicationShell
     from ui.pages.scenery_page import SceneryLibraryPage
     import region_adopt
+    import stream_seasons
     import tile_stream
     from ui.pages.settings_page import SettingsPage
     from ui.pages.expert_settings_page import ExpertSettingsPage
@@ -560,6 +561,7 @@ class ConfigUI(QMainWindow):
     # Home's snapshot, once a second (home_snapshot.build).
     home_snapshot_ready = Signal(object)
     _adopt_progress = Signal(str, int, int)   # region, files done, total
+    _seasons_progress = Signal(int, int)      # tiles done, total
 
     def __init__(self, cfg, *args, **kwargs):
         super().__init__()
@@ -1048,6 +1050,7 @@ class ConfigUI(QMainWindow):
         self.home_page.notice_bar.dismissed.connect(self._dismiss_notice)
         self.home_snapshot_ready.connect(self.home_page.set_snapshot)
         self._adopt_progress.connect(self._on_adopt_progress)
+        self._seasons_progress.connect(self._on_seasons_progress)
         self.home_page.primary_action_requested.connect(self.on_run)
         self.home_page.tuning_requested.connect(
             lambda: self.navigate_to("settings", "Auto-Tuning")
@@ -1083,6 +1086,7 @@ class ConfigUI(QMainWindow):
         stream_panel.limit_changed.connect(self._on_stream_limit)
         stream_panel.roughness_change_requested.connect(self._on_stream_roughness)
         stream_panel.fetch_missing_change_requested.connect(self._on_stream_fetch_missing)
+        stream_panel.seasons_change_requested.connect(self._on_stream_seasons)
         stream_panel.open_map_requested.connect(self._open_scenery_map)
         stream_panel.refresh_requested.connect(self._refresh_stream_panel)
         self._stream_workers = []
@@ -7854,6 +7858,73 @@ class ConfigUI(QMainWindow):
                 + " It takes effect the next time AutoOrtho starts."
             )
         self._refresh_stream_panel()
+
+    def _on_stream_seasons(self, enabled):
+        scenery_dir = self.cfg.ao_scenery_path
+        try:
+            name = tile_stream.set_stream_seasons(scenery_dir, enabled)
+        except Exception as exc:
+            self.display_error(f"Could not change seasons for downloaded tiles:\n{exc}")
+            self._refresh_stream_panel()
+            return
+        self._refresh_stream_panel()
+        if not enabled:
+            self.update_status_bar(
+                "Tiles you download from now on keep the XP11 set's look.")
+            return
+        root = os.path.join(scenery_dir, name)
+        pending = stream_seasons.pending_tiles(root)
+        if not pending:
+            self.update_status_bar("Tiles you download on the map get seasons.")
+            return
+        reply = QMessageBox.question(
+            self, "Add Seasons",
+            f"Add seasons to the {len(pending):,} tiles you have already "
+            f"downloaded? It takes a few seconds per tile and runs in the "
+            f"background.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._patch_stream_seasons(root, pending)
+
+    def _patch_stream_seasons(self, root, cells):
+        import threading
+        cancel = threading.Event()
+        task_id = "scenery-stream-seasons"
+        self.task_manager.create_task(
+            task_id, TaskType.SEASONS, "Add seasons to downloaded tiles",
+            package=f"{len(cells):,} tiles", stage="Patching DSFs",
+            cancellable=True, cancel_callback=cancel.set)
+        workers = int(getattr(self.cfg.seasons, "seasons_convert_workers", 2) or 2)
+
+        def progress(done, total):
+            self._seasons_progress.emit(int(done), int(total))
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.task_manager.fail_task(task_id, str(result))
+                return
+            patched, failed = result
+            if cancel.is_set():
+                self.task_manager.mark_cancelled(task_id)
+            elif failed:
+                self.task_manager.fail_task(
+                    task_id, f"{failed} of {len(cells)} tiles could not be patched.")
+            else:
+                self.task_manager.complete_task(
+                    task_id, stage=f"Added seasons to {patched:,} tiles")
+
+        self._run_stream_job(
+            lambda: stream_seasons.patch_tiles(
+                root, cells, workers=workers, progress=progress,
+                cancelled=cancel.is_set),
+            done)
+
+    def _on_seasons_progress(self, done, total):
+        self.task_manager.update_task(
+            "scenery-stream-seasons", progress=100.0 * done / max(1, total),
+            stage=f"{done:,} of {total:,} tiles")
 
     def _open_scenery_map(self):
         """Show the map's Scenery & Cache view to download tiles."""

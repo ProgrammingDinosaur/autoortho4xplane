@@ -514,6 +514,14 @@ def stream_regions(ao_scenery_dir: str) -> List[Tuple[str, str, List[Cell]]]:
     return []
 
 
+def _seasons():
+    if __package__:
+        from . import stream_seasons
+    else:
+        import stream_seasons
+    return stream_seasons
+
+
 def _hidden_for(ao_scenery_dir: str, root: str, marker: dict,
                 custom_scenery_dir: str) -> set:
     """DSFs the mount hides because an installed package already has them
@@ -528,8 +536,14 @@ def keep_offline(ao_scenery_dir: str, cells: Iterable[Cell],
                  progress: Optional[Callable[[int, int, int], None]] = None,
                  cancelled: Optional[Callable[[], bool]] = None,
                  package_factory: Optional[Callable[..., "tile_stream.StreamPackage"]] = None,
+                 seasons_patcher: Optional[Callable[[str, Cell], bool]] = None,
                  ) -> ChangeResult:
     """Pin ``cells`` and download their streamed DSFs and water masks now.
+
+    When the package has Seasons turned on (XP11 set), each downloaded tile
+    then gets X-Plane 12's season rasters (``seasons_patcher``, by default
+    :func:`stream_seasons.patch_tile`); a tile it fails on stays as
+    downloaded.
 
     ``progress(done, total, bytes)`` is called after each tile of each
     package. Tiles none of the indexes have (open water, no coverage) end up
@@ -550,6 +564,9 @@ def keep_offline(ao_scenery_dir: str, cells: Iterable[Cell],
         root = os.path.join(ao_scenery_dir, name)
         hidden = _hidden_for(ao_scenery_dir, root, marker, custom_scenery_dir)
         pkg = factory(root, marker, hidden=hidden)
+        patcher = None
+        if marker.get("seasons") and _seasons().applies(marker):
+            patcher = seasons_patcher or _seasons().patch_tile
         try:
             available = [c for c in cells
                          if pkg.entry(tile_stream.dsf_rel(*c)) is not None]
@@ -564,10 +581,16 @@ def keep_offline(ao_scenery_dir: str, cells: Iterable[Cell],
                 if stop.is_set() or cancelled():
                     return None
                 try:
-                    return pkg.download_tile(*cell, cancelled=cancelled)
+                    got = pkg.download_tile(*cell, cancelled=cancelled)
                 except tile_stream.ThrottledError:
                     stop.set()  # before this worker picks up the next tile
                     raise
+                if patcher is not None and not cancelled():
+                    try:
+                        patcher(root, cell)
+                    except Exception as exc:  # the tile stays as downloaded
+                        log.warning("Cache: seasons for %s failed: %s", cell_name(cell), exc)
+                return got
 
             with ThreadPoolExecutor(max_workers=KEEP_WORKERS,
                                     thread_name_prefix="keep-offline") as pool:

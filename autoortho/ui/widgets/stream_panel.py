@@ -36,6 +36,10 @@ ROUGHNESS_HELP = (
     "Higher values make terrain less shiny at sunrise and sunset (1.0 is "
     "matte). Installed regions have their own setting in Scenery Patches."
 )
+SEASONS_HELP = (
+    "Adds X-Plane 12's seasons to the XP11 set's tiles you download on the "
+    "map, a few seconds per tile. Tiles downloaded while flying stay as they are."
+)
 FETCH_HELP = (
     "Tiles download the first time X-Plane needs them. Turn this off to use "
     "only the tiles you download on the map; elsewhere X-Plane shows its "
@@ -68,6 +72,7 @@ class StreamPanel(QGroupBox):
     limit_changed = Signal(int)
     roughness_change_requested = Signal(object)   # float, or None to clear
     fetch_missing_change_requested = Signal(bool)
+    seasons_change_requested = Signal(bool)
     open_map_requested = Signal()
     refresh_requested = Signal()
 
@@ -78,7 +83,7 @@ class StreamPanel(QGroupBox):
         self.state = {
             "enabled": False, "source": None, "overlays": False,
             "disk_limit_gb": None, "roughness": None, "fetch_missing": True,
-            "ortho": (0, 0), "overlay": (0, 0),
+            "seasons": False, "ortho": (0, 0), "overlay": (0, 0),
         }
 
         layout = QVBoxLayout(self)
@@ -150,6 +155,11 @@ class StreamPanel(QGroupBox):
         layout.addWidget(self.overlays_check)
         layout.addWidget(self.overlays_help)
 
+        self.seasons_check = QCheckBox("Add &seasons to downloaded tiles")
+        self.seasons_help = _secondary(SEASONS_HELP)
+        layout.addWidget(self.seasons_check)
+        layout.addWidget(self.seasons_help)
+
         roughness_row = QHBoxLayout()
         self.roughness_check = QCheckBox("Set terrain &reflectivity")
         self.roughness_spin = QDoubleSpinBox()
@@ -188,6 +198,7 @@ class StreamPanel(QGroupBox):
         self.roughness_check.clicked.connect(self._roughness_edited)
         self.roughness_spin.editingFinished.connect(self._roughness_edited)
         self.fetch_check.clicked.connect(self._fetch_clicked)
+        self.seasons_check.clicked.connect(self._seasons_clicked)
         self.map_button.clicked.connect(self.open_map_requested)
         self._show_state()
 
@@ -241,6 +252,7 @@ class StreamPanel(QGroupBox):
             limit = int(round(float(state.get("disk_limit_gb") or 20)))
             self.limit_spin.setValue(max(self.limit_spin.minimum(), limit))
             self.fetch_check.setChecked(bool(state.get("fetch_missing", True)))
+            self.seasons_check.setChecked(bool(state.get("seasons")))
             roughness = state.get("roughness")
             self.roughness_check.setChecked(roughness is not None)
             if roughness is not None:
@@ -283,6 +295,11 @@ class StreamPanel(QGroupBox):
         if not has_overlays:
             self.overlays_check.setChecked(False)
         self.overlays_help.setText(OVERLAY_HELP if has_overlays else NO_OVERLAY_HELP)
+        # Only the XP11 set lacks seasons; it applies to a set in use.
+        seasons = self.enabled and self.state.get("source") == "xp11"
+        self.seasons_check.setVisible(seasons)
+        self.seasons_help.setVisible(seasons)
+        self.seasons_check.setEnabled(editable and seasons)
         if self.busy:
             return  # set_busy shows its own message
         if self.runtime_locked:
@@ -305,6 +322,10 @@ class StreamPanel(QGroupBox):
             )
         else:
             self.disable_requested.emit()
+
+    def _seasons_clicked(self, checked: bool):
+        if self.enabled and checked != bool(self.state.get("seasons")):
+            self.seasons_change_requested.emit(checked)
 
     def _fetch_clicked(self, checked: bool):
         if self.enabled and checked != bool(self.state.get("fetch_missing", True)):

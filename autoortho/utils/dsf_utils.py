@@ -193,12 +193,23 @@ class DsfUtils:
 
         # BASED on script by hotbso https://github.com/hotbso/o4xp_2_xp12/blob/main/o4xp_2_xp12.py. Credit to him.
 
-        skip_main_dsf = False
         if dsf_folder in processed_dsf_seasons:
             if dsf_filename in processed_dsf_seasons[dsf_folder]:
                 log.info(f"DSF {dsf_folder}/{dsf_filename} already processed")
                 return SeasonsAddResult.ADDED
 
+        dsf_to_parse_location = os.path.join(self.ao_path, "z_autoortho", "scenery", package_name, "Earth nav data", dsf_folder, dsf_filename)
+        backup_dir = os.path.join(self.get_scenery_dsf_backup_dir(package_name), dsf_folder)
+        return self.add_seasons_to_dsf_file(dsf_to_parse_location, cache_dir, backup_dir)
+
+    def add_seasons_to_dsf_file(self, dsf_to_parse_location, cache_dir, backup_dir=None) -> SeasonsAddResult:
+        """Add X-Plane 12's season rasters from Global Scenery to one DSF.
+
+        ``backup_dir`` keeps the original (skipped for streamed tiles, which
+        can be downloaded again)."""
+        dsf_folder = os.path.basename(os.path.dirname(dsf_to_parse_location))
+        dsf_filename = os.path.basename(dsf_to_parse_location)
+        skip_main_dsf = False
 
         try:
             global_dsf_file_path = self.get_dsf_folder_location(dsf_folder, dsf_filename)
@@ -209,17 +220,22 @@ class DsfUtils:
         ao_mesh_dsf_txt_file_path = f"{os.path.join(cache_dir, f"ao_{dsf_filename}.txt")}"
         global_dsf_txt_file_path = f"{os.path.join(cache_dir, f"global_{dsf_filename}.txt")}"
 
-        # get the name of the dsf to parse
         os.makedirs(cache_dir, exist_ok=True)
-        dsf_to_parse_location = os.path.join(self.ao_path, "z_autoortho", "scenery", package_name, "Earth nav data", dsf_folder, dsf_filename)
 
+        broken_rasters = False
         if self.convert_dsf_to_txt(dsf_to_parse_location, ao_mesh_dsf_txt_file_path):
             with open(ao_mesh_dsf_txt_file_path, "r") as file:
                 for line in file:
+                    if line.startswith("RASTER_DEF "):
+                        name = line.split(None, 1)[1].strip() if len(line.split()) > 1 else ""
+                        if name.rstrip("0123456789") in ("spr", "sum", "fal", "win"):
+                            log.debug("Found season rasters, skipping file")
+                            skip_main_dsf = True
+                            break
                     if line.startswith("RASTER_"):
-                        log.debug(f"Found RASTER line, skipping file")
-                        skip_main_dsf = True
-                        break
+                        # An earlier patch on X-Plane 12.1+ copied only the
+                        # elevation definition; replace what it left.
+                        broken_rasters = True
         else:
             log.error(f"Failed to convert {dsf_to_parse_location} to txt")
             shutil.rmtree(cache_dir)
@@ -233,18 +249,9 @@ class DsfUtils:
             log.debug(f"Removed cache directory {cache_dir}")
             return SeasonsAddResult.ADDED
 
-        raster_refs = []
-        on_raster_refs = False
         if self.convert_dsf_to_txt(global_dsf_file_path, global_dsf_txt_file_path):
             with open(global_dsf_txt_file_path, "r") as file:
-                for line in file:
-                    if line.startswith("RASTER_") and any(raster in line for raster in self.SAFE_RASTERS):
-                        on_raster_refs = True
-                        raster_refs.append(line)
-                    elif on_raster_refs:
-                        break # stop at the first line after the raster refs
-                    else:
-                        continue
+                raster_refs = self.season_raster_lines(file)
         else:
             log.error(f"Failed to convert {global_dsf_file_path} to txt")
             shutil.rmtree(cache_dir)
@@ -259,6 +266,11 @@ class DsfUtils:
 
 
         if not skip_main_dsf:
+            if broken_rasters:
+                with open(ao_mesh_dsf_txt_file_path, "r") as file:
+                    kept = [line for line in file if not line.startswith("RASTER_")]
+                with open(ao_mesh_dsf_txt_file_path, "w") as file:
+                    file.writelines(kept)
             with open(ao_mesh_dsf_txt_file_path, "a") as file:
                 for ref in raster_refs:
                     file.write(ref)
@@ -284,14 +296,14 @@ class DsfUtils:
                     log.debug(f"Removed cache directory {cache_dir}")
                     return SeasonsAddResult.FAILED
 
-            main_backup_dir = os.path.join(self.get_scenery_dsf_backup_dir(package_name), dsf_folder)
-            os.makedirs(main_backup_dir, exist_ok=True)
-            backup_path = os.path.join(main_backup_dir, dsf_filename + ".bak")
-            if not os.path.exists(backup_path):
-                shutil.copy(dsf_to_parse_location, backup_path)
-                log.debug(f"Backed up old {dsf_to_parse_location}")
-            else:
-                log.debug(f"Backup exists for {backup_path}")
+            if backup_dir:
+                os.makedirs(backup_dir, exist_ok=True)
+                backup_path = os.path.join(backup_dir, dsf_filename + ".bak")
+                if not os.path.exists(backup_path):
+                    shutil.copy(dsf_to_parse_location, backup_path)
+                    log.debug(f"Backed up old {dsf_to_parse_location}")
+                else:
+                    log.debug(f"Backup exists for {backup_path}")
 
             baked_dsf_file_path = compressed_temp_mesh_dsf_file_path if CFG.seasons.compress_dsf else temp_mesh_dsf_file_path
             shutil.move(baked_dsf_file_path, dsf_to_parse_location)
@@ -301,6 +313,31 @@ class DsfUtils:
         log.debug(f"Removed cache directory {cache_dir}")
 
         return SeasonsAddResult.ADDED
+
+    @classmethod
+    def season_raster_lines(cls, lines) -> list:
+        """RASTER_DEF and RASTER_DATA lines of the rasters to copy from a
+        Global Scenery DSF (as DSFTool text), definitions first.
+
+        The n-th RASTER_DATA belongs to the n-th RASTER_DEF. X-Plane 12.1+
+        DSFs list rasters the patch must not copy (``sea_level``) between
+        the ones it wants, so each is picked by its name: ``spr1`` and
+        ``spr2`` are seasons, ``elevation`` and ``soundscape`` are kept as
+        before.
+        """
+        defs, datas = [], []
+        for line in lines:
+            if line.startswith("RASTER_DEF "):
+                defs.append(line)
+            elif line.startswith("RASTER_DATA "):
+                datas.append(line)
+        keep = []
+        for i, line in enumerate(defs):
+            parts = line.split(None, 1)
+            name = parts[1].strip() if len(parts) > 1 else ""
+            if name.rstrip("0123456789") in cls.SAFE_RASTERS:
+                keep.append(i)
+        return [defs[i] for i in keep] + [datas[i] for i in keep if i < len(datas)]
 
     def scan_for_dsfs(self, scenery_package_path):
         total_dsfs = 0

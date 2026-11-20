@@ -1684,8 +1684,9 @@ def _create_package(ao_scenery_dir: str, source: str, kind: str, limit: float,
         raise ValueError(f"{spec['label']} has no {kind} tiles")
     root = os.path.join(ao_scenery_dir, name)
     is_new = not os.path.isdir(root)
+    old_marker = read_marker(root) or {}
     if fetch_missing is None:
-        fetch_missing = (read_marker(root) or {}).get("fetch_missing", True)
+        fetch_missing = old_marker.get("fetch_missing", True)
     os.makedirs(root, exist_ok=True)
     try:
         info = download_index(url, os.path.join(root, INDEX_NAME), session=session)
@@ -1701,6 +1702,8 @@ def _create_package(ao_scenery_dir: str, source: str, kind: str, limit: float,
         marker["roughness"] = _check_roughness(roughness)
     if not fetch_missing:
         marker["fetch_missing"] = False
+    if kind == "ortho" and old_marker.get("seasons"):
+        marker["seasons"] = True  # a refresh of the same set keeps it
     write_marker(root, marker)
     return name
 
@@ -1769,6 +1772,19 @@ def set_stream_roughness(ao_scenery_dir: str, roughness: Optional[float]) -> str
     return name
 
 
+def set_stream_seasons(ao_scenery_dir: str, enabled: bool) -> str:
+    """Whether tiles downloaded on the map get X-Plane 12's season rasters
+    (XP11 set; see :mod:`stream_seasons`). Returns the package name."""
+    name, ortho = _streamed_ortho(ao_scenery_dir)
+    marker = dict(ortho)
+    if enabled:
+        marker["seasons"] = True
+    else:
+        marker.pop("seasons", None)
+    write_marker(os.path.join(ao_scenery_dir, name), marker)
+    return name
+
+
 def set_fetch_missing(ao_scenery_dir: str, enabled: bool) -> None:
     """Whether tiles not stored yet are offered to X-Plane and downloaded
     while flying (on), or only stored tiles are used and the rest come from
@@ -1821,6 +1837,7 @@ def stream_summary(ao_scenery_dir: str) -> dict:
     packages = stream_packages(ao_scenery_dir)
     summary = {"enabled": False, "source": None, "overlays": False,
                "disk_limit_gb": None, "roughness": None, "fetch_missing": True,
+               "seasons": False,
                "ortho": (0, 0), "overlay": (0, 0)}
     for name, marker in packages.items():
         kind = marker.get("kind", "ortho")
@@ -1833,7 +1850,8 @@ def stream_summary(ao_scenery_dir: str) -> dict:
             summary.update(enabled=True, source=marker.get("source"),
                            disk_limit_gb=marker.get("disk_limit_gb"),
                            roughness=marker.get("roughness"),
-                           fetch_missing=bool(marker.get("fetch_missing", True)))
+                           fetch_missing=bool(marker.get("fetch_missing", True)),
+                           seasons=bool(marker.get("seasons")))
     return summary
 
 
