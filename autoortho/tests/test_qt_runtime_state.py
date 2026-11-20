@@ -522,6 +522,77 @@ def test_setup_wizard_applies_selected_paths(config_ui, monkeypatch):
     assert config_ui.lt_cache_dir_edit.text() == "/new/archive"
     assert config_ui.cfg.general.setup_complete is True
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_setup_wizard_turns_on_streaming(qt_app, config_ui, monkeypatch, fails):
+    import tile_stream
+
+    enabled, started, errors = [], [], []
+    paths = {
+        "xplane_path": config_ui.xplane_path_edit.text(),
+        "scenery_path": config_ui.scenery_path_edit.text(),
+        "cache_dir": config_ui.cache_dir_edit.text(),
+        "long_term_cache_dir": "",
+        "download_dir": config_ui.download_dir_edit.text(),
+    }
+
+    class FakeWizard:
+        def __init__(self, *args, **kwargs):
+            assert kwargs["streaming_locked"] is False
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def get_selected_paths(self):
+            return paths
+
+        def get_selected_region_ids(self):
+            return []
+
+        def selected_streaming(self):
+            return {"source": "xp11", "overlays": False, "disk_limit_gb": 30}
+
+        def start_now(self):
+            return True
+
+    def enable_streaming(ao_scenery_dir, source, overlays=True,
+                         disk_limit_gb=20.0, **kwargs):
+        enabled.append((ao_scenery_dir, source, overlays, disk_limit_gb))
+        if fails:
+            raise RuntimeError("index download failed")
+        return ["z_ao_stream_xp11"]
+
+    def apply_settings():
+        config_ui.settings_session.mark_applied(config_ui._snapshot_settings())
+        return True
+
+    monkeypatch.setattr("config_ui_qt.SetupWizard", FakeWizard)
+    monkeypatch.setattr(tile_stream, "enable_streaming", enable_streaming)
+    monkeypatch.setattr(config_ui, "on_save", apply_settings)
+    monkeypatch.setattr(config_ui, "_run_readiness_checks", lambda: None)
+    monkeypatch.setattr(config_ui, "on_run", lambda: started.append(True))
+    monkeypatch.setattr(config_ui, "display_error", errors.append)
+
+    config_ui._maybe_show_setup_wizard(force=True)
+    # Setting up streaming runs off the UI thread; AutoOrtho waits for it.
+    assert started == []
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and (
+        not (started or errors) or config_ui._stream_workers
+    ):
+        qt_app.processEvents()
+        time.sleep(0.01)
+
+    assert enabled == [(config_ui.cfg.ao_scenery_path, "xp11", False, 30)]
+    if fails:
+        assert started == []
+        assert errors and "index download failed" in errors[0]
+        assert "index download failed" in config_ui.task_manager.task("scenery-stream").error
+    else:
+        assert started == [True]
+        assert errors == []
+
+
 def test_verify_invalid_configuration_is_recoverable(config_ui):
     config_ui.xplane_path_edit.setText("/path/that/does/not/exist")
 

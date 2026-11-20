@@ -12,10 +12,19 @@ On a new installation, AutoOrtho opens a guided setup wizard that:
 
 1. **Welcome and checks:** the required FUSE backend for this platform.
 2. **X-Plane:** detected, or browse for it.
-3. **Scenery:** the scenery folder, and regions to install (or use scenery
-   you already have). To fly without installing regions, turn on
-   [scenery streaming](scenery.md#streaming-scenery-instead-of-installing-regions)
-   in the Scenery Library after setup.
+3. **Scenery:** the scenery folder, whether to
+   [stream scenery](scenery.md#streaming-scenery-instead-of-installing-regions),
+   and regions to install (or use scenery you already have). Tick **Stream
+   scenery you haven't installed** to fly without installing regions, or
+   stream as well as install: installed regions are always used first.
+   Choose the **Scenery set** (sets marked **Soon** can't be picked yet),
+   the **Disk limit**, and whether to **Include overlays**; turn overlays off
+   if you use simHeaven X-World or another overlay package. With streaming
+   on, you can finish without selecting a region. When you click **Finish**,
+   AutoOrtho downloads the tile index (a few megabytes) in the background;
+   if that fails, it shows the error and the task in the task list, and you
+   can turn streaming on later from the Scenery Library. Streaming can't be
+   changed here while AutoOrtho or X-Plane is running.
 4. **Image cache:** one folder, its free space, and a disk cache limit
    (with a suggestion for that drive). The long-term cache and download
    folders are under **More folders…**.
@@ -24,7 +33,8 @@ On a new installation, AutoOrtho opens a guided setup wizard that:
    this PC, can test your connection, and can suggest a target.
 6. **Limits and ready:** **Use what's available (recommended)** or your own
    limits, a last readiness check, and **Start AutoOrtho when setup
-   finishes** (it waits if scenery is still being installed).
+   finishes** (it waits if scenery is still being installed, or until
+   streaming is set up).
 
 Existing installations with valid paths and dependencies are detected
 automatically and are not forced through the wizard. The wizard remains

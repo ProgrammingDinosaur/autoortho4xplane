@@ -556,7 +556,16 @@ def _check_dependencies() -> ReadinessCheck:
     return _linux_dependency_state()
 
 
-def _check_scenery(values: Any, scenery_choices: Iterable[Any]) -> tuple[ReadinessCheck, tuple[str, ...], bool]:
+def _check_scenery(
+    values: Any,
+    scenery_choices: Iterable[Any],
+    streaming: bool = False,
+) -> tuple[ReadinessCheck, tuple[str, ...], bool]:
+    """Check the scenery choice.
+
+    ``streaming`` means scenery streaming will be turned on, which covers
+    every tile that isn't installed, so no region needs to be selected.
+    """
     choices = tuple(_normalize_scenery_choice(choice) for choice in scenery_choices)
     selected_region_ids = tuple(choice.region_id for choice in choices if choice.selected)
     scenery_path = _path_value(values, "scenery_path")
@@ -603,12 +612,15 @@ def _check_scenery(values: Any, scenery_choices: Iterable[Any]) -> tuple[Readine
                 title="Scenery",
                 status=ReadinessStatus.SUCCESS,
                 message=(
-                    f"{len(selected_region_ids)} region(s) selected for installation."
-                    if not installed_scenery_present
-                    else (
-                        "Existing scenery found and "
-                        f"{len(selected_region_ids)} additional region(s) selected."
+                    (
+                        f"{len(selected_region_ids)} region(s) selected for installation."
+                        if not installed_scenery_present
+                        else (
+                            "Existing scenery found and "
+                            f"{len(selected_region_ids)} additional region(s) selected."
+                        )
                     )
+                    + (" Streaming covers the rest." if streaming else "")
                 ),
                 fix_action="",
                 last_checked=_now(),
@@ -636,13 +648,32 @@ def _check_scenery(values: Any, scenery_choices: Iterable[Any]) -> tuple[Readine
             True,
         )
 
+    if streaming:
+        return (
+            ReadinessCheck(
+                id="setup-scenery",
+                title="Scenery",
+                status=ReadinessStatus.SUCCESS,
+                message="Scenery streaming: tiles download as you fly.",
+                fix_action="",
+                last_checked=_now(),
+                details={"installed": False, "selected": selected_region_ids,
+                         "streaming": True},
+            ),
+            selected_region_ids,
+            False,
+        )
+
     return (
         ReadinessCheck(
             id="setup-scenery",
             title="Scenery",
             status=ReadinessStatus.WARNING,
             message="No scenery is selected yet.",
-            fix_action="Select at least one region or point to an existing install.",
+            fix_action=(
+                "Select at least one region, turn on scenery streaming, "
+                "or point to an existing install."
+            ),
             last_checked=_now(),
             details={"installed": False, "selected": selected_region_ids},
         ),
@@ -651,17 +682,26 @@ def _check_scenery(values: Any, scenery_choices: Iterable[Any]) -> tuple[Readine
     )
 
 
-def build_readiness(values: Any, scenery_choices: Iterable[Any] = (), search_roots: Iterable[str | os.PathLike[str]] | None = None) -> SetupReadiness:
+def build_readiness(
+    values: Any,
+    scenery_choices: Iterable[Any] = (),
+    search_roots: Iterable[str | os.PathLike[str]] | None = None,
+    *,
+    streaming: bool = False,
+) -> SetupReadiness:
+    """Readiness of a setup; ``streaming`` means streaming will be turned on."""
     xplane = _check_xplane(values, search_roots=search_roots)
     storage = _check_paths(values)
     dependencies = _check_dependencies()
-    scenery, selected_region_ids, installed_scenery_present = _check_scenery(values, scenery_choices)
+    scenery, selected_region_ids, installed_scenery_present = _check_scenery(
+        values, scenery_choices, streaming=streaming
+    )
     can_finish = (
         not xplane.is_blocking
         and not storage.is_blocking
         and not dependencies.is_blocking
         and not scenery.is_blocking
-        and (installed_scenery_present or bool(selected_region_ids))
+        and (installed_scenery_present or bool(selected_region_ids) or streaming)
     )
     return SetupReadiness(
         checks=(xplane, storage, dependencies, scenery),

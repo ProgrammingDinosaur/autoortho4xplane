@@ -3466,6 +3466,7 @@ class ConfigUI(QMainWindow):
             paging_k=guards.paging_k(self.cfg),
             texture_format=guards.texture_format(self.cfg),
             disk_cache_gb=self.file_cache_slider.value(),
+            streaming_locked=self.scenery_library_page.stream_panel.runtime_locked,
         )
         if wizard.exec() != QDialog.DialogCode.Accepted:
             return
@@ -3516,12 +3517,27 @@ class ConfigUI(QMainWindow):
                     ),
                 )
         # "Start AutoOrtho when setup finishes": not while scenery is still
-        # being installed (it would mount half a region).
+        # being installed (it would mount half a region), and only once
+        # streaming is set up (its folders are mounted at start).
         start_now = getattr(wizard, "start_now", None)
-        if callable(start_now) and start_now():
+        start = callable(start_now) and start_now()
+        selected_streaming = getattr(wizard, "selected_streaming", None)
+        streaming = selected_streaming() if callable(selected_streaming) else None
+        if streaming:
+            self._on_stream_enable(
+                streaming["source"],
+                streaming["overlays"],
+                streaming["disk_limit_gb"],
+                on_success=self.on_run if start and not installing else None,
+            )
+        if start:
             if installing:
                 self.update_status_bar(
                     "Setup saved. Start streaming once the scenery has installed."
+                )
+            elif streaming:
+                self.update_status_bar(
+                    "Setup saved. AutoOrtho starts once scenery streaming is set up."
                 )
             else:
                 QTimer.singleShot(0, self.on_run)
@@ -7550,6 +7566,9 @@ class ConfigUI(QMainWindow):
 
     def _after_stream_change(self):
         """New or removed streaming folders become mounts on the next start."""
+        # Streaming folders count as scenery: the last readiness result may
+        # say none is installed, so check again before the next start.
+        self._readiness_signature = None
         try:
             self.cfg.refresh_derived_paths(create_missing=False)
         except Exception as exc:
@@ -7576,8 +7595,12 @@ class ConfigUI(QMainWindow):
         return box.clickedButton() is accept
 
     def _apply_stream_change(self, operation, busy_message, done_message,
-                             error_message, task_title=None, package=""):
-        """Run a streaming change in the background and show the outcome."""
+                             error_message, task_title=None, package="",
+                             on_success=None):
+        """Run a streaming change in the background and show the outcome.
+
+        ``on_success`` runs after a change that worked (not after a failure).
+        """
         panel = self.scenery_library_page.stream_panel
         task_id = "scenery-stream"
         if task_title:
@@ -7601,6 +7624,8 @@ class ConfigUI(QMainWindow):
                 f"{done_message} It takes effect the next time AutoOrtho starts."
             )
             self._after_stream_change()
+            if on_success is not None:
+                QTimer.singleShot(0, on_success)
 
         self._run_stream_job(operation, done)
 
@@ -7608,7 +7633,7 @@ class ConfigUI(QMainWindow):
     def _stream_source_label(source):
         return tile_stream.SOURCES.get(source, {}).get("label", source or "")
 
-    def _on_stream_enable(self, source, overlays, limit_gb):
+    def _on_stream_enable(self, source, overlays, limit_gb, on_success=None):
         scenery_dir = self.cfg.ao_scenery_path
         if not scenery_dir:
             self.scenery_library_page.stream_panel.restore()
@@ -7624,6 +7649,7 @@ class ConfigUI(QMainWindow):
             "Could not turn on scenery streaming",
             task_title="Turn on scenery streaming",
             package=self._stream_source_label(source),
+            on_success=on_success,
         )
 
     def _streamed_bytes(self):

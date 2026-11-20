@@ -36,6 +36,13 @@ imagery is fetched as usual.
 
 ### Turning it on
 
+On a new installation, the setup wizard offers streaming on its
+**Scenery** step: tick **Stream scenery you haven't installed** and pick the
+same settings as below. You can stream instead of installing regions, or as
+well. See [First-run setup](config.md#first-run-setup).
+
+To turn it on later:
+
 1. Stop AutoOrtho if it's running. Streaming settings are locked while
    AutoOrtho or X-Plane is running.
 2. Open **Scenery Library**. The **Stream scenery** panel is at the top.
@@ -199,8 +206,8 @@ deleting the tiles streamed so far. Installed regions aren't affected.
   installed regions, not to streamed tiles yet.
 - **Keep Offline** keeps only the streamed scenery. Imagery isn't
   downloaded ahead of time; it's cached as you fly.
-- The setup wizard doesn't offer streaming yet. Turn it on in the Scenery
-  Library after setup.
+- The setup wizard only turns streaming on. To change its settings or turn
+  it off afterwards, use the Scenery Library.
 
 ## Configuring scenery_packs.ini
 
