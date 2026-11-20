@@ -380,3 +380,37 @@ def test_export_imagery_comparison_writes_local_bundle(
     ddm_path.write_text(json.dumps(unsafe), encoding="utf-8")
     with pytest.raises(ValueError, match="unsafe"):
         export_imagery_comparison(ddm_path, tmp_path / "safe-root")
+
+
+class _CountingProcess:
+    """Counts the costly psutil calls a sample makes."""
+
+    def __init__(self):
+        self.full_info_calls = 0
+        self.thread_calls = 0
+
+    def memory_full_info(self):
+        self.full_info_calls += 1
+        return type("Full", (), {"uss": 1234})()
+
+    def num_threads(self):
+        self.thread_calls += 1
+        return 7
+
+
+def test_uss_and_thread_count_are_read_at_most_every_detail_interval(monkeypatch):
+    from autoortho import diagnostics
+
+    clock = [100.0]
+    monkeypatch.setattr(diagnostics.time, "monotonic", lambda: clock[0])
+    process, cache = _CountingProcess(), {}
+
+    assert diagnostics._detail_fields(process, cache) == (1234, 7)
+    for _ in range(5):
+        clock[0] += 1.0
+        assert diagnostics._detail_fields(process, cache) == (1234, 7)
+    assert (process.full_info_calls, process.thread_calls) == (1, 1)
+
+    clock[0] += diagnostics._DETAIL_SAMPLE_SECONDS
+    diagnostics._detail_fields(process, cache)
+    assert (process.full_info_calls, process.thread_calls) == (2, 2)

@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-from PySide6.QtCore import QSignalBlocker, Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QEvent, QSignalBlocker, QSize, Qt, Signal
+from PySide6.QtGui import QFont, QTextLayout, QTextOption
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
@@ -24,6 +24,73 @@ class NavigationDestination:
     key: str
     title: str
     tooltip: str = ""
+
+
+# Labels longer than about this many average characters wrap onto extra
+# lines instead of widening the rail. The default English labels fit on one.
+NAVIGATION_LABEL_WRAP_CHARS = 20
+NAVIGATION_RAIL_MIN_WIDTH = 176
+
+
+def wrap_navigation_label(text: str, font: QFont, width: int) -> str:
+    """Break ``text`` into lines no wider than ``width`` where possible.
+
+    Uses Unicode line breaking, so scripts without spaces (CJK) wrap too.
+    A single unbreakable word wider than ``width`` stays on its own line.
+    """
+    if not text or width <= 0:
+        return text
+    option = QTextOption()
+    option.setWrapMode(QTextOption.WrapMode.WordWrap)
+    layout = QTextLayout(text, font)
+    layout.setTextOption(option)
+    lines: list[str] = []
+    layout.beginLayout()
+    try:
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(width)
+            start = line.textStart()
+            lines.append(text[start:start + line.textLength()].strip())
+    finally:
+        layout.endLayout()
+    return "\n".join(part for part in lines if part) or text
+
+
+class NavigationButton(QToolButton):
+    """Rail button that wraps long (e.g. translated) labels.
+
+    ``text()`` keeps returning the label as set; the button displays a copy
+    with line breaks so its size hint stays narrow and grows in height.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._label = ""
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt API
+        self._label = text
+        self._apply_wrapped_text()
+
+    def text(self) -> str:
+        return self._label
+
+    def changeEvent(self, event: QEvent) -> None:  # noqa: N802 - Qt API
+        super().changeEvent(event)
+        if event.type() in (
+            QEvent.Type.FontChange,
+            QEvent.Type.StyleChange,
+        ):
+            self._apply_wrapped_text()
+
+    def _apply_wrapped_text(self) -> None:
+        metrics = self.fontMetrics()
+        width = metrics.averageCharWidth() * NAVIGATION_LABEL_WRAP_CHARS
+        wrapped = wrap_navigation_label(self._label, self.font(), width)
+        if QToolButton.text(self) != wrapped:
+            QToolButton.setText(self, wrapped)
 
 
 class NavigationRail(QFrame):
@@ -44,7 +111,6 @@ class NavigationRail(QFrame):
         )
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFrameShadow(QFrame.Shadow.Raised)
-        self.setMinimumWidth(176)
         self.setSizePolicy(
             QSizePolicy.Policy.Minimum,
             QSizePolicy.Policy.Expanding,
@@ -70,6 +136,16 @@ class NavigationRail(QFrame):
         if self._destinations:
             self.set_current_destination(self._destinations[0].key, emit=False)
 
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt API
+        hint = super().sizeHint()
+        return QSize(max(NAVIGATION_RAIL_MIN_WIDTH, hint.width()), hint.height())
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt API
+        # Never let the shell squeeze the rail below what its labels need;
+        # a fixed setMinimumWidth() would override this and clip them.
+        hint = self.sizeHint()
+        return QSize(hint.width(), super().minimumSizeHint().height())
+
     @staticmethod
     def _default_destinations() -> list[NavigationDestination]:
         return [
@@ -93,7 +169,7 @@ class NavigationRail(QFrame):
                 raise ValueError("title is required when destination is a key")
             item = NavigationDestination(destination, title, tooltip)
 
-        button = QToolButton(self)
+        button = NavigationButton(self)
         button.setObjectName(f"{item.key}Destination")
         button.setText(item.title.replace("&", "&&"))
         button.setToolTip(item.tooltip or item.title)
@@ -179,4 +255,9 @@ class NavigationRail(QFrame):
                 break
 
 
-__all__ = ["NavigationDestination", "NavigationRail"]
+__all__ = [
+    "NavigationButton",
+    "NavigationDestination",
+    "NavigationRail",
+    "wrap_navigation_label",
+]

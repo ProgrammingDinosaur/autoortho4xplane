@@ -24,6 +24,191 @@ If you manually move things around outside of the configuration utility, things 
 
 *IMPORTANT*
 
+## Streaming scenery instead of installing regions
+
+You don't have to download whole regions before you fly. With scenery
+streaming on, AutoOrtho downloads each 1x1 degree tile the first time
+X-Plane needs it, from the same GitHub releases the region installer uses.
+
+Only the tile's base mesh is downloaded: its DSF file and water masks,
+typically about 3 MB per tile and up to about 15 MB for detailed ones. The terrain files are generated on the fly, and satellite
+imagery is fetched as usual.
+
+### Turning it on
+
+On a new installation, the setup wizard offers streaming on its
+**Scenery** step: tick **Stream scenery you haven't installed** and pick the
+same settings as below. You can stream instead of installing regions, or as
+well. See [First-run setup](config.md#first-run-setup).
+
+To turn it on later:
+
+1. Stop AutoOrtho if it's running. Streaming settings are locked while
+   AutoOrtho or X-Plane is running.
+2. Open **Scenery Library**. The **Stream scenery** panel is at the top.
+3. Pick the **Scenery set**:
+   - **XP11 legacy set (kubilus1/autoortho-scenery):** the same meshes as
+     the regions offered in the Scenery Library.
+   - **XP12 set:** coming soon. It's marked **Soon** until its packages are
+     ready for streaming.
+4. Choose whether to **Include overlays** (roads, forests, buildings). See
+   [Overlays and simHeaven](#overlays-and-simheaven).
+5. Set the **Disk limit** (20 GB by default).
+6. Tick **Stream scenery you haven't installed**. AutoOrtho downloads the
+   tile index, a few megabytes, and sets up the streaming folders.
+7. Start AutoOrtho, then X-Plane.
+
+You can change the scenery set, overlays and disk limit at any time while
+AutoOrtho is stopped. Changes are applied right away, whether streaming is
+on or off, and take effect the next time AutoOrtho starts. AutoOrtho asks
+first when a change would delete tiles you've already streamed.
+
+### Installed regions always come first
+
+Streaming only covers tiles you haven't installed. If a region is installed,
+X-Plane uses its tiles and streaming fills in the rest of the world. That
+means you can:
+
+- **Stream everything** and install nothing.
+- **Install the regions you fly most** and stream the rest. Installed tiles
+  load without waiting for a download, and you can fly them offline.
+
+To stream a region you have installed, uninstall it from the Scenery
+Library.
+
+### Overlays and simHeaven
+
+**If you use simHeaven X-World or another overlay package, turn
+Include overlays off.** simHeaven already provides roads, forests and
+buildings, so streaming AutoOrtho's overlays as well would duplicate them.
+
+With overlays on, AutoOrtho streams the overlays that come with the scenery
+set. If you still have the classic `Custom Scenery/yAutoOrtho_Overlays`
+folder, its tiles are used instead of streamed ones, even when it's disabled
+in `scenery_packs.ini`. To stream overlays instead, move that folder out of
+`Custom Scenery`.
+
+### Disk use
+
+Streamed tiles stay on disk, so each tile is downloaded only once. When the
+stored tiles grow past the disk limit, AutoOrtho removes the tiles you
+haven't used for the longest time, down to 90% of the limit.
+
+- Tiles used in the last two hours are never removed.
+- Tiles you [keep for offline flying](#keeping-tiles-for-offline-flying)
+  are never removed and don't count toward the limit.
+- Overlays get a quarter of the limit on top of it. With a 20 GB limit,
+  overlays can use another 5 GB.
+- The panel shows how many tiles are stored and how much space they use.
+  The disk limit covers only the base mesh. Satellite imagery has its own
+  cache limit in **Settings**.
+
+### When you fly
+
+- When X-Plane opens a tile, AutoOrtho downloads it and the tiles around
+  it. The first flight in a new area takes longer to load. Later flights
+  there load at normal speed.
+- If a tile can't be downloaded (no connection, or GitHub is unavailable),
+  X-Plane gets the tile from its default Global Scenery instead, so you see
+  default terrain there rather than an error. A missing overlay tile is
+  served empty, and a missing water mask is served blank, which shows
+  X-Plane's default water along that stretch of coast until the scenery
+  reloads.
+- Dropped connections are retried straight away, so a hiccup costs a
+  second or two rather than a fallback.
+- If GitHub throttles downloads, AutoOrtho pauses downloads (from one minute
+  up to 15 minutes) and then tries again. Tiles needed during the pause
+  come from Global Scenery.
+- Downloaded tile indexes are checked for updates once a week.
+
+### Where the files are
+
+Streaming creates these folders next to your installed regions in
+`Custom Scenery/z_autoortho/scenery/`:
+
+- `z_ao_stream_xp11`: the streamed base mesh.
+- `yAO_stream_xp11_overlays`: the streamed overlays, if you included them.
+
+Like installed regions, each one appears in `Custom Scenery` while AutoOrtho
+is running. Don't edit or move these folders yourself; use the Stream
+scenery panel.
+
+When AutoOrtho starts, it adds the streaming folders to `scenery_packs.ini`
+and keeps the streamed overlays above the AutoOrtho base meshes. The first
+time it changes the file, it keeps your original as
+`scenery_packs.ini.ao_backup`.
+
+### Seeing and managing stored tiles on the map
+
+**Flight Plan & Map** has a map with two views. Switch with the buttons
+above the map:
+
+- **Imagery Sources:** the Custom Map editor, which picks the imagery source
+  per tile.
+- **Cache:** what AutoOrtho has stored for each 1x1 degree tile.
+
+In the Cache view, tiles are coloured by what's stored: **Streamed
+scenery** (base mesh, overlays and water masks), **Imagery** (cached
+satellite imagery), or **Both**. Choose **Colour by: Size** to colour them
+by how much space they use instead. A white outline marks tiles kept for
+offline flying. Hover over a tile to see its sizes, imagery zoom levels and
+sources, and when it was last used. The line under the map shows the
+totals.
+
+To select tiles, click one or drag a box. Hold Ctrl or Shift to add to the
+selection, or to remove a tile you click. Press Esc to clear it. **More**
+has **Select Stored Tiles in View** and **Zoom to Stored Tiles**.
+
+Deleting tiles and keeping them offline only work while AutoOrtho and
+X-Plane are stopped, like the streaming settings. You can look at the map at
+any time.
+
+#### Deleting stored tiles
+
+Select tiles, then choose **Delete** > **Streamed Scenery**, **Imagery** or
+**Both**. AutoOrtho shows how much it's about to delete and asks first.
+
+- Deleted streamed scenery is downloaded again the next time you fly there,
+  so you need an internet connection then. Deleting it also stops keeping
+  the tile for offline flying.
+- Deleted imagery is downloaded again when X-Plane needs it.
+- Installed regions aren't affected. Only streamed tiles and cached imagery
+  are deleted.
+
+#### Keeping tiles for offline flying
+
+Select tiles, then click **Keep Offline**. AutoOrtho shows how much
+streamed scenery it will download, then downloads each tile's DSF and water
+masks (and overlays, if you stream them) right away. Progress shows in the
+**Activity** panel, where you can cancel it. Kept tiles are never removed
+to make room.
+
+The confirmation also estimates how much space the imagery for those tiles
+would take at ZL16, ZL17 and ZL18. Keep Offline doesn't download imagery. To
+fly a kept area offline with satellite imagery, fly it once with a
+connection so its imagery is cached, and make sure the imagery cache limit
+in **Settings** is large enough to hold it.
+
+To stop keeping tiles, select them and choose **Keep Offline** >
+**Stop Keeping**. Their files stay on disk until the disk limit needs the
+space.
+
+Tiles with no streamed scenery, such as open water, are skipped.
+
+### Turning it off
+
+Untick **Stream scenery you haven't installed**. AutoOrtho asks before
+deleting the tiles streamed so far. Installed regions aren't affected.
+
+### Limitations
+
+- **Scenery Patches** (Seasons, Terrain reflectivity) are applied only to
+  installed regions, not to streamed tiles yet.
+- **Keep Offline** keeps only the streamed scenery. Imagery isn't
+  downloaded ahead of time; it's cached as you fly.
+- The setup wizard only turns streaming on. To change its settings or turn
+  it off afterwards, use the Scenery Library.
+
 ## Configuring scenery_packs.ini
 
 Any scenery added to XPlane requires being setup in the scenery_packs.ini file
@@ -49,12 +234,18 @@ towards the bottom of your scenery_packs.ini file:
 Landmarks, airports, etc
 simHeaven, special layers, etc
 yAutoOrtho_Overlays
+yAO_stream_xp11_overlays
 z_ao_aus_pac
 z_ao_eur
 z_ao_na
+z_ao_stream_xp11
 z_autoortho
 zzz_global_scenery
 ```
+
+`yAO_stream_xp11_overlays` and `z_ao_stream_xp11` appear only if
+[scenery streaming](#streaming-scenery-instead-of-installing-regions) is on.
+AutoOrtho places them for you when it starts.
 
 ## Installing in custom directories
 

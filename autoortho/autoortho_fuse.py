@@ -38,9 +38,18 @@ except ImportError:
     import wait_bands
 
 try:
-    from autoortho.time_exclusion import time_exclusion_manager
+    from autoortho.time_exclusion import (
+        time_exclusion_manager, _find_global_scenery_dsf, _parse_dsf_coordinates,
+    )
 except ImportError:
-    from time_exclusion import time_exclusion_manager
+    from time_exclusion import (
+        time_exclusion_manager, _find_global_scenery_dsf, _parse_dsf_coordinates,
+    )
+
+try:
+    from autoortho import tile_stream
+except ImportError:
+    import tile_stream
 
 import logging
 log = logging.getLogger(__name__)
@@ -54,6 +63,11 @@ try:
     from autoortho import getortho
 except ImportError:
     import getortho
+
+try:
+    from autoortho import disk_texture
+except ImportError:
+    import disk_texture
 
 try:
     from autoortho.diagnostics import profile_span, record_stage
@@ -195,6 +209,11 @@ def tilemeters(lat_deg, zoom):
 
 
 MEMTRACE = False
+# Debug lines written on every FUSE call (getattr, open, read, opendir...)
+# only when AO_TRACE_READS=1 (see getortho.TRACE_READS). X-Plane makes
+# thousands of these calls a second while it loads scenery, which filled the
+# rotated log in seconds and pushed out everything else, startup included.
+TRACE_READS = os.environ.get("AO_TRACE_READS") == "1"
 
 
 def locked(fn):
@@ -257,8 +276,14 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
         # - Fallback: + fallback_timeout if enabled (default 30s)
         # - Buffer: + 15s for DDS operations
         # - Safety: + 60s additional buffer for daemon_timeout
-        max_startup_budget = wait_bands.tile_budget_seconds(initial_load=True)
-        
+        # Never below the first-load cap: 3.1.0 used it with default settings
+        # (1875 s timeout), and the 60 s default near wait gave only 675 s.
+        # macFUSE drops the whole mount when one request outlives this.
+        max_startup_budget = max(
+            wait_bands.tile_budget_seconds(initial_load=True),
+            wait_bands.INITIAL_LOAD_CAP_S,
+        )
+
         # Add fallback timeout if enabled
         fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)
         if isinstance(fallback_extends, str):
@@ -750,6 +775,21 @@ class DSFPrefetchScheduler:
                     )
 
 
+class _DirectHandle:
+    """One X-Plane open of a texture served from its cache file.
+
+    ``live`` turns on when the file failed a read: the rest of this open is
+    served by a live tile (holding a tile reference until release).
+    """
+
+    __slots__ = ("texture", "live", "lock")
+
+    def __init__(self, texture):
+        self.texture = texture
+        self.live = False
+        self.lock = threading.Lock()
+
+
 class AutoOrtho(Operations):
 
     open_paths = []
@@ -767,6 +807,13 @@ class AutoOrtho(Operations):
 
     startup = True
 
+    # Streaming defaults, so instances built without __init__ (tests) work.
+    _stream = None
+    _virtual_files = {}
+    _virtual_lock = threading.Lock()
+    _stream_fallback = set()
+    _stream_placeholders = set()
+
     def __init__(self, root, cache_dir='.cache', *args, **kwargs):
         log.info(f"ROOT: {root}")
         self.dds_re = re.compile(r".*/(\d+)[-_](\d+)[-_]((?!ZL)\S*)(\d{2}).dds")
@@ -782,7 +829,8 @@ class AutoOrtho(Operations):
         self.cache_dir = cache_dir
 
         getortho.clear_shutdown_request()
-        self.tc = getortho.TileCacher(cache_dir)
+        # Shared workers pass one TileCacher to every mount they serve.
+        self.tc = kwargs.get("tile_cacher") or getortho.TileCacher(cache_dir)
         
         # Register terrain index for this scenery
         # This indexes .ter files to discover actual tile zoom levels
@@ -832,8 +880,50 @@ class AutoOrtho(Operations):
         # Used when time exclusion redirects DSF reads to global scenery
         self._redirected_dsf_fhs = {}
 
+        # Textures served from their cache file: fh -> _DirectHandle. Their
+        # handles start above any OS file descriptor; live DDS opens use 0.
+        self._direct = {}
+        self._direct_lock = threading.Lock()
+        self._direct_fh = itertools.count(1 << 32)
+
         self.use_ns = kwargs.get("use_ns", False)
-        
+
+        # Streaming package: DSFs and masks are fetched on first open and
+        # .ter files are generated, instead of coming from an install.
+        self._stream = None
+        self._virtual_files = {}
+        self._virtual_lock = threading.Lock()
+        self._virtual_fh = itertools.count(1 << 40)
+        self._stream_fallback = set()
+        self._stream_placeholders = set()  # masks served as blank stand-ins
+        marker = tile_stream.read_marker(self.root)
+        if marker is not None:
+            try:
+                if marker.get("kind") == "overlay":
+                    # Overlays the classic download already installed win.
+                    hidden = tile_stream.overlay_hidden_dsfs(
+                        str(getattr(CFG.paths, "scenery_path", "") or "")
+                    )
+                else:
+                    hidden = tile_stream.installed_dsfs(
+                        os.path.dirname(self.root), self.root
+                    )
+                self._stream = tile_stream.StreamPackage(
+                    self.root,
+                    marker,
+                    on_terrain=self._terrain_lookup.add_virtual_tiles,
+                    hidden=hidden,
+                )
+                threading.Thread(
+                    target=tile_stream.refresh_index,
+                    args=(self.root, marker),
+                    name="tile-index-refresh",
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                log.error(f"Tile stream disabled for {self.root}: {exc}")
+                self._stream = None
+
         # Initialize time exclusion manager with dataref tracker
         try:
             from autoortho.datareftrack import dt as datareftracker
@@ -858,6 +948,8 @@ class AutoOrtho(Operations):
     def shutdown(self):
         """Stop background DSF scheduling when this FUSE runtime exits."""
         self._dsf_prefetch_scheduler.shutdown()
+        if self._stream is not None:
+            self._stream.shutdown()
 
     def destroy(self, path=None):
         self.shutdown()
@@ -940,12 +1032,15 @@ class AutoOrtho(Operations):
         # The first-load budget applies before X-Plane ever connected (must
         # match getortho.py); stutters that briefly drop the connection do
         # not get extended timeouts.
-        initial_load = False
-        try:
-            from datareftrack import dt as datareftracker
-            initial_load = not getattr(datareftracker, 'has_ever_connected', False)
-        except ImportError:
-            pass  # datareftracker not available, use base budget
+        # getortho already imported the tracker under whichever name this
+        # build uses. Importing it again here by its bare name failed in
+        # package and frozen builds, so every read paid a full sys.path
+        # search for a module that never loads.
+        datareftracker = getattr(getortho, "datareftracker", None)
+        initial_load = (
+            datareftracker is not None
+            and not getattr(datareftracker, 'has_ever_connected', False)
+        )
         tile_budget = wait_bands.tile_budget_seconds(initial_load)
         
         # Check if fallback extends the budget
@@ -982,7 +1077,8 @@ class AutoOrtho(Operations):
     # ==================
 
     def _access(self, path, mode):
-        log.debug(f"ACCESS: {path}")
+        if TRACE_READS:
+            log.debug(f"ACCESS: {path}")
         #m = re.match(".*/(\d+)[-_](\d+)[-_](\D*)(\d+).dds", path)
         #if m:
         #    log.info(f"ACCESS: Found DDS file {path}: %s " % str(m.groups()))
@@ -1083,7 +1179,8 @@ class AutoOrtho(Operations):
 
 
     def getattr(self, path, fh=None):
-        log.debug(f"GETATTR {path}")
+        if TRACE_READS:
+            log.debug(f"GETATTR {path}")
         
         # Check for DSF time exclusion redirect
         # Instead of hiding DSF files (which breaks X-Plane's indexing),
@@ -1106,8 +1203,109 @@ class AutoOrtho(Operations):
         elif path.endswith("AOISWORKING"):
             return self._getattr_marker(now)
         else:
+            if self._stream is not None:
+                attrs = self._getattr_stream(path)
+                if attrs is not None:
+                    return attrs
             # Real filesystem files - never cache, always get fresh stats
             return self._getattr_real_file(path)
+
+    @staticmethod
+    def _stream_rel(path):
+        return path.replace("\\", "/").lstrip("/")
+
+    @staticmethod
+    def _dsf_latlon(rel):
+        m = re.search(r"([+-]\d{2})([+-]\d{3})\.dsf$", rel)
+        return int(m.group(1)), int(m.group(2))
+
+    def _virtual_attrs(self, size):
+        stamp = int(self._stream.index.built or time.time())
+        return {
+            'st_atime': stamp,
+            'st_ctime': stamp,
+            'st_mtime': stamp,
+            'st_mode': 33060,  # regular file, read-only
+            'st_blksize': 32768,
+            'st_nlink': 1,
+            'st_uid': self.default_uid,
+            'st_gid': self.default_gid,
+            'st_size': size,
+        }
+
+    def _getattr_stream(self, path):
+        """Attributes of a streamable file not fetched yet, or None.
+
+        Must stay cheap: directory listings stat every entry, so nothing is
+        downloaded here. A DSF reports its size from the index, or the Global
+        Scenery file's when it can't be fetched right now.
+        """
+        if not path.endswith((".dsf", ".png", ".ter")):
+            return None
+        if os.path.exists(self._full_path(path)):
+            return None
+        rel = self._stream_rel(path)
+        stream = self._stream
+        if rel.endswith(".ter"):
+            if not rel.startswith("terrain/"):
+                return None
+            data = stream.ter_bytes(rel.split("/", 1)[1])
+            return None if data is None else self._virtual_attrs(len(data))
+        size = stream.remote_size(rel)
+        if size is None:
+            return None
+        if rel.endswith(".png") and (rel in self._stream_placeholders
+                                     or stream.remote.in_cooldown()):
+            return self._virtual_attrs(len(stream.placeholder_png(rel)))
+        if rel.endswith(".dsf") and (rel in self._stream_fallback or stream.unavailable(rel)):
+            if stream.kind == "overlay":
+                lat, lon = self._dsf_latlon(rel)
+                return self._virtual_attrs(len(tile_stream.empty_overlay_dsf(lat, lon)))
+            folder, fname = _parse_dsf_coordinates(path)
+            global_dsf = _find_global_scenery_dsf(folder, fname) if folder else None
+            if global_dsf:
+                return self._getattr_redirected_dsf(global_dsf)
+        return self._virtual_attrs(size)
+
+    def _open_stream_dsf(self, path, flags):
+        """Make a streamed DSF local, or open Global Scenery in its place.
+
+        Returns an open handle for the fallback, or None when the AutoOrtho
+        file is now on disk and the normal open should proceed.
+        """
+        rel = self._stream_rel(path)
+        if self._stream.entry(rel) is None:
+            return None
+        if self._stream.ensure_local(rel) is not None:
+            self._stream_fallback.discard(rel)
+            self._stream.prefetch_neighbors(rel)
+            return None
+        self._stream.prefetch_neighbors(rel)
+        if self._stream.kind == "overlay":
+            # Global Scenery can't stand in for an overlay; an empty one keeps
+            # X-Plane loading (that tile just lacks roads and objects).
+            lat, lon = self._dsf_latlon(rel)
+            log.info(f"OPEN: overlay DSF [{path}] not streamed yet; serving an empty overlay")
+            self._stream_fallback.add(rel)
+            fh = next(self._virtual_fh)
+            with self._virtual_lock:
+                self._virtual_files[fh] = tile_stream.empty_overlay_dsf(lat, lon)
+            time_exclusion_manager.register_dsf_open(path)
+            return fh
+        folder, fname = _parse_dsf_coordinates(path)
+        global_dsf = _find_global_scenery_dsf(folder, fname) if folder else None
+        if not global_dsf:
+            log.warning(f"OPEN: DSF [{path}] could not be streamed and has no Global Scenery file")
+            raise FuseOSError(errno.ENOENT)
+        log.info(f"OPEN: DSF [{path}] not streamed yet; using Global Scenery {global_dsf}")
+        if system_type == 'windows':
+            fh = os.open(global_dsf, flags | os.O_BINARY)
+        else:
+            fh = os.open(global_dsf, flags)
+        self._stream_fallback.add(rel)
+        self._redirected_dsf_fhs[fh] = global_dsf
+        time_exclusion_manager.register_dsf_open(path)
+        return fh
 
     @staticmethod
     def _resolve_dds_maptype(maptype: str) -> str:
@@ -1162,8 +1360,9 @@ class AutoOrtho(Operations):
         row, col, maptype, zoom = match.groups()
         maptype = self._resolve_dds_maptype(maptype)
         dds_size = self._get_dds_size_cached(int(row), int(col), maptype, int(zoom))
-        log.debug("GETATTR: Fetch for path: %s", path)
-        
+        if TRACE_READS:
+            log.debug("GETATTR: Fetch for path: %s", path)
+
         attrs = {
             'st_atime': now, 
             'st_ctime': now, 
@@ -1175,7 +1374,8 @@ class AutoOrtho(Operations):
             'st_gid': self.default_gid,
             'st_size': dds_size,
         }
-        log.debug(f"GETATTR: ATTRS: {attrs}")
+        if TRACE_READS:
+            log.debug(f"GETATTR: ATTRS: {attrs}")
         return attrs
 
     def _getattr_poison(self, now):
@@ -1238,11 +1438,13 @@ class AutoOrtho(Operations):
                 self._negative_getattr_cache.move_to_end(cache_key)  # LRU
                 raise FuseOSError(errno.ENOENT)
 
-        log.debug(f"GETATTR FULLPATH {full_path}")
+        if TRACE_READS:
+            log.debug(f"GETATTR FULLPATH {full_path}")
         try:
             st = os.lstat(full_path)
         except OSError as e:
-            log.debug(f"GETATTR: lstat failed for {full_path}: {e}")
+            if TRACE_READS:
+                log.debug(f"GETATTR: lstat failed for {full_path}: {e}")
             if getattr(e, "errno", None) in (errno.ENOENT, errno.ENOTDIR):
                 with self._negative_getattr_cache_lock:
                     # Cache Miss + Missing File: We just found out file does not exist
@@ -1250,7 +1452,8 @@ class AutoOrtho(Operations):
                         self._negative_getattr_cache.popitem(last=False)
                     self._negative_getattr_cache[cache_key] = None
             raise FuseOSError(errno.ENOENT)
-        log.debug(f"GETATTR: Orig stat: {st}")
+        if TRACE_READS:
+            log.debug(f"GETATTR: Orig stat: {st}")
         attrs = {k: getattr(st, k) for k in (
             'st_atime',
             'st_ctime',
@@ -1263,9 +1466,10 @@ class AutoOrtho(Operations):
             'st_ino',
             'st_dev',
         )}
-        log.debug(f"GETATTR: ATTRS: {attrs}")
+        if TRACE_READS:
+            log.debug(f"GETATTR: ATTRS: {attrs}")
         return attrs
-    
+
     def _getattr_redirected_dsf(self, redirect_path):
         """Get attributes for a DSF file redirected to global scenery.
         
@@ -1316,7 +1520,17 @@ class AutoOrtho(Operations):
             for entry in os.listdir(full_path):
                 # DSF files are always included - never filter them out
                 # Time exclusion is handled by redirecting reads, not hiding files
+                if self._stream is not None and (
+                    entry == tile_stream.MARKER_NAME or ".part" in entry
+                ):
+                    continue
                 entries.append(entry)
+            if self._stream is not None:
+                parts = self._stream_rel(path).split("/")
+                if len(parts) == 2 and parts[0] == tile_stream.DSF_DIR:
+                    present = set(entries)
+                    entries.extend(n for n in self._stream.dsf_names(parts[1])
+                                   if n not in present)
             return entries
         return ['.', '..']
 
@@ -1393,9 +1607,9 @@ class AutoOrtho(Operations):
     #@locked
     def open(self, path, flags):
 
-        log.debug(f"OPEN: {path} {flags}")
         full_path = self._full_path(path)
-        log.debug(f"OPEN: FULLPATH {full_path}")
+        if TRACE_READS:
+            log.debug(f"OPEN: {path} {flags} FULLPATH {full_path}")
 
         # Handle DSF files with time exclusion redirect
         if self.dsf_re.match(path):
@@ -1419,6 +1633,16 @@ class AutoOrtho(Operations):
                     log.warning(f"OPEN: Failed to open redirected DSF {redirect_path}: {e}, falling back to ORTHO mode")
                     # Fall through to open the original file
             
+            if self._stream is not None:
+                if os.path.exists(full_path):
+                    self._stream.touch(full_path)
+                    self._stream.note_local_dsf(full_path)
+                    self._stream.prefetch_neighbors(self._stream_rel(path))
+                else:
+                    fallback_fh = self._open_stream_dsf(path, flags)
+                    if fallback_fh is not None:
+                        return fallback_fh
+
             # Normal mode - serve AutoOrtho ortho scenery
             log.info(f"OPEN: DSF [{path}]{pid_text} opened in ORTHO mode (AutoOrtho scenery)")
             self._schedule_dsf_prefetch(path)
@@ -1441,6 +1665,15 @@ class AutoOrtho(Operations):
 
             tile_id = f"{row}_{col}_{maptype}_{zoom}"
             getortho.note_texture_requested(row, col, zoom)
+            # A finished texture is served from its cache file, with no
+            # tile in memory (see disk_texture.py).
+            direct = getortho.open_disk_texture(self.tc, row, col, maptype, zoom)
+            if direct is not None:
+                fh = next(self._direct_fh)
+                with self._direct_lock:
+                    self._direct[fh] = _DirectHandle(direct)
+                self._set_dds_size_cached(row, col, maptype, zoom, direct.size)
+                return fh
             with profile_span(
                 "fuse.dds_open",
                 tile_id=tile_id,
@@ -1467,9 +1700,47 @@ class AutoOrtho(Operations):
             except Exception as exc:  # load-ahead is best effort
                 log.debug(f"Load-ahead could not note {path}: {exc}")
 
+        if self._stream is not None and not os.path.exists(full_path):
+            rel = self._stream_rel(path)
+            if rel.startswith("terrain/") and rel.endswith(".ter"):
+                data = self._stream.ter_bytes(rel.split("/", 1)[1])
+                if data is None:
+                    raise FuseOSError(errno.ENOENT)
+                fh = next(self._virtual_fh)
+                with self._virtual_lock:
+                    self._virtual_files[fh] = data
+                return fh
+            if rel.endswith(".png") and self._stream.entry(rel) is not None:
+                if self._stream.ensure_local(rel) is None:
+                    # X-Plane stops with an error on a missing terrain mask;
+                    # a blank one keeps it flying (default water on that tile).
+                    log.warning(f"OPEN: water mask [{path}] could not be streamed "
+                                "in time; serving a blank stand-in until the scenery reloads")
+                    self._stream_placeholders.add(rel)
+                    fh = next(self._virtual_fh)
+                    with self._virtual_lock:
+                        self._virtual_files[fh] = self._stream.placeholder_png(rel)
+                    return fh
+                self._stream_placeholders.discard(rel)
+        elif self._stream is not None and path.endswith(".png"):
+            self._stream.touch(full_path)
+
         if system_type == 'windows':
             return os.open(full_path, flags | os.O_BINARY)
         return os.open(full_path, flags)
+
+    def _switch_direct_to_live(self, direct, row, col, maptype, zoom):
+        """Serve the rest of a direct open from a live tile.
+
+        The cache file stays open until release: another read of this open
+        may still be using it.
+        """
+        with direct.lock:
+            if direct.live:
+                return
+            self.tc._open_tile(row, col, maptype, zoom)
+            direct.live = True
+        getortho.bump("dds_direct_fallbacks")
 
     def _create(self, path, mode, fi=None):
         uid, gid, pid = fuse_get_context()
@@ -1481,7 +1752,8 @@ class AutoOrtho(Operations):
     #@profile
     #@lru_cache
     def read(self, path, length, offset, fh):
-        log.debug(f"READ: {path} {offset} {length} {fh}")
+        if TRACE_READS:
+            log.debug(f"READ: {path} {offset} {length} {fh}")
         m = self.dds_re.match(path)
         if m:
             row, col, maptype, zoom = m.groups()
@@ -1492,6 +1764,17 @@ class AutoOrtho(Operations):
             if getortho.is_shutdown_requested():
                 log.info(f"Shutdown in progress, returning fallback data for {path}")
                 return _generate_fallback_dds_bytes(offset, length)
+            direct = self._direct.get(fh) if fh else None
+            if direct is not None and not direct.live:
+                try:
+                    return direct.texture.read(offset, length)
+                except disk_texture.DiskTextureFailed as exc:
+                    log.warning(f"Direct read of {path} failed, serving it live: {exc}")
+                    try:
+                        self._switch_direct_to_live(direct, row, col, maptype, zoom)
+                    except Exception as switch_exc:
+                        log.error(f"Could not serve {path} live: {switch_exc}")
+                        return _generate_fallback_dds_bytes(offset, length)
             key = self._tile_key(row, col, maptype, zoom)
             tile_id = f"{row}_{col}_{maptype}_{zoom}"
             request_started = time.monotonic()
@@ -1567,6 +1850,7 @@ class AutoOrtho(Operations):
             )
             read_outcome = "ok"
             admitted = False
+            weight = 0
             lock_held = True
             try:
                 with profile_span(
@@ -1580,8 +1864,11 @@ class AutoOrtho(Operations):
                 # out into the fallback texture instead of the base level.
                 needs_slot = getattr(t, "needs_live_slot", None)
                 if needs_slot is None or needs_slot(offset, length):
+                    slot_weight = getattr(t, "live_slot_weight", None)
+                    weight = slot_weight(offset, length) if slot_weight else 0
                     admitted = getortho.acquire_live_tile_slot(
-                        max(0.0, request_deadline - time.monotonic())
+                        max(0.0, request_deadline - time.monotonic()),
+                        weight=weight,
                     )
                     if not admitted:
                         read_outcome = "fallback"
@@ -1613,7 +1900,7 @@ class AutoOrtho(Operations):
                 return _generate_fallback_dds_bytes(offset, length)
             finally:
                 if admitted:
-                    getortho.release_live_tile_slot()
+                    getortho.release_live_tile_slot(weight=weight)
                 if lock_held:
                     lock.release()
                 record_stage(
@@ -1626,6 +1913,10 @@ class AutoOrtho(Operations):
                         "length": length,
                     },
                 )
+
+        virtual = self._virtual_files.get(fh)
+        if virtual is not None:
+            return virtual[offset:offset + length]
 
         # Regular file passthrough
         with self.fh_locks.setdefault(fh, threading.Lock()):
@@ -1658,16 +1949,19 @@ class AutoOrtho(Operations):
         return 0
 
     def releasedir(self, path, fh):
-        log.debug(f"RELEASEDIR: {path}")
+        if TRACE_READS:
+            log.debug(f"RELEASEDIR: {path}")
         return 0
-    
+
     def opendir(self, path):
-        log.debug(f"OPENDIR: {path}")
-        return 0 
+        if TRACE_READS:
+            log.debug(f"OPENDIR: {path}")
+        return 0
 
     #@locked
     def release(self, path, fh):
-        log.debug(f"RELEASE: {path}")
+        if TRACE_READS:
+            log.debug(f"RELEASE: {path}")
         
         # Unregister DSF close for time exclusion tracking
         if self.dsf_re.match(path):
@@ -1686,7 +1980,21 @@ class AutoOrtho(Operations):
             col = int(col)
             zoom = int(zoom)
             maptype = self._resolve_dds_maptype(maptype)
+            if fh:
+                with self._direct_lock:
+                    direct = self._direct.pop(fh, None)
+                if direct is not None:
+                    with direct.lock:
+                        direct.texture.close()
+                        live = direct.live
+                    if live:
+                        self.tc._close_tile(row, col, maptype, zoom)
+                    return 0
             self.tc._close_tile(row, col, maptype, zoom)
+            return 0
+        if fh in self._virtual_files:
+            with self._virtual_lock:
+                self._virtual_files.pop(fh, None)
             return 0
         try:
             return os.close(fh)
@@ -1695,12 +2003,14 @@ class AutoOrtho(Operations):
 
     # X-Plane never writes to files in the FUSE mount
     def _fsync(self, path, fdatasync, fh):
-        log.debug(f"FSYNC: {path}")
+        if TRACE_READS:
+            log.debug(f"FSYNC: {path}")
         return self.flush(path, fh)
 
 
     def close(self, path=None, fh=None):
-        log.debug(f"CLOSE: {path}")
+        if TRACE_READS:
+            log.debug(f"CLOSE: {path}")
         if path is None and fh is None:
             self.shutdown()
         return 0

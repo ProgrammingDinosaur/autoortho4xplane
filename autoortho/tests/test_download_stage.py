@@ -6,6 +6,7 @@ rules of ``_BrokerDownloadStage`` (bounded outstanding work with slots reserved
 for live requests).  Nothing here touches the network.
 """
 
+import os
 import sys
 import threading
 import time
@@ -99,6 +100,27 @@ def test_begin_network_attempt_honours_cancellation(chunk):
 # ---------------------------------------------------------------------------
 # finish_network_attempt
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("header", ["X-VE-Tile-Info", "x-ve-tile-info"])
+def test_provider_no_tile_answer_fails_chunk_for_good(chunk, header):
+    # Bing's no-imagery answer: HTTP 200, a 1 KB PNG and this header.
+    request = _prepare(chunk)
+    outcome = chunk.finish_network_attempt(
+        request,
+        FakeResponse(
+            200,
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 64,
+            headers={header: "no-tile", "content-type": "image/png"},
+        ),
+    )
+
+    assert outcome.resolved is True
+    assert chunk.permanent_failure is True
+    assert chunk.failure_reason == "no_imagery"
+    assert chunk.data == b""
+    assert chunk.ready.is_set()
+    assert not os.path.exists(chunk.cache_path)
+
 
 def test_successful_response_persists_and_marks_ready(chunk):
     request = _prepare(chunk)
@@ -259,6 +281,27 @@ def test_unrelated_retries_do_not_consume_broker_timeout_budget(chunk):
 
     assert outcome.resolved is False
     assert chunk.broker_timeout_count == 1
+    assert chunk.permanent_failure is False
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_queue_timeouts_retry_soon_without_using_timeout_budget(chunk, wrapped):
+    # A request that expired in the broker queue never reached the provider:
+    # it must not count toward the timeout budget that fails a chunk for good.
+    request = _prepare(chunk)
+    for _ in range(getortho.MAX_BROKER_TIMEOUT_ATTEMPTS + 1):
+        error = getortho.BrokerQueueTimeoutError("timed out waiting in broker queue")
+        if wrapped:
+            # The synchronous path re-raises broker timeouts as requests ones.
+            try:
+                raise getortho.requests.exceptions.Timeout(str(error)) from error
+            except getortho.requests.exceptions.Timeout as exc:
+                error = exc
+        outcome = chunk.finish_network_attempt(request, error=error)
+
+        assert outcome.resolved is False
+        assert outcome.requeue_delay == 0.25
+    assert chunk.broker_timeout_count == 0
     assert chunk.permanent_failure is False
 
 

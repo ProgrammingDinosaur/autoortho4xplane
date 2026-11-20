@@ -21,6 +21,7 @@ from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QCursor,
     QIcon,
     QKeySequence,
     QPainter,
@@ -40,7 +41,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QStackedWidget,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -74,7 +77,10 @@ AVAILABLE_FILL = QColor(200, 200, 200, 40)
 AVAILABLE_EDGE = QColor(200, 200, 200, 150)
 LABEL = QColor("#b0b0b0")
 
-PAINT, ERASE, PAN = "paint", "erase", "pan"
+PAINT, ERASE, PAN, SELECT = "paint", "erase", "pan", "select"
+SOURCES_VIEW, CACHE_VIEW = "sources", "cache"
+SELECTION_COLOR = QColor("#4dd0e1")
+PINNED_COLOR = QColor("#ffffff")
 MAX_UNDO = 100
 
 
@@ -225,6 +231,9 @@ class MapCanvas(QWidget):
     """Mercator map that paints cells and reports drag boxes."""
 
     boxSelected = Signal(list)       # list[(lat, lon)]
+    # Cache view: (cells, additive). A click selects one cell; Ctrl or
+    # Shift adds to (or, for a single cell, toggles) the selection.
+    cellsPicked = Signal(list, bool)
     hoverChanged = Signal(object)    # (lat, lon) or None
     viewChanged = Signal()
 
@@ -254,6 +263,14 @@ class MapCanvas(QWidget):
         self._drag_now: Optional[QPointF] = None
         self._pan_start: Optional[tuple[QPointF, QPointF]] = None
         self._hover: Optional[tuple[int, int]] = None
+        # Cache view layer: colour -> rects, plus pinned and selected cells.
+        self.view = SOURCES_VIEW
+        self._cache_rects: list[tuple[QColor, list[QRectF]]] = []
+        self._cache_legend: list[tuple[str, str]] = []
+        self.pinned: set[tuple[int, int]] = set()
+        self._pinned_rects: list[QRectF] = []
+        self.selection: set[tuple[int, int]] = set()
+        self._selection_rects: list[QRectF] = []
         self._update_cursor()
 
     # -- data -------------------------------------------------------------
@@ -273,6 +290,30 @@ class MapCanvas(QWidget):
     def set_mode(self, mode: str):
         self.mode = mode
         self._update_cursor()
+
+    def set_view(self, view: str):
+        self.view = view
+        self.update()
+
+    def set_cache_layer(self, groups: list[tuple[str, Iterable[tuple[int, int]]]],
+                        pinned: Iterable[tuple[int, int]],
+                        legend: list[tuple[str, str]]):
+        """Cells to fill per colour in the cache view, and its legend."""
+        layer = []
+        for color, cells in groups:
+            fill = QColor(color)
+            fill.setAlpha(130)
+            layer.append((fill, [cell_rect(*c) for c in cells]))
+        self._cache_rects = layer
+        self.pinned = set(pinned)
+        self._pinned_rects = [cell_rect(*c) for c in self.pinned]
+        self._cache_legend = list(legend)
+        self.update()
+
+    def set_selection(self, cells: Iterable[tuple[int, int]]):
+        self.selection = set(cells)
+        self._selection_rects = [cell_rect(*c) for c in self.selection]
+        self.update()
 
     # -- view -------------------------------------------------------------
     @property
@@ -389,13 +430,18 @@ class MapCanvas(QWidget):
             painter.drawPath(self.outline["land"])
             painter.setBrush(OCEAN)
             painter.drawPath(self.outline["lakes"])
-            painter.setBrush(AVAILABLE_FILL)
-            painter.drawRects(self._available_rects)
-            for maptype, rects in self._cell_rects.items():
-                color = QColor(MAPTYPE_COLORS.get(maptype, FALLBACK_COLOR))
-                color.setAlpha(110)
-                painter.setBrush(color)
-                painter.drawRects(rects)
+            if self.view == CACHE_VIEW:
+                for fill, rects in self._cache_rects:
+                    painter.setBrush(fill)
+                    painter.drawRects(rects)
+            else:
+                painter.setBrush(AVAILABLE_FILL)
+                painter.drawRects(self._available_rects)
+                for maptype, rects in self._cell_rects.items():
+                    color = QColor(MAPTYPE_COLORS.get(maptype, FALLBACK_COLOR))
+                    color.setAlpha(110)
+                    painter.setBrush(color)
+                    painter.drawRects(rects)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(coast)
@@ -403,11 +449,13 @@ class MapCanvas(QWidget):
             painter.drawPath(self.outline["lakes"])
             painter.setPen(border)
             painter.drawPath(self.outline["borders"])
+            if self.view == CACHE_VIEW:
+                self._paint_cache_marks(painter)
         painter.resetTransform()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
         south, north, west, east = self.visible_bounds()
-        if cell_px >= 12:
+        if cell_px >= 12 and self.view != CACHE_VIEW:
             self._paint_cell_edges(painter, south, north, west, east)
         if cell_px >= 5:
             self._paint_grid(painter, south, north, west, east)
@@ -422,6 +470,24 @@ class MapCanvas(QWidget):
         tl = self.to_screen(r.left(), r.top())
         br = self.to_screen(r.right(), r.bottom())
         return QRectF(tl, br)
+
+    def _paint_cache_marks(self, painter):
+        """Pinned outlines and the selection, in map units (current transform)."""
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        if self._selection_rects:
+            fill = QColor(SELECTION_COLOR)
+            fill.setAlpha(70)
+            pen = QPen(SELECTION_COLOR, 1.5)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(fill)
+            painter.drawRects(self._selection_rects)
+        if self._pinned_rects:
+            pen = QPen(PINNED_COLOR, 2.0)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRects(self._pinned_rects)
 
     def _paint_cell_edges(self, painter, south, north, west, east):
         dashed = QPen(AVAILABLE_EDGE, 1.0, Qt.PenStyle.DashLine)
@@ -479,10 +545,13 @@ class MapCanvas(QWidget):
 
     def _paint_legend(self, painter):
         """Compact key for the sources in use, top-right corner."""
-        items = [(MAPTYPE_COLORS.get(m, FALLBACK_COLOR), m)
-                 for m in sorted(set(self.cells.values()))]
-        if self.available:
-            items.append(("#6a6f74", "Installed (default source)"))
+        if self.view == CACHE_VIEW:
+            items = list(self._cache_legend)
+        else:
+            items = [(MAPTYPE_COLORS.get(m, FALLBACK_COLOR), m)
+                     for m in sorted(set(self.cells.values()))]
+            if self.available:
+                items.append(("#6a6f74", "Installed (default source)"))
         if not items:
             return
         metrics = painter.fontMetrics()
@@ -498,9 +567,14 @@ class MapCanvas(QWidget):
         y = box.top() + 4
         for color, text in items:
             swatch = QRectF(box.left() + 8, y + (row - 10) / 2, 10, 10)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(color))
-            painter.drawRect(swatch)
+            if color.startswith("outline:"):  # an outline, not a fill
+                painter.setPen(QPen(QColor(color.split(":", 1)[1]), 2.0))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(swatch.adjusted(1, 1, -1, -1))
+            else:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(color))
+                painter.drawRect(swatch)
             painter.setPen(LABEL)
             painter.drawText(QPointF(swatch.right() + 8,
                                      y + row / 2 + metrics.ascent() / 2 - 1),
@@ -522,7 +596,12 @@ class MapCanvas(QWidget):
         if self._drag_start is None or self._drag_now is None:
             return
         rect = QRectF(self._drag_start, self._drag_now).normalized()
-        color = QColor("#dd7373") if self.mode == ERASE else QColor("#ffffff")
+        if self.mode == ERASE:
+            color = QColor("#dd7373")
+        elif self.mode == SELECT:
+            color = QColor(SELECTION_COLOR)
+        else:
+            color = QColor("#ffffff")
         painter.setPen(QPen(color, 1.5, Qt.PenStyle.DashLine))
         fill = QColor(color)
         fill.setAlpha(28)
@@ -587,7 +666,13 @@ class MapCanvas(QWidget):
         cells = cells_in_box(y_to_lat(ya), y_to_lat(yb),
                              x_to_lon(a.x()), x_to_lon(b.x()))
         self.update()
-        self.boxSelected.emit(cells)
+        if self.mode == SELECT:
+            additive = bool(event.modifiers() & (
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.ShiftModifier))
+            self.cellsPicked.emit(cells, additive)
+        else:
+            self.boxSelected.emit(cells)
 
     def leaveEvent(self, _event):
         if self._hover is not None:
@@ -653,6 +738,8 @@ class CustomMapEditor(QWidget):
     """Toolbar, map canvas and status line around a CustomMapConfig."""
 
     cellsChanged = Signal()
+    viewChanged = Signal(str)   # SOURCES_VIEW or CACHE_VIEW
+    cacheChanged = Signal()     # the Cache view deleted or downloaded files
     _tilesLoaded = Signal(list)
 
     def __init__(
@@ -662,6 +749,8 @@ class CustomMapEditor(QWidget):
         scenery_path: Callable[[], str],
         discover: Callable[[str], list[str]],
         parent=None,
+        cache_paths: Optional[Callable[[], tuple[str, str, str]]] = None,
+        task_manager=None,
     ):
         super().__init__(parent)
         self.config = config
@@ -674,12 +763,44 @@ class CustomMapEditor(QWidget):
         self._scanning = False
         self._hover = None
         self._fitted = False
+        self.view = SOURCES_VIEW
+        self.cache_panel = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(6)
 
-        bar = QHBoxLayout()
+        # View toggle (only when the cache view can be offered).
+        self.view_buttons = {}
+        if cache_paths is not None:
+            toggle = QHBoxLayout()
+            toggle.setSpacing(0)
+            self.view_group = QButtonGroup(self)
+            self.view_group.setExclusive(True)
+            for view, label, tip in (
+                (SOURCES_VIEW, "Imagery Sources",
+                 "Choose the imagery source per tile"),
+                (CACHE_VIEW, "Cache",
+                 "See, delete and keep for offline flying what AutoOrtho "
+                 "has stored per tile"),
+            ):
+                button = QToolButton()
+                button.setText(label)
+                button.setToolTip(tip)
+                button.setCheckable(True)
+                button.setProperty("chip", True)
+                self.view_group.addButton(button)
+                self.view_buttons[view] = button
+                button.toggled.connect(
+                    lambda on, v=view: on and self.set_view(v)
+                )
+                toggle.addWidget(button)
+            toggle.addStretch(1)
+            root.addLayout(toggle)
+
+        self.sources_bar = QWidget()
+        bar = QHBoxLayout(self.sources_bar)
+        bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(6)
         self.maptype_combo = QComboBox()
         self.maptype_combo.setToolTip("Imagery source to paint")
@@ -752,11 +873,26 @@ class CustomMapEditor(QWidget):
         self.clear_action.triggered.connect(self.clear_all)
         self.more_button.setMenu(menu)
         bar.addWidget(self.more_button)
-        root.addLayout(bar)
 
         self.canvas = MapCanvas(self)
         self.canvas.boxSelected.connect(self._apply_box)
         self.canvas.hoverChanged.connect(self._on_hover)
+
+        self.toolbars = QStackedWidget()
+        self.toolbars.addWidget(self.sources_bar)
+        if cache_paths is not None:
+            if __package__ and __package__.startswith("autoortho."):
+                from autoortho.ui.widgets.cache_map_panel import CachePanel
+            else:
+                from ui.widgets.cache_map_panel import CachePanel
+            self.cache_panel = CachePanel(self.canvas, cache_paths,
+                                          task_manager=task_manager)
+            self.cache_panel.statusChanged.connect(self._on_cache_status)
+            self.cache_panel.cacheChanged.connect(self.cacheChanged)
+            self.toolbars.addWidget(self.cache_panel)
+        self.toolbars.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                    QSizePolicy.Policy.Maximum)
+        root.addWidget(self.toolbars)
         root.addWidget(self.canvas, 1)
 
         self.status = QLabel("Looking for installed scenery tiles…")
@@ -776,8 +912,49 @@ class CustomMapEditor(QWidget):
 
         self._tilesLoaded.connect(self._on_tiles_loaded)
         self.mode_buttons[PAINT].setChecked(True)
+        if self.view_buttons:
+            self.view_buttons[SOURCES_VIEW].setChecked(True)
         self.reload_cells()
         self._update_buttons()
+
+    # -- views ------------------------------------------------------------
+    def set_view(self, view: str):
+        """Switch between the imagery-source editor and the Cache view."""
+        if view == CACHE_VIEW and self.cache_panel is None:
+            return
+        if view == self.view:
+            return
+        self.view = view
+        button = self.view_buttons.get(view)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+        QToolTip.hideText()
+        if view == CACHE_VIEW:
+            self.toolbars.setCurrentWidget(self.cache_panel)
+            self.cache_panel.activate()
+        else:
+            if self.cache_panel is not None:
+                self.cache_panel.deactivate()
+            self.toolbars.setCurrentWidget(self.sources_bar)
+            self.canvas.set_view(SOURCES_VIEW)
+            self.canvas.set_mode(self._sources_mode())
+            self._refresh_status()
+        self.viewChanged.emit(view)
+
+    def _sources_mode(self) -> str:
+        for mode, button in self.mode_buttons.items():
+            if button.isChecked():
+                return mode
+        return PAINT
+
+    def set_runtime_locked(self, locked: bool):
+        """Cache changes are only allowed while AutoOrtho is stopped."""
+        if self.cache_panel is not None:
+            self.cache_panel.set_runtime_locked(locked)
+
+    def _on_cache_status(self, text: str):
+        if self.view == CACHE_VIEW:
+            self.status.setText(text)
 
     # -- data -------------------------------------------------------------
     def reload_cells(self):
@@ -827,9 +1004,13 @@ class CustomMapEditor(QWidget):
         super().showEvent(event)
         if not self._tiles_loaded and not self._scanning:
             self.refresh_tiles()
+        if self.view == CACHE_VIEW:
+            self.cache_panel.refresh_if_stale()
 
     # -- editing ----------------------------------------------------------
     def _set_mode(self, mode: str):
+        if self.view != SOURCES_VIEW:
+            return
         self.canvas.set_mode(mode)
         self._refresh_status()
 
@@ -862,6 +1043,8 @@ class CustomMapEditor(QWidget):
         self.cellsChanged.emit()
 
     def _apply_box(self, cells: list):
+        if self.view != SOURCES_VIEW:
+            return
         cells = [c for c in cells if c in self.canvas.available]
         if not cells:
             return
@@ -872,14 +1055,14 @@ class CustomMapEditor(QWidget):
             self._apply({c: maptype for c in cells})
 
     def undo(self):
-        if not self._undo:
+        if not self._undo or self.view != SOURCES_VIEW:
             return
         before, after = self._undo.pop()
         self._redo.append((before, after))
         self._apply(before, record=False)
 
     def redo(self):
-        if not self._redo:
+        if not self._redo or self.view != SOURCES_VIEW:
             return
         before, after = self._redo.pop()
         self._undo.append((before, after))
@@ -964,6 +1147,13 @@ class CustomMapEditor(QWidget):
     # -- status -----------------------------------------------------------
     def _on_hover(self, cell):
         self._hover = cell
+        if self.view == CACHE_VIEW:
+            if cell is None or self.canvas._drag_start is not None:
+                QToolTip.hideText()
+            else:
+                QToolTip.showText(QCursor.pos(),
+                                  self.cache_panel.hover_text(cell), self.canvas)
+            return
         self._refresh_status()
 
     def _update_buttons(self):
@@ -975,6 +1165,8 @@ class CustomMapEditor(QWidget):
         self.clear_action.setEnabled(bool(self.canvas.cells))
 
     def _refresh_status(self, *_):
+        if self.view != SOURCES_VIEW:
+            return
         count = len(self.canvas.cells)
         parts = [f"{count} tile{'s' if count != 1 else ''} assigned"]
         if not self._tiles_loaded:

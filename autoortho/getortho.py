@@ -85,6 +85,11 @@ except ImportError:
     import texture_plan
     import wait_bands
 
+try:
+    from autoortho import disk_texture
+except ImportError:
+    import disk_texture
+
 # Photo textures X-Plane holds (finest level read in the last 20 minutes):
 # the graphics memory estimate auto-tuning watches for the texture cap.
 held_textures = texture_plan.HeldTextures()
@@ -183,10 +188,12 @@ import psutil
 try:
     from autoortho.http2_broker import (
         HTTP2Broker,
+        MultiBrokerClient,
         RequestTimeout as BrokerRequestTimeout,
         BrokerCancelledError,
         BrokerCapacityError,
         BrokerTimeoutError,
+        BrokerQueueTimeoutError,
         BrokerTransportError,
         BrokerShutdownError,
         BrokerError,
@@ -195,22 +202,28 @@ except ImportError:
     try:
         from http2_broker import (
             HTTP2Broker,
+            MultiBrokerClient,
             RequestTimeout as BrokerRequestTimeout,
             BrokerCancelledError,
             BrokerCapacityError,
             BrokerTimeoutError,
+            BrokerQueueTimeoutError,
             BrokerTransportError,
             BrokerShutdownError,
             BrokerError,
         )
     except ImportError:
         HTTP2Broker = None
+        MultiBrokerClient = None
         BrokerRequestTimeout = None
 
         class BrokerError(Exception):
             """Placeholder used when the broker package is unavailable."""
 
         class BrokerTimeoutError(BrokerError):
+            """Placeholder used when the broker package is unavailable."""
+
+        class BrokerQueueTimeoutError(BrokerTimeoutError):
             """Placeholder used when the broker package is unavailable."""
 
         class BrokerCancelledError(BrokerError):
@@ -358,7 +371,9 @@ def _batch_read_cache_files(paths: list) -> dict:
     # Try native batch read first (OpenMP parallel, fastest)
     if native is not None:
         try:
-            with _native_build_context() as threads:
+            # About two files a thread: a read of a few files needs no team
+            # half the CPU wide (see _settle_native_team).
+            with _native_build_context(cap=-(-len(paths) // 2)) as threads:
                 results = native.batch_read_cache(paths, max_threads=threads, validate_jpeg=True)
             output = {}
             for path, (data, success) in zip(paths, results):
@@ -455,6 +470,7 @@ def _get_native_dds():
             # Respect user's compressor preference from config
             use_ispc = CFG.pydds.compressor.upper() == "ISPC"
             AoDDS.set_use_ispc(use_ispc)
+            _sync_decode_memory_limit()
             
             # Check if hybrid function is available (preferred)
             has_hybrid = hasattr(AoDDS, 'build_from_jpegs')
@@ -600,6 +616,9 @@ _tile_queue_initialized = False
 # Priority constants for buffer pool acquisition
 # Import from AoDDS when available, or use local fallbacks
 PRIORITY_LIVE = 0       # Live tiles requested by X-Plane (premium, front of queue)
+# Rows of a level X-Plane has started reading but not reached yet: after every
+# read X-Plane is waiting on (near 0, middle 10+, far 30), before prefetch.
+PRIORITY_READ_AHEAD = 50
 PRIORITY_PREFETCH = 100 # Prefetch/pre-built tiles (low priority, back of queue)
 PRIORITY_BACKGROUND_DDS = PRIORITY_PREFETCH
 PRIORITY_CACHE_REPAIR = 500
@@ -1136,6 +1155,11 @@ def _build_dds_native(cache_dir: str, tile_row: int, tile_col: int,
 
 MEMTRACE = False
 
+# Per-read and per-chunk debug lines (several per 64 KB read) only when
+# AO_TRACE_READS=1. At the default DEBUG level they cost more than the reads
+# themselves once many textures load at once.
+TRACE_READS = os.environ.get("AO_TRACE_READS") == "1"
+
 log = logging.getLogger(__name__)
 
 
@@ -1177,19 +1201,63 @@ def _get_http2_client():
         if _http2_client is not None:
             return _http2_client
         try:
-            _http2_client = HTTP2Broker.connect(
-                address,
-                token,
+            client_kwargs = dict(
                 max_pending=resolve_provider_setting("provider_max_in_flight"),
                 queue_timeout=resolve_provider_setting(
                     "provider_queue_timeout"
                 ),
+                live_queue_timeout=_live_queue_timeout_seconds(),
             )
+            addresses = [a for a in address.split(",") if a]
+            if len(addresses) > 1 and MultiBrokerClient is not None:
+                # Several broker processes (provider_broker_processes).
+                _http2_client = MultiBrokerClient.connect(
+                    addresses, token.split(","), **client_kwargs
+                )
+            else:
+                _http2_client = HTTP2Broker.connect(
+                    address, token, **client_kwargs
+                )
         except Exception as exc:
             _http2_client_failed = True
             log.error("Could not connect to shared HTTP/2 broker: %s", exc)
             return None
         return _http2_client
+
+
+def _live_queue_timeout_seconds():
+    """How long a live request may wait in the broker queue before a retry.
+
+    Twice the in-flight near-read wait (at least 10 s): longer and the read
+    that asked for it has already given up, while a lost request held its
+    chunk for the whole provider queue timeout (60 s by default).
+    """
+    try:
+        near = wait_bands.wait_seconds(wait_bands.NEAR, False)
+    except Exception:
+        near = 6.0
+    return max(10.0, 2.0 * float(near))
+
+
+def _provider_has_no_imagery(response):
+    """True when the provider said it has no imagery for this tile."""
+    headers = getattr(response, "headers", None) or {}
+    try:
+        items = headers.items()
+    except AttributeError:
+        return False
+    for name, value in items:
+        if str(name).lower() == "x-ve-tile-info":
+            return str(value).strip().lower() == "no-tile"
+    return False
+
+
+def _broker_timeout_of(error):
+    """The broker timeout behind ``error`` (raised or wrapped), else None."""
+    for candidate in (error, getattr(error, "__cause__", None)):
+        if isinstance(candidate, BrokerTimeoutError):
+            return candidate
+    return None
 
 
 def _close_http2_client():
@@ -1558,10 +1626,45 @@ try:
     )
 except (TypeError, ValueError):
     _live_tile_admission_limit = 16
+
+
+def _live_build_memory_bytes(cache_mem_gb=None):
+    """Byte budget of live builds admitted at once.
+
+    ``[autoortho] live_build_memory_mb``; 0 (default) derives it from
+    ``[cache] cache_mem_limit``: a quarter of it, between 256 MB and 2 GB.
+    """
+    try:
+        explicit = float(getattr(CFG.autoortho, "live_build_memory_mb", 0) or 0)
+    except (TypeError, ValueError):
+        explicit = 0
+    if explicit > 0:
+        return int(explicit * 1048576)
+    try:
+        if cache_mem_gb is None:
+            cache_mem_gb = float(getattr(CFG.cache, "cache_mem_limit", 4))
+        derived = int(float(cache_mem_gb) * 1024 ** 3 / 4)
+    except (TypeError, ValueError):
+        derived = 1024 ** 3
+    return max(256 * 1048576, min(2 * 1024 ** 3, derived))
+
+
+def live_build_weight(width, height, mip):
+    """Memory a live build of level ``mip`` holds while it runs.
+
+    The RGBA image plus its BC data and resize buffers: about 4.5 bytes per
+    pixel (75 MB for a 4096 px level, 1.2 MB for 512 px).
+    """
+    w = max(1, int(width) >> int(mip))
+    h = max(1, int(height) >> int(mip))
+    return w * h * 9 // 2
+
+
 # Resizable so the governor can widen or narrow live admission while
-# streaming (live_settings.py).
+# streaming (live_settings.py), and weighted by each build's memory.
 _live_tile_admission = ResizableGate(
-    _live_tile_admission_limit
+    _live_tile_admission_limit,
+    byte_budget=_live_build_memory_bytes(),
 )
 
 _read_ahead_executor = None
@@ -1620,14 +1723,20 @@ def _live_read_end():
     live_pressure_controller.live_read_end()
 
 
-def acquire_live_tile_slot(timeout: float) -> bool:
-    """Bound complete live tile work before expensive tile state is created."""
+def acquire_live_tile_slot(timeout: float, weight: int = 0) -> bool:
+    """Bound complete live tile work before expensive tile state is created.
+
+    ``weight`` is the memory the build will hold (:func:`live_build_weight`);
+    pass the same value to :func:`release_live_tile_slot`.
+    """
     started = time.monotonic()
-    acquired = _live_tile_admission.acquire(blocking=False)
+    acquired = _live_tile_admission.acquire(blocking=False, weight=weight)
     if not acquired:
         # The governor's compute signal: live tiles queueing for admission.
         bump("live_admission_waits")
-        acquired = _live_tile_admission.acquire(timeout=max(0.0, timeout))
+        acquired = _live_tile_admission.acquire(
+            timeout=max(0.0, timeout), weight=weight
+        )
     waited_ms = (time.monotonic() - started) * 1000.0
     record_stage(
         "tile.admission_wait",
@@ -1639,9 +1748,9 @@ def acquire_live_tile_slot(timeout: float) -> bool:
     return acquired
 
 
-def release_live_tile_slot() -> None:
+def release_live_tile_slot(weight: int = 0) -> None:
     try:
-        _live_tile_admission.release()
+        _live_tile_admission.release(weight=weight)
     except ValueError:
         log.error("Live tile admission released without a matching acquire")
 
@@ -1855,6 +1964,33 @@ def _thread_budget_for(active: int) -> int:
     return max(1, _native_cpu_budget() // max(2, active))
 
 
+def _partial_build_threads_supported(native_dds) -> bool:
+    check = getattr(native_dds, "partial_mipmap_supports_threads", None)
+    try:
+        return bool(check and check())
+    except Exception:
+        return False
+
+
+def _partial_build_threads(chunk_count: int) -> int:
+    """Threads one partial mm0 build reserves.
+
+    A partial build covers a band of rows (32 chunks per 8192 px row), too
+    little work for a full team: reserving the whole CPU let only one band
+    build at a time, so every texture being read at full resolution queued
+    behind the others. About eight chunks per thread keeps one band fast
+    while several textures build side by side.
+    """
+    budget = _native_cpu_budget()
+    override = os.environ.get("AO_PARTIAL_BUILD_THREADS")
+    if override:
+        try:
+            return max(1, min(budget, int(override)))
+        except ValueError:
+            pass
+    return max(1, min(budget // 2 or 1, -(-chunk_count // 8)))
+
+
 class _BackgroundBuildDeferred(Exception):
     """Raised when speculative DDS work should yield to live X-Plane requests."""
 
@@ -1862,9 +1998,12 @@ class _BackgroundBuildDeferred(Exception):
 class _native_build_context:
     """``__enter__`` returns the per-build OpenMP thread budget under the same lock
     that increments the active-build counter, so each build sees itself in the count."""
-    def __init__(self, threads=None, *, priority=PRIORITY_LIVE):
+    def __init__(self, threads=None, *, priority=PRIORITY_LIVE, cap=None):
         self._requested_threads = threads
         self._priority = priority
+        # An upper bound on the threads granted that, unlike ``threads``,
+        # never makes the build wait for them.
+        self._cap = cap
 
     def __enter__(self):
         global _active_native_builds, _active_native_thread_count, _peak_native_thread_count
@@ -1891,6 +2030,8 @@ class _native_build_context:
                     self._requested_threads or _thread_budget_for(_active_native_builds),
                     budget - _active_native_thread_count,
                 )
+                if self._cap:
+                    self._threads = max(1, min(self._threads, int(self._cap)))
                 _active_native_thread_count += self._threads
                 if _active_native_thread_count > _peak_native_thread_count:
                     _peak_native_thread_count = _active_native_thread_count
@@ -1905,7 +2046,54 @@ class _native_build_context:
             _active_native_builds -= 1
             _active_native_thread_count -= self._threads
             _native_build_condition.notify_all()
+        _settle_native_team(self._threads)
         return False
+
+
+# OpenMP worker threads that calling threads keep (see _settle_native_team).
+_native_team_lock = threading.Lock()
+_native_team_keepers = {}
+_native_team_kept = 0
+
+
+def _settle_native_team(threads):
+    """Free this thread's OpenMP team unless it is one of the few that keep one.
+
+    libgomp keeps a team of worker threads for every thread that ran a
+    parallel region, until that thread exits (on Windows, not even then).
+    Builds run on many long-lived threads, so each kept a team: the mount
+    worker grew from about 160 threads to 634 while a flight loaded and
+    stayed near 470. Threads keep teams of up to a quarter of the CPU budget,
+    since a new team costs 0.3 to 1 ms a build, until the kept teams add up
+    to one budget; every other thread frees its team when its build ends.
+    The cap keeps one wide build from taking the whole share. A keeper's
+    share is handed on only when its team is freed: the teams of keepers
+    that exit are not freed on Windows.
+    """
+    global _native_team_kept
+    workers = max(0, int(threads or 1) - 1)
+    ident = threading.get_ident()
+    budget = _native_cpu_budget()
+    with _native_team_lock:
+        kept = _native_team_keepers.get(ident)
+        if kept is not None and workers <= kept:
+            return
+        grow = workers - (kept or 0)
+        if workers <= max(1, budget // 4) and _native_team_kept + grow <= budget:
+            _native_team_keepers[ident] = workers
+            _native_team_kept += grow
+            return
+        if kept is not None:
+            # Freed below, so its share can go to another thread.
+            del _native_team_keepers[ident]
+            _native_team_kept -= kept
+    native = _get_native_dds()
+    release = getattr(native, "release_thread_team", None)
+    try:
+        if release is not None and release():
+            bump("native_teams_released")
+    except Exception as exc:
+        log.debug(f"Releasing this thread's OpenMP team failed: {exc}")
 
 
 def _defer_background_build_if_live(tile=None):
@@ -2072,8 +2260,27 @@ def _on_live_predictive_memory(value):
 def _on_live_cache_limit(value):
     try:
         TileCacher.cache_mem_lim = int(float(value) * 1024 ** 3)
+        _live_tile_admission.set_byte_budget(_live_build_memory_bytes(value))
+        _sync_decode_memory_limit()
     except (TypeError, ValueError):
         pass
+
+
+def _sync_decode_memory_limit():
+    """Match the native decode pool's limit to the live build memory budget.
+
+    Builds hold their decoded chunks until they compose them, so a limit
+    below what live admission lets in made builds wait at the pool, holding
+    buffers and a build gate slot, and then allocate past it anyway.
+    """
+    native = _get_native_dds()
+    setter = getattr(native, "set_decode_build_memory", None)
+    if setter is None:
+        return
+    try:
+        setter(_live_tile_admission.byte_budget)
+    except Exception as exc:
+        log.debug(f"Setting the decode pool's limit failed: {exc}")
 
 
 def _on_live_prefetch(_value):
@@ -3423,6 +3630,20 @@ class _BrokerDownloadStage(object):
             self._retire_deferred(pending)
         return len(removed)
 
+    def promote(self, chunk, priority) -> bool:
+        """Raise one chunk in the deferred queue, or its request at the broker."""
+        key = getattr(chunk, "chunk_id", None) or id(chunk)
+        moved = bool(self._deferred.reprioritize(key, int(priority)))
+        request_id = getattr(chunk, "_broker_request_id", None)
+        if request_id:
+            broker = _get_http2_client()
+            if broker is not None:
+                try:
+                    moved = bool(broker.reprioritize(request_id, int(priority))) or moved
+                except BrokerError:
+                    pass
+        return moved
+
     def reprioritize_deferred(self):
         for pending in self._deferred.items():
             key = getattr(pending.obj, "chunk_id", None) or id(pending.obj)
@@ -3848,6 +4069,38 @@ class ChunkGetter(Getter):
     _queued_chunk_objs = {}
     _queued_chunk_waiters = {}
     _queued_lock = threading.Lock()
+
+    def promote(self, chunk, priority) -> bool:
+        """Raise one queued or in-flight chunk to ``priority`` (lower is sooner).
+
+        A chunk queued ahead of need (read-ahead, prefetch) that a read now
+        waits for must not stay behind other work. Returns True if it moved.
+        """
+        priority = int(priority)
+        if int(getattr(chunk, "priority", priority)) <= priority:
+            return False
+        chunk.priority = priority
+        chunk_id = getattr(chunk, "chunk_id", None)
+        if chunk_id is None:
+            return False
+        moved = False
+        if getattr(chunk, "prefetch", False) and priority < PRIORITY_PREFETCH:
+            chunk.prefetch = False
+            item = self.prefetch_queue.remove(chunk_id)
+            if item is not None:
+                self.live_queue.put_nowait(item, item_key=chunk_id, item_priority=priority)
+                moved = True
+        if not moved:
+            moved = bool(self.live_queue.reprioritize(chunk_id, priority))
+        stage = self._async_stage
+        if stage is not None:
+            try:
+                moved = stage.promote(chunk, priority) or moved
+            except Exception:
+                log.debug("Download stage promotion failed for %s", chunk, exc_info=True)
+        if moved:
+            bump("chunk_promoted")
+        return moved
 
     def reprioritize_queue(self) -> None:
         """Re-key queued work and move promoted prefetch into the live lane."""
@@ -4628,6 +4881,13 @@ def _cleanup_temp(path: str):
 # Consulted by _save_to_dir to choose the right LT cache backoff interval.
 _atomic_write_last_errno: dict[str, int] = {}
 
+# Write directories _atomic_write has already created. os.makedirs costs three
+# file-system calls (about 0.1 ms on Windows) and ran once per chunk written; a
+# directory removed later (cache cleanup) is dropped from here on the failed
+# write and created again.
+_known_write_dirs: set[str] = set()
+_MAX_KNOWN_WRITE_DIRS = 65_536
+
 
 def _atomic_write(target_path: str, data: bytes) -> bool:
     """Atomically write ``data`` to ``target_path`` via tempfile + ``os.replace``.
@@ -4637,11 +4897,16 @@ def _atomic_write(target_path: str, data: bytes) -> bool:
     failure. Bookkeeping (disk budget, stats) is the caller's responsibility.
     """
     write_dir = os.path.dirname(target_path)
-    try:
-        os.makedirs(write_dir, exist_ok=True)
-    except OSError as e:
-        log.debug(f"_atomic_write: makedirs failed for {write_dir}: {e}")
-        return False
+    dir_was_known = write_dir in _known_write_dirs
+    if not dir_was_known:
+        try:
+            os.makedirs(write_dir, exist_ok=True)
+        except OSError as e:
+            log.debug(f"_atomic_write: makedirs failed for {write_dir}: {e}")
+            return False
+        if len(_known_write_dirs) >= _MAX_KNOWN_WRITE_DIRS:
+            _known_write_dirs.clear()
+        _known_write_dirs.add(write_dir)
 
     if os.path.exists(target_path):
         try:
@@ -4657,12 +4922,17 @@ def _atomic_write(target_path: str, data: bytes) -> bool:
         with open(temp_filename, 'wb') as h:
             h.write(data)
     except FileNotFoundError:
+        _known_write_dirs.discard(write_dir)
+        if dir_was_known:
+            # The directory went away after it was created: create it again.
+            return _atomic_write(target_path, data)
         try:
             _chunk_cache_index.invalidate(target_path)
         except NameError:
             pass
         return False
     except OSError as e:
+        _known_write_dirs.discard(write_dir)
         _atomic_write_last_errno[write_dir] = e.errno
         _cleanup_temp(temp_filename)
         log.warning(f"_atomic_write: failed to write temp for {target_path}: {e}")
@@ -4699,6 +4969,7 @@ def _atomic_write(target_path: str, data: bytes) -> bool:
             if getattr(e, 'winerror', None) in (5, 32, 33) and attempt < max_attempts:
                 time.sleep(0.05 * attempt)
                 continue
+            _known_write_dirs.discard(write_dir)
             _cleanup_temp(temp_filename)
             log.warning(f"_atomic_write: failed to replace {target_path}: {e}")
             return False
@@ -4880,6 +5151,9 @@ class TerrainTileLookup:
         self._highzoom_index: Dict[Tuple[int, int], List[Tuple[int, int, str, int]]] = {}
         self._highzoom_count = 0
         self._index_lock = threading.Lock()
+        # Tiles known from streamed DSFs, which have no .ter files on disk.
+        self._virtual: set = set()
+        self._virtual_highzoom: Dict[Tuple[int, int], List[Tuple[int, int, str, int]]] = {}
         self._index_ready = threading.Event()
         self._index_cancel = threading.Event()
         self._index_error = None
@@ -4903,7 +5177,14 @@ class TerrainTileLookup:
             else:
                 self._load_or_build_highzoom_index()
         else:
-            log.warning(f"TerrainTileLookup: Folder not found: {terrain_folder}")
+            streaming = os.path.isfile(
+                os.path.join(os.path.dirname(terrain_folder), "ao_stream.json")
+            )
+            # A streaming package generates its .ter files; its tiles arrive
+            # through add_virtual_tiles instead.
+            (log.debug if streaming else log.warning)(
+                f"TerrainTileLookup: Folder not found: {terrain_folder}"
+            )
             self._index_ready.set()
     
     def get_tiles_for_position(self, lat: float, lon: float,
@@ -4924,7 +5205,7 @@ class TerrainTileLookup:
         Returns:
             List of (row, col, maptype, zoom) tuples for tiles that exist.
         """
-        if not self._folder_exists:
+        if not self._folder_exists and not self._virtual:
             return []
         
         results = []
@@ -4958,9 +5239,11 @@ class TerrainTileLookup:
         """
         cache_key = (row, col, maptype, zoom)
         self._lookups += 1
-        
+
         # Check cache first
         with self._cache_lock:
+            if cache_key in self._virtual:
+                return True
             if cache_key in self._cache:
                 self._cache_hits += 1
                 return self._cache[cache_key]
@@ -4989,6 +5272,34 @@ class TerrainTileLookup:
         """Check if a specific tile exists."""
         return self._tile_exists(row, col, maptype, zoom)
 
+    def add_virtual_tiles(self, tiles) -> None:
+        """Record textures used by a streamed DSF.
+
+        Streaming packages generate their .ter files on demand, so there is
+        nothing on disk to find; the DSF's terrain list stands in for them.
+        """
+        new_highzoom = []
+        with self._cache_lock:
+            for tile in tiles:
+                key = (int(tile[0]), int(tile[1]), str(tile[2]), int(tile[3]))
+                if key in self._virtual:
+                    continue
+                self._virtual.add(key)
+                row_val, col_val, maptype, zoom = key
+                if (
+                    zoom in (18, 19)
+                    and maptype.upper() not in ("ZL", "")
+                    and row_val % self.TILE_GRID_STEP == 0
+                    and col_val % self.TILE_GRID_STEP == 0
+                ):
+                    new_highzoom.append(key)
+        if new_highzoom:
+            with self._index_lock:
+                for key in new_highzoom:
+                    lat, lon = self._tile_to_latlon(key[0], key[1], key[3])
+                    bucket = (int(math.floor(lat)), int(math.floor(lon)))
+                    self._virtual_highzoom.setdefault(bucket, []).append(key)
+
     def get_tiles_for_bounds(
         self,
         lat_min: float,
@@ -5000,7 +5311,7 @@ class TerrainTileLookup:
         tile_zooms=(16, 18),
     ) -> List[Tuple[int, int, str, int]]:
         """Return terrain tiles intersecting geographic bounds."""
-        if not self._folder_exists:
+        if not self._folder_exists and not self._virtual:
             return []
         maptypes = (
             [maptype_filter]
@@ -5233,10 +5544,13 @@ class TerrainTileLookup:
         Returns:
             List of (row, col, maptype, zoom) tuples for matching tiles
         """
-        if not self._index_ready.is_set():
-            return []
         with self._index_lock:
-            highzoom_index = self._highzoom_index
+            highzoom_index = self._highzoom_index if self._index_ready.is_set() else {}
+            if self._virtual_highzoom:
+                merged = {k: list(v) for k, v in highzoom_index.items()}
+                for key, entries in self._virtual_highzoom.items():
+                    merged.setdefault(key, []).extend(entries)
+                highzoom_index = merged
         if not highzoom_index:
             return []
 
@@ -7192,6 +7506,115 @@ def note_texture_requested(row, col, zoom):
     """FUSE hook: X-Plane opened a texture."""
     if terrain_load_ahead is not None:
         terrain_load_ahead.note_texture_request(row, col, zoom)
+
+
+def note_texture_wanted(tile_id, row, col, tilename_zoom, width, mip):
+    """X-Plane wants level ``mip`` of a texture now: evidence for the paging model.
+
+    ``width`` is the texture's level-0 width in pixels.
+    """
+    try:
+        held_textures.note(tile_id, max(1, int(width) >> int(mip)))
+    except Exception:  # statistics only
+        pass
+    camera = current_camera()
+    if camera is None:
+        return
+    try:
+        distance, _lat, _lon, size_m = tile_distance_m(
+            row, col, tilename_zoom, camera
+        )
+        get_paging_model().note_read(mip, distance, size_m, int(width))
+    except Exception as exc:  # statistics only
+        log.debug(f"Paging sample for {tile_id} failed: {exc}")
+
+
+def _expected_dds_size(width, height):
+    """Size of a DDS of ``width`` x ``height`` in the configured format."""
+    block = 16 if str(CFG.pydds.format).upper() in ("BC3", "DXT5") else 8
+    size = 128
+    w, h = int(width), int(height)
+    while w >= 1 and h >= 1:
+        size += max(1, (w * h) >> 4) * block
+        w >>= 1
+        h >>= 1
+    return size
+
+
+def _tile_dimensions(tilename_zoom, max_zoom, width=16, height=16):
+    """Pixel size of a tile's DDS, as ``Tile.__init__`` derives it."""
+    diff = int(tilename_zoom) - int(max_zoom)
+    if diff >= 0:
+        cols, rows = width >> diff, height >> diff
+    else:
+        cols, rows = width << (-diff), height << (-diff)
+    return max(1, cols) * 256, max(1, rows) * 256
+
+
+def open_disk_texture(tile_cacher, row, col, map_type, zoom):
+    """A :class:`disk_texture.DiskTexture` for this texture, or None.
+
+    Only when the DDS cache holds its finished, exact DDS at the tile's
+    current target zoom ([pydds] serve_from_disk). A texture X-Plane already
+    has open as a live tile stays live, so one texture is never served two
+    ways at once.
+    """
+    cache = dynamic_dds_cache
+    if cache is None or not getattr(cache, "serve_from_disk", False):
+        return None
+    if is_shutdown_requested():
+        return None
+    try:
+        maptype = tile_cacher._resolve_maptype(row, col, map_type, zoom)
+        tile_id = f"{row}_{col}_{maptype}_{zoom}"
+        with tile_cacher.tc_lock:
+            live = tile_cacher.tiles.get(tile_id)
+            if live is not None and live.refs > 0:
+                return None
+        max_zoom = tile_cacher._get_target_zoom_level(zoom, row=row, col=col)
+        width, height = _tile_dimensions(zoom, max_zoom)
+        entry = cache.open_direct(
+            row, col, maptype, zoom, max_zoom,
+            _expected_dds_size(width, height),
+        )
+        if entry is None:
+            return None
+        if entry["width"] != width or entry["height"] != height:
+            cache.unpin(entry["key"])
+            return None
+
+        dxt_format = CFG.pydds.format
+        block_bytes = colour_table.block_bytes(dxt_format)
+
+        def recolour(data, offset):
+            try:
+                table = season_colour_table(row, col, zoom)
+            except Exception as exc:
+                log.debug(f"Season lookup for {tile_id} failed: {exc}")
+                return data
+            if table is None:
+                return data
+            return colour_table.apply(data, offset, block_bytes, table)
+
+        def note_wanted(mip, _level_width):
+            note_texture_wanted(tile_id, row, col, zoom, width, mip)
+
+        texture = disk_texture.DiskTexture(
+            entry,
+            unpin=cache.unpin,
+            invalidate=cache.invalidate,
+            recolour=recolour,
+            note_wanted=note_wanted,
+            metric=bump,
+        )
+    except disk_texture.DiskTextureFailed as exc:
+        log.debug(f"Direct read unavailable for {row}_{col}_{zoom}: {exc}")
+        return None
+    except Exception as exc:
+        log.debug(f"Direct read open failed for {row}_{col}_{zoom}: {exc}")
+        return None
+    bump("dds_direct_opens")
+    return texture
 
 
 def _start_terrain_load_ahead():
@@ -10133,7 +10556,8 @@ class Chunk(object):
         schedule it instead of occupying a thread.
         """
 
-        log.debug(f"Getting {self}")
+        if TRACE_READS:
+            log.debug(f"Getting {self}")
 
         # Signal that download has started (not waiting in queue anymore)
         self.download_started.set()
@@ -10186,7 +10610,8 @@ class Chunk(object):
         # download alive longer than the caller is willing to wait.
         _http_timeout = timeout or (5, wait_bands.http_read_timeout_seconds())
 
-        log.debug(f"Requesting {self.url} ..")
+        if TRACE_READS:
+            log.debug(f"Requesting {self.url} ..")
 
         return _NetworkRequest(
             url=url,
@@ -10240,8 +10665,23 @@ class Chunk(object):
         except Exception as err:
             return self._handle_attempt_error(request, err)
 
+        if _provider_has_no_imagery(response):
+            # Bing answers 200 with a 1 KB PNG and "X-VE-Tile-Info: no-tile"
+            # where it has no imagery at this zoom. Asking again never
+            # helps: fail the chunk for good so the lower-zoom fallbacks
+            # fill it and healing does not keep re-requesting it.
+            log.debug(f"Provider has no imagery for {self}")
+            bump('chunk_no_imagery')
+            self.permanent_failure = True
+            self.failure_reason = "no_imagery"
+            self.data = b''
+            self.ready.set()
+            self._notify_ready()
+            return _AttemptOutcome(resolved=True)
+
         if data and _is_jpeg(data[:3]):
-            log.debug(f"Data for {self} is JPEG")
+            if TRACE_READS:
+                log.debug(f"Data for {self} is JPEG")
             self.data = data
         else:
             log.debug(f"Invalid JPEG for {self} (HTTP {status_code} "
@@ -10369,6 +10809,15 @@ class Chunk(object):
         if isinstance(error, (requests.exceptions.ConnectionError,
                               requests.exceptions.Timeout,
                               BrokerTimeoutError)):
+            # A request that never left the broker queue did not reach the
+            # provider (local saturation or a lost request): retry it soon
+            # instead of backing off as for a provider failure.
+            # _profiled_http_get re-raises broker timeouts as requests
+            # Timeouts, so the cause is checked too.
+            if isinstance(_broker_timeout_of(error), BrokerQueueTimeoutError):
+                bump("chunk_broker_queue_timeout")
+                log.warning(f"{self} expired in the broker queue; retrying")
+                return _AttemptOutcome(requeue_delay=0.25)
             if (
                 isinstance(error, BrokerTimeoutError)
             ):
@@ -10922,6 +11371,13 @@ class Tile(object):
         self._degraded_provenance_logged = False
         self._persisted_exact_rows = set()
         self._exact_row_enqueue_failed = set()
+        # Zooms whose rest of level was queued on a live read (see
+        # _read_ahead_level).
+        self._read_ahead_zooms = set()
+        # The DDS cache metadata last applied, and its file's stat signature
+        # (see _dds_cache_metadata).
+        self._dds_meta_signature = None
+        self._dds_meta_cached = None
         self._partial_restore_attempted = False
         self._exact_row_states = {}
         self._exact_row_lock = threading.Lock()
@@ -11162,6 +11618,27 @@ class Tile(object):
         self._restore_provenance_from_metadata(metadata)
         self._load_partial_dds_rows(metadata)
         return bool(self._persisted_exact_rows)
+
+    def _dds_cache_metadata(self):
+        """This tile's DDS cache metadata, applied to the tile when it changed.
+
+        X-Plane reads a texture in 64 KB pieces, 683 of them for an 8192 px
+        one, and each used to parse the metadata again and re-apply its
+        provenance and saved rows: Python work under the GIL that made reads
+        crawl with many textures open. The file's stat signature now says
+        whether anything changed since this tile last applied it (its own
+        saves change it too, about once per row).
+        """
+        signature = dynamic_dds_cache.metadata_signature(self.id, self.max_zoom, self)
+        if signature is not None and signature == self._dds_meta_signature:
+            bump("dds_metadata_unchanged")
+            return self._dds_meta_cached
+        meta = dynamic_dds_cache.load_metadata(self.id, self.max_zoom, self)
+        self._restore_provenance_from_metadata(meta or {})
+        self._load_partial_dds_rows(meta)
+        self._dds_meta_signature = signature
+        self._dds_meta_cached = meta
+        return meta
 
     def _restore_provenance_from_metadata(self, metadata):
         try:
@@ -11525,6 +12002,18 @@ class Tile(object):
             return False
         total_rows = int(entry.get("total", 0))
         if total_rows <= 0:
+            return False
+        # get_bytes calls this on every read until the texture is complete.
+        # Rows this tile persisted itself are already in memory: reloading
+        # them re-read and re-hashed every saved row on each read, so a
+        # texture's reads grew slower as it filled in.
+        referenced = {
+            int(row) for row in (entry.get("row_revisions") or {})
+        }
+        with self._exact_row_lock:
+            already_held = bool(referenced) and referenced <= self._persisted_exact_rows
+        if already_held:
+            bump("partial_dds_reload_skipped")
             return False
         mm = self.dds.mipmap_list[0]
         bytes_per_chunk_row = mm.length // total_rows
@@ -13313,16 +13802,15 @@ class Tile(object):
         if dynamic_dds_cache is not None and not self._prepopulated:
             cache_has_requested_mipmap = True
             try:
-                meta = dynamic_dds_cache.load_metadata(self.id, self.max_zoom, self)
+                meta = self._dds_cache_metadata()
                 populated = meta.get("populated_mipmaps") if meta else None
-                self._restore_provenance_from_metadata(meta or {})
-                self._load_partial_dds_rows(meta)
                 if populated is not None and 0 not in populated:
                     cache_has_requested_mipmap = False
-                    log.debug(
-                        f"GET_BYTES: DDS cache entry for {self.id} is partial "
-                        f"and missing mipmap 0; ignoring partial cache"
-                    )
+                    if TRACE_READS:
+                        log.debug(
+                            f"GET_BYTES: DDS cache entry for {self.id} is partial "
+                            f"and missing mipmap 0; ignoring partial cache"
+                        )
                     bump("dynamic_dds_cache_skip_partial_missing_mm0")
                     self._maybe_promote_partial_cache_to_mm0(requested_mipmap)
                 elif populated is not None and requested_mipmap not in populated:
@@ -13396,7 +13884,8 @@ class Tile(object):
         # ═══════════════════════════════════════════════════════════════════
 
         mipmap = requested_mipmap
-        log.debug(f"Get_bytes for mipmap {mipmap} ...")
+        if TRACE_READS:
+            log.debug(f"Get_bytes for mipmap {mipmap} ...")
         
         # ═══════════════════════════════════════════════════════════════════
         # LIVE AOPIPELINE: Try fast full-tile build when requesting mipmap 0
@@ -13435,11 +13924,12 @@ class Tile(object):
         )
         
         if mipmap == 0:
-            log.debug(f"GET_BYTES_DIAG: mipmap=0 offset={offset} length={length} "
-                     f"reaches_data={request_reaches_mipmap_0_data} "
-                     f"covers_mipmap={request_covers_mipmap_0} "
-                     f"already_attempted={self._aopipeline_attempted} "
-                     f"retrieved={self.dds.mipmap_list[0].retrieved if self.dds and self.dds.mipmap_list else 'N/A'}")
+            if TRACE_READS:
+                log.debug(f"GET_BYTES_DIAG: mipmap=0 offset={offset} length={length} "
+                         f"reaches_data={request_reaches_mipmap_0_data} "
+                         f"covers_mipmap={request_covers_mipmap_0} "
+                         f"already_attempted={self._aopipeline_attempted} "
+                         f"retrieved={self.dds.mipmap_list[0].retrieved if self.dds and self.dds.mipmap_list else 'N/A'}")
         
         if (mipmap == 0 and 
             request_reaches_mipmap_0_data and
@@ -13545,7 +14035,8 @@ class Tile(object):
 
         # Exit if already retrieved
         if self.dds.mipmap_list[mipmap].retrieved:
-            log.debug(f"We already have mipmap {mipmap} for {self}")
+            if TRACE_READS:
+                log.debug(f"We already have mipmap {mipmap} for {self}")
             return True
 
         mm = self.dds.mipmap_list[mipmap]
@@ -13553,10 +14044,12 @@ class Tile(object):
             self.get_mipmap(mipmap, time_budget=time_budget)
             return True
         
-        log.debug(f"Retrieving {length} bytes from mipmap {mipmap} offset {offset}")
+        if TRACE_READS:
+            log.debug(f"Retrieving {length} bytes from mipmap {mipmap} offset {offset}")
 
         mm_offset = max(0, offset - self.dds.mipmap_list[mipmap].startpos)
-        log.debug(f"MM_offset: {mm_offset}  Offset {offset}.  Startpos {self.dds.mipmap_list[mipmap]}")
+        if TRACE_READS:
+            log.debug(f"MM_offset: {mm_offset}  Offset {offset}.  Startpos {self.dds.mipmap_list[mipmap]}")
 
         base_width_px = max(4, int(self.dds.width) >> mipmap)
         base_height_px = max(4, int(self.dds.height) >> mipmap)
@@ -13576,19 +14069,20 @@ class Tile(object):
             endrow,
         )
 
-        log.debug(
-            "Startrow: %s Endrow: %s Composition rows: %s-%s "
-            "Reduction steps: %s bytes_per_chunk_row: %s "
-            "width_px: %s height_px: %s",
-            startrow,
-            endrow,
-            composition_startrow,
-            composition_endrow,
-            reduction_steps,
-            bytes_per_chunk_row,
-            base_width_px,
-            base_height_px,
-        )
+        if TRACE_READS:
+            log.debug(
+                "Startrow: %s Endrow: %s Composition rows: %s-%s "
+                "Reduction steps: %s bytes_per_chunk_row: %s "
+                "width_px: %s height_px: %s",
+                startrow,
+                endrow,
+                composition_startrow,
+                composition_endrow,
+                reduction_steps,
+                bytes_per_chunk_row,
+                base_width_px,
+                base_height_px,
+            )
         bump("partial_rows_requested", endrow - startrow + 1)
         
         # ═══════════════════════════════════════════════════════════════════
@@ -13800,7 +14294,8 @@ class Tile(object):
                 )
 
     def read_dds_bytes(self, offset, length):
-        log.debug(f"READ DDS BYTES: {offset} {length}")
+        if TRACE_READS:
+            log.debug(f"READ DDS BYTES: {offset} {length}")
 
         # Signal that a live tile read is in progress.
         # While any live reads are active, prefetching and background DDS
@@ -13843,6 +14338,10 @@ class Tile(object):
         header_chunk = False
         first_needed = 0
         wanted = None
+        # This read's own band and start state for its statistics: the
+        # tile's ``_read_band`` is shared by concurrent reads of the tile.
+        read_band = None
+        read_starting = False
         if streaming_options.flag("read_classifier"):
             with self._lock:
                 header_chunk, wanted, first_needed = read_pattern.classify(
@@ -13862,11 +14361,25 @@ class Tile(object):
             elif first_needed > 0 and first_needed < len(self.dds.mipmap_list):
                 bump("read_incidental_tails")
         if streaming_options.flag("wait_bands") and not header_chunk:
+            # The finest level this read builds (the loop below builds every
+            # level from here on that the read overlaps).
+            builds_from = max(first_needed, self.find_mipmap_pos(offset))
             level = wanted if wanted is not None else self._last_wanted_mip
             if level is None:
-                level = max(first_needed, self.find_mipmap_pos(offset))
+                level = builds_from
+            elif wanted is None and level > builds_from:
+                # A read the classifier could not place inherits the tile's
+                # last wanted level, which an earlier or concurrent read may
+                # have set to the base level. Waiting by that band built
+                # finer levels on the far read's 0.5 s and marked them done
+                # with coarser imagery, so X-Plane's real read of them moments
+                # later was served that stand-in (seen while a flight loaded).
+                bump("read_band_inherited_coarser")
+                level = builds_from
             level = min(level, len(self.dds.mipmap_list) - 1)
-            request_budget = self._band_budget(level, request_budget)
+            request_budget, read_band, read_starting = self._band_wait(
+                level, request_budget
+            )
         for mipmap in self.dds.mipmap_list:
             if mipmap.idx < first_needed:
                 continue
@@ -13903,23 +14416,30 @@ class Tile(object):
             needed_start = max(
                 offset, self.dds.mipmap_list[first_needed].startpos
             )
+        mm0_served_exact = None
         if first_needed < len(self.dds.mipmap_list) and needed_start < offset + len(data):
-            self._record_mipmap_provenance(
+            mm0_served_exact = self._record_mipmap_provenance(
                 needed_start, offset + len(data) - needed_start
             )
         if wanted is not None:
             # OrthoStreamXP's quality measure: the share of X-Plane's reads
             # answered with real imagery at the level it wanted.
             real = self.real_from() <= wanted
+            if not real and wanted == 0 and mm0_served_exact:
+                # Mipmap 0 streams row by row, so real_from() counts it only
+                # once every row is exact; this read's own rows were.
+                real = True
             bump("reads_wanted_real" if real else "reads_wanted_standin")
             if not real and streaming_options.flag("wait_bands"):
-                self._note_late(wanted, read_started)
-            if getattr(self, "_read_band", None) == wait_bands.NEAR:
+                self._note_late(
+                    wanted, read_started, band=read_band, starting=read_starting
+                )
+            if read_band == wait_bands.NEAR:
                 # Target fidelity (the governor's goal): near reads answered
                 # with real imagery at the target zoom.
                 bump("near_reads_real" if real else "near_reads_standin")
                 if not real:
-                    self._note_near_miss(wanted)
+                    self._note_near_miss(wanted, starting=read_starting)
                 if (
                     real
                     and not getattr(self, "_sharp_noted", False)
@@ -13956,6 +14476,14 @@ class Tile(object):
 
         Never longer than what is left of the tile's own budget.
         """
+        return self._band_wait(mip, tile_budget)[0]
+
+    def _band_wait(self, mip, tile_budget):
+        """``(budget, band, starting)`` of one read (see ``_band_budget``).
+
+        The tile keeps the latest band for download priorities; the read
+        keeps its own for statistics.
+        """
         band = wait_bands.band_of(mip, self.max_mipmap)
         camera = current_camera()
         if camera is not None:
@@ -13977,7 +14505,7 @@ class Tile(object):
         bump(f"read_band_{band}")
         if tile_budget is not None:
             wait = min(wait, tile_budget.remaining)
-        return TimeBudget(wait)
+        return TimeBudget(wait), band, starting
 
     def _mm0_all_exact(self):
         """Mipmap 0 is complete and every row of it is real target imagery."""
@@ -14065,7 +14593,7 @@ class Tile(object):
         self._maybe_persist_complete_dds()
         return True
 
-    def _note_near_miss(self, wanted):
+    def _note_near_miss(self, wanted, starting=None):
         """A near read was blurry in flight: count what prefetch had done for it.
 
         Bumps one ``near_miss_<kind>`` counter (prefetch_ledger.MISS_KINDS)
@@ -14073,7 +14601,9 @@ class Tile(object):
         (prefetch can't know where a flight begins), without a position, and
         below the prefetcher's own minimum speed (it does not run there).
         """
-        if getattr(self, "_read_starting", False):
+        if starting is None:
+            starting = getattr(self, "_read_starting", False)
+        if starting:
             return
         camera = current_camera()
         if camera is None:
@@ -14100,9 +14630,17 @@ class Tile(object):
         except Exception as exc:  # statistics only
             log.debug(f"Near miss note for {self.id} failed: {exc}")
 
-    def _note_late(self, wanted, read_started):
-        """A near or middle read stopped waiting: time its imagery's arrival."""
-        if getattr(self, "_read_band", None) not in (wait_bands.NEAR, wait_bands.MIDDLE):
+    def _note_late(self, wanted, read_started, band=None, starting=None):
+        """A near or middle read stopped waiting: time its imagery's arrival.
+
+        ``band`` and ``starting`` are the read's own (the tile's latest when
+        not given).
+        """
+        if band is None:
+            band = getattr(self, "_read_band", None)
+        if starting is None:
+            starting = bool(getattr(self, "_read_starting", False))
+        if band not in (wait_bands.NEAR, wait_bands.MIDDLE):
             return
         try:
             level = min(int(wanted), int(self.max_mipmap))
@@ -14115,7 +14653,7 @@ class Tile(object):
                 level,
                 grid.materialized(),
                 read_started,
-                bool(getattr(self, "_read_starting", False)),
+                bool(starting),
             )
         except Exception as exc:  # statistics only
             log.debug(f"Late arrival note for {self.id} failed: {exc}")
@@ -14144,25 +14682,39 @@ class Tile(object):
             bump("live_admission_skipped")
         return needed
 
+    def live_slot_weight(self, offset, length):
+        """Memory the live build of this read holds (for admission).
+
+        Weighted by the read's first level (its largest): the whole level
+        for a read of all of it, otherwise the share of its 256-pixel rows
+        the read covers (rows are built as they are read).
+        """
+        dds = self.dds
+        if dds is None or not dds.mipmap_list:
+            return 0
+        try:
+            start = max(int(offset), dds.mipmap_list[0].startpos)
+            mip = self.find_mipmap_pos(start)
+            mm = dds.mipmap_list[mip]
+            full = live_build_weight(dds.width, dds.height, mip)
+            covered = min(int(offset) + int(length), mm.endpos) - start
+            if covered >= mm.length:
+                return full
+            rows = max(1, math.ceil((max(4, int(dds.height) >> mip)) / 256))
+            row_bytes = max(1, math.ceil(mm.length / rows))
+            first = (start - mm.startpos) // row_bytes
+            last = (start + max(1, covered) - 1 - mm.startpos) // row_bytes
+            return min(full, math.ceil(full * (last - first + 1) / rows))
+        except Exception:
+            return 0
+
     def _note_wanted_level(self, mip):
         """X-Plane wants ``mip`` of this tile now: evidence for the paging model."""
         self._last_wanted_mip = mip
-        try:
-            held_textures.note(self.id, max(1, int(self.dds.width) >> int(mip)))
-        except Exception:  # statistics only
-            pass
-        camera = current_camera()
-        if camera is None:
-            return
-        try:
-            distance, _lat, _lon, size_m = tile_distance_m(
-                self.row, self.col, self.tilename_zoom, camera
-            )
-            get_paging_model().note_read(
-                mip, distance, size_m, int(self.dds.width)
-            )
-        except Exception as exc:  # statistics only
-            log.debug(f"Paging sample for {self.id} failed: {exc}")
+        note_texture_wanted(
+            self.id, getattr(self, "row", None), getattr(self, "col", None),
+            getattr(self, "tilename_zoom", None), int(self.dds.width), mip,
+        )
 
     def _read_unsealed(self, offset, length):
         """Bytes served as they are now, without sealing any mipmap-0 row."""
@@ -14273,8 +14825,14 @@ class Tile(object):
         return data
 
     def _record_mipmap_provenance(self, offset, length):
+        """Count where the served bytes came from.
+
+        Returns whether the mipmap 0 bytes in the range were all exact target
+        imagery, or None when the range has none.
+        """
         if self.dds is None or not self.dds.mipmap_list or length <= 0:
-            return
+            return None
+        served_exact = None
         requested_mipmap = self.find_mipmap_pos(offset)
         counters = {f"requested_mipmap:{requested_mipmap}": 1}
         if not self._effective_target_reported:
@@ -14309,6 +14867,7 @@ class Tile(object):
                 pydds.MipmapProvenance.MISSING_COLOR, 0
             )
             unknown = max(0, overlap_length - exact - lower - missing)
+            served_exact = exact >= overlap_length
             counters.update(
                 {
                     "mm0_served_exact_bytes": exact,
@@ -14347,6 +14906,7 @@ class Tile(object):
                     unknown,
                 )
         bump_many(counters)
+        return served_exact
 
     def _get_or_create_tile_time_budget(self):
         """The tile's budget across its reads (wait_bands.tile_budget_seconds)."""
@@ -14459,7 +15019,8 @@ class Tile(object):
         
         if time_budget is not None:
             # Use the provided per-request budget
-            log.debug(f"GET_IMG: Using provided budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
+            if TRACE_READS:
+                log.debug(f"GET_IMG: Using provided budget (elapsed={time_budget.elapsed:.2f}s, remaining={time_budget.remaining:.2f}s)")
         else:
             # Fallback: create budget if caller didn't provide one (internal
             # calls, tests). The tile budget from the wait bands, longer only
@@ -14495,11 +15056,14 @@ class Tile(object):
 
         # Get effective zoom  
         zoom = min((self.max_zoom - mipmap), self.max_zoom)
-        log.debug(f"GET_IMG: Default tile zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Default tile zoom: {self.tilename_zoom}, Requested Mipmap: {mipmap}, Requested mipmap zoom: {zoom}")
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(zoom, min_zoom)
-        log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")        
+        if TRACE_READS:
+            log.debug(f"Will use:  Zoom: {zoom},  Zoom_diff: {zoom_diff}")
         
-        log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Final zoom {zoom} for mipmap {mipmap}, coords: {col}x{row}, size: {width}x{height}")
         
         # Do we already have this img?
         with self._lock:
@@ -14516,7 +15080,8 @@ class Tile(object):
             if cached is not None:
                 return cached
 
-        log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: MM List before { {x.idx:x.retrieved for x in self.dds.mipmap_list} }")
         with self._lock:
             already_retrieved = mipmap < len(self.dds.mipmap_list) and self.dds.mipmap_list[mipmap].retrieved
         if already_retrieved:
@@ -14558,7 +15123,8 @@ class Tile(object):
             if 0 <= local_index < len(composed_sources):
                 composed_sources[local_index] = int(source)
             
-        log.debug(f"GET_IMG: Chunk indices - start: {startchunk}, end: {endchunk}, chunks_per_row: {chunks_per_row}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Chunk indices - start: {startchunk}, end: {endchunk}, chunks_per_row: {chunks_per_row}")
 
 
         # TODO: For further optimization, this wait could be moved to callers of get_img.
@@ -14572,16 +15138,20 @@ class Tile(object):
                 startchunk,
                 endchunk if endchunk is not None else grid.logical_length,
             )
-        log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(self.chunks[zoom])} for zoom {zoom}")
+        if TRACE_READS:
+            log.debug(f"Start chunk: {startchunk}  End chunk: {endchunk}  Chunklen {len(self.chunks[zoom])} for zoom {zoom}")
 
-        log.debug(f"GET_IMG: {self} : Retrieve mipmap for ZOOM: {zoom} MIPMAP: {mipmap}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: {self} : Retrieve mipmap for ZOOM: {zoom} MIPMAP: {mipmap}")
         data_updated = False
-        log.debug(f"GET_IMG: {self} submitting chunks for zoom {zoom}.")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: {self} submitting chunks for zoom {zoom}.")
         for chunk in chunks:
             if self._is_live:
                 _revive_for_request(chunk)
             if not chunk.ready.is_set():
-                log.debug(f"GET_IMG: Submitting chunk {chunk} for zoom {zoom}")
+                if TRACE_READS:
+                    log.debug(f"GET_IMG: Submitting chunk {chunk} for zoom {zoom}")
                 # INVERTED: Lower detail (higher mipmap) = lower priority number (more urgent)
                 # This ensures lower-detail tiles load first, minimizing missing tiles
                 base_priority = self.max_mipmap - mipmap
@@ -14614,7 +15184,8 @@ class Tile(object):
                 chunk_getter.submit(chunk)
                 data_updated = True
             else:
-                log.debug(f"GET_IMG: Chunk {chunk} already ready - reusing for mipmap {mipmap}")
+                if TRACE_READS:
+                    log.debug(f"GET_IMG: Chunk {chunk} already ready - reusing for mipmap {mipmap}")
         if data_updated and mipmap == 0 and self._is_live:
             self._warm_fallback_mipmap_chunks()
 
@@ -14635,9 +15206,11 @@ class Tile(object):
             img_height = 256 * requested_rows
             partial_row_offset = startrow * 256
         
-        log.debug(f"GET_IMG: Using download dimensions {width}x{height} chunks = {img_width}x{img_height} pixels")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Using download dimensions {width}x{height} chunks = {img_width}x{img_height} pixels")
         
-        log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Create new image: Zoom: {zoom} | {(img_width, img_height)}")
         
         # === PRE-INITIALIZE BASE LAYER FOR MIPMAP 0 ===
         # When building mipmap 0 (highest detail), instead of starting with a blank 
@@ -14768,7 +15341,8 @@ class Tile(object):
                 composed_sources
             )
 
-        log.debug(f"GET_IMG: Will use image {new_im}")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Will use image {new_im}")
 
         # Check if we have any chunks to process
         if len(chunks) == 0:
@@ -14841,8 +15415,9 @@ class Tile(object):
                 deferred_chunks.append((chunk, start_x, start_y))
 
         pass1_ready = len(chunks_with_images)
-        log.debug(f"GET_IMG: Pass 1 (quick): {pass1_ready}/{total_chunks} chunks ready, "
-                 f"{len(deferred_chunks)} deferred")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Pass 1 (quick): {pass1_ready}/{total_chunks} chunks ready, "
+                     f"{len(deferred_chunks)} deferred")
 
         # === PASS 2: POLL DEFERRED CHUNKS (time-capped) ===
         # Poll all deferred chunks, processing any that become ready.
@@ -14917,8 +15492,9 @@ class Tile(object):
                                if id(chunk) not in chunks_with_images]
 
         pass2_ready = len(chunks_with_images) - pass1_ready
-        log.debug(f"GET_IMG: Pass 2 (poll): {pass2_ready} additional chunks, "
-                 f"{len(deferred_chunks)} still deferred")
+        if TRACE_READS:
+            log.debug(f"GET_IMG: Pass 2 (poll): {pass2_ready} additional chunks, "
+                     f"{len(deferred_chunks)} still deferred")
 
         # === PASS 3: FALLBACK RESOLUTION ===
         # Apply fallback chain to still-missing chunks: disk cache, mipmap scaling, network
@@ -15134,7 +15710,8 @@ class Tile(object):
                     f"Fallback budget: {fallback_budget.elapsed:.2f}s/{fallback_timeout:.1f}s "
                     f"(exhausted={fallback_budget.exhausted})")
         else:
-            log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
+            if TRACE_READS:
+                log.debug(f"GET_IMG: DONE!  IMG created {new_im}")
 
         # OPTIMIZATION: In-place desaturation when image isn't cached
         # Only copy when image was saved to cache AND needs desaturation
@@ -16616,6 +17193,7 @@ class Tile(object):
         row_chunks = grid.ensure_rows(startrow, endrow)
         # Submit downloads for any chunks not ready
         pending = False
+        promote = getattr(chunk_getter, "promote", None)
         for chunk in row_chunks:
             if priority == PRIORITY_LIVE:
                 _revive_for_request(chunk)
@@ -16625,10 +17203,16 @@ class Tile(object):
                     chunk.priority = priority
                     chunk.prefetch = priority != PRIORITY_LIVE
                     chunk_getter.submit(chunk)
+                elif promote is not None:
+                    # Queued ahead of need (read-ahead, prefetch): this read
+                    # waits for it now.
+                    promote(chunk, priority)
         if pending and priority == PRIORITY_LIVE and zoom == self.max_zoom:
             # The row may miss its deadline: fetch the cheap fallback zoom
             # now so it is cached by then.
             self._warm_fallback_mipmap_chunks()
+        if priority == PRIORITY_LIVE:
+            self._read_ahead_level(grid, endrow)
 
         if deadline is None:
             deadline = self._row_deadline(
@@ -16644,6 +17228,37 @@ class Tile(object):
             for chunk in row_chunks
         ]
         return jpeg_datas, chunks_width, chunks_height
+
+    def _read_ahead_level(self, grid, endrow):
+        """Queue the rest of a level X-Plane started reading, behind its rows.
+
+        X-Plane reads from the start of the level it wants to the end of the
+        file (read_pattern.py), so every later row will be asked for within
+        moments. Fetching them only as each read arrives left a texture's
+        rows downloading one at a time: 32 round trips for the mipmap 0 of an
+        8192 px texture. Queued once per level at PRIORITY_READ_AHEAD: behind
+        every read X-Plane is waiting on, so a near texture's 1,000 chunks never
+        hold up the far textures' few. A read that reaches a row promotes its
+        chunks (ChunkGetter.promote).
+        """
+        if endrow + 1 >= grid.height:
+            return
+        with self._lock:
+            if grid.zoom in self._read_ahead_zooms:
+                return
+            self._read_ahead_zooms.add(grid.zoom)
+        queued = 0
+        for chunk in grid.ensure_rows(endrow + 1, grid.height - 1):
+            if chunk.ready.is_set() or chunk.permanent_failure:
+                continue
+            if getattr(chunk, "in_queue", False) or getattr(chunk, "in_flight", False):
+                continue
+            chunk.priority = PRIORITY_READ_AHEAD
+            chunk.prefetch = False
+            if chunk_getter.submit(chunk):
+                queued += 1
+        if queued:
+            bump("level_read_ahead_chunks", queued)
 
     def _resolve_partial_sources(
         self,
@@ -16964,17 +17579,23 @@ class Tile(object):
                     )
                 return manifest
 
+            bounded = _partial_build_threads_supported(native_dds)
+            # Libraries without the bounded entry point run the OpenMP
+            # default team, so they must reserve the whole budget.
+            reserve = (
+                _partial_build_threads(chunks_width * chunks_height)
+                if bounded else _native_cpu_budget()
+            )
+
             def native_build(sources):
                 with self._source_lease(
                     source
                     for source in sources
                     if isinstance(source, (bytes, bytearray))
                 ), _native_build_context(
-                    threads=_native_cpu_budget(), priority=priority
-                ):
-                    # The partial-build ABI has no max_threads argument.
-                    # Reserve its full OpenMP default (bounded in the worker
-                    # environment).
+                    threads=reserve, priority=priority
+                ) as threads:
+                    extra = {"max_threads": threads} if bounded else {}
                     if (
                         allow_incomplete
                         and hasattr(native_dds, "build_partial_mipmap_v2")
@@ -16985,6 +17606,7 @@ class Tile(object):
                             chunks_height=chunks_height,
                             format=dxt_format,
                             missing_color=missing_color,
+                            **extra,
                         )
                     return native_dds.build_partial_mipmap(
                         jpeg_datas=[
@@ -16996,7 +17618,8 @@ class Tile(object):
                         chunks_width=chunks_width,
                         chunks_height=chunks_height,
                         format=dxt_format,
-                        missing_color=missing_color
+                        missing_color=missing_color,
+                        **extra,
                     )
 
             expected_length = (
@@ -17017,9 +17640,21 @@ class Tile(object):
                     return False
                 return True
 
+            def current_dds():
+                # The tile can be closed while the native build runs.
+                dds = self.dds
+                if dds is None or len(dds.mipmap_list) == 0:
+                    log.debug("_try_native_partial_mipmap_build: DDS cleared during build")
+                    bump("native_partial_dds_cleared")
+                    return None
+                return dds
+
             source_manifest = manifest_for(jpeg_datas, fallback_provenance)
             result = native_build(partial_sources)
             if not build_ok(result):
+                return False
+            dds = current_dds()
+            if dds is None:
                 return False
 
             # The native decoder paints a JPEG it cannot decode with missing
@@ -17029,7 +17664,7 @@ class Tile(object):
                 result.data,
                 chunks_width,
                 chunks_height,
-                self.dds.blocksize,
+                dds.blocksize,
                 missing_color,
                 [
                     index
@@ -17083,25 +17718,24 @@ class Tile(object):
                 generation=generation,
             )
 
-            # Guard against DDS being cleared during build
-            if self.dds is None or len(self.dds.mipmap_list) == 0:
-                log.debug(f"_try_native_partial_mipmap_build: DDS cleared during build")
+            dds = current_dds()
+            if dds is None:
                 return False
-            
+
             if not coordinator.can_commit_partial(revision):
                 return True
 
             def install_rows(committed):
                 self.ready.clear()
                 try:
-                    mm = self.dds.mipmap_list[mipmap]
-                    sparse = self.dds.ensure_sparse_mipmap(
+                    mm = dds.mipmap_list[mipmap]
+                    sparse = dds.ensure_sparse_mipmap(
                         mipmap,
                         bytes_per_chunk_row,
                         coordinator.total_rows,
                     )
                     for row_result in committed:
-                        self.dds.write_mipmap_at(
+                        dds.write_mipmap_at(
                             mipmap,
                             row_result.manifest.row_index
                             * bytes_per_chunk_row,
@@ -17124,16 +17758,17 @@ class Tile(object):
 
             build_succeeded = True
             build_time = time.monotonic() - build_start
-            log.debug(
-                "_try_native_partial_mipmap_build: SUCCESS rows %d-%d "
-                "(%d bytes at offset %d, %.1fms native, %.1fms total)",
-                startrow,
-                endrow,
-                result.bytes_written,
-                startrow * bytes_per_chunk_row,
-                result.elapsed_ms,
-                build_time * 1000,
-            )
+            if TRACE_READS:
+                log.debug(
+                    "_try_native_partial_mipmap_build: SUCCESS rows %d-%d "
+                    "(%d bytes at offset %d, %.1fms native, %.1fms total)",
+                    startrow,
+                    endrow,
+                    result.bytes_written,
+                    startrow * bytes_per_chunk_row,
+                    result.elapsed_ms,
+                    build_time * 1000,
+                )
             return True
         except Exception as e:
             log.debug(
@@ -18111,6 +18746,81 @@ class TileCacher(object):
         # Floor: never set target below 0
         return max(0, my_target)
 
+    @staticmethod
+    def _close_evicted(batch) -> int:
+        """Close tiles already removed from ``self.tiles`` (outside tc_lock)."""
+        closed = 0
+        for tile_id, t in batch:
+            try:
+                # Release external references BEFORE close() so the
+                # tile object can be garbage-collected once close()
+                # drops the last internal references.
+                # TileCompletionTracker may hold a strong ref to
+                # the tile, preventing GC for up to 10 minutes.
+                if tile_completion_tracker is not None:
+                    try:
+                        tile_completion_tracker.stop_tracking(tile_id)
+                    except Exception:
+                        pass
+                _ledger_evicted(t)
+                t.close()
+            except Exception:
+                pass
+            finally:
+                t = None
+            closed += 1
+        return closed
+
+    # Tiles checked per cleaner pass for a finished DDS on disk.
+    _DISK_BACKED_SCAN = 256
+
+    def _drop_disk_backed(self) -> int:
+        """Drop closed tiles whose finished DDS is in the disk cache.
+
+        With direct reads on ([pydds] serve_from_disk), every later open of
+        such a texture is served from its cache file, so keeping the tile in
+        memory only costs RAM.
+        """
+        cache = dynamic_dds_cache
+        if cache is None or not getattr(cache, "serve_from_disk", False):
+            return 0
+        with self.tc_lock:
+            candidates = [
+                (idx, t) for idx, t in self.tiles.items()
+                if t.refs <= 0
+                and (
+                    getattr(t, "_dds_persisted", False)
+                    or getattr(t, "_dds_persistence_accepted", False)
+                )
+                and not getattr(t, "_dds_needs_healing", False)
+            ][: self._DISK_BACKED_SCAN]
+        on_disk = []
+        for idx, t in candidates:
+            try:
+                # The same check a direct open makes: dropping a tile whose
+                # entry cannot be read directly would force a rebuild.
+                entry = cache.open_direct(
+                    t.row, t.col, t.maptype, t.tilename_zoom, t.max_zoom,
+                    t.dds.total_size,
+                )
+                if entry is not None:
+                    cache.unpin(entry["key"])
+                    on_disk.append(idx)
+            except Exception:
+                continue
+        if not on_disk:
+            return 0
+        batch = []
+        with self.tc_lock:
+            for idx in on_disk:
+                t = self.tiles.get(idx)
+                if t is not None and t.refs <= 0:
+                    batch.append((idx, self.tiles.pop(idx)))
+        dropped = self._close_evicted(batch)
+        if dropped:
+            bump("tiles_dropped_disk_backed", dropped)
+        return dropped
+
     def _evict_batch(self, max_to_evict: int) -> int:
         """
         Evict tiles with minimal lock holding time.
@@ -18154,30 +18864,10 @@ class TileCacher(object):
             
             if not batch:
                 break
-            
+
             # PHASE 2: Close tiles OUTSIDE lock (slow I/O operations)
             # This is safe because tiles are already removed from self.tiles
-            for tile_id, t in batch:
-                try:
-                    # Release external references BEFORE close() so the
-                    # tile object can be garbage-collected once close()
-                    # drops the last internal references.
-                    # TileCompletionTracker may hold a strong ref to
-                    # the tile, preventing GC for up to 10 minutes.
-                    if tile_completion_tracker is not None:
-                        try:
-                            tile_completion_tracker.stop_tracking(
-                                tile_id
-                            )
-                        except Exception:
-                            pass
-                    _ledger_evicted(t)
-                    t.close()
-                except Exception:
-                    pass
-                finally:
-                    t = None
-                evicted += 1
+            evicted += self._close_evicted(batch)
 
         # Prompt garbage collection after large eviction batches.
         # DDS buffers are multi-MB objects; Python's generational GC may
@@ -18229,6 +18919,15 @@ class TileCacher(object):
             if not self.enable_cache:
                 self._clean_stop.wait(poll_interval)
                 continue
+
+            # Finished textures are served from disk: their closed tiles go
+            # first, before any memory pressure builds up.
+            try:
+                if self._drop_disk_backed() >= 8:
+                    _release_memory_to_os()
+                    cur_mem = _get_process_mem_bytes(process)
+            except Exception as exc:
+                log.debug(f"Disk-backed tile drop failed: {exc}")
 
             # Use aggregated memory across all workers when available; otherwise local RSS
             # Also check for staleness to avoid using outdated stats
@@ -18448,7 +19147,8 @@ class TileCacher(object):
         map_type = self._resolve_maptype(row, col, map_type, zoom)
         idx = self._to_tile_id(row, col, map_type, zoom)
 
-        log.debug(f"Get_tile: {idx}")
+        if TRACE_READS:
+            log.debug(f"Get_tile: {idx}")
         reopened = False
         with self.tc_lock:
             tile = self.tiles.get(idx)
@@ -18513,7 +19213,8 @@ class TileCacher(object):
             t.refs -= 1
 
             if self.enable_cache: # and not t.should_close():
-                log.debug(f"Cache enabled.  Delay tile close for {tile_id}")
+                if TRACE_READS:
+                    log.debug(f"Cache enabled.  Delay tile close for {tile_id}")
                 if t.refs <= 0:
                     release_completed_sources = t
                     release_live_owner = t

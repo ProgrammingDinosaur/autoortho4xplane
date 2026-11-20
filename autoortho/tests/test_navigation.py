@@ -45,3 +45,24 @@ def test_navigation_rail_emits_selection_changes(qt_app):
 
     assert rail.current_destination() == "diagnostics"
     assert seen == ["diagnostics"]
+
+
+def test_navigation_button_wraps_long_label(qt_app):
+    rail = NavigationRail()
+    button = rail.button_for("scenery-library")
+    one_line_height = button.sizeHint().height()
+    label = "Scenery Library With A Much Longer Localized Name"
+
+    button.setText(label)
+
+    assert button.text() == label
+    assert button.sizeHint().height() > one_line_height
+    assert rail.minimumSizeHint().width() >= button.sizeHint().width()
+
+
+def test_navigation_short_labels_stay_on_one_line(qt_app):
+    from PySide6.QtWidgets import QToolButton
+
+    rail = NavigationRail()
+    for key in rail.destination_keys():
+        assert "\n" not in QToolButton.text(rail.button_for(key))

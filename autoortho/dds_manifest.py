@@ -32,6 +32,13 @@ _FALLBACK_SOURCES = frozenset(
         MipmapSource.CASCADE_NETWORK_FALLBACK,
     )
 )
+# The same as raw byte values. Manifests are checked on every read of a
+# texture being built; building an enum per source cost about 0.4 s of
+# Python per 8192 px texture.
+_FALLBACK_VALUES = frozenset(int(source) for source in _FALLBACK_SOURCES)
+_VALID_VALUES = frozenset(int(source) for source in MipmapSource)
+_TARGET_VALUE = int(MipmapSource.TARGET_PROVIDER)
+_MISSING_VALUE = int(MipmapSource.MISSING_COLOR)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,10 +62,8 @@ class RowBuildManifest:
         if not self.sources:
             raise ValueError("manifest sources must not be empty")
         for value in self.sources:
-            try:
-                MipmapSource(value)
-            except ValueError as exc:
-                raise ValueError(f"invalid mipmap source value: {value}") from exc
+            if value not in _VALID_VALUES:
+                raise ValueError(f"invalid mipmap source value: {value}")
         if self.compressed_length <= 0:
             raise ValueError("manifest compressed_length must be positive")
         if len(self.compressed_sha256) != hashlib.sha256().digest_size:
@@ -90,25 +95,24 @@ class RowBuildManifest:
 
     @property
     def is_exact(self) -> bool:
-        return all(
-            source == int(MipmapSource.TARGET_PROVIDER)
-            for source in self.sources
-        )
+        return self.sources.count(_TARGET_VALUE) == len(self.sources)
 
     @property
     def fallback_indices(self) -> tuple[int, ...]:
         return tuple(
             index
             for index, value in enumerate(self.sources)
-            if MipmapSource(value) in _FALLBACK_SOURCES
+            if value in _FALLBACK_VALUES
         )
 
     @property
     def missing_indices(self) -> tuple[int, ...]:
+        if _MISSING_VALUE not in self.sources:
+            return ()
         return tuple(
             index
             for index, value in enumerate(self.sources)
-            if value == int(MipmapSource.MISSING_COLOR)
+            if value == _MISSING_VALUE
         )
 
     @property

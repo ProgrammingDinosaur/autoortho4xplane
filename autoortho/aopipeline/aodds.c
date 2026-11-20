@@ -2331,6 +2331,45 @@ AODDS_API int32_t aodds_build_partial_mipmap(
 }
 
 
+/* Same as aodds_build_partial_mipmap, bounded to max_threads OpenMP threads
+ * (0 = the OpenMP default). The thread count applies to every parallel region
+ * the build runs (decode, compose, compress) and is restored afterwards, so a
+ * caller can run several partial builds at once without each one claiming a
+ * full team of threads. */
+AODDS_API int32_t aodds_build_partial_mipmap_mt(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunks_width,
+    int32_t chunks_height,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool,
+    int32_t max_threads
+) {
+#if AOPIPELINE_HAS_OPENMP
+    int previous = omp_get_max_threads();
+    if (max_threads > 0) {
+        omp_set_num_threads(max_threads);
+    }
+#endif
+    int32_t result = aodds_build_partial_mipmap(
+        jpeg_data, jpeg_sizes, chunks_width, chunks_height, format,
+        missing_r, missing_g, missing_b, output, output_size, bytes_written,
+        pool);
+#if AOPIPELINE_HAS_OPENMP
+    if (max_threads > 0) {
+        omp_set_num_threads(previous);
+    }
+#endif
+    return result;
+}
+
+
 /*============================================================================
  * Build Mipmap Chain: Generate starting mipmap + all smaller mipmaps
  * 
@@ -3907,8 +3946,10 @@ AODDS_API int32_t aodds_builder_add_fallback_image(
     
     /* Allocate and copy image data */
     uint8_t* data = NULL;
+    int from_pool = 0;
     if (builder->pool) {
         data = aodecode_acquire_buffer(builder->pool);
+        from_pool = (data != NULL);
     }
     if (!data) {
         data = (uint8_t*)malloc(CHUNK_BUFFER_SIZE);
@@ -3926,8 +3967,8 @@ AODDS_API int32_t aodds_builder_add_fallback_image(
     builder->chunks[chunk_index].height = height;
     builder->chunks[chunk_index].stride = width * 4;
     builder->chunks[chunk_index].channels = 4;
-    builder->chunks[chunk_index].from_pool = (builder->pool != NULL);
-    
+    builder->chunks[chunk_index].from_pool = from_pool;
+
     builder->chunk_status[chunk_index] = CHUNK_STATUS_FALLBACK;
     builder->status.chunks_received++;
     builder->status.chunks_fallback++;
@@ -4384,6 +4425,31 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     
     *bytes_written = total_written;
     return 1;
+}
+
+/*
+ * Free the OpenMP threads the calling thread keeps for its parallel regions.
+ *
+ * libgomp gives every thread that starts a parallel region its own team of
+ * worker threads and keeps that team until the thread exits. AutoOrtho's
+ * native builds run on many long-lived threads (FUSE readers, build and
+ * prefetch workers), so each one kept a team: the mount worker grew from
+ * about 160 threads to 634 while a flight loaded and stayed near 470.
+ * omp_pause_resource frees only the calling thread's team (libgomp's
+ * gomp_pause_host); the next parallel region on that thread creates a new
+ * one. Returns 1 when the team was freed, 0 when this runtime cannot
+ * (LLVM's libomp pauses its whole runtime instead, so it is left alone).
+ */
+AODDS_API int32_t aodds_release_thread_team(void) {
+#if AOPIPELINE_HAS_OPENMP && defined(__GNUC__) && !defined(__clang__)
+    if (omp_in_parallel()) {
+        return 0;
+    }
+    return omp_pause_resource(omp_pause_soft, omp_get_initial_device()) == 0
+        ? 1 : 0;
+#else
+    return 0;
+#endif
 }
 
 AODDS_API const char* aodds_version(void) {

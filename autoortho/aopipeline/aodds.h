@@ -403,6 +403,26 @@ AODDS_API int32_t aodds_build_partial_mipmap(
 );
 
 /**
+ * aodds_build_partial_mipmap bounded to max_threads OpenMP threads
+ * (0 = OpenMP default), so concurrent partial builds can share the CPU.
+ */
+AODDS_API int32_t aodds_build_partial_mipmap_mt(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunks_width,
+    int32_t chunks_height,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    aodecode_pool_t* pool,
+    int32_t max_threads
+);
+
+/**
  * Build a mipmap chain from JPEG data: starting level + all smaller mipmaps.
  * 
  * This function builds the requested mipmap level AND all smaller mipmaps
@@ -609,6 +629,13 @@ AODDS_API int32_t aodds_get_use_ispc(void);
  * @return 1 if fallback compressor will be used, 0 if ISPC is active
  */
 AODDS_API int32_t aodds_using_fallback_compressor(void);
+
+/**
+ * Free the OpenMP worker threads the calling thread keeps between parallel
+ * regions (libgomp keeps one team per calling thread until it exits).
+ * Returns 1 when freed, 0 when the runtime cannot release one thread's team.
+ */
+AODDS_API int32_t aodds_release_thread_team(void);
 
 /**
  * Get version information for the aodds module.

@@ -1,0 +1,56 @@
+name: Download transport
+
+# The download brokers use curl_cffi (libcurl, shipped as a compiled wheel per
+# platform) and fall back to httpx. Nothing here is compiled by us, so this
+# checks instead that the pinned wheel installs and loads its native library on
+# every platform AutoOrtho ships for, and that the broker tests pass with it.
+# Runs on PRs that touch the broker, the pinned requirements or the
+# PyInstaller spec, or manually from the Actions tab.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'autoortho/http2_broker.py'
+      - 'autoortho/tests/test_http2_broker.py'
+      - 'requirements.txt'
+      - 'autoortho.spec'
+      - '.github/workflows/download_transport.yml'
+
+jobs:
+  curl-transport:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      # The tests' conftest loads Qt, which needs EGL and GL on Linux runners.
+      - name: Install Qt system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1
+
+      - name: Install requirements
+        run: |
+          python -m pip install -U pip pytest
+          python -m pip install -r requirements.txt
+
+      - name: curl_cffi loads its native library
+        run: |
+          python -c "import curl_cffi, curl_cffi.requests; from curl_cffi import Curl; Curl(); print('curl_cffi', curl_cffi.__version__)"
+
+      - name: Brokers pick curl
+        working-directory: autoortho
+        run: |
+          python -c "import http2_broker as hb; c = hb.resolve_http_client('auto'); print('broker client:', c); assert c == 'curl'"
+
+      - name: Broker tests
+        working-directory: autoortho
+        run: |
+          python -m pytest -q tests/test_http2_broker.py

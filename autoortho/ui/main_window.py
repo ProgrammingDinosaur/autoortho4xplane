@@ -62,6 +62,7 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.widgets.scenery_patches import SceneryPatchesWidget
     from autoortho.ui.shell import ApplicationShell
     from autoortho.ui.pages.scenery_page import SceneryLibraryPage
+    from autoortho import tile_stream
     from autoortho.ui.pages.settings_page import SettingsPage
     from autoortho.ui.pages.expert_settings_page import ExpertSettingsPage
     from autoortho.ui.widgets.target_cost_panel import TargetCostPanel
@@ -95,6 +96,7 @@ if __package__ and __package__.startswith("autoortho."):
     )
     from autoortho import downloader
     from autoortho.version import __version__
+    from autoortho import worker_restart
 else:
     import utils.resources_rc
     from utils.constants import MAPTYPES, system_type
@@ -138,6 +140,7 @@ else:
     from ui.widgets.scenery_patches import SceneryPatchesWidget
     from ui.shell import ApplicationShell
     from ui.pages.scenery_page import SceneryLibraryPage
+    import tile_stream
     from ui.pages.settings_page import SettingsPage
     from ui.pages.expert_settings_page import ExpertSettingsPage
     from ui.widgets.target_cost_panel import TargetCostPanel
@@ -172,6 +175,7 @@ else:
     )
     import downloader
     from version import __version__
+    import worker_restart
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -597,6 +601,12 @@ class ConfigUI(QMainWindow):
         self._closing = False
         self._shutdown_in_progress = False
         self._ready_to_close = False
+        if sys.platform == "darwin":
+            # Clicking the Dock icon activates the app but Qt does not show a
+            # hidden window; bring it back the way Mac users expect.
+            app = QApplication.instance()
+            if app is not None:
+                app.applicationStateChanged.connect(self._on_app_state_changed)
         self.runtime_state = RuntimeState.STOPPED
         self.mount_control_worker = None
         self._stop_target_state = RuntimeState.STOPPED
@@ -1073,6 +1083,15 @@ class ConfigUI(QMainWindow):
         self.scenery_library_page.settings_requested.connect(
             lambda: self.navigate_to("settings", "Setup & Storage")
         )
+        stream_panel = self.scenery_library_page.stream_panel
+        stream_panel.enable_requested.connect(self._on_stream_enable)
+        stream_panel.disable_requested.connect(self._on_stream_disable)
+        stream_panel.source_change_requested.connect(self._on_stream_source)
+        stream_panel.overlays_change_requested.connect(self._on_stream_overlays)
+        stream_panel.limit_changed.connect(self._on_stream_limit)
+        stream_panel.refresh_requested.connect(self._refresh_stream_panel)
+        self._stream_workers = []
+        QTimer.singleShot(0, self._refresh_stream_panel)
         self.shell.add_page(
             self.scenery_library_page,
             key="scenery-library",
@@ -1084,9 +1103,18 @@ class ConfigUI(QMainWindow):
             [m for m in MAPTYPES if m not in ("Use tile default", "Custom Map")],
             scenery_path=lambda: self.cfg.ao_scenery_path,
             discover=discover_dsf_tiles,
+            cache_paths=lambda: (
+                self.cfg.ao_scenery_path,
+                self.cfg.paths.cache_dir,
+                self.cfg.xplane_custom_scenery_path,
+            ),
+            task_manager=self.task_manager,
         )
         self.custom_map_editor.cellsChanged.connect(
             self._on_custom_map_changed
+        )
+        self.custom_map_editor.cacheChanged.connect(
+            self._refresh_stream_panel
         )
         self.flight_plan_page = FlightPlanPage(
             self.simbrief_group, self.custom_map_editor
@@ -2068,10 +2096,12 @@ class ConfigUI(QMainWindow):
         except Exception:
             cores = None
         home = (governor_snapshot or {}).get("home") or {}
-        mounted = len([
-            handle for handle in getattr(self, "mount_workers", [])
+        # A shared worker serves several mounts.
+        mounted = sum(
+            len(getattr(handle, "mounts", ()) or ()) or 1
+            for handle in getattr(self, "mount_workers", [])
             if handle.process.poll() is None
-        ]) or len(getattr(self.cfg, "scenery_mounts", []) or [])
+        ) or len(getattr(self.cfg, "scenery_mounts", []) or [])
         snapshot = home_snapshot_module.build(
             runtime=runtime,
             governor=governor_snapshot,
@@ -2129,6 +2159,11 @@ class ConfigUI(QMainWindow):
                       QSystemTrayIcon.ActivationReason.DoubleClick):
             self._restore_from_tray()
 
+    def _on_app_state_changed(self, state):
+        if (state == Qt.ApplicationState.ApplicationActive
+                and self._hidden_to_tray and not self.isVisible()):
+            self._restore_from_tray()
+
     def _restore_from_tray(self):
         self._hidden_to_tray = False
         self.showNormal()
@@ -2147,11 +2182,32 @@ class ConfigUI(QMainWindow):
             if self.isVisible() and not self._hidden_to_tray:
                 self._hidden_to_tray = True
                 self.hide()
+                self._announce_hidden_to_tray(tray)
         elif self.runtime_state in (RuntimeState.STOPPED, RuntimeState.ERROR):
             if self._tray is not None:
                 self._tray.hide()
             if self._hidden_to_tray:
                 self._restore_from_tray()
+
+    _tray_notice_shown = False
+
+    def _announce_hidden_to_tray(self, tray):
+        """Once per launch: the window vanishing reads as a crash otherwise
+        (Windows tucks new tray icons behind the overflow arrow)."""
+        if self._tray_notice_shown:
+            return
+        self._tray_notice_shown = True
+        if sys.platform == "darwin":
+            where = "Click its menu bar icon or the Dock icon to show it."
+        else:
+            where = ("Click its tray icon (under the ^ arrow on the taskbar) "
+                     "to show it.")
+        tray.showMessage(
+            "AutoOrtho is still streaming",
+            f"The window is hidden while streaming. {where}",
+            QSystemTrayIcon.MessageIcon.Information,
+            8000,
+        )
 
     def _update_tray_summary(self, snapshot):
         """The tray tooltip reads like Home's headline; ! when a notice waits."""
@@ -2739,7 +2795,7 @@ class ConfigUI(QMainWindow):
             ),
         )
         self.shell.set_xplane_state(xplane_connected)
-        self.scenery_library_page.set_runtime_locked(
+        self._set_runtime_locked(
             xplane_connected
             or self.runtime_state
             not in (RuntimeState.STOPPED, RuntimeState.ERROR)
@@ -2753,11 +2809,10 @@ class ConfigUI(QMainWindow):
         self.home_page.set_xplane_state(
             "Connected" if xplane_connected else "Disconnected"
         )
-        mounted_count = len(
-            [
-                handle for handle in getattr(self, "mount_workers", [])
-                if handle.process.poll() is None
-            ]
+        mounted_count = sum(
+            len(getattr(handle, "mounts", ()) or ()) or 1
+            for handle in getattr(self, "mount_workers", [])
+            if handle.process.poll() is None
         )
         self.home_page.set_mounted_scenery(
             f"{mounted_count} active",
@@ -3411,6 +3466,7 @@ class ConfigUI(QMainWindow):
             paging_k=guards.paging_k(self.cfg),
             texture_format=guards.texture_format(self.cfg),
             disk_cache_gb=self.file_cache_slider.value(),
+            streaming_locked=self.scenery_library_page.stream_panel.runtime_locked,
         )
         if wizard.exec() != QDialog.DialogCode.Accepted:
             return
@@ -3461,12 +3517,27 @@ class ConfigUI(QMainWindow):
                     ),
                 )
         # "Start AutoOrtho when setup finishes": not while scenery is still
-        # being installed (it would mount half a region).
+        # being installed (it would mount half a region), and only once
+        # streaming is set up (its folders are mounted at start).
         start_now = getattr(wizard, "start_now", None)
-        if callable(start_now) and start_now():
+        start = callable(start_now) and start_now()
+        selected_streaming = getattr(wizard, "selected_streaming", None)
+        streaming = selected_streaming() if callable(selected_streaming) else None
+        if streaming:
+            self._on_stream_enable(
+                streaming["source"],
+                streaming["overlays"],
+                streaming["disk_limit_gb"],
+                on_success=self.on_run if start and not installing else None,
+            )
+        if start:
             if installing:
                 self.update_status_bar(
                     "Setup saved. Start streaming once the scenery has installed."
+                )
+            elif streaming:
+                self.update_status_bar(
+                    "Setup saved. AutoOrtho starts once scenery streaming is set up."
                 )
             else:
                 QTimer.singleShot(0, self.on_run)
@@ -6243,7 +6314,8 @@ class ConfigUI(QMainWindow):
         self.hide_check.setToolTip(
             "Minimize AutoOrtho window to system tray when running.\n"
             "Helps keep desktop clean during long flights.\n"
-            "You can still access it from the system tray."
+            "You can still access it from the system tray (the menu bar on\n"
+            "macOS, or by clicking the Dock icon)."
         )
         general_layout.addWidget(self.hide_check)
 
@@ -7455,6 +7527,205 @@ class ConfigUI(QMainWindow):
                 self.on_restore_default_dsfs(region_id)
             return
 
+    # -- Scenery streaming ------------------------------------------------
+
+    def _set_runtime_locked(self, locked):
+        """Streaming settings and cache changes wait until AutoOrtho and
+        X-Plane are stopped."""
+        self.scenery_library_page.set_runtime_locked(locked)
+        editor = getattr(self, "custom_map_editor", None)
+        if editor is not None:
+            editor.set_runtime_locked(locked)
+
+    def _run_stream_job(self, operation, on_done):
+        """Run a streaming setup job off the UI thread."""
+        worker = ServiceWorker(lambda cancel_event: operation(), self)
+        self._stream_workers.append(worker)
+
+        def finished(result, current=worker):
+            if current in self._stream_workers:
+                self._stream_workers.remove(current)
+            on_done(result)
+
+        worker.completed.connect(finished)
+        worker.start()
+        return worker
+
+    def _refresh_stream_panel(self):
+        scenery_dir = self.cfg.ao_scenery_path
+
+        def show(result):
+            panel = self.scenery_library_page.stream_panel
+            if isinstance(result, Exception):
+                log.warning(f"Could not read streaming state: {result}")
+                panel.restore()
+                return
+            panel.set_state(result)
+
+        self._run_stream_job(lambda: tile_stream.stream_summary(scenery_dir), show)
+
+    def _after_stream_change(self):
+        """New or removed streaming folders become mounts on the next start."""
+        # Streaming folders count as scenery: the last readiness result may
+        # say none is installed, so check again before the next start.
+        self._readiness_signature = None
+        try:
+            self.cfg.refresh_derived_paths(create_missing=False)
+        except Exception as exc:
+            log.warning(f"Could not refresh scenery mounts: {exc}")
+        try:
+            tile_stream.ensure_all_pack_orders(
+                self.cfg.ao_scenery_path, self.cfg.xplane_custom_scenery_path
+            )
+        except Exception as exc:
+            log.warning(f"Could not order streaming packages: {exc}")
+        self._refresh_stream_panel()
+
+    def _confirm_stream_delete(self, title, text, accept_label, cancel_label="Cancel"):
+        """Ask before a streaming change deletes stored tiles."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(title)
+        box.setText(title)
+        box.setInformativeText(text)
+        accept = box.addButton(accept_label, QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton(cancel_label, QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.exec()
+        return box.clickedButton() is accept
+
+    def _apply_stream_change(self, operation, busy_message, done_message,
+                             error_message, task_title=None, package="",
+                             on_success=None):
+        """Run a streaming change in the background and show the outcome.
+
+        ``on_success`` runs after a change that worked (not after a failure).
+        """
+        panel = self.scenery_library_page.stream_panel
+        task_id = "scenery-stream"
+        if task_title:
+            self.task_manager.create_task(
+                task_id, TaskType.SCENERY_INSTALL, task_title,
+                package=package, stage=busy_message.rstrip("…"),
+            )
+        panel.set_busy(True, busy_message)
+
+        def done(result):
+            if isinstance(result, Exception):
+                if task_title:
+                    self.task_manager.fail_task(task_id, str(result))
+                self.display_error(f"{error_message}:\n{result}")
+                panel.restore()
+                self._refresh_stream_panel()
+                return
+            if task_title:
+                self.task_manager.complete_task(task_id)
+            self.update_status_bar(
+                f"{done_message} It takes effect the next time AutoOrtho starts."
+            )
+            self._after_stream_change()
+            if on_success is not None:
+                QTimer.singleShot(0, on_success)
+
+        self._run_stream_job(operation, done)
+
+    @staticmethod
+    def _stream_source_label(source):
+        return tile_stream.SOURCES.get(source, {}).get("label", source or "")
+
+    def _on_stream_enable(self, source, overlays, limit_gb, on_success=None):
+        scenery_dir = self.cfg.ao_scenery_path
+        if not scenery_dir:
+            self.scenery_library_page.stream_panel.restore()
+            self.display_error("Set the scenery folder before turning on streaming.")
+            return
+        os.makedirs(scenery_dir, exist_ok=True)
+        self._apply_stream_change(
+            lambda: tile_stream.enable_streaming(
+                scenery_dir, source, overlays=overlays, disk_limit_gb=limit_gb
+            ),
+            "Downloading the tile index…",
+            "Scenery streaming is on.",
+            "Could not turn on scenery streaming",
+            task_title="Turn on scenery streaming",
+            package=self._stream_source_label(source),
+            on_success=on_success,
+        )
+
+    def _streamed_bytes(self):
+        state = self.scenery_library_page.stream_panel.state
+        return state.get("ortho", (0, 0))[0] + state.get("overlay", (0, 0))[0]
+
+    def _on_stream_disable(self):
+        panel = self.scenery_library_page.stream_panel
+        stored = self._streamed_bytes()
+        if stored and not self._confirm_stream_delete(
+            "Turn off scenery streaming?",
+            f"The tiles streamed so far ({format_bytes(stored)}) will be deleted. "
+            "Regions you have installed aren't affected.",
+            "Turn off and delete tiles",
+            "Keep streaming",
+        ):
+            panel.restore()
+            return
+        scenery_dir = self.cfg.ao_scenery_path
+        self._apply_stream_change(
+            lambda: tile_stream.disable_streaming(scenery_dir),
+            "Removing streamed tiles…",
+            "Scenery streaming is off.",
+            "Could not turn off scenery streaming",
+        )
+
+    def _on_stream_overlays(self, enabled):
+        panel = self.scenery_library_page.stream_panel
+        stored = panel.state.get("overlay", (0, 0))[0]
+        if not enabled and stored and not self._confirm_stream_delete(
+            "Stop streaming overlays?",
+            f"The overlay tiles streamed so far ({format_bytes(stored)}) will be "
+            "deleted. Roads, forests and buildings then come only from your "
+            "other scenery, such as simHeaven X-World.",
+            "Remove overlays",
+        ):
+            panel.restore()
+            return
+        scenery_dir = self.cfg.ao_scenery_path
+        self._apply_stream_change(
+            lambda: tile_stream.set_stream_overlays(scenery_dir, enabled),
+            "Downloading the overlay index…" if enabled else "Removing overlay tiles…",
+            "Streamed overlays are on." if enabled else "Streamed overlays are off.",
+            "Could not change streamed overlays",
+        )
+
+    def _on_stream_source(self, source):
+        panel = self.scenery_library_page.stream_panel
+        label = self._stream_source_label(source)
+        old_label = self._stream_source_label(panel.state.get("source"))
+        stored = self._streamed_bytes()
+        if stored and not self._confirm_stream_delete(
+            f"Switch to {label}?",
+            f"The tiles streamed from {old_label} ({format_bytes(stored)}) will be "
+            f"deleted once {label} is ready.",
+            "Switch and delete tiles",
+        ):
+            panel.restore()
+            return
+        scenery_dir = self.cfg.ao_scenery_path
+        self._apply_stream_change(
+            lambda: tile_stream.change_stream_source(scenery_dir, source),
+            "Downloading the tile index…",
+            f"Now streaming {label}.",
+            "Could not switch the streamed scenery set",
+            task_title="Switch streamed scenery set",
+            package=label,
+        )
+
+    def _on_stream_limit(self, limit_gb):
+        try:
+            tile_stream.update_stream_settings(self.cfg.ao_scenery_path, limit_gb)
+        except Exception as exc:
+            self.display_error(f"Could not change the streaming disk limit:\n{exc}")
+        self._refresh_stream_panel()
+
     def on_delete_scenery(self, region_id):
         """Handle scenery deletion"""
         region = self.dl.regions.get(region_id)
@@ -8469,7 +8740,7 @@ class ConfigUI(QMainWindow):
                 self.runtime_state,
                 action_enabled=action_enabled,
             )
-            self.scenery_library_page.set_runtime_locked(
+            self._set_runtime_locked(
                 self.runtime_state != RuntimeState.STOPPED
                 and self.runtime_state != RuntimeState.ERROR
             )
@@ -8548,6 +8819,8 @@ class ConfigUI(QMainWindow):
             if success:
                 self._runtime_error_message = ""
                 self._restart_pending = False
+                self._worker_restart_policy().reset()
+                self._worker_restart_failure = None
                 self._set_runtime_state(RuntimeState.RUNNING, message)
                 self.mount_monitor_timer.start()
             else:
@@ -8583,9 +8856,74 @@ class ConfigUI(QMainWindow):
         if self.mount_control_worker is worker:
             self.mount_control_worker = None
 
+    def _worker_restart_policy(self):
+        policy = getattr(self, "_restart_policy", None)
+        if policy is None:
+            policy = worker_restart.RestartPolicy()
+            self._restart_policy = policy
+        return policy
+
+    def _try_restart_dead_workers(self, dead):
+        """Remount regions whose worker died; True if every one is handled.
+
+        The remount runs off the UI thread. A worker that cannot be restarted
+        (too many restarts, or the remount failed) leaves streaming to stop
+        with an error, as before.
+        """
+        restart = getattr(self, "restart_mount_worker", None)
+        if restart is None or getattr(self, "_close_after_stop", False):
+            return False
+        restarting = self.__dict__.setdefault("_restarting_worker_pids", set())
+        policy = self._worker_restart_policy()
+        for handle, _exit_code in dead:
+            if handle.pid in restarting:
+                continue
+            if not policy.allow(handle.mountpoint):
+                log.error(
+                    "Mount worker for %s died %d times in %.0f minutes; "
+                    "not restarting it again",
+                    handle.mountpoint,
+                    policy.max_restarts,
+                    policy.window_seconds / 60.0,
+                )
+                return False
+
+        for handle, exit_code in dead:
+            if handle.pid in restarting:
+                continue
+            restarting.add(handle.pid)
+            self.update_status_bar(
+                f"Scenery mount {handle.volname or handle.mountpoint} stopped "
+                f"(code {exit_code}); remounting…"
+            )
+
+            def run(current=handle):
+                try:
+                    if restart(current) is None:
+                        self._worker_restart_failure = (
+                            f"Mount worker for {current.mountpoint} "
+                            f"(PID {current.pid}) died and could not be remounted."
+                        )
+                finally:
+                    restarting.discard(current.pid)
+
+            threading.Thread(
+                target=run, name="ao-remount", daemon=True
+            ).start()
+        return True
+
     def _check_mount_workers(self):
         if self.runtime_state != RuntimeState.RUNNING:
             return
+        failure = getattr(self, "_worker_restart_failure", None)
+        if failure:
+            self._worker_restart_failure = None
+            log.error("Streaming failed before cleanup: %s", failure)
+            self.mount_monitor_timer.stop()
+            self._runtime_error_message = failure
+            self._start_mount_control("stop", stop_target=RuntimeState.ERROR)
+            return
+        restarting = getattr(self, "_restarting_worker_pids", set())
         handles = list(getattr(self, "mount_workers", []))
         dead = []
         for handle in handles:
@@ -8593,6 +8931,10 @@ class ConfigUI(QMainWindow):
             if exit_code is not None:
                 dead.append((handle, exit_code))
         if handles and not dead:
+            return
+        if not handles and restarting:
+            return  # the replacement worker is starting
+        if dead and self._try_restart_dead_workers(dead):
             return
 
         self.mount_monitor_timer.stop()
@@ -10533,6 +10875,11 @@ class ConfigUI(QMainWindow):
                 panel.stop()
             event.accept()
             return
+
+        if self._hidden_to_tray:
+            # A dialog parented to a hidden window can open out of sight
+            # (macOS), leaving the quit stuck behind it.
+            self._restore_from_tray()
 
         if self.runtime_state == RuntimeState.RUNNING:
             reply = QMessageBox.question(

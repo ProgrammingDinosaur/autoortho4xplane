@@ -80,24 +80,45 @@ class FlightPlanPage(QWidget):
         body.addLayout(left, 2)
 
         map_group = QGroupBox("Custom Map")
+        self.map_group = map_group
         map_layout = QVBoxLayout(map_group)
-        map_description = QLabel(
-            "Choose the imagery source for individual one-degree scenery "
-            "tiles. Tiles you leave unpainted use the default source. "
-            "Takes effect when Map type is set to Custom Map."
-        )
+        map_description = QLabel(self.MAP_TEXT["sources"][1])
         map_description.setWordWrap(True)
         map_description.setProperty("textRole", "secondary")
+        self.map_description = map_description
         map_layout.addWidget(map_description)
         if map_editor is not None:
             map_editor.setParent(map_group)
             map_layout.addWidget(map_editor, 1)
+            view_changed = getattr(map_editor, "viewChanged", None)
+            if view_changed is not None:
+                view_changed.connect(self._on_map_view)
         else:
             map_layout.addWidget(QLabel("The custom map is unavailable."))
             map_layout.addStretch()
         map_group.setMinimumHeight(460)
         body.addWidget(map_group, 3)
         root.addLayout(body, 1)
+
+    MAP_TEXT = {
+        "sources": (
+            "Custom Map",
+            "Choose the imagery source for individual one-degree scenery "
+            "tiles. Tiles you leave unpainted use the default source. "
+            "Takes effect when Map type is set to Custom Map.",
+        ),
+        "cache": (
+            "Cache",
+            "What AutoOrtho has stored per one-degree tile: streamed scenery "
+            "and cached imagery. Select tiles to delete what is stored, or to "
+            "keep their streamed scenery for offline flying.",
+        ),
+    }
+
+    def _on_map_view(self, view):
+        title, text = self.MAP_TEXT.get(view, self.MAP_TEXT["sources"])
+        self.map_group.setTitle(title)
+        self.map_description.setText(text)
 
     # Below this width the map stacks under the flight details instead of
     # sharing the row, so the map editor never gets squeezed.

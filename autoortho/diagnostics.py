@@ -44,8 +44,35 @@ _MAX_DETAIL_ITEMS = 16
 _MAX_DETAIL_LENGTH = 512
 _MAX_SELF_MEMORY_SAMPLES = 36_000
 _MAX_OBSERVED_MEMORY_SAMPLES = 7_200
+# USS and the thread count are refreshed less often than RSS and CPU. On Windows a
+# full memory read walks the process's whole working set (about 10 ms for a 2 GB
+# process) and a thread count lists every process on the system, so sampling them
+# every second cost about 16% of a flight's CPU.
+_DETAIL_SAMPLE_SECONDS = 10.0
 
 _active_profiler: Optional["PerformanceProfiler"] = None
+
+
+def _detail_fields(process: psutil.Process, cache: dict) -> tuple[int, int]:
+    """A process's USS bytes and thread count, read at most every
+    ``_DETAIL_SAMPLE_SECONDS``; the last values are returned in between."""
+    now = time.monotonic()
+    taken = cache.get("taken")
+    if taken is None or now - taken >= _DETAIL_SAMPLE_SECONDS:
+        uss = 0
+        try:
+            uss = int(getattr(process.memory_full_info(), "uss", 0) or 0)
+        except (
+            AttributeError,
+            psutil.AccessDenied,
+            psutil.NoSuchProcess,
+            NotImplementedError,
+        ):
+            pass
+        threads = int(process.num_threads())
+        cache.update(taken=now, uss=uss, threads=threads)
+    return cache["uss"], cache["threads"]
+
 _active_profiler_lock = threading.RLock()
 
 
@@ -568,6 +595,7 @@ class PerformanceProfiler:
         self._sampler_thread: Optional[threading.Thread] = None
         self._profile_write_lock = threading.Lock()
         self._process: Optional[psutil.Process] = None
+        self._detail: dict = {}
         self._tracemalloc = None
         self._allocation_start = None
         self._stopped = False
@@ -690,6 +718,7 @@ class PerformanceProfiler:
             "process": process,
             "started_wall_time": time.time(),
             "samples": [],
+            "detail": {},
         }
         with self._lock:
             self._observed_processes[int(pid)] = entry
@@ -770,19 +799,8 @@ class PerformanceProfiler:
             memory = process.memory_info()
             rss = int(memory.rss)
             vms = int(memory.vms)
-            uss = 0
-            try:
-                full_memory = process.memory_full_info()
-                uss = int(getattr(full_memory, "uss", 0) or 0)
-            except (
-                AttributeError,
-                psutil.AccessDenied,
-                psutil.NoSuchProcess,
-                NotImplementedError,
-            ):
-                pass
+            uss, threads = _detail_fields(process, self._detail)
             cpu_percent = float(process.cpu_percent(interval=None))
-            threads = int(process.num_threads())
             io_read = 0
             io_write = 0
             try:
@@ -834,17 +852,7 @@ class PerformanceProfiler:
         process = entry["process"]
         try:
             memory = process.memory_info()
-            uss = 0
-            try:
-                full_memory = process.memory_full_info()
-                uss = int(getattr(full_memory, "uss", 0) or 0)
-            except (
-                AttributeError,
-                psutil.AccessDenied,
-                psutil.NoSuchProcess,
-                NotImplementedError,
-            ):
-                pass
+            uss, threads = _detail_fields(process, entry.setdefault("detail", {}))
             io_read = 0
             io_write = 0
             try:
@@ -866,7 +874,7 @@ class PerformanceProfiler:
                 int(memory.vms),
                 0,
                 round(float(process.cpu_percent(interval=None)), 2),
-                int(process.num_threads()),
+                threads,
                 io_read,
                 io_write,
             )

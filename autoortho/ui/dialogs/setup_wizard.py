@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -10,8 +11,14 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho import guards, hardware
     from autoortho import limits as limits_module
     from autoortho import target_cost
+    from autoortho import tile_stream
     from autoortho.ui.dynamic_zoom_editor import PRESETS
     from autoortho.ui.widgets.connection_test_panel import ConnectionTestPanel
+    from autoortho.ui.widgets.stream_panel import (
+        LOCKED_HELP,
+        NO_OVERLAY_HELP,
+        OVERLAY_HELP,
+    )
     from autoortho.ui.widgets.limits_editor import LimitsEditor
     from autoortho.ui.widgets.target_cost_panel import TargetCostPanel
     from autoortho.ui.service_worker import ServiceWorker
@@ -29,8 +36,14 @@ else:
     import hardware
     import limits as limits_module
     import target_cost
+    import tile_stream
     from ui.dynamic_zoom_editor import PRESETS
     from ui.widgets.connection_test_panel import ConnectionTestPanel
+    from ui.widgets.stream_panel import (
+        LOCKED_HELP,
+        NO_OVERLAY_HELP,
+        OVERLAY_HELP,
+    )
     from ui.widgets.limits_editor import LimitsEditor
     from ui.widgets.target_cost_panel import TargetCostPanel
     from ui.service_worker import ServiceWorker
@@ -50,6 +63,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -161,6 +175,43 @@ def _normalize_choice(choice: Any, selected_region_ids: set[str]) -> SceneryChoi
         description=str(getattr(choice, "description", "")),
         size_bytes=int(getattr(choice, "size_bytes", getattr(choice, "size", 0)) or 0),
     )
+
+
+def _secondary(text: str = "") -> QLabel:
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setProperty("textRole", "secondary")
+    return label
+
+
+def _ao_scenery_dir(scenery_path: str) -> str:
+    """Where installed regions and streaming packages live."""
+    return str(
+        Path(os.path.expanduser(scenery_path or "")) / "z_autoortho" / "scenery"
+    )
+
+
+def existing_stream(scenery_path: str) -> dict | None:
+    """Streaming already set up in this scenery folder: its source, overlay
+    choice and disk limit, or None."""
+    if not scenery_path:
+        return None
+    packages = tile_stream.stream_packages(_ao_scenery_dir(scenery_path))
+    found = None
+    overlays = False
+    for marker in packages.values():
+        kind = marker.get("kind", "ortho")
+        if kind == "overlay":
+            overlays = True
+        elif kind == "ortho" and found is None:
+            found = {
+                "source": marker.get("source"),
+                "disk_limit_gb": marker.get("disk_limit_gb"),
+            }
+    if found is None:
+        return None
+    found["overlays"] = overlays
+    return found
 
 
 class _BasePage(QWizardPage):
@@ -492,39 +543,28 @@ class StoragePage(_BasePage):
         return not self.wizard_ref.readiness.checks[1].is_blocking
 
 
-class DependenciesPage(_BasePage):
-    def __init__(self, wizard: "SetupWizard"):
-        super().__init__(
-            wizard,
-            "Dependencies",
-            "Virtual drive file system driver (FUSE)",
-        )
-        layout = QVBoxLayout(self)
-        self.summary_label = QLabel()
-        self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label)
-        layout.addStretch(1)
-
-    def isComplete(self) -> bool:  # noqa: N802
-        return self.wizard_ref.readiness.checks[2].is_ready
-
-
 class SceneryPage(_BasePage):
     def __init__(self, wizard: "SetupWizard"):
         super().__init__(
             wizard,
             "Scenery",
-            "Install a region, or point at scenery you already have",
+            "Stream scenery, install regions, or point at scenery you already have",
         )
+        # Streaming already set up in the chosen scenery folder (summary dict).
+        self._existing_stream: dict | None = None
         layout = QVBoxLayout(self)
         folder_form = QFormLayout()
         label_widget, row = wizard.storage_page.scenery_row
         folder_form.addRow(label_widget, row)
         layout.addLayout(folder_form)
+        layout.addWidget(self._build_stream_box())
         self.note_label = QLabel()
         self.note_label.setWordWrap(True)
         layout.addWidget(self.note_label)
+        regions_label = QLabel("&Regions to install")
+        layout.addWidget(regions_label)
         self.list_widget = QListWidget()
+        regions_label.setBuddy(self.list_widget)
         self.list_widget.setAccessibleName(
             "Scenery regions available for installation"
         )
@@ -538,6 +578,145 @@ class SceneryPage(_BasePage):
         self.storage_label.setWordWrap(True)
         layout.addWidget(self.storage_label)
         layout.addStretch(1)
+
+    def _build_stream_box(self) -> QGroupBox:
+        """Streaming choice: the same settings as the Scenery Library panel."""
+        box = QGroupBox("Stream scenery")
+        layout = QVBoxLayout(box)
+        self.stream_check = QCheckBox("Stream scenery you &haven't installed")
+        self.stream_check.setToolTip(
+            "Fly anywhere without installing regions first."
+        )
+        layout.addWidget(self.stream_check)
+        layout.addWidget(_secondary(
+            "Each tile downloads the first time X-Plane needs it, so you can "
+            "fly without installing a region. Regions you install are always "
+            "used first, so you can also install the ones you fly most and "
+            "stream the rest."
+        ))
+
+        row = QHBoxLayout()
+        source_label = QLabel("Scenery s&et")
+        self.stream_source_combo = QComboBox()
+        source_label.setBuddy(self.stream_source_combo)
+        model = self.stream_source_combo.model()
+        first_available = -1
+        for key, spec in tile_stream.SOURCES.items():
+            available = bool(spec.get("available"))
+            label = spec["label"] if available else f"{spec['label']} — Soon"
+            self.stream_source_combo.addItem(label, key)
+            index = self.stream_source_combo.count() - 1
+            if available and first_available < 0:
+                first_available = index
+            if not available:
+                item = model.item(index)
+                item.setEnabled(False)
+                item.setToolTip(
+                    "Coming soon: these packages are being repackaged for streaming."
+                )
+        if first_available >= 0:
+            self.stream_source_combo.setCurrentIndex(first_available)
+        limit_label = QLabel("Disk li&mit")
+        self.stream_limit_spin = QSpinBox()
+        self.stream_limit_spin.setRange(5, 1000)
+        self.stream_limit_spin.setSuffix(" GB")
+        self.stream_limit_spin.setValue(20)
+        self.stream_limit_spin.setToolTip(
+            "Tiles you haven't used for a while are removed above this size. "
+            "Overlays get a quarter of it on top."
+        )
+        limit_label.setBuddy(self.stream_limit_spin)
+        row.addWidget(source_label)
+        row.addWidget(self.stream_source_combo, 1)
+        row.addSpacing(12)
+        row.addWidget(limit_label)
+        row.addWidget(self.stream_limit_spin)
+        layout.addLayout(row)
+
+        self.stream_overlays_check = QCheckBox(
+            "Include &overlays (roads, forests, buildings)"
+        )
+        self.stream_overlays_check.setChecked(True)
+        self.stream_overlays_help = _secondary(OVERLAY_HELP)
+        layout.addWidget(self.stream_overlays_check)
+        layout.addWidget(self.stream_overlays_help)
+        self.stream_status_label = _secondary()
+        layout.addWidget(self.stream_status_label)
+
+        self.stream_check.toggled.connect(self._stream_changed)
+        self.stream_source_combo.currentIndexChanged.connect(self._stream_changed)
+        self.stream_overlays_check.toggled.connect(self._stream_changed)
+        return box
+
+    def _source_has_overlays(self) -> bool:
+        spec = tile_stream.SOURCES.get(self.stream_source_combo.currentData(), {})
+        return bool(spec.get("overlay_index"))
+
+    def show_existing_stream(self, marker: dict | None) -> None:
+        """Show that the scenery folder already streams (``marker``), or not."""
+        was_existing = self._existing_stream is not None
+        self._existing_stream = marker
+        blockers = [
+            QSignalBlocker(widget)
+            for widget in (
+                self.stream_check,
+                self.stream_source_combo,
+                self.stream_overlays_check,
+            )
+        ]
+        if marker is not None:
+            self.stream_check.setChecked(True)
+            index = self.stream_source_combo.findData(marker.get("source"))
+            if index >= 0:
+                self.stream_source_combo.setCurrentIndex(index)
+            self.stream_overlays_check.setChecked(bool(marker.get("overlays")))
+            limit = int(round(float(marker.get("disk_limit_gb") or 20)))
+            self.stream_limit_spin.setValue(
+                max(self.stream_limit_spin.minimum(), limit)
+            )
+        elif was_existing:
+            self.stream_check.setChecked(False)
+        del blockers
+        self.refresh_stream_controls()
+
+    def refresh_stream_controls(self) -> None:
+        wizard = self.wizard_ref
+        existing = self._existing_stream is not None
+        editable = not wizard.streaming_locked and not existing
+        has_overlays = self._source_has_overlays()
+        self.stream_check.setEnabled(editable)
+        for widget in (self.stream_source_combo, self.stream_limit_spin):
+            widget.setEnabled(editable and self.stream_check.isChecked())
+        self.stream_overlays_check.setEnabled(
+            editable and self.stream_check.isChecked() and has_overlays
+        )
+        if not has_overlays and self.stream_overlays_check.isChecked():
+            blocker = QSignalBlocker(self.stream_overlays_check)
+            self.stream_overlays_check.setChecked(False)
+            del blocker
+        self.stream_overlays_help.setText(
+            OVERLAY_HELP if has_overlays else NO_OVERLAY_HELP
+        )
+        if existing:
+            message = (
+                "Streaming is already on for this scenery folder. Change its "
+                "settings in the Scenery Library."
+            )
+        elif wizard.streaming_locked:
+            message = LOCKED_HELP
+        elif self.stream_check.isChecked():
+            message = (
+                "Finish downloads the tile index (a few megabytes) and sets up "
+                "streaming."
+            )
+        else:
+            message = ""
+        self.stream_status_label.setText(message)
+        self.stream_status_label.setVisible(bool(message))
+
+    def _stream_changed(self, *_args) -> None:
+        self.refresh_stream_controls()
+        self.wizard_ref._refresh_readiness()
 
     def _on_item_changed(self, _item: QListWidgetItem) -> None:
         self.wizard_ref._sync_scenery_selection()
@@ -851,9 +1030,13 @@ class SetupWizard(QWizard):
         paging_k: float = target_cost.DEFAULT_K,
         texture_format: str = "BC1",
         disk_cache_gb: int = 30,
+        streaming_locked: bool = False,
     ):
         super().__init__(parent)
         self.disk_cache_gb = int(disk_cache_gb)
+        # Streaming settings can't change while AutoOrtho or X-Plane runs.
+        self.streaming_locked = bool(streaming_locked)
+        self._stream_checked_path: str | None = None
         self.target = dict(target or {
             "mode": "fixed", "max_zoom": 16, "airport_zoom": 18, "steps": [],
         })
@@ -870,7 +1053,20 @@ class SetupWizard(QWizard):
         self.paging_k = float(paging_k)
         self.texture_format = texture_format
         self.setWindowTitle("AutoOrtho Setup Wizard")
+        # On Windows Qt switches QWizard to AeroStyle when it is shown, which
+        # paints the page area with a hard-coded white palette under the dark
+        # theme's light text. ModernStyle follows the application palette.
+        self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
         self.setOption(QWizard.WizardOption.NoBackButtonOnStartPage, True)
+        for which in (
+            QWizard.WizardButton.NextButton,
+            QWizard.WizardButton.FinishButton,
+        ):
+            button = self.button(which)
+            button.setProperty("role", "primary")
+            # The wizard polished its buttons on creation; re-read the role.
+            button.style().unpolish(button)
+            button.style().polish(button)
 
         self._values = _default_paths()
         if initial_values is not None:
@@ -925,6 +1121,32 @@ class SetupWizard(QWizard):
 
     def get_selected_region_ids(self) -> list[str]:
         return list(self.selected_region_ids)
+
+    def streaming_chosen(self) -> bool:
+        """Whether Finish should turn on scenery streaming."""
+        page = getattr(self, "scenery_page", None)
+        if page is None or self.streaming_locked:
+            return False
+        if page._existing_stream is not None or not page.stream_check.isChecked():
+            return False
+        source = page.stream_source_combo.currentData()
+        return bool(tile_stream.SOURCES.get(source, {}).get("available"))
+
+    def selected_streaming(self) -> dict | None:
+        """Streaming to turn on when setup finishes: ``source``, ``overlays``
+        and ``disk_limit_gb`` for :func:`tile_stream.enable_streaming`, or
+        None (streaming off, locked, or already set up)."""
+        if not self.streaming_chosen():
+            return None
+        page = self.scenery_page
+        return {
+            "source": str(page.stream_source_combo.currentData()),
+            "overlays": (
+                page.stream_overlays_check.isChecked()
+                and page._source_has_overlays()
+            ),
+            "disk_limit_gb": int(page.stream_limit_spin.value()),
+        }
 
     def set_value(self, key: str, value: str) -> None:
         self._values[key] = value
@@ -989,7 +1211,6 @@ class SetupWizard(QWizard):
         self.welcome_page = WelcomePage(self)
         self.xplane_page = XPlanePage(self)
         self.storage_page = StoragePage(self)
-        self.dependencies_page = DependenciesPage(self)
         self.scenery_page = SceneryPage(self)
         self.quality_page = QualityPage(self)
         self.limits_page = LimitsPage(self)
@@ -1073,19 +1294,32 @@ class SetupWizard(QWizard):
         self._refresh_readiness()
 
     def _refresh_readiness(self) -> None:
-        self._readiness = build_readiness(self._values, self._choices, search_roots=self.xplane_search_roots)
+        scenery_path = self._values.get("scenery_path", "")
+        if scenery_path != self._stream_checked_path:
+            self._stream_checked_path = scenery_path
+            self.scenery_page.show_existing_stream(existing_stream(scenery_path))
+        self._readiness = build_readiness(
+            self._values,
+            self._choices,
+            search_roots=self.xplane_search_roots,
+            streaming=self.streaming_chosen(),
+        )
         self.xplane_page.status_label.setText(self._format_status(self._readiness.checks[0]))
         self.storage_page._refresh_storage_summary()
-        self.dependencies_page.summary_label.setText(self._format_status(self._readiness.checks[2]))
         self.welcome_page.checks_label.setText(
             self._format_status(self._readiness.checks[2])
         )
         self.storage_page.refresh_cache_hint()
-        self.scenery_page.note_label.setText(
-            "Existing scenery means you can finish without selecting a region."
-            if self._readiness.installed_scenery_present
-            else "Select at least one region to enable Finish."
-        )
+        if self._readiness.installed_scenery_present:
+            note = "Existing scenery means you can finish without selecting a region."
+        elif self.streaming_chosen():
+            note = (
+                "Streaming covers every tile you haven't installed, so you can "
+                "finish without selecting a region."
+            )
+        else:
+            note = "Select at least one region, or turn on streaming, to enable Finish."
+        self.scenery_page.note_label.setText(note)
         self.scenery_page.status_label.setText(self._format_status(self._readiness.checks[3]))
         selected_bytes = sum(
             choice.size_bytes
@@ -1141,8 +1375,20 @@ class SetupWizard(QWizard):
                 "{bandwidth_mbps}, CPU {cpu_cores}".format(**described)
             )
         lines.append(f"Selected region IDs: {', '.join(self._readiness.selected_region_ids) or 'none'}")
+        lines.append(f"Scenery streaming: {self._describe_streaming()}")
         lines.append(f"Scenery installed: {'yes' if self._readiness.installed_scenery_present else 'no'}")
         return "\n".join(lines)
+
+    def _describe_streaming(self) -> str:
+        page = getattr(self, "scenery_page", None)
+        if page is not None and page._existing_stream is not None:
+            return "on (already set up)"
+        chosen = self.selected_streaming()
+        if chosen is None:
+            return "off"
+        label = tile_stream.SOURCES[chosen["source"]]["label"]
+        overlays = "with overlays" if chosen["overlays"] else "no overlays"
+        return f"turn on — {label}, {overlays}, {chosen['disk_limit_gb']} GB limit"
 
     def done(self, result: int) -> None:
         self.quality_page.connection_panel.stop()
