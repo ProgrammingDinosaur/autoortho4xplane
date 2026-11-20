@@ -260,7 +260,8 @@ def test_change_source_keeps_settings_and_old_tiles_until_ready(tmp_path, grid_r
     host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
                       spec["overlay_index"]: gz_index(grid_release)})
     scenery = str(tmp_path)
-    ts.enable_streaming(scenery, "xp11", overlays=True, disk_limit_gb=30, session=host)
+    ts.enable_streaming(scenery, "xp11", overlays=True, disk_limit_gb=30,
+                        roughness=0.8, session=host)
     # The new set's index can't be downloaded: streaming stays as it was.
     with pytest.raises(IOError):
         ts.change_stream_source(scenery, "other", session=host)
@@ -270,7 +271,40 @@ def test_change_source_keeps_settings_and_old_tiles_until_ready(tmp_path, grid_r
     packages = ts.stream_packages(scenery)
     assert list(packages) == ["z_ao_stream_other"]  # it has no overlays
     assert packages["z_ao_stream_other"]["disk_limit_gb"] == 30
+    assert packages["z_ao_stream_other"]["roughness"] == 0.8
     assert ts.change_stream_source(scenery, "other", session=host) == []
+
+
+def test_terrain_reflectivity_of_streamed_tiles(tmp_path, grid_release):
+    spec = ts.SOURCES["xp11"]
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    with pytest.raises(ValueError):  # streaming is off
+        ts.set_stream_roughness(scenery, 0.5)
+    ts.enable_streaming(scenery, "xp11", overlays=False, session=host)
+    assert ts.stream_summary(scenery)["roughness"] is None
+    with pytest.raises(ValueError):
+        ts.set_stream_roughness(scenery, 1.5)
+
+    assert ts.set_stream_roughness(scenery, 0.7) == "z_ao_stream_xp11"
+    root = tmp_path / "z_ao_stream_xp11"
+    marker = ts.read_marker(str(root))
+    assert marker["roughness"] == 0.7 and ts.stream_summary(scenery)["roughness"] == 0.7
+    # Generated .ter files carry it; the package reads it when mounted.
+    package = ts.StreamPackage(str(root), marker, remote=host)
+    try:
+        ter = package.ter_bytes("25000_31296_BI16.ter").decode()
+        assert ter.endswith("SUPER_ROUGHNESS 0.7\n")
+    finally:
+        package.shutdown()
+
+    ts.set_stream_roughness(scenery, None)
+    assert "roughness" not in ts.read_marker(str(root))
+    package = ts.StreamPackage(str(root), ts.read_marker(str(root)), remote=host)
+    try:
+        assert "SUPER_ROUGHNESS" not in package.ter_bytes("25000_31296_BI16.ter").decode()
+    finally:
+        package.shutdown()
 
 
 def test_stream_summary_when_off(tmp_path):
@@ -363,7 +397,8 @@ def test_stream_panel_states(qt_app):
     from ui.widgets.stream_panel import NO_OVERLAY_HELP, OVERLAY_HELP
     events = []
     for name in ("enable_requested", "disable_requested", "source_change_requested",
-                 "overlays_change_requested", "limit_changed", "refresh_requested"):
+                 "overlays_change_requested", "limit_changed",
+                 "roughness_change_requested", "refresh_requested"):
         getattr(panel, name).connect(lambda *a, n=name: events.append((n,) + a))
 
     # XP12 is the default; it has no overlays, so that option is off.
@@ -402,6 +437,23 @@ def test_stream_panel_states(qt_app):
     panel.limit_spin.setValue(45)
     panel.limit_spin.editingFinished.emit()
     assert events[-1] == ("limit_changed", 45)
+
+    # Terrain reflectivity: unset by default, applied right away while on.
+    assert panel.roughness is None and not panel.roughness_spin.isEnabled()
+    panel.roughness_check.click()
+    assert events[-1] == ("roughness_change_requested", 1.0)
+    assert panel.roughness_spin.isEnabled()
+    panel.roughness_spin.setValue(0.6)
+    panel.roughness_spin.editingFinished.emit()
+    assert events[-1] == ("roughness_change_requested", 0.6)
+    panel.set_state(dict(panel.state, roughness=0.6))
+    count = len(events)
+    panel.roughness_spin.editingFinished.emit()  # nothing changed
+    assert len(events) == count
+    panel.roughness_check.click()
+    assert events[-1] == ("roughness_change_requested", None)
+    panel.set_state(dict(panel.state, roughness=None))
+    assert not panel.roughness_check.isChecked()
 
     # Busy and running lock everything; unlocking asks for fresh usage.
     panel.set_busy(True, "Downloading the overlay index…")

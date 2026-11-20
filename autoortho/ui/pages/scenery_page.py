@@ -84,6 +84,7 @@ def _status_text(value) -> str:
         "applied": "Applied",
         "partially_applied": "Partial",
         "not_applied": "Not applied",
+        "included": "Included",
     }.get(raw.lower(), raw.replace("_", " ").title() or "Not applied")
 
 

@@ -16,6 +16,7 @@ def _status(status):
     return {
         "applied": ("Applied", "success"),
         "partially_applied": ("Partial", "warning"),
+        "included": ("Included", "success"),
     }.get(value, ("Not applied", "info"))
 
 

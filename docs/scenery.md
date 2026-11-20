@@ -64,13 +64,15 @@ To turn it on later:
    [Overlays and simHeaven](#overlays-and-simheaven). The option is off for
    the XP12 set, which has none.
 5. Set the **Disk limit** (20 GB by default).
+   Optionally tick **Set terrain reflectivity** and pick a value. See
+   [Terrain reflectivity of streamed tiles](#terrain-reflectivity-of-streamed-tiles).
 6. Tick **Stream scenery you haven't installed**. AutoOrtho downloads the
    tile index (about 30 MB for the XP12 set, 6 MB for the XP11 set) and
    sets up the streaming folders.
 7. Start AutoOrtho, then X-Plane.
 
-You can change the scenery set, overlays and disk limit at any time while
-AutoOrtho is stopped. Changes are applied right away, whether streaming is
+You can change the scenery set, overlays, disk limit and terrain
+reflectivity at any time while AutoOrtho is stopped. Changes are applied right away, whether streaming is
 on or off, and take effect the next time AutoOrtho starts. AutoOrtho asks
 first when a change would delete tiles you've already streamed.
 
@@ -99,6 +101,17 @@ set. If you still have the classic `Custom Scenery/yAutoOrtho_Overlays`
 folder, its tiles are used instead of streamed ones, even when it's disabled
 in `scenery_packs.ini`. To stream overlays instead, move that folder out of
 `Custom Scenery`.
+
+### Terrain reflectivity of streamed tiles
+
+Terrain reflectivity is X-Plane's `SUPER_ROUGHNESS` setting. Higher values
+make terrain less shiny at sunrise and sunset; 1.0 is matte. Untick
+**Set terrain reflectivity** to use X-Plane's default.
+
+The value applies to every streamed tile, including tiles already stored,
+because their terrain files are generated as X-Plane reads them. It takes
+effect the next time AutoOrtho starts. Installed regions keep their own
+value, set in **Scenery Patches**.
 
 ### Disk use
 
@@ -216,11 +229,10 @@ deleting the tiles streamed so far. Installed regions aren't affected.
 
 ### Limitations
 
-- **Scenery Patches** (Seasons, Terrain reflectivity) are applied only to
-  installed regions. The XP12 set doesn't need the Seasons patch: its tiles
-  already include X-Plane 12's seasonal data. Tiles streamed from the XP11
-  legacy set have no seasons, and terrain reflectivity can't be set for
-  streamed tiles yet.
+- The **Seasons** patch in Scenery Patches applies only to installed
+  regions. The XP12 set doesn't need it: its tiles already include X-Plane
+  12's seasonal data. Tiles streamed from the XP11 legacy set have no
+  seasons.
 - **Keep Offline** keeps only the streamed scenery. Imagery isn't
   downloaded ahead of time; it's cached as you fly.
 - The setup wizard only turns streaming on. To change its settings or turn

@@ -276,7 +276,13 @@ option is off for it anyway.
 ### Do streamed XP12 tiles need the Seasons patch?
 No. The XP12 set's tiles already include X-Plane 12's seasonal data. The
 Seasons patch in **Scenery Patches** is for installed regions from the XP11
-legacy set.
+legacy set. An installed package that already has seasonal data, such as an
+XP12 package, shows Seasons as **Included** and doesn't offer the patch.
+
+### Can I set terrain reflectivity for streamed tiles?
+Yes. In the Stream scenery panel, tick **Set terrain reflectivity** and pick
+a value. It applies to all streamed tiles from the next start. See
+[Terrain reflectivity of streamed tiles](scenery.md#terrain-reflectivity-of-streamed-tiles).
 
 ### Scenery streaming is on, but I see default X-Plane terrain in some places
 Those tiles couldn't be downloaded when X-Plane asked for them, so X-Plane

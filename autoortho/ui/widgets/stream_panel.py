@@ -4,6 +4,7 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -24,6 +25,10 @@ OVERLAY_HELP = "Turn this off if you use simHeaven X-World or another overlay pa
 NO_OVERLAY_HELP = (
     "This scenery set has no overlays. Use simHeaven X-World for roads, "
     "forests and buildings."
+)
+ROUGHNESS_HELP = (
+    "Higher values make terrain less shiny at sunrise and sunset (1.0 is "
+    "matte). Installed regions have their own setting in Scenery Patches."
 )
 LOCKED_HELP = "Streaming settings are locked while AutoOrtho or X-Plane is running."
 
@@ -50,6 +55,7 @@ class StreamPanel(QGroupBox):
     source_change_requested = Signal(str)
     overlays_change_requested = Signal(bool)
     limit_changed = Signal(int)
+    roughness_change_requested = Signal(object)   # float, or None to clear
     refresh_requested = Signal()
 
     def __init__(self, parent=None):
@@ -58,7 +64,8 @@ class StreamPanel(QGroupBox):
         self.runtime_locked = False
         self.state = {
             "enabled": False, "source": None, "overlays": False,
-            "disk_limit_gb": None, "ortho": (0, 0), "overlay": (0, 0),
+            "disk_limit_gb": None, "roughness": None,
+            "ortho": (0, 0), "overlay": (0, 0),
         }
 
         layout = QVBoxLayout(self)
@@ -117,6 +124,20 @@ class StreamPanel(QGroupBox):
         layout.addWidget(self.overlays_check)
         layout.addWidget(self.overlays_help)
 
+        roughness_row = QHBoxLayout()
+        self.roughness_check = QCheckBox("Set terrain &reflectivity")
+        self.roughness_spin = QDoubleSpinBox()
+        self.roughness_spin.setRange(0.0, 1.0)
+        self.roughness_spin.setDecimals(1)
+        self.roughness_spin.setSingleStep(0.1)
+        self.roughness_spin.setValue(1.0)
+        self.roughness_spin.setAccessibleName("Terrain reflectivity of streamed tiles")
+        roughness_row.addWidget(self.roughness_check)
+        roughness_row.addWidget(self.roughness_spin)
+        roughness_row.addStretch()
+        layout.addLayout(roughness_row)
+        layout.addWidget(_secondary(ROUGHNESS_HELP))
+
         usage_row = QHBoxLayout()
         self.usage_label = _secondary()
         self.usage_label.setWordWrap(False)
@@ -138,6 +159,8 @@ class StreamPanel(QGroupBox):
         self.source_combo.activated.connect(self._source_activated)
         self.overlays_check.clicked.connect(self._overlays_clicked)
         self.limit_spin.editingFinished.connect(self._limit_edited)
+        self.roughness_check.clicked.connect(self._roughness_edited)
+        self.roughness_spin.editingFinished.connect(self._roughness_edited)
         self._show_state()
 
     # -- state ----------------------------------------------------------
@@ -145,6 +168,13 @@ class StreamPanel(QGroupBox):
     @property
     def enabled(self) -> bool:
         return bool(self.state.get("enabled"))
+
+    @property
+    def roughness(self):
+        """The terrain reflectivity picked, or None for X-Plane's default."""
+        if not self.roughness_check.isChecked():
+            return None
+        return round(self.roughness_spin.value(), 1)
 
     def set_state(self, summary: dict) -> None:
         """Show what is on disk (see :func:`tile_stream.stream_summary`)."""
@@ -182,6 +212,10 @@ class StreamPanel(QGroupBox):
             self.overlays_check.setChecked(bool(state.get("overlays")))
             limit = int(round(float(state.get("disk_limit_gb") or 20)))
             self.limit_spin.setValue(max(self.limit_spin.minimum(), limit))
+            roughness = state.get("roughness")
+            self.roughness_check.setChecked(roughness is not None)
+            if roughness is not None:
+                self.roughness_spin.setValue(float(roughness))
         self._show_usage()
         self._refresh_controls()
 
@@ -210,8 +244,10 @@ class StreamPanel(QGroupBox):
     def _refresh_controls(self):
         editable = not self.busy and not self.runtime_locked
         has_overlays = self._source_has_overlays()
-        for widget in (self.enable_check, self.source_combo, self.limit_spin):
+        for widget in (self.enable_check, self.source_combo, self.limit_spin,
+                       self.roughness_check):
             widget.setEnabled(editable)
+        self.roughness_spin.setEnabled(editable and self.roughness_check.isChecked())
         self.overlays_check.setEnabled(editable and has_overlays)
         if not has_overlays:
             self.overlays_check.setChecked(False)
@@ -238,6 +274,13 @@ class StreamPanel(QGroupBox):
             )
         else:
             self.disable_requested.emit()
+
+    def _roughness_edited(self, *_args):
+        self.roughness_spin.setEnabled(
+            self.roughness_check.isEnabled() and self.roughness_check.isChecked()
+        )
+        if self.enabled and self.roughness != self.state.get("roughness"):
+            self.roughness_change_requested.emit(self.roughness)
 
     def _source_activated(self, _index: int):
         source = str(self.source_combo.currentData())

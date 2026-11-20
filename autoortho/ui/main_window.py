@@ -1089,6 +1089,7 @@ class ConfigUI(QMainWindow):
         stream_panel.source_change_requested.connect(self._on_stream_source)
         stream_panel.overlays_change_requested.connect(self._on_stream_overlays)
         stream_panel.limit_changed.connect(self._on_stream_limit)
+        stream_panel.roughness_change_requested.connect(self._on_stream_roughness)
         stream_panel.refresh_requested.connect(self._refresh_stream_panel)
         self._stream_workers = []
         QTimer.singleShot(0, self._refresh_stream_panel)
@@ -7135,6 +7136,14 @@ class ConfigUI(QMainWindow):
         seasons_header_font.setBold(True)
         seasons_header.setFont(seasons_header_font)
 
+        # Built with X-Plane 12's seasonal data (e.g. the XP12 set): nothing to add
+        if seasons_status == downloader.SeasonsApplyStatus.INCLUDED:
+            included = menu.addAction("Included in this scenery")
+            included.setEnabled(False)
+            included.setToolTip(
+                "This scenery already has X-Plane 12's native seasons."
+            )
+
         # Add Seasons - only if not applied
         add_seasons_action = None
         if seasons_status == downloader.SeasonsApplyStatus.NOT_APPLIED:
@@ -7641,8 +7650,11 @@ class ConfigUI(QMainWindow):
             return
         os.makedirs(scenery_dir, exist_ok=True)
         self._apply_stream_change(
-            lambda: tile_stream.enable_streaming(
-                scenery_dir, source, overlays=overlays, disk_limit_gb=limit_gb
+            lambda roughness=self.scenery_library_page.stream_panel.roughness: (
+                tile_stream.enable_streaming(
+                    scenery_dir, source, overlays=overlays, disk_limit_gb=limit_gb,
+                    roughness=roughness,
+                )
             ),
             "Downloading the tile index…",
             "Scenery streaming is on.",
@@ -7718,6 +7730,18 @@ class ConfigUI(QMainWindow):
             task_title="Switch streamed scenery set",
             package=label,
         )
+
+    def _on_stream_roughness(self, roughness):
+        try:
+            tile_stream.set_stream_roughness(self.cfg.ao_scenery_path, roughness)
+        except Exception as exc:
+            self.display_error(f"Could not change the terrain reflectivity:\n{exc}")
+        else:
+            self.update_status_bar(
+                "Terrain reflectivity of streamed tiles changed. It takes effect "
+                "the next time AutoOrtho starts."
+            )
+        self._refresh_stream_panel()
 
     def _on_stream_limit(self, limit_gb):
         try:

@@ -34,8 +34,18 @@ an installed region:
 - `z_ao_stream_<set>`: base mesh (`kind: ortho`).
 - `yAO_stream_<set>_overlays`: overlays (`kind: overlay`), optional.
 
-The marker records the set, the index URL and its `Last-Modified`, and the
-disk limit; overlays get a quarter of the ortho limit. Code only ever
+The marker records the set, the index URL and its `Last-Modified`, the
+disk limit (overlays get a quarter of the ortho limit) and, on the ortho
+package, the terrain reflectivity (`roughness`), which `synthesize_ter`
+appends to every generated `.ter` as `SUPER_ROUGHNESS`
+(`set_stream_roughness`).
+
+Installed packages built with X-Plane 12's seasonal rasters (`spr*`,
+`sum*`, `fal*`, `win*` in the DSF's DEMN table, as in the XP12 set) show
+Seasons as **Included** (`SeasonsApplyStatus.INCLUDED`), and the Seasons patch
+isn't offered. `package_has_native_seasons` checks the package's first DSF
+and caches the answer in `.ao_native_seasons.json` next to it, because
+unpacking a 7z DSF takes seconds. Code only ever
 deletes folders that contain a marker.
 
 ### What happens on open

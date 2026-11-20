@@ -273,11 +273,10 @@ def border_textures(ter_bytes: bytes) -> List[str]:
 # DSF terrain list
 # ---------------------------------------------------------------------------
 
-def dsf_terrain_names(data: bytes) -> Optional[List[str]]:
-    """Terrain definitions listed in an uncompressed DSF, or None.
+def _defn_table(data: bytes, table_id: bytes) -> Optional[List[str]]:
+    """A string table inside the DEFN atom of an uncompressed DSF, or None.
 
-    Reads the TERT table inside the DEFN atom (atom ids are stored
-    byte-reversed). 7z-compressed DSFs return None.
+    Atom ids are stored byte-reversed. 7z-compressed DSFs return None.
     """
     if len(data) < 12 or data[:8] != b"XPLNEDSF":
         return None
@@ -296,13 +295,85 @@ def dsf_terrain_names(data: bytes) -> Optional[List[str]]:
                 sub_len = struct.unpack_from("<I", data, sub + 4)[0]
                 if sub_len < 8:
                     return None
-                if sub_id == b"TRET":
+                if sub_id == table_id:
                     table = data[sub + 8:sub + sub_len]
                     return [n.decode("utf-8", "replace") for n in table.split(b"\0") if n]
                 sub += sub_len
             return []
         pos += length
     return None
+
+
+def dsf_terrain_names(data: bytes) -> Optional[List[str]]:
+    """Terrain definitions (TERT table) listed in an uncompressed DSF, or None."""
+    return _defn_table(data, b"TRET")
+
+
+def dsf_raster_names(data: bytes) -> Optional[List[str]]:
+    """Raster layers (DEMN table) of an uncompressed DSF, or None."""
+    return _defn_table(data, b"NMED")
+
+
+# X-Plane 12 seasonal rasters are named spr1, sum1, fal1, win1, ...
+_SEASON_RASTERS = ("spr", "sum", "fal", "win")
+
+
+def package_has_native_seasons(package_dir: str) -> bool:
+    """Whether a scenery package's DSFs already carry X-Plane 12's seasonal
+    rasters, so the Seasons patch has nothing to add. Checks the first DSF
+    (packages are built with one tool and settings); cached per file."""
+    dsf_root = os.path.join(package_dir, DSF_DIR)
+    try:
+        folders = sorted(e.name for e in os.scandir(dsf_root) if e.is_dir())
+    except OSError:
+        return False
+    for folder in folders:
+        try:
+            names = sorted(e.name for e in os.scandir(os.path.join(dsf_root, folder))
+                           if e.is_file() and e.name.lower().endswith(".dsf"))
+        except OSError:
+            continue
+        if names:
+            path = os.path.join(dsf_root, folder, names[0])
+            try:
+                st = os.stat(path)
+            except OSError:
+                return False
+            # Unpacking a 7z DSF takes seconds, so the answer is kept in the
+            # package for as long as that DSF is unchanged.
+            key = {"dsf": f"{folder}/{names[0]}", "size": st.st_size,
+                   "mtime_ns": st.st_mtime_ns}
+            cache = os.path.join(package_dir, NATIVE_SEASONS_CACHE)
+            try:
+                with open(cache, encoding="utf-8") as fh:
+                    cached = json.load(fh)
+                if {k: cached.get(k) for k in key} == key:
+                    return bool(cached.get("seasons"))
+            except (OSError, ValueError, AttributeError):
+                pass
+            found = _dsf_has_seasons(path)
+            try:
+                with open(cache, "w", encoding="utf-8") as fh:
+                    json.dump(dict(key, seasons=found), fh)
+            except OSError:
+                pass
+            return found
+    return False
+
+
+NATIVE_SEASONS_CACHE = ".ao_native_seasons.json"
+
+
+def _dsf_has_seasons(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return False
+    if data.startswith(SEVENZIP_MAGIC):
+        data = unpack_7z_dsf(path) or b""
+    rasters = dsf_raster_names(data) or []
+    return any(name.startswith(_SEASON_RASTERS) for name in rasters)
 
 
 SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
@@ -1490,9 +1561,16 @@ def _create_package(ao_scenery_dir: str, source: str, kind: str, limit: float,
               "index_url": url, "index_last_modified": info["last_modified"],
               "disk_limit_gb": float(limit)}
     if roughness is not None and kind == "ortho":
-        marker["roughness"] = roughness
+        marker["roughness"] = _check_roughness(roughness)
     write_marker(root, marker)
     return name
+
+
+def _check_roughness(value: float) -> float:
+    value = round(float(value), 2)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"Terrain reflectivity must be between 0 and 1, not {value}")
+    return value
 
 
 def _streamed_ortho(ao_scenery_dir: str) -> Tuple[str, dict]:
@@ -1536,6 +1614,21 @@ def change_stream_source(ao_scenery_dir: str, source: str,
     return created
 
 
+def set_stream_roughness(ao_scenery_dir: str, roughness: Optional[float]) -> str:
+    """Set the terrain reflectivity (SUPER_ROUGHNESS) of streamed tiles, or
+    clear it with None. Their .ter files are generated on demand, so this
+    applies to every streamed tile from the next mount on. Returns the
+    package name."""
+    name, ortho = _streamed_ortho(ao_scenery_dir)
+    marker = dict(ortho)
+    if roughness is None:
+        marker.pop("roughness", None)
+    else:
+        marker["roughness"] = _check_roughness(roughness)
+    write_marker(os.path.join(ao_scenery_dir, name), marker)
+    return name
+
+
 def update_stream_settings(ao_scenery_dir: str, disk_limit_gb: float) -> None:
     """Apply a new disk limit to existing streaming packages."""
     for name, marker in stream_packages(ao_scenery_dir).items():
@@ -1574,7 +1667,8 @@ def stream_summary(ao_scenery_dir: str) -> dict:
     and the tiles stored per package kind."""
     packages = stream_packages(ao_scenery_dir)
     summary = {"enabled": False, "source": None, "overlays": False,
-               "disk_limit_gb": None, "ortho": (0, 0), "overlay": (0, 0)}
+               "disk_limit_gb": None, "roughness": None,
+               "ortho": (0, 0), "overlay": (0, 0)}
     for name, marker in packages.items():
         kind = marker.get("kind", "ortho")
         if kind not in ("ortho", "overlay"):
@@ -1584,7 +1678,8 @@ def stream_summary(ao_scenery_dir: str) -> dict:
             summary["overlays"] = True
         else:
             summary.update(enabled=True, source=marker.get("source"),
-                           disk_limit_gb=marker.get("disk_limit_gb"))
+                           disk_limit_gb=marker.get("disk_limit_gb"),
+                           roughness=marker.get("roughness"))
     return summary
 
 

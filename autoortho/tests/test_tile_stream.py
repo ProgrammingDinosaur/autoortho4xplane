@@ -104,6 +104,71 @@ def test_dsf_terrain_names_and_tiles():
     assert ts.dsf_terrain_names(b"7z\xbc\xaf'\x1c" + b"\0" * 40) is None
 
 
+def make_raster_dsf(rasters):
+    nmed = _atom(b"NMED", b"".join(n.encode() + b"\0" for n in rasters))
+    tert = _atom(b"TRET", b"terrain/1_2_BI16.ter\0")
+    return (b"XPLNEDSF" + struct.pack("<I", 1) + _atom(b"DAEH", b"")
+            + _atom(b"NFED", tert + nmed) + b"\0" * 16)
+
+
+def make_installed_package(root, dsf_bytes):
+    folder = root / "Earth nav data" / "+40-010"
+    folder.mkdir(parents=True)
+    (folder / "+40-010.dsf").write_bytes(dsf_bytes)
+    return str(root)
+
+
+XP12_RASTERS = ["elevation", "sea_level", "soundscape", "spr1", "spr2",
+                "sum1", "sum2", "fal1", "fal2", "win1", "win2"]
+
+
+def test_dsf_raster_names_and_native_seasons(tmp_path):
+    dsf = make_raster_dsf(XP12_RASTERS)
+    assert ts.dsf_raster_names(dsf) == XP12_RASTERS
+    assert ts.dsf_terrain_names(dsf) == ["terrain/1_2_BI16.ter"]
+    assert ts.dsf_raster_names(make_dsf([])) == []
+
+    assert ts.package_has_native_seasons(make_installed_package(tmp_path / "xp12", dsf))
+    assert not ts.package_has_native_seasons(
+        make_installed_package(tmp_path / "xp11", make_dsf(["terrain/1_2_BI16.ter"])))
+    assert not ts.package_has_native_seasons(
+        make_installed_package(tmp_path / "elev", make_raster_dsf(["elevation"])))
+    assert not ts.package_has_native_seasons(str(tmp_path / "missing"))
+
+    # The answer is kept next to the package while its first DSF is unchanged.
+    cache = tmp_path / "xp11" / ts.NATIVE_SEASONS_CACHE
+    stored = json.loads(cache.read_text())
+    assert stored["seasons"] is False and stored["dsf"] == "+40-010/+40-010.dsf"
+    cache.write_text(json.dumps(dict(stored, seasons=True)))
+    assert ts.package_has_native_seasons(str(tmp_path / "xp11"))  # read, not rechecked
+    cache.write_text(json.dumps(dict(stored, seasons=True, size=1)))
+    assert not ts.package_has_native_seasons(str(tmp_path / "xp11"))  # stale: rechecked
+
+
+def test_installed_package_with_native_seasons_shows_included(tmp_path):
+    import downloader
+    scenery = tmp_path / "Custom Scenery"
+    info = scenery / "z_autoortho" / "xp12area_info.json"
+    info.parent.mkdir(parents=True)
+    info.write_text('{"name": "xp12area"}')
+
+    def status():
+        release = downloader.Release("xp12area", install_dir=str(scenery))
+        release.load(str(info))
+        return release.seasons_apply_status
+
+    package = scenery / "z_autoortho" / "scenery" / "z_ao_xp12area"
+    make_installed_package(package, make_dsf(["terrain/1_2_BI16.ter"]))
+    assert status() == downloader.SeasonsApplyStatus.NOT_APPLIED
+    dsf = package / "Earth nav data" / "+40-010" / "+40-010.dsf"
+    dsf.write_bytes(make_raster_dsf(XP12_RASTERS) + b"x")  # new size: not cached
+    assert status() == downloader.SeasonsApplyStatus.INCLUDED
+    # Seasons applied by the patch keep their own status.
+    info.write_text('{"name": "xp12area", "processed_dsf_seasons": {"+40-010": ["+40-010.dsf"]},'
+                    ' "dsf_folders_files": {"+40-010": ["+40-010.dsf"]}}')
+    assert status() == downloader.SeasonsApplyStatus.APPLIED
+
+
 # ---------------------------------------------------------------------------
 # Fake release host
 # ---------------------------------------------------------------------------
