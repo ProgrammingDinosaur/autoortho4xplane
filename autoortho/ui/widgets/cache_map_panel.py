@@ -1,8 +1,10 @@
 """Cache view of the map: what AutoOrtho has stored per 1x1 degree tile.
 
 Shows streamed base mesh and cached imagery on the shared MapCanvas, lets
-the user select tiles, delete what is stored, and keep tiles for offline
-flying (download their streamed scenery now and pin it). The scanning and
+the user select tiles (one by one, by box, or a whole region of the scenery
+set), delete what is stored, and download tiles to keep them (their
+scenery is stored now and pinned, so it works offline and is never removed
+to make room). This replaces installing regions. The scanning and
 file work lives in :mod:`cache_inventory`; this module is the toolbar and
 the glue.
 """
@@ -49,7 +51,7 @@ STATE_COLORS = {
     "both": "#3fb27f",
 }
 STATE_LABELS = {
-    "mesh": "Streamed scenery",
+    "mesh": "Scenery",
     "imagery": "Imagery",
     "both": "Both",
 }
@@ -79,7 +81,7 @@ def describe_cell(cell, usage: Optional["ci.CellUsage"]) -> str:
     title = cell_label(*cell)
     if usage is None or (usage.total == 0 and not usage.pinned):
         return f"{title}\nNothing stored"
-    lines = [title + ("  ·  kept for offline flying" if usage.pinned else "")]
+    lines = [title + ("  ·  downloaded (kept)" if usage.pinned else "")]
     if usage.has_mesh:
         parts = []
         if usage.dsf_bytes:
@@ -90,10 +92,10 @@ def describe_cell(cell, usage: Optional["ci.CellUsage"]) -> str:
             parts.append(f"{usage.mask_files} water mask"
                          f"{'s' if usage.mask_files != 1 else ''} "
                          f"{format_bytes(usage.mask_bytes)}")
-        lines.append(f"Streamed scenery: {format_bytes(usage.mesh_bytes)}")
+        lines.append(f"Scenery: {format_bytes(usage.mesh_bytes)}")
         lines.append("  " + ", ".join(parts))
     elif usage.pinned:
-        lines.append("Streamed scenery: not downloaded yet")
+        lines.append("Scenery: not downloaded yet")
     if usage.has_imagery:
         detail = []
         if usage.chunk_files:
@@ -121,6 +123,7 @@ class CachePanel(QWidget):
     _scanned = Signal(int, object)    # generation, CacheInventory or Exception
     _finished = Signal(object, object)  # callback, result
     _progress = Signal(int, int, int)   # done, total, bytes
+    _regions_read = Signal(object)      # list of regions, or Exception
 
     def __init__(self, canvas, paths: Callable[[], tuple[str, str, str]],
                  task_manager=None, parent=None):
@@ -171,12 +174,22 @@ class CachePanel(QWidget):
         self.colour_combo.currentIndexChanged.connect(self._paint_layer)
         bar.addWidget(self.colour_combo)
 
+        self.regions_button = QToolButton()
+        self.regions_button.setText("Regions")
+        self.regions_button.setAccessibleName("Select a whole region of the scenery set")
+        self.regions_button.setToolTip("Select every tile of a region, then Download")
+        self.regions_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.regions_menu = QMenu(self.regions_button)
+        self.regions_button.setMenu(self.regions_menu)
+        self.regions: list = []           # (region id, label, cells)
+        bar.addWidget(self.regions_button)
+
         self.delete_button = QToolButton()
         self.delete_button.setText("Delete")
         self.delete_button.setAccessibleName("Delete stored data of the selected tiles")
         self.delete_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         delete_menu = QMenu(self.delete_button)
-        self.delete_mesh_action = delete_menu.addAction("Streamed Scenery…")
+        self.delete_mesh_action = delete_menu.addAction("Scenery…")
         self.delete_mesh_action.triggered.connect(lambda: self.delete_selected("mesh"))
         self.delete_imagery_action = delete_menu.addAction("Imagery…")
         self.delete_imagery_action.triggered.connect(lambda: self.delete_selected("imagery"))
@@ -186,8 +199,8 @@ class CachePanel(QWidget):
         bar.addWidget(self.delete_button)
 
         self.keep_button = QToolButton()
-        self.keep_button.setText("Keep Offline")
-        self.keep_button.setAccessibleName("Keep the selected tiles for offline flying")
+        self.keep_button.setText("Download")
+        self.keep_button.setAccessibleName("Download the selected tiles and keep them")
         self.keep_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         self.keep_button.clicked.connect(self.keep_selected)
         keep_menu = QMenu(self.keep_button)
@@ -222,6 +235,7 @@ class CachePanel(QWidget):
         escape.setContext(Qt.ShortcutContext.WidgetShortcut)
         escape.activated.connect(lambda: self.active and self.clear_selection())
 
+        self._regions_read.connect(self._on_regions)
         self._scanned.connect(self._on_scanned)
         self._finished.connect(self._call_back)
         self._progress.connect(self._on_progress)
@@ -281,8 +295,40 @@ class CachePanel(QWidget):
                 log.warning("Cache view: scan failed", exc_info=True)
                 result = exc
             self._scanned.emit(generation, result)
+            self._read_regions(ao_dir)
 
         threading.Thread(target=work, name="cache-map-scan", daemon=True).start()
+
+    def _read_regions(self, ao_dir: str):
+        """Read the scenery set's regions (on the scan thread)."""
+        try:
+            regions = ci.stream_regions(ao_dir) if ao_dir else []
+        except Exception as exc:
+            log.warning("Cache view: could not read the regions", exc_info=True)
+            regions = exc
+        self._regions_read.emit(regions)
+
+    def _on_regions(self, regions):
+        self.regions_menu.clear()
+        if isinstance(regions, Exception):
+            regions = []
+        self.regions = regions
+        for rid, label, cells in regions:
+            action = self.regions_menu.addAction(f"{label} ({len(cells):,} tiles)")
+            action.triggered.connect(lambda _=False, r=rid: self.select_region(r))
+        if not regions:
+            empty = self.regions_menu.addAction("Choose a scenery set in the Scenery Library first")
+            empty.setEnabled(False)
+
+    def select_region(self, region_id: str):
+        """Select every tile of a region and show it."""
+        for rid, label, cells in self.regions:
+            if rid == region_id:
+                self.set_selection(cells)
+                self.canvas.fit_cells(cells)
+                self._message = f"{label} selected"
+                self._emit_status()
+                return
 
     def _on_scanned(self, generation: int, result):
         if generation != self._generation:
@@ -322,7 +368,7 @@ class CachePanel(QWidget):
         legend = [(c, labels[c]) for c in order if c in labels]
         pinned = [c for c, u in inv.cells.items() if u.pinned]
         if pinned:
-            legend.append((f"outline:{PINNED_COLOR.name()}", "Kept for offline flying"))
+            legend.append((f"outline:{PINNED_COLOR.name()}", "Downloaded (kept)"))
         self.canvas.set_cache_layer([(c, groups[c]) for c in order if c in groups],
                                     pinned, legend)
 
@@ -398,8 +444,8 @@ class CachePanel(QWidget):
         if not self.locked and has_selection:
             self.delete_button.setToolTip("Delete what is stored for the selected tiles")
             self.keep_button.setToolTip(
-                "Download the streamed scenery of the selected tiles now and "
-                "never remove it to make room")
+                "Download the scenery of the selected tiles now and keep it: "
+                "it works offline and is never removed to make room")
         self.delete_mesh_action.setEnabled(can_change and self.selection_bytes("mesh") > 0)
         self.delete_imagery_action.setEnabled(
             can_change and self.selection_bytes("imagery") > 0)
@@ -420,9 +466,9 @@ class CachePanel(QWidget):
             parts.append("Reading the cache…")
         if inv is not None:
             mesh_tiles = inv.mesh_cells
-            parts.append(f"Streamed scenery {format_bytes(inv.mesh_bytes)} in "
+            parts.append(f"Scenery {format_bytes(inv.mesh_bytes)} in "
                          f"{mesh_tiles} tile{'s' if mesh_tiles != 1 else ''}"
-                         + (f" ({inv.pinned_cells} kept offline)" if inv.pinned_cells else ""))
+                         + (f" ({inv.pinned_cells} downloaded)" if inv.pinned_cells else ""))
             parts.append(f"imagery {format_bytes(inv.imagery_bytes)} in "
                          f"{inv.imagery_cells} tile{'s' if inv.imagery_cells != 1 else ''}")
         if self.selection:
@@ -432,7 +478,7 @@ class CachePanel(QWidget):
             parts.append("click or drag to select tiles" if self.mode == SELECT
                          else "drag to pan")
         if self.locked:
-            parts.append("stop AutoOrtho to delete or keep tiles")
+            parts.append("stop AutoOrtho to delete or download tiles")
         if self._message:
             parts.append(self._message)
         self.statusChanged.emit(" · ".join(parts))
@@ -484,13 +530,13 @@ class CachePanel(QWidget):
             self._message = "nothing of that kind is stored in the selection"
             self._emit_status()
             return
-        what = {"mesh": "streamed scenery", "imagery": "imagery",
-                "both": "streamed scenery and imagery"}[kind]
+        what = {"mesh": "scenery", "imagery": "imagery",
+                "both": "scenery and imagery"}[kind]
         details = []
         if kind in ("mesh", "both"):
-            details.append("Streamed scenery is downloaded again the next time "
-                           "you fly there, so it needs internet then. Tiles kept "
-                           "for offline flying stop being kept.")
+            details.append("Scenery is downloaded again the next time you fly "
+                           "there if downloading while flying is on, so it needs "
+                           "internet then. Downloaded tiles stop being kept.")
         if kind in ("imagery", "both"):
             details.append("Imagery is downloaded again when X-Plane needs it.")
         if not self._confirm(f"Delete {what}?",
@@ -534,7 +580,7 @@ class CachePanel(QWidget):
         except OSError as exc:
             self._message = f"Could not change kept tiles: {exc}"
         else:
-            self._message = "the tiles are no longer kept for offline flying"
+            self._message = "the tiles are no longer kept and may be removed to make room"
         self.refresh()
 
     def keep_selected(self):
@@ -542,9 +588,8 @@ class CachePanel(QWidget):
             return
         if self.inventory is not None and not self.inventory.streaming:
             QMessageBox.information(
-                self, "Keep Tiles Offline",
-                "Keeping tiles for offline flying works with scenery streaming. "
-                "Turn it on in the Scenery Library first.")
+                self, "Download Tiles",
+                "Choose a scenery set in the Scenery Library first.")
             return
         ao_dir, _, custom = self.paths()
         cells = sorted(self.selection)
@@ -569,25 +614,25 @@ class CachePanel(QWidget):
             tiles = f"{count} tile{'s' if count != 1 else ''}"
             if not covered:
                 QMessageBox.information(
-                    self, "Keep Tiles Offline",
-                    f"None of the {tiles} have streamed scenery (open water, or "
-                    "outside the scenery set).")
+                    self, "Download Tiles",
+                    f"None of the {tiles} have scenery in the scenery set (open "
+                    "water, or not covered).")
                 return
-            text = (f"Download about {format_bytes(size)} of streamed scenery now "
+            text = (f"Download about {format_bytes(size)} of scenery now "
                     f"({files} DSF{'s' if files != 1 else ''} not stored yet)?"
-                    if files else "The streamed scenery of these tiles is already "
-                    "stored. Keep it for offline flying?")
-            details = [f"Kept tiles are never removed to make room and don't count "
-                       f"toward the streaming disk limit. Water masks add a little "
-                       f"to the download."]
+                    if files else "The scenery of these tiles is already "
+                    "stored. Keep it?")
+            details = ["Downloaded tiles work offline, are never removed to make "
+                       "room and don't count toward the disk limit. Water masks "
+                       "add a little to the download."]
             if covered < count:
-                details.append(f"{count - covered} of the {tiles} have no streamed "
+                details.append(f"{count - covered} of the {tiles} have no "
                                "scenery (open water or not covered) and are skipped.")
             details.append("Imagery isn't downloaded. Caching it for these tiles "
                            "would take about " + ", ".join(
                                f"{format_bytes(b)} at ZL{z}" for z, (_n, b) in
                                sorted(imagery.items())) + ".")
-            if self._confirm(f"Keep {tiles} for offline flying?", text,
+            if self._confirm(f"Download {tiles}?", text,
                              "\n\n".join(details),
                              "Download and Keep" if files else "Keep",
                              destructive=False):
@@ -604,11 +649,11 @@ class CachePanel(QWidget):
         self._keep_total = size
         if self.task_manager is not None:
             self.task_manager.create_task(
-                task_id, TaskType.CACHE, "Keep tiles for offline flying",
-                package=tiles, stage="Downloading streamed scenery",
+                task_id, TaskType.CACHE, "Download scenery tiles",
+                package=tiles, stage="Downloading scenery",
                 cancellable=True, cancel_callback=cancel.set)
             self.task_manager.update_task(task_id, progress=0.0, bytes_total=size)
-        self._set_busy(f"Downloading streamed scenery for {tiles}…")
+        self._set_busy(f"Downloading scenery for {tiles}…")
 
         def done(result):
             self.busy = ""
@@ -616,8 +661,8 @@ class CachePanel(QWidget):
             if failed:
                 self._message = f"Download failed: {result}"
             else:
-                self._message = (f"kept {count - len(result.missing)} tiles, "
-                                 f"downloaded {format_bytes(result.bytes)}")
+                self._message = (f"downloaded {count - len(result.missing)} tiles "
+                                 f"({format_bytes(result.bytes)})")
                 if result.errors:
                     self._message += f", {len(result.errors)} failed (try again later)"
             if self.task_manager is not None:
@@ -642,7 +687,7 @@ class CachePanel(QWidget):
             cancelled=cancel.is_set), done)
 
     def _on_progress(self, done: int, total: int, size: int):
-        self.busy = f"Downloading streamed scenery: {done} of {total}…"
+        self.busy = f"Downloading scenery: {done} of {total} tiles…"
         self._emit_status()
         if self.task_manager is not None:
             self.task_manager.update_task(

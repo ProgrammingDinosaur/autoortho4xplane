@@ -78,7 +78,7 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho import guards, hardware
     from autoortho import limits as limits_module
     from autoortho.ui.pages.flight_plan_page import FlightPlanPage
-    from autoortho.ui.widgets.custom_map_editor import CustomMapEditor
+    from autoortho.ui.widgets.custom_map_editor import CACHE_VIEW, CustomMapEditor
     from autoortho.ui.pages.diagnostics_page import DiagnosticsPage
     from autoortho.ui.dynamic_zoom_editor import DynamicZoomEditor, PRESETS
     from autoortho.ui.theme import (
@@ -157,7 +157,7 @@ else:
     import hardware
     import limits as limits_module
     from ui.pages.flight_plan_page import FlightPlanPage
-    from ui.widgets.custom_map_editor import CustomMapEditor
+    from ui.widgets.custom_map_editor import CACHE_VIEW, CustomMapEditor
     from ui.pages.diagnostics_page import DiagnosticsPage
     from ui.dynamic_zoom_editor import DynamicZoomEditor, PRESETS
     from ui.theme import (
@@ -1090,6 +1090,8 @@ class ConfigUI(QMainWindow):
         stream_panel.overlays_change_requested.connect(self._on_stream_overlays)
         stream_panel.limit_changed.connect(self._on_stream_limit)
         stream_panel.roughness_change_requested.connect(self._on_stream_roughness)
+        stream_panel.fetch_missing_change_requested.connect(self._on_stream_fetch_missing)
+        stream_panel.open_map_requested.connect(self._open_scenery_map)
         stream_panel.refresh_requested.connect(self._refresh_stream_panel)
         self._stream_workers = []
         QTimer.singleShot(0, self._refresh_stream_panel)
@@ -7650,10 +7652,11 @@ class ConfigUI(QMainWindow):
             return
         os.makedirs(scenery_dir, exist_ok=True)
         self._apply_stream_change(
-            lambda roughness=self.scenery_library_page.stream_panel.roughness: (
+            lambda roughness=self.scenery_library_page.stream_panel.roughness,
+            fetch=self.scenery_library_page.stream_panel.fetch_missing: (
                 tile_stream.enable_streaming(
                     scenery_dir, source, overlays=overlays, disk_limit_gb=limit_gb,
-                    roughness=roughness,
+                    roughness=roughness, fetch_missing=fetch,
                 )
             ),
             "Downloading the tile index…",
@@ -7742,6 +7745,26 @@ class ConfigUI(QMainWindow):
                 "the next time AutoOrtho starts."
             )
         self._refresh_stream_panel()
+
+    def _on_stream_fetch_missing(self, enabled):
+        try:
+            tile_stream.set_fetch_missing(self.cfg.ao_scenery_path, enabled)
+        except Exception as exc:
+            self.display_error(f"Could not change downloading while flying:\n{exc}")
+        else:
+            self.update_status_bar(
+                ("Tiles download as X-Plane needs them." if enabled else
+                 "Only tiles you download on the map are used.")
+                + " It takes effect the next time AutoOrtho starts."
+            )
+        self._refresh_stream_panel()
+
+    def _open_scenery_map(self):
+        """Show the map's Scenery & Cache view to download tiles."""
+        self.navigate_to("flight-plan-map")
+        editor = getattr(self, "custom_map_editor", None)
+        if editor is not None:
+            editor.set_view(CACHE_VIEW)
 
     def _on_stream_limit(self, limit_gb):
         try:

@@ -1274,7 +1274,7 @@ class AutoOrtho(Operations):
         file is now on disk and the normal open should proceed.
         """
         rel = self._stream_rel(path)
-        if self._stream.entry(rel) is None:
+        if not self._stream.streams(rel):
             return None
         if self._stream.ensure_local(rel) is not None:
             self._stream_fallback.discard(rel)

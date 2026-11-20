@@ -497,6 +497,23 @@ def mesh_download_estimate(ao_scenery_dir: str, cells: Iterable[Cell]) -> Tuple[
     return size, files, len(covered)
 
 
+def stream_regions(ao_scenery_dir: str) -> List[Tuple[str, str, List[Cell]]]:
+    """Areas of the streamed scenery set as (region id, label, tiles), by
+    label, for selecting a whole area on the map."""
+    for name, marker in tile_stream.stream_packages(ao_scenery_dir).items():
+        if marker.get("kind", "ortho") != "ortho":
+            continue
+        root = os.path.join(ao_scenery_dir, name)
+        path = marker.get("index", tile_stream.INDEX_NAME)
+        if not os.path.isabs(path):
+            path = os.path.join(root, path)
+        regions = tile_stream.TileIndex.load(path).regions()
+        out = [(rid, tile_stream.region_label(rid), sorted(cells))
+               for rid, cells in regions.items() if rid]
+        return sorted(out, key=lambda r: r[1])
+    return []
+
+
 def _hidden_for(ao_scenery_dir: str, root: str, marker: dict,
                 custom_scenery_dir: str) -> set:
     """DSFs the mount hides because an installed package already has them

@@ -470,3 +470,80 @@ def test_stream_panel_states(qt_app):
     panel.set_state({"enabled": False})
     assert not panel.enabled and not panel.enable_check.isChecked()
     assert panel.usage_bar.isHidden()
+
+
+# ---------------------------------------------------------------------------
+# Only stored tiles (downloading while flying off)
+# ---------------------------------------------------------------------------
+
+def test_offline_only_offers_stored_tiles_and_fetches_nothing(tmp_path, grid_release):
+    host = FakeHost({URL: grid_release["blob"]})
+    pkg, root = make_pkg(tmp_path, grid_release, host, fetch_missing=False)
+    try:
+        folder = "+30-010"
+        assert pkg.dsf_names(folder) == []  # the mount lists stored ones itself
+        rel = ts.dsf_rel(40, -9)
+        assert not pkg.streams(rel) and pkg.remote_size(rel) is None
+        assert pkg.prefetch_neighbors(rel) == 0
+        assert pkg.streams("textures/1_1_ZL16.png") is False  # not in the index
+        # Downloading on the map still works.
+        assert pkg.fetch_now(rel) > 0
+        assert host.ranges >= 1
+    finally:
+        pkg.shutdown()
+    pkg, _ = make_pkg(tmp_path, grid_release, host)
+    try:
+        assert pkg.streams(ts.dsf_rel(40, -9)) and pkg.dsf_names("+30-010")
+    finally:
+        pkg.shutdown()
+
+
+def test_offline_only_choice_survives_refreshes_and_set_changes(tmp_path, grid_release,
+                                                               monkeypatch):
+    spec = ts.SOURCES["xp11"]
+    other = {"label": "Other set", "available": True,
+             "ortho_index": "https://example.invalid/other.json.gz", "overlay_index": None}
+    monkeypatch.setitem(ts.SOURCES, "other", other)
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
+                      spec["overlay_index"]: gz_index(grid_release),
+                      other["ortho_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    ts.enable_streaming(scenery, "xp11", overlays=True, fetch_missing=False, session=host)
+    assert all(m.get("fetch_missing") is False for m in ts.stream_packages(scenery).values())
+    assert ts.stream_summary(scenery)["fetch_missing"] is False
+    ts.set_stream_overlays(scenery, True, session=host)  # rewrites the marker
+    assert ts.stream_packages(scenery)["yAO_stream_xp11_overlays"]["fetch_missing"] is False
+    ts.change_stream_source(scenery, "other", session=host)
+    assert ts.stream_packages(scenery)["z_ao_stream_other"]["fetch_missing"] is False
+    ts.set_fetch_missing(scenery, True)
+    assert "fetch_missing" not in ts.stream_packages(scenery)["z_ao_stream_other"]
+    assert ts.stream_summary(scenery)["fetch_missing"] is True
+
+
+def test_index_lists_tiles_per_region(grid_release):
+    data = dict(grid_release["index"])
+    data["assets"] = [dict(a, region="eur-w") for a in data["assets"]]
+    regions = ts.TileIndex(data).regions()
+    assert list(regions) == ["eur-w"] and len(regions["eur-w"]) == 9
+    assert ts.region_label("eur-w") == "Europe West"
+    assert ts.region_label("new_area") == "New Area"
+
+
+def test_stream_panel_fetch_toggle_and_map_button(qt_app):
+    from ui.widgets.stream_panel import StreamPanel
+    panel = StreamPanel()
+    events = []
+    panel.fetch_missing_change_requested.connect(lambda v: events.append(("fetch", v)))
+    panel.open_map_requested.connect(lambda: events.append(("map",)))
+    assert not panel.map_button.isEnabled()
+    panel.fetch_check.click()  # off: picked before turning on, no request
+    assert events == [] and panel.fetch_missing is False
+    panel.set_state({"enabled": True, "source": "xp12", "fetch_missing": True,
+                     "ortho": (0, 0), "overlay": (0, 0)})
+    assert panel.fetch_check.isChecked() and panel.map_button.isEnabled()
+    panel.fetch_check.click()
+    assert events == [("fetch", False)]
+    panel.map_button.click()
+    assert events[-1] == ("map",)
+    panel.set_runtime_locked(True)
+    assert not panel.fetch_check.isEnabled()

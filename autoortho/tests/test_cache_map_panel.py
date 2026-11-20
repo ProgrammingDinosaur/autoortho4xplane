@@ -56,7 +56,7 @@ def test_toggle_switches_toolbar_canvas_and_mode(setup):
     assert editor.canvas.view == cme.CACHE_VIEW
     assert editor.canvas.mode == cme.SELECT
     assert panel.inventory is not None
-    assert "Streamed scenery 3.3 KB in 2 tiles (1 kept offline)" in editor.status.text()
+    assert "Scenery 3.3 KB in 2 tiles (1 downloaded)" in editor.status.text()
 
     editor.view_buttons[cme.SOURCES_VIEW].setChecked(True)
     assert editor.canvas.view == cme.SOURCES_VIEW
@@ -76,11 +76,11 @@ def test_layer_colours_and_legend(setup):
     editor, panel, _, _ = setup
     editor.set_view(cme.CACHE_VIEW)
     legend = [text for _c, text in editor.canvas._cache_legend]
-    assert legend == ["Both", "Kept for offline flying"]
+    assert legend == ["Both", "Downloaded (kept)"]
     assert editor.canvas.pinned == {(47, -123)}
     panel.colour_combo.setCurrentIndex(1)  # by size
     assert [t for _c, t in editor.canvas._cache_legend] == [
-        "Under 100 MB", "Kept for offline flying"]
+        "Under 100 MB", "Downloaded (kept)"]
 
 
 def test_click_box_and_additive_selection(setup):
@@ -207,8 +207,8 @@ def test_hover_text_lists_sizes_zooms_and_pin(setup):
     editor, panel, _, _ = setup
     editor.set_view(cme.CACHE_VIEW)
     text = panel.hover_text((47, -123))
-    assert text.startswith("+47-123  ·  kept for offline flying")
-    assert "Streamed scenery: 2.0 KB" in text
+    assert text.startswith("+47-123  ·  downloaded (kept)")
+    assert "Scenery: 2.0 KB" in text
     assert "Imagery: 660 B" in text and "ZL16–18" in text and "BI" in text
     assert "Last used:" in text
     assert panel.hover_text((0, 0)) == "+00+000\nNothing stored"
@@ -220,6 +220,29 @@ def test_flight_plan_page_retitles_the_map_box(setup):
     editor, _, _, _ = setup
     page = FlightPlanPage(QWidget(), editor)
     editor.set_view(cme.CACHE_VIEW)
-    assert page.map_group.title() == "Cache"
+    assert page.map_group.title() == "Scenery & Cache"
     editor.set_view(cme.SOURCES_VIEW)
     assert page.map_group.title() == "Custom Map"
+
+
+def test_regions_menu_selects_a_whole_region(setup, monkeypatch):
+    editor, panel, _, _ = setup
+    cells = [(47, -123), (47, -122), (48, -123)]
+    monkeypatch.setattr(ci, "stream_regions",
+                        lambda _ao: [("na-n", "North America North", cells)])
+    panel._read_regions("ao")
+    actions = panel.regions_menu.actions()
+    assert [a.text() for a in actions] == ["North America North (3 tiles)"]
+    editor.set_view(cme.CACHE_VIEW)
+    actions[0].trigger()
+    assert panel.selection == set(cells)
+    assert "North America North selected" in editor.status.text()
+    assert panel.keep_button.text() == "Download"
+
+
+def test_regions_menu_without_a_scenery_set(setup, monkeypatch):
+    _, panel, _, _ = setup
+    monkeypatch.setattr(ci, "stream_regions", lambda _ao: [])
+    panel._read_regions("ao")
+    (action,) = panel.regions_menu.actions()
+    assert not action.isEnabled() and "scenery set" in action.text()

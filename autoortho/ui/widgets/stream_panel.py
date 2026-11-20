@@ -1,4 +1,9 @@
-"""Scenery streaming controls shown at the top of the Scenery Library."""
+"""AutoOrtho scenery controls shown at the top of the Scenery Library.
+
+One streaming package per scenery set holds every tile AutoOrtho has: tiles
+downloaded on the map (kept) and, unless the user turns it off, tiles
+downloaded the first time X-Plane needs them.
+"""
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
@@ -9,6 +14,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QProgressBar,
+    QPushButton,
     QSpinBox,
     QVBoxLayout,
 )
@@ -29,6 +35,11 @@ NO_OVERLAY_HELP = (
 ROUGHNESS_HELP = (
     "Higher values make terrain less shiny at sunrise and sunset (1.0 is "
     "matte). Installed regions have their own setting in Scenery Patches."
+)
+FETCH_HELP = (
+    "Tiles download the first time X-Plane needs them. Turn this off to use "
+    "only the tiles you download on the map; elsewhere X-Plane shows its "
+    "default scenery."
 )
 LOCKED_HELP = "Streaming settings are locked while AutoOrtho or X-Plane is running."
 
@@ -56,28 +67,31 @@ class StreamPanel(QGroupBox):
     overlays_change_requested = Signal(bool)
     limit_changed = Signal(int)
     roughness_change_requested = Signal(object)   # float, or None to clear
+    fetch_missing_change_requested = Signal(bool)
+    open_map_requested = Signal()
     refresh_requested = Signal()
 
     def __init__(self, parent=None):
-        super().__init__("Stream scenery", parent)
+        super().__init__("AutoOrtho scenery", parent)
         self.busy = False
         self.runtime_locked = False
         self.state = {
             "enabled": False, "source": None, "overlays": False,
-            "disk_limit_gb": None, "roughness": None,
+            "disk_limit_gb": None, "roughness": None, "fetch_missing": True,
             "ortho": (0, 0), "overlay": (0, 0),
         }
 
         layout = QVBoxLayout(self)
 
-        self.enable_check = QCheckBox("Stream scenery you &haven't installed")
+        self.enable_check = QCheckBox("Use AutoOrtho &scenery")
         self.enable_check.setToolTip(
-            "Fly anywhere without installing regions first."
+            "Download tiles on the map, or as X-Plane needs them, instead of "
+            "installing whole regions."
         )
         layout.addWidget(self.enable_check)
         layout.addWidget(_secondary(
-            "Each tile downloads the first time X-Plane needs it. Regions you "
-            "have installed are always used first."
+            "Pick a scenery set, then download the tiles or regions you want "
+            "on the map. Regions installed earlier are always used first."
         ))
 
         row = QHBoxLayout()
@@ -107,8 +121,9 @@ class StreamPanel(QGroupBox):
         self.limit_spin.setSuffix(" GB")
         self.limit_spin.setValue(20)
         self.limit_spin.setToolTip(
-            "Tiles you haven't used for a while are removed above this size. "
-            "Overlays get a quarter of it on top."
+            "Tiles downloaded while flying that you haven't used for a while "
+            "are removed above this size. Tiles you download on the map don't "
+            "count. Overlays get a quarter of it on top."
         )
         limit_label.setBuddy(self.limit_spin)
         row.addWidget(source_label)
@@ -117,6 +132,17 @@ class StreamPanel(QGroupBox):
         row.addWidget(limit_label)
         row.addWidget(self.limit_spin)
         layout.addLayout(row)
+
+        fetch_row = QHBoxLayout()
+        self.fetch_check = QCheckBox("&Download tiles while flying")
+        self.fetch_check.setChecked(True)
+        self.map_button = QPushButton("Download Tiles on the Map…")
+        self.map_button.setAccessibleName("Open the map to download tiles or regions")
+        fetch_row.addWidget(self.fetch_check)
+        fetch_row.addStretch()
+        fetch_row.addWidget(self.map_button)
+        layout.addLayout(fetch_row)
+        layout.addWidget(_secondary(FETCH_HELP))
 
         self.overlays_check = QCheckBox("Include &overlays (roads, forests, buildings)")
         self.overlays_check.setChecked(True)
@@ -161,6 +187,8 @@ class StreamPanel(QGroupBox):
         self.limit_spin.editingFinished.connect(self._limit_edited)
         self.roughness_check.clicked.connect(self._roughness_edited)
         self.roughness_spin.editingFinished.connect(self._roughness_edited)
+        self.fetch_check.clicked.connect(self._fetch_clicked)
+        self.map_button.clicked.connect(self.open_map_requested)
         self._show_state()
 
     # -- state ----------------------------------------------------------
@@ -212,6 +240,7 @@ class StreamPanel(QGroupBox):
             self.overlays_check.setChecked(bool(state.get("overlays")))
             limit = int(round(float(state.get("disk_limit_gb") or 20)))
             self.limit_spin.setValue(max(self.limit_spin.minimum(), limit))
+            self.fetch_check.setChecked(bool(state.get("fetch_missing", True)))
             roughness = state.get("roughness")
             self.roughness_check.setChecked(roughness is not None)
             if roughness is not None:
@@ -229,7 +258,8 @@ class StreamPanel(QGroupBox):
         limit_gb = self.limit_spin.value()
         self.usage_bar.setRange(0, 1000)
         self.usage_bar.setValue(min(1000, int(1000 * size / (limit_gb * 1e9))))
-        text = f"{tiles:,} tiles stored · {format_bytes(size)} of {limit_gb} GB"
+        text = f"{tiles:,} tiles stored · {format_bytes(size)}"
+        text += f" · limit {limit_gb} GB for tiles downloaded while flying"
         if self.state.get("overlays"):
             overlay_limit = max(1, limit_gb // 4)
             text += f" · overlays {format_bytes(overlay_size)} of {overlay_limit} GB"
@@ -245,8 +275,9 @@ class StreamPanel(QGroupBox):
         editable = not self.busy and not self.runtime_locked
         has_overlays = self._source_has_overlays()
         for widget in (self.enable_check, self.source_combo, self.limit_spin,
-                       self.roughness_check):
+                       self.roughness_check, self.fetch_check):
             widget.setEnabled(editable)
+        self.map_button.setEnabled(self.enabled)
         self.roughness_spin.setEnabled(editable and self.roughness_check.isChecked())
         self.overlays_check.setEnabled(editable and has_overlays)
         if not has_overlays:
@@ -274,6 +305,14 @@ class StreamPanel(QGroupBox):
             )
         else:
             self.disable_requested.emit()
+
+    def _fetch_clicked(self, checked: bool):
+        if self.enabled and checked != bool(self.state.get("fetch_missing", True)):
+            self.fetch_missing_change_requested.emit(checked)
+
+    @property
+    def fetch_missing(self) -> bool:
+        return self.fetch_check.isChecked()
 
     def _roughness_edited(self, *_args):
         self.roughness_spin.setEnabled(

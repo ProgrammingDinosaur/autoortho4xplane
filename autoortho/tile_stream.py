@@ -73,6 +73,22 @@ SOURCES = OrderedDict([
         "overlay_index": INDEX_BASE_URL + "overlay_index_xp11.json.gz",
     }),
 ])
+# Names of the areas the release zips are grouped by (the index's
+# ``assets[].region``), for picking a whole area on the map.
+REGION_LABELS = {
+    "afr": "Africa", "asi": "Asia", "aus_pac": "Australia & Pacific",
+    "eur": "Europe", "na": "North America", "sa": "South America",
+    "afr-n": "Africa North", "afr-s": "Africa South", "asi-c": "Asia Central",
+    "asi-n": "Asia North", "asi-s": "Asia South", "aus-pac": "Australia & Pacific",
+    "eur-e": "Europe East", "eur-w": "Europe West", "greenland": "Greenland",
+    "na-n": "North America North", "na-s": "North America South",
+}
+
+
+def region_label(region: str) -> str:
+    return REGION_LABELS.get(region, region.replace("_", " ").replace("-", " ").title())
+
+
 ORTHO_PACKAGE = "z_ao_stream_{source}"
 OVERLAY_PACKAGE = "yAO_stream_{source}_overlays"
 LEGACY_OVERLAY_FOLDER = "yAutoOrtho_Overlays"
@@ -519,6 +535,20 @@ class TileIndex:
     def asset_url(self, asset: int) -> str:
         return self.assets[asset]["url"]
 
+    def regions(self) -> Dict[str, List[Tuple[int, int]]]:
+        """Tiles per area (the ``region`` of the zip each DSF is in)."""
+        out: Dict[str, List[Tuple[int, int]]] = {}
+        for folder, names in self._dsf_dirs.items():
+            for name in names:
+                entry = self.lookup(f"{DSF_DIR}/{folder}/{name}")
+                cell = dsf_cell(name)
+                if entry is None or cell is None:
+                    continue
+                asset = self.assets[entry[_ENTRY_ASSET]]
+                region = asset.get("region") or ""
+                out.setdefault(region, []).append(cell)
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Remote access
@@ -919,6 +949,9 @@ class StreamPackage:
         self.open_timeout = float(marker.get("open_timeout", 30))
         self.roughness = marker.get("roughness")
         self.prefetch_ring = int(marker.get("prefetch_ring", 1))
+        # False: only tiles already stored are offered to X-Plane (the rest
+        # come from Global Scenery) and no DSF is downloaded while flying.
+        self.fetch_missing = bool(marker.get("fetch_missing", True))
         limit_gb = marker.get("disk_limit_gb")
         self.disk_limit = int(float(limit_gb) * 1e9) if limit_gb else 0
         self.on_terrain = on_terrain
@@ -972,8 +1005,19 @@ class StreamPackage:
 
     # -- listing --------------------------------------------------------
     def dsf_names(self, folder: str) -> List[str]:
+        """DSFs to list beside the stored ones (none when only stored tiles
+        are offered)."""
+        if not self.fetch_missing:
+            return []
         return [n for n in self.index.dsf_names(folder)
                 if f"{DSF_DIR}/{folder}/{n}" not in self.hidden]
+
+    def streams(self, rel: str) -> bool:
+        """Whether X-Plane may be offered ``rel`` before it is stored. Masks
+        always are: a stored tile must never miss one."""
+        if self.fetch_missing or not rel.endswith(".dsf"):
+            return self.entry(rel) is not None
+        return False
 
     def entry(self, rel: str) -> Optional[list]:
         if rel in self.hidden:
@@ -981,7 +1025,8 @@ class StreamPackage:
         return self.index.lookup(rel)
 
     def remote_size(self, rel: str) -> Optional[int]:
-        e = self.entry(rel)
+        """Size of a file X-Plane may be offered before it is stored."""
+        e = self.entry(rel) if self.streams(rel) else None
         return e[_ENTRY_SIZE] if e else None
 
     def recently_failed(self, rel: str, window: float = 300.0) -> bool:
@@ -1066,7 +1111,7 @@ class StreamPackage:
         heading that way, so the ring around it also covers the tiles ahead.
         """
         m = re.search(r"([+-]\d{2})([+-]\d{3})\.dsf$", rel)
-        if not m or self.prefetch_ring <= 0:
+        if not m or self.prefetch_ring <= 0 or not self.fetch_missing:
             return 0
         lat0, lon0 = int(m.group(1)), int(m.group(2))
         queued = 0
@@ -1598,7 +1643,8 @@ def stream_packages(ao_scenery_dir: str) -> Dict[str, dict]:
 
 def enable_streaming(ao_scenery_dir: str, source: str, overlays: bool = True,
                      disk_limit_gb: float = 20.0, roughness: Optional[float] = None,
-                     session: Optional[requests.Session] = None) -> List[str]:
+                     session: Optional[requests.Session] = None,
+                     fetch_missing: Optional[bool] = None) -> List[str]:
     """Create the streaming package(s) for a source and fetch their indexes.
 
     Returns the folder names set up. Overlays get a quarter of the disk
@@ -1608,10 +1654,12 @@ def enable_streaming(ao_scenery_dir: str, source: str, overlays: bool = True,
     if not spec or not spec.get("available"):
         raise ValueError(f"Scenery source {source!r} is not available yet")
     created = [_create_package(ao_scenery_dir, source, "ortho", float(disk_limit_gb),
-                               roughness=roughness, session=session)]
+                               roughness=roughness, session=session,
+                               fetch_missing=fetch_missing)]
     if overlays and spec.get("overlay_index"):
         created.append(_create_package(ao_scenery_dir, source, "overlay",
-                                       _overlay_limit(disk_limit_gb), session=session))
+                                       _overlay_limit(disk_limit_gb), session=session,
+                                       fetch_missing=fetch_missing))
     else:
         _remove_package(ao_scenery_dir, OVERLAY_PACKAGE.format(source=source))
     return created
@@ -1623,8 +1671,10 @@ def _overlay_limit(disk_limit_gb: float) -> float:
 
 def _create_package(ao_scenery_dir: str, source: str, kind: str, limit: float,
                     roughness: Optional[float] = None,
-                    session: Optional[requests.Session] = None) -> str:
-    """Create (or refresh) one streaming package folder and download its index."""
+                    session: Optional[requests.Session] = None,
+                    fetch_missing: Optional[bool] = None) -> str:
+    """Create (or refresh) one streaming package folder and download its index.
+    ``fetch_missing`` None keeps the folder's current choice (default on)."""
     spec = SOURCES[source]
     if kind == "overlay":
         name, url = OVERLAY_PACKAGE.format(source=source), spec.get("overlay_index")
@@ -1634,6 +1684,8 @@ def _create_package(ao_scenery_dir: str, source: str, kind: str, limit: float,
         raise ValueError(f"{spec['label']} has no {kind} tiles")
     root = os.path.join(ao_scenery_dir, name)
     is_new = not os.path.isdir(root)
+    if fetch_missing is None:
+        fetch_missing = (read_marker(root) or {}).get("fetch_missing", True)
     os.makedirs(root, exist_ok=True)
     try:
         info = download_index(url, os.path.join(root, INDEX_NAME), session=session)
@@ -1647,6 +1699,8 @@ def _create_package(ao_scenery_dir: str, source: str, kind: str, limit: float,
               "disk_limit_gb": float(limit)}
     if roughness is not None and kind == "ortho":
         marker["roughness"] = _check_roughness(roughness)
+    if not fetch_missing:
+        marker["fetch_missing"] = False
     write_marker(root, marker)
     return name
 
@@ -1694,7 +1748,8 @@ def change_stream_source(ao_scenery_dir: str, source: str,
     overlays = any(m.get("kind") == "overlay" for m in stream_packages(ao_scenery_dir).values())
     created = enable_streaming(ao_scenery_dir, source, overlays=overlays,
                                disk_limit_gb=ortho.get("disk_limit_gb") or 20,
-                               roughness=ortho.get("roughness"), session=session)
+                               roughness=ortho.get("roughness"), session=session,
+                               fetch_missing=ortho.get("fetch_missing", True))
     disable_streaming(ao_scenery_dir, keep_source=source)
     return created
 
@@ -1712,6 +1767,19 @@ def set_stream_roughness(ao_scenery_dir: str, roughness: Optional[float]) -> str
         marker["roughness"] = _check_roughness(roughness)
     write_marker(os.path.join(ao_scenery_dir, name), marker)
     return name
+
+
+def set_fetch_missing(ao_scenery_dir: str, enabled: bool) -> None:
+    """Whether tiles not stored yet are offered to X-Plane and downloaded
+    while flying (on), or only stored tiles are used and the rest come from
+    Global Scenery (off). Applies from the next mount."""
+    for name, marker in stream_packages(ao_scenery_dir).items():
+        marker = dict(marker)
+        if enabled:
+            marker.pop("fetch_missing", None)
+        else:
+            marker["fetch_missing"] = False
+        write_marker(os.path.join(ao_scenery_dir, name), marker)
 
 
 def update_stream_settings(ao_scenery_dir: str, disk_limit_gb: float) -> None:
@@ -1752,7 +1820,7 @@ def stream_summary(ao_scenery_dir: str) -> dict:
     and the tiles stored per package kind."""
     packages = stream_packages(ao_scenery_dir)
     summary = {"enabled": False, "source": None, "overlays": False,
-               "disk_limit_gb": None, "roughness": None,
+               "disk_limit_gb": None, "roughness": None, "fetch_missing": True,
                "ortho": (0, 0), "overlay": (0, 0)}
     for name, marker in packages.items():
         kind = marker.get("kind", "ortho")
@@ -1764,7 +1832,8 @@ def stream_summary(ao_scenery_dir: str) -> dict:
         else:
             summary.update(enabled=True, source=marker.get("source"),
                            disk_limit_gb=marker.get("disk_limit_gb"),
-                           roughness=marker.get("roughness"))
+                           roughness=marker.get("roughness"),
+                           fetch_missing=bool(marker.get("fetch_missing", True)))
     return summary
 
 
