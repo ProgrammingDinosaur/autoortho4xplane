@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.2">
     
     
       
@@ -805,6 +805,50 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#do-i-have-to-download-whole-scenery-regions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Do I have to download whole scenery regions?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#i-use-simheaven-should-i-include-overlays-when-streaming" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        I use simHeaven. Should I include overlays when streaming?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#scenery-streaming-is-on-but-i-see-default-x-plane-terrain-in-some-places" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scenery streaming is on, but I see default X-Plane terrain in some places
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-cant-i-change-the-stream-scenery-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why can't I change the Stream scenery settings?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#i-installed-scenery-clicked-start-streaming-but-x-plane-did-not-automatically-start" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1347,6 +1391,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../developer/resource-usage-plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource usage: design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../developer/settings-refactor-proposal/" class="md-nav__link">
         
   
@@ -1355,6 +1427,34 @@
     
   
     Settings refactor proposal: Target, Limits, Governor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../developer/tile-streaming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scenery streaming: how it works and how to maintain it
   
 
     
@@ -1606,6 +1706,50 @@
     <span class="md-ellipsis">
       
         Something went wrong with scenery setup and I'd like to start again. How do I reinstall?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#do-i-have-to-download-whole-scenery-regions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Do I have to download whole scenery regions?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#i-use-simheaven-should-i-include-overlays-when-streaming" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        I use simHeaven. Should I include overlays when streaming?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#scenery-streaming-is-on-but-i-see-default-x-plane-terrain-in-some-places" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scenery streaming is on, but I see default X-Plane terrain in some places
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#why-cant-i-change-the-stream-scenery-settings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why can't I change the Stream scenery settings?
       
     </span>
   </a>
@@ -2164,6 +2308,33 @@ unless other issues are seen.</p>
 <p>If in doubt, re-install the scenery packs.</p>
 <h3 id="something-went-wrong-with-scenery-setup-and-id-like-to-start-again-how-do-i-reinstall">Something went wrong with scenery setup and I'd like to start again.  How do I reinstall?</h3>
 <p>AutoOrtho checks for metadata for installed scenery packs in <code>Custom Scenery/z_autoorth/**_info.json</code>  Where '**' is a shortname for each scenery pack installed.  You can delete the corresponding .json file, and re-run the configuration utility and should be able to reinstall the scenery pack</p>
+<h3 id="do-i-have-to-download-whole-scenery-regions">Do I have to download whole scenery regions?</h3>
+<p>No. Turn on <strong>Stream scenery you haven't installed</strong> in the Scenery Library
+and AutoOrtho downloads each tile the first time X-Plane needs it. Installed
+regions are still used first, so you can install the areas you fly most and
+stream the rest. See
+<a href="../scenery/#streaming-scenery-instead-of-installing-regions">Streaming scenery instead of installing regions</a>.</p>
+<h3 id="i-use-simheaven-should-i-include-overlays-when-streaming">I use simHeaven. Should I include overlays when streaming?</h3>
+<p>No. Untick <strong>Include overlays</strong> in the Stream scenery panel. simHeaven
+already provides roads, forests and buildings, and streaming AutoOrtho's
+overlays as well would duplicate them.</p>
+<h3 id="scenery-streaming-is-on-but-i-see-default-x-plane-terrain-in-some-places">Scenery streaming is on, but I see default X-Plane terrain in some places</h3>
+<p>Those tiles couldn't be downloaded when X-Plane asked for them, so X-Plane
+got them from its Global Scenery instead. Check that:</p>
+<ul>
+<li>AutoOrtho was running before X-Plane started, and streaming was turned on
+  before AutoOrtho started. Streaming changes take effect on the next start.</li>
+<li>Your connection to GitHub works.</li>
+</ul>
+<p>The log says which tiles fell back and why: look for
+<code>not streamed yet; using Global Scenery</code> and
+<code>Tile stream: host returned ..., pausing fetches</code>. The second means GitHub
+throttled downloads; AutoOrtho tries again after a pause. Reload the scenery
+or restart the flight once the tiles have downloaded.</p>
+<h3 id="why-cant-i-change-the-stream-scenery-settings">Why can't I change the Stream scenery settings?</h3>
+<p>They're locked while AutoOrtho or X-Plane is running, because the streaming
+folders are mounted when AutoOrtho starts. Stop AutoOrtho, change the
+settings, and start it again.</p>
 <h3 id="i-installed-scenery-clicked-start-streaming-but-x-plane-did-not-automatically-start">I installed scenery, clicked "Start Streaming," but X-Plane did not automatically start</h3>
 <p>You have to start X-Plane separately from this tool.  It's also best to start X-Plane <em>after</em> starting autoortho so that all new files and directories are picked up.</p>
 <hr />

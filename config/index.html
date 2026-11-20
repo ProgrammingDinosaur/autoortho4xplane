@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.1">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.2">
     
     
       
@@ -1259,6 +1259,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../developer/resource-usage-plan/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource usage: design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../developer/settings-refactor-proposal/" class="md-nav__link">
         
   
@@ -1267,6 +1295,34 @@
     
   
     Settings refactor proposal: Target, Limits, Governor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../developer/tile-streaming/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scenery streaming: how it works and how to maintain it
   
 
     
@@ -1756,8 +1812,19 @@
 <ol>
 <li><strong>Welcome and checks:</strong> the required FUSE backend for this platform.</li>
 <li><strong>X-Plane:</strong> detected, or browse for it.</li>
-<li><strong>Scenery:</strong> the scenery folder, and regions to install (or use scenery
-   you already have).</li>
+<li><strong>Scenery:</strong> the scenery folder, whether to
+   <a href="../scenery/#streaming-scenery-instead-of-installing-regions">stream scenery</a>,
+   and regions to install (or use scenery you already have). Tick <strong>Stream
+   scenery you haven't installed</strong> to fly without installing regions, or
+   stream as well as install: installed regions are always used first.
+   Choose the <strong>Scenery set</strong> (sets marked <strong>Soon</strong> can't be picked yet),
+   the <strong>Disk limit</strong>, and whether to <strong>Include overlays</strong>; turn overlays off
+   if you use simHeaven X-World or another overlay package. With streaming
+   on, you can finish without selecting a region. When you click <strong>Finish</strong>,
+   AutoOrtho downloads the tile index (a few megabytes) in the background;
+   if that fails, it shows the error and the task in the task list, and you
+   can turn streaming on later from the Scenery Library. Streaming can't be
+   changed here while AutoOrtho or X-Plane is running.</li>
 <li><strong>Image cache:</strong> one folder, its free space, and a disk cache limit
    (with a suggestion for that drive). The long-term cache and download
    folders are under <strong>More folders…</strong>.</li>
@@ -1766,7 +1833,8 @@
    this PC, can test your connection, and can suggest a target.</li>
 <li><strong>Limits and ready:</strong> <strong>Use what's available (recommended)</strong> or your own
    limits, a last readiness check, and <strong>Start AutoOrtho when setup
-   finishes</strong> (it waits if scenery is still being installed).</li>
+   finishes</strong> (it waits if scenery is still being installed, or until
+   streaming is set up).</li>
 </ol>
 <p>Existing installations with valid paths and dependencies are detected
 automatically and are not forced through the wizard. The wizard remains
@@ -1777,10 +1845,13 @@ changes are discarded and the last applied configuration remains active.</p>
 <p>The application is organized around five primary destinations:</p>
 <ul>
 <li><strong>Home</strong> — what AutoOrtho is doing now (see <a href="#home">Home</a> below).</li>
-<li><strong>Scenery Library</strong> — scenery search, filters, installation, updates, and
-  package details.</li>
-<li><strong>Flight Plan &amp; Map</strong> — SimBrief controls, loaded-flight details, and the
-  local Custom Map Editor.</li>
+<li><strong>Scenery Library</strong> — scenery search, filters, installation, updates,
+  package details, and <a href="../scenery/#streaming-scenery-instead-of-installing-regions">scenery streaming</a>
+  (fly without installing regions).</li>
+<li><strong>Flight Plan &amp; Map</strong> — SimBrief controls, loaded-flight details, and a map
+  with two views: the Custom Map editor and the
+  <a href="../scenery/#seeing-and-managing-stored-tiles-on-the-map">Cache view</a> of
+  what AutoOrtho has stored per tile.</li>
 <li><strong>Settings</strong> — Essentials first, every setting with <strong>Show all settings</strong>,
   search, exact numeric inputs, and Apply/Revert.</li>
 <li><strong>Diagnostics</strong> — health checks, searchable logs, export actions, and
