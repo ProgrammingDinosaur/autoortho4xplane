@@ -18,8 +18,10 @@ except ImportError:
 
 try:
     from autoortho.utils.constants import system_type
+    from autoortho.utils.log_streams import rotating_file_handler, tolerant_console
 except ImportError:
     from utils.constants import system_type
+    from utils.log_streams import rotating_file_handler, tolerant_console
 
 try:
     from autoortho.aostats import update_process_memory_stat, clear_process_memory_stat
@@ -119,10 +121,10 @@ def configure_worker_logging(mount_name, loglevel: str):
 
     log_dir = Path.home() / ".autoortho-data" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    fh = logging.handlers.RotatingFileHandler(
+    fh = rotating_file_handler(
         log_dir / f"worker-{mount_name}.log",
-        maxBytes=10_485_760,
-        backupCount=3,
+        max_bytes=10_485_760,
+        backup_count=3,
     )
     fh.setFormatter(logging.Formatter("[WORKER %(process)d][%(mount)s]: %(message)s"))
     fh.addFilter(AddMount())
@@ -131,7 +133,7 @@ def configure_worker_logging(mount_name, loglevel: str):
     root.setLevel(level)
     root.addFilter(AddMount())
 
-    console = logging.StreamHandler(sys.stdout)
+    console = logging.StreamHandler(tolerant_console(sys.stdout))
     console.setFormatter(logging.Formatter("[WORKER %(process)d][%(mount)s]: %(message)s"))
     console.addFilter(AddMount())
     root.addHandler(console)
