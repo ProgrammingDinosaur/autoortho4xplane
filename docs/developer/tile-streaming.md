@@ -177,11 +177,15 @@ gh release upload tile-index dist/tile-index/*.json.gz --clobber
 
 A set hosted as one release per area, from local copies of the release
 files (repeat `--local-dir` per area; `{area}` is filled from each folder's
-`<area>_info.json`):
+`<area>_info.json`). The XP12 set is hosted at
+`ProgrammingDinosaur/autoortho-scenery-xp12`, one release per area tagged
+`<area>_v1.4`: `afr-n`, `afr-s`, `asi-c`, `asi-n`, `asi-s`, `aus-pac`,
+`eur-e`, `eur-w`, `greenland`, `na-n`, `na-s` and `sa` (18,695 tiles,
+238 GB). Each build replaces the index, so pass every area:
 
 ```bash
 python scripts/build_tile_index.py \
-    --local-dir D:/xp12/greenland/release --local-dir D:/xp12/eur/release \
+    --local-dir D:/xp12/afr-n/release --local-dir D:/xp12/afr-s/release ... \
     --url-base "https://github.com/ProgrammingDinosaur/autoortho-scenery-xp12/releases/download/{area}_v1.4/" \
     --variant xp12 --name "XP12 set (flightwusel v1.4)" \
     --out dist/tile-index/tile_index_xp12.json.gz
@@ -191,6 +195,21 @@ Index entries are `[asset, header_offset, compressed_size, size, method,
 crc]`; the format version is `tile_stream.INDEX_FORMAT`. Bump it only for
 incompatible changes, since installed copies refuse unknown formats.
 
+- **Format 2** (written by the builder) packs the entries, because parsing
+  a million JSON lists costs about 500 MB that Python keeps afterwards.
+  `files` holds `names` (DSFs and anything else, sorted), `masks` (base64
+  of the water masks' sorted little-endian uint64 keys,
+  `row << 36 | col << 8 | zoom`) and `entries` (base64 of 24-byte records,
+  `<HQIIHI`, names first, then masks). See `tile_stream.pack_files`. The
+  full XP12 index (1.35 million files) loads in about 0.2 s and uses about
+  50 MB.
+- **Format 1** stores `files` as `{path: entry}`. It's still read, and
+  AutoOrtho 3.3.0 reads only format 1. So the XP11 indexes stay format 1
+  under their current names. Publish a format 2 index only for a source that
+  3.3.0 shows as **Soon**, or under a new file name.
+- `--convert INDEX --out NEW` rewrites an index in the current format
+  without reading the releases.
+
 ## Repackaging a solid archive
 
 Packages shipped as one solid `.7z` (like the XP12 flightwusel set) can't be
@@ -198,6 +217,8 @@ streamed. `scripts/repack_scenery.py` turns an extracted package into
 kubilus-style release zips: whole 1x1 degree tiles per zip, each under
 1900 MB, DSFs 7z-compressed inside (X-Plane reads them natively), and an
 `<area>_info.json`. The result also works with the classic region installer.
+Release notes credit the original package and name the zip that holds its
+`README.txt` and `_docs/` (`asi-n` ships no `README.txt`).
 
 ```bash
 7z x z_ao_greenland_zl16_o4xp1.40.13+je_v1.4.7z -oD:/xp12/greenland/extracted
@@ -212,6 +233,7 @@ Then rebuild the set's index (above) with every area uploaded so far.
 ## Adding a scenery set
 
 Add an entry to `tile_stream.SOURCES` with its label, `ortho_index` and
-`overlay_index` (or `None`) URLs. Set `available: False` to show it in the
-panel as **Soon** until its index is published. The panel turns
+`overlay_index` (or `None`) URLs. The first available entry is the default
+in the panel and the setup wizard (currently `xp12`). Set
+`available: False` to show it as **Soon** until its index is published. The panel turns
 **Include overlays** off for a set without overlays.

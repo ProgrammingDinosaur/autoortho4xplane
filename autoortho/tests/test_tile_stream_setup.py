@@ -225,7 +225,7 @@ def test_enable_and_disable_streaming(tmp_path, grid_release):
     assert ts.disable_streaming(str(scenery)) == ["z_ao_stream_xp11"]
     assert (scenery / "z_ao_eur").is_dir()  # never touched
     with pytest.raises(ValueError):
-        ts.enable_streaming(str(scenery), "xp12", session=host)
+        ts.enable_streaming(str(scenery), "no-such-set", session=host)
 
 
 def test_overlays_can_be_added_and_removed_while_streaming(tmp_path, grid_release):
@@ -360,21 +360,30 @@ def test_pack_order_without_ini_does_nothing(tmp_path):
 def test_stream_panel_states(qt_app):
     from ui.widgets.stream_panel import StreamPanel
     panel = StreamPanel()
-    xp12 = panel.source_combo.findData("xp12")
-    assert not panel.source_combo.model().item(xp12).isEnabled()
-    assert "Soon" in panel.source_combo.itemText(xp12)
-    assert panel.source_combo.currentData() == "xp11"
+    from ui.widgets.stream_panel import NO_OVERLAY_HELP, OVERLAY_HELP
     events = []
     for name in ("enable_requested", "disable_requested", "source_change_requested",
                  "overlays_change_requested", "limit_changed", "refresh_requested"):
         getattr(panel, name).connect(lambda *a, n=name: events.append((n,) + a))
 
+    # XP12 is the default; it has no overlays, so that option is off.
+    assert panel.source_combo.currentData() == "xp12"
+    assert all(panel.source_combo.model().item(i).isEnabled()
+               for i in range(panel.source_combo.count()))
+    assert not panel.overlays_check.isEnabled()
+    assert panel.overlays_help.text() == NO_OVERLAY_HELP
+
     # Off: settings can be picked before turning streaming on, without requests.
+    xp11 = panel.source_combo.findData("xp11")
+    panel.source_combo.setCurrentIndex(xp11)
+    panel.source_combo.activated.emit(xp11)  # what a user's pick sends
+    assert panel.overlays_check.isEnabled()
+    assert panel.overlays_help.text() == OVERLAY_HELP
     panel.overlays_check.click()
     assert panel.overlays_check.isEnabled() and events == []
     assert panel.usage_bar.isHidden() and panel.status_label.isHidden()
     panel.enable_check.click()
-    assert events == [("enable_requested", "xp11", False, 20)]
+    assert events == [("enable_requested", "xp11", True, 20)]
 
     # On: each change is requested right away.
     events.clear()

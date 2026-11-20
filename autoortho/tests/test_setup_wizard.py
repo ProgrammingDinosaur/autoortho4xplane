@@ -103,7 +103,7 @@ def test_wizard_accepts_established_install_without_selection(qt_app, tmp_path, 
 
 import tile_stream
 from ui.dialogs.setup_wizard import existing_stream
-from ui.widgets.stream_panel import LOCKED_HELP, OVERLAY_HELP
+from ui.widgets.stream_panel import LOCKED_HELP, NO_OVERLAY_HELP, OVERLAY_HELP
 
 
 def _region_choices():
@@ -139,7 +139,7 @@ def test_streaming_without_regions_enables_finish(qt_app, tmp_path, monkeypatch)
     assert wizard.review_page.isComplete() is True
     assert wizard.button(QWizard.WizardButton.FinishButton).isEnabled()
     assert wizard.selected_streaming() == {
-        "source": "xp11", "overlays": True, "disk_limit_gb": 20,
+        "source": "xp12", "overlays": False, "disk_limit_gb": 20,
     }
     assert "finish without selecting a region" in page.note_label.text()
     assert wizard.readiness.by_id("setup-scenery").message.startswith(
@@ -166,7 +166,7 @@ def test_streaming_alongside_regions(qt_app, tmp_path, monkeypatch):
 
     assert wizard.selected_region_ids == ("eu",)
     assert wizard.selected_streaming() == {
-        "source": "xp11", "overlays": False, "disk_limit_gb": 50,
+        "source": "xp12", "overlays": False, "disk_limit_gb": 50,
     }
     assert wizard.readiness.can_finish is True
     assert "Streaming covers the rest" in wizard.readiness.by_id("setup-scenery").message
@@ -188,7 +188,14 @@ def test_streaming_offers_only_available_sets(qt_app, tmp_path, monkeypatch):
         if not spec.get("available"):
             assert combo.itemText(index).endswith("Soon")
     assert tile_stream.SOURCES[combo.currentData()]["available"] is True
-    # The overlays question carries the simHeaven hint.
+    # XP12 is the default and has no overlays; the XP11 set's overlays
+    # question carries the simHeaven hint.
+    assert combo.currentData() == "xp12"
+    assert page.stream_overlays_help.text() == NO_OVERLAY_HELP
+    page.stream_check.setChecked(True)
+    combo.setCurrentIndex(combo.findData("xp11"))
+    qt_app.processEvents()
+    assert page.stream_overlays_check.isEnabled()
     assert page.stream_overlays_help.text() == OVERLAY_HELP
     assert "simHeaven" in OVERLAY_HELP
 
@@ -197,10 +204,11 @@ def test_streaming_offers_only_available_sets(qt_app, tmp_path, monkeypatch):
 
 
 def test_unavailable_set_is_never_chosen(qt_app, tmp_path, monkeypatch):
-    monkeypatch.setitem(
-        tile_stream.SOURCES, "xp11",
-        dict(tile_stream.SOURCES["xp11"], available=False),
-    )
+    for key in list(tile_stream.SOURCES):
+        monkeypatch.setitem(
+            tile_stream.SOURCES, key,
+            dict(tile_stream.SOURCES[key], available=False),
+        )
     wizard = _build_wizard(tmp_path, monkeypatch, scenery_choices=_region_choices())
     wizard.scenery_page.stream_check.setChecked(True)
     qt_app.processEvents()

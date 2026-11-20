@@ -28,11 +28,17 @@ If you manually move things around outside of the configuration utility, things 
 
 You don't have to download whole regions before you fly. With scenery
 streaming on, AutoOrtho downloads each 1x1 degree tile the first time
-X-Plane needs it, from the same GitHub releases the region installer uses.
+X-Plane needs it, from scenery releases on GitHub.
 
-Only the tile's base mesh is downloaded: its DSF file and water masks,
-typically about 3 MB per tile and up to about 15 MB for detailed ones. The terrain files are generated on the fly, and satellite
-imagery is fetched as usual.
+Only the tile's base mesh is downloaded: its DSF file and water masks. The
+terrain files are generated on the fly, and satellite imagery is fetched as
+usual. How big a tile is depends on the scenery set and the area:
+
+- **XP12 set:** about 12 MB per tile on average, from about 4 MB in Africa
+  to about 27 MB in western Europe. Detailed tiles with a lot of coastline or
+  lakes, such as in the Alps, can reach about 55 MB.
+- **XP11 legacy set:** typically about 3 MB per tile and up to about 15 MB
+  for detailed ones.
 
 ### Turning it on
 
@@ -47,15 +53,20 @@ To turn it on later:
    AutoOrtho or X-Plane is running.
 2. Open **Scenery Library**. The **Stream scenery** panel is at the top.
 3. Pick the **Scenery set**:
+   - **XP12 set (flightwusel v1.4, by jonaseberle):** the default. A base
+     mesh made for X-Plane 12, covering the whole world (all 12 areas of the
+     flightwusel set). It already includes X-Plane 12's seasonal data. It has
+     no overlays, so use simHeaven X-World for roads, forests and
+     buildings.
    - **XP11 legacy set (kubilus1/autoortho-scenery):** the same meshes as
-     the regions offered in the Scenery Library.
-   - **XP12 set:** coming soon. It's marked **Soon** until its packages are
-     ready for streaming.
+     the regions offered in the Scenery Library, with overlays.
 4. Choose whether to **Include overlays** (roads, forests, buildings). See
-   [Overlays and simHeaven](#overlays-and-simheaven).
+   [Overlays and simHeaven](#overlays-and-simheaven). The option is off for
+   the XP12 set, which has none.
 5. Set the **Disk limit** (20 GB by default).
 6. Tick **Stream scenery you haven't installed**. AutoOrtho downloads the
-   tile index, a few megabytes, and sets up the streaming folders.
+   tile index (about 30 MB for the XP12 set, 6 MB for the XP11 set) and
+   sets up the streaming folders.
 7. Start AutoOrtho, then X-Plane.
 
 You can change the scenery set, overlays and disk limit at any time while
@@ -74,7 +85,8 @@ means you can:
   load without waiting for a download, and you can fly them offline.
 
 To stream a region you have installed, uninstall it from the Scenery
-Library.
+Library. The regions in the Scenery Library are from the XP11 legacy set, so
+an installed region shows its XP11 mesh even when you stream the XP12 set.
 
 ### Overlays and simHeaven
 
@@ -126,8 +138,10 @@ haven't used for the longest time, down to 90% of the limit.
 Streaming creates these folders next to your installed regions in
 `Custom Scenery/z_autoortho/scenery/`:
 
-- `z_ao_stream_xp11`: the streamed base mesh.
-- `yAO_stream_xp11_overlays`: the streamed overlays, if you included them.
+- `z_ao_stream_xp12` or `z_ao_stream_xp11`: the streamed base mesh of the
+  set you picked.
+- `yAO_stream_xp11_overlays`: the streamed overlays, if you included them
+  (XP11 legacy set only).
 
 Like installed regions, each one appears in `Custom Scenery` while AutoOrtho
 is running. Don't edit or move these folders yourself; use the Stream
@@ -203,7 +217,10 @@ deleting the tiles streamed so far. Installed regions aren't affected.
 ### Limitations
 
 - **Scenery Patches** (Seasons, Terrain reflectivity) are applied only to
-  installed regions, not to streamed tiles yet.
+  installed regions. The XP12 set doesn't need the Seasons patch: its tiles
+  already include X-Plane 12's seasonal data. Tiles streamed from the XP11
+  legacy set have no seasons, and terrain reflectivity can't be set for
+  streamed tiles yet.
 - **Keep Offline** keeps only the streamed scenery. Imagery isn't
   downloaded ahead of time; it's cached as you fly.
 - The setup wizard only turns streaming on. To change its settings or turn
@@ -234,17 +251,17 @@ towards the bottom of your scenery_packs.ini file:
 Landmarks, airports, etc
 simHeaven, special layers, etc
 yAutoOrtho_Overlays
-yAO_stream_xp11_overlays
 z_ao_aus_pac
 z_ao_eur
 z_ao_na
-z_ao_stream_xp11
+z_ao_stream_xp12
 z_autoortho
 zzz_global_scenery
 ```
 
-`yAO_stream_xp11_overlays` and `z_ao_stream_xp11` appear only if
-[scenery streaming](#streaming-scenery-instead-of-installing-regions) is on.
+The `z_ao_stream_...` and `yAO_stream_..._overlays` folders appear only if
+[scenery streaming](#streaming-scenery-instead-of-installing-regions) is on;
+the overlays folder only with the XP11 legacy set.
 AutoOrtho places them for you when it starts.
 
 ## Installing in custom directories

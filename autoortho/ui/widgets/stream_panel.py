@@ -241,6 +241,7 @@ class StreamPanel(QGroupBox):
 
     def _source_activated(self, _index: int):
         source = str(self.source_combo.currentData())
+        self._refresh_controls()  # sets differ in whether they have overlays
         if self.enabled and source != self.state.get("source"):
             self.source_change_requested.emit(source)
         else:

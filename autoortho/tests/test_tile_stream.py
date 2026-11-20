@@ -730,7 +730,49 @@ def test_builder_indexes_local_release_with_final_urls(tmp_path):
     index = ts.TileIndex.load(str(index_path))
     assert index.variant == "xp12"
     assert index.asset_url(0) == "https://github.com/o/r/releases/download/test_v1/z_test_00.zip"
-    assert "Earth nav data/+30-010/+39-009.dsf" in index.files
-    assert "textures/100000_125184_ZL18.png" in index.files
+    assert index.lookup("Earth nav data/+30-010/+39-009.dsf") is not None
+    assert index.lookup("textures/100000_125184_ZL18.png") is not None
     data = json.load(gzip.open(index_path, "rt"))
+    assert data["format"] == ts.INDEX_FORMAT == 2
     assert data["ter"]["verified"] == 4 and data["ter"]["exceptions"] == {}
+
+    # An index in the old format converts without reading the releases.
+    old = dict(data, format=1, files={rel: index.lookup(rel) for rel in (
+        "Earth nav data/+30-010/+39-009.dsf", "textures/100000_125184_ZL18.png")})
+    old_path, new_path = tmp_path / "old.json.gz", tmp_path / "new.json.gz"
+    with gzip.open(old_path, "wt") as fh:
+        json.dump(old, fh)
+    bti.main(["--convert", str(old_path), "--out", str(new_path)])
+    converted = ts.TileIndex.load(str(new_path))
+    assert json.load(gzip.open(new_path, "rt"))["format"] == 2
+    assert len(converted) == 2 and converted.name == old["name"]
+    assert converted.lookup("textures/100000_125184_ZL18.png") ==         index.lookup("textures/100000_125184_ZL18.png")
+
+
+def test_packed_index_finds_every_file_and_nothing_else():
+    files = {
+        "Earth nav data/+30-010/+39-009.dsf": [0, 10, 20, 30, 93, 0xFFFFFFFF],
+        "Earth nav data/+30-010/+38-009.dsf": [1, 2**40, 5, 6, 0, 7],
+        "textures/100000_125184_ZL18.png": [2, 99, 8, 9, 8, 123],
+        "textures/25000_31296_ZL16.png": [131, 1, 2, 3, 0, 4],
+        "textures/0_0_ZL0.png": [3, 4, 5, 6, 0, 7],
+        "textures/0100_5_ZL16.png": [4, 5, 6, 7, 0, 8],   # not a mask name
+        "textures/water_overlay.png": [5, 6, 7, 8, 0, 9],
+    }
+    data = {"format": 1, "assets": [], "files": files}
+    old = ts.TileIndex(data)
+    new = ts.TileIndex(dict(data, format=2, files=ts.pack_files(files)))
+    for index in (old, new):
+        assert len(index) == len(files)
+        assert all(index.lookup(rel) == entry for rel, entry in files.items())
+        assert index.lookup("textures/100_5_ZL16.png") is None
+        assert index.lookup("textures/100000_125184_ZL17.png") is None
+        assert index.lookup("Earth nav data/+30-010/+30-010.dsf") is None
+        assert index.dsf_count == 2
+        assert index.dsf_names("+30-010") == ["+38-009.dsf", "+39-009.dsf"]
+    packed = ts.pack_files(files)
+    assert len(packed["names"]) == 4  # DSFs and non-mask textures keep names
+    with pytest.raises(ValueError):
+        ts.TileIndex(dict(data, format=2, files=dict(packed, names=packed["names"][:-1])))
+    with pytest.raises(ValueError):
+        ts.TileIndex(dict(data, format=3))

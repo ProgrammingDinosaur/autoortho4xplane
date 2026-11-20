@@ -17,11 +17,12 @@ On a new installation, AutoOrtho opens a guided setup wizard that:
    and regions to install (or use scenery you already have). Tick **Stream
    scenery you haven't installed** to fly without installing regions, or
    stream as well as install: installed regions are always used first.
-   Choose the **Scenery set** (sets marked **Soon** can't be picked yet),
-   the **Disk limit**, and whether to **Include overlays**; turn overlays off
-   if you use simHeaven X-World or another overlay package. With streaming
+   Choose the **Scenery set** (the XP12 set by default, or the XP11 legacy
+   set), the **Disk limit**, and whether to **Include overlays** (XP11
+   legacy set only); turn overlays off if you use simHeaven X-World or
+   another overlay package. With streaming
    on, you can finish without selecting a region. When you click **Finish**,
-   AutoOrtho downloads the tile index (a few megabytes) in the background;
+   AutoOrtho downloads the tile index (about 30 MB) in the background;
    if that fails, it shows the error and the task in the task list, and you
    can turn streaming on later from the Scenery Library. Streaming can't be
    changed here while AutoOrtho or X-Plane is running.

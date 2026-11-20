@@ -17,6 +17,9 @@ The index is a gzipped JSON file written by ``scripts/build_tile_index.py``.
 
 from __future__ import annotations
 
+import array
+import base64
+import bisect
 import functools
 import gzip
 import hashlib
@@ -29,6 +32,7 @@ import os
 import queue
 import re
 import struct
+import sys
 import threading
 import time
 import zlib
@@ -42,7 +46,9 @@ import requests
 
 log = logging.getLogger(__name__)
 
-INDEX_FORMAT = 1
+# Format 2 stores entries packed (see pack_files); format 1 is still read.
+INDEX_FORMAT = 2
+READABLE_INDEX_FORMATS = (1, 2)
 MARKER_NAME = "ao_stream.json"
 INDEX_NAME = "tile_index.json.gz"
 DSF_DIR = "Earth nav data"
@@ -52,18 +58,19 @@ DSF_DIR = "Earth nav data"
 INDEX_BASE_URL = (
     "https://github.com/ProgrammingDinosaur/autoortho4xplane/releases/download/tile-index/"
 )
+# The first available source is the default in the UI.
 SOURCES = OrderedDict([
+    ("xp12", {
+        "label": "XP12 set (flightwusel v1.4, by jonaseberle)",
+        "available": True,
+        "ortho_index": INDEX_BASE_URL + "tile_index_xp12.json.gz",
+        "overlay_index": None,  # base mesh only; pair with simHeaven
+    }),
     ("xp11", {
         "label": "XP11 legacy set (kubilus1/autoortho-scenery)",
         "available": True,
         "ortho_index": INDEX_BASE_URL + "tile_index_xp11.json.gz",
         "overlay_index": INDEX_BASE_URL + "overlay_index_xp11.json.gz",
-    }),
-    ("xp12", {
-        "label": "XP12 set (ProgrammingDinosaur/autoortho-scenery-xp12)",
-        "available": False,  # waiting on the repackaged release zips
-        "ortho_index": INDEX_BASE_URL + "tile_index_xp12.json.gz",
-        "overlay_index": None,  # base mesh only; pair with simHeaven
     }),
 ])
 ORTHO_PACKAGE = "z_ao_stream_{source}"
@@ -152,6 +159,10 @@ _LOCAL_HEADER_SIG = 0x04034B50
 
 # Index entry fields: [asset, header_offset, compressed_size, size, method, crc]
 _ENTRY_ASSET, _ENTRY_OFFSET, _ENTRY_CSIZE, _ENTRY_SIZE, _ENTRY_METHOD, _ENTRY_CRC = range(6)
+_PACKED_ENTRY = struct.Struct("<HQIIHI")
+# Water masks are almost all of an index's files; format 2 keys them by
+# (row, col, zoom) instead of by name.
+_MASK_NAME = re.compile(r"textures/(0|[1-9]\d*)_(0|[1-9]\d*)_ZL(0|[1-9]\d*)\.png")
 
 EARTH_RADIUS = 6378137.0
 
@@ -327,25 +338,86 @@ def terrain_tiles(names: Iterable[str]) -> List[Tuple[int, int, str, int]]:
 # Index
 # ---------------------------------------------------------------------------
 
+def _mask_key(rel: str) -> Optional[int]:
+    """Integer key of a water mask path, or None for any other file."""
+    match = _MASK_NAME.fullmatch(rel)
+    if not match:
+        return None
+    row, col, zoom = (int(g) for g in match.groups())
+    if row >= 1 << 28 or col >= 1 << 28 or zoom >= 1 << 8:
+        return None
+    return (row << 36) | (col << 8) | zoom
+
+
+def _u64_array(raw: bytes) -> array.array:
+    keys = array.array("Q")
+    keys.frombytes(raw)
+    if sys.byteorder == "big":
+        keys.byteswap()  # stored little-endian
+    return keys
+
+
+def pack_files(files: Dict[str, list]) -> dict:
+    """Format 2 ``files`` block from a {path: entry} mapping.
+
+    Parsing a million entries as JSON lists costs about 500 MB that Python
+    keeps after they are freed, so entries are packed into one blob
+    (24 bytes each): first those of ``names``, sorted, then the water masks
+    in the order of ``masks``, their sorted integer keys (little-endian
+    uint64).
+    """
+    names, masks = [], []
+    for rel, entry in files.items():
+        key = _mask_key(rel)
+        if key is None:
+            names.append((rel, entry))
+        else:
+            masks.append((key, entry))
+    names.sort()
+    masks.sort()
+    keys = array.array("Q", (key for key, _ in masks))
+    if sys.byteorder == "big":
+        keys.byteswap()
+    entries = b"".join(_PACKED_ENTRY.pack(*entry) for _, entry in names + masks)
+    return {
+        "names": [rel for rel, _ in names],
+        "masks": base64.b64encode(keys.tobytes()).decode("ascii"),
+        "entries": base64.b64encode(entries).decode("ascii"),
+    }
+
+
 class TileIndex:
     """Where each streamable file lives inside the published zips."""
 
     def __init__(self, data: dict):
-        if data.get("format") != INDEX_FORMAT:
-            raise ValueError(f"Unsupported tile index format {data.get('format')!r}")
+        fmt = data.get("format")
+        if fmt not in READABLE_INDEX_FORMATS:
+            raise ValueError(f"Unsupported tile index format {fmt!r}")
         self.name = data.get("name", "")
         self.variant = data.get("variant", "")
         self.built = data.get("built", 0)
         self.assets: List[dict] = data["assets"]
-        self.files: Dict[str, list] = data["files"]
+        files = data["files"] if fmt == 2 else pack_files(data["files"])
+        self._names: Dict[str, int] = {rel: i for i, rel in enumerate(files["names"])}
+        self._mask_keys = _u64_array(base64.b64decode(files["masks"]))
+        self._entries = base64.b64decode(files["entries"])
+        if len(self._entries) != len(self) * _PACKED_ENTRY.size:
+            raise ValueError("Tile index entries don't match its file list")
         ter = data.get("ter", {})
         self.ter_params: dict = ter.get("params", {})
         self.ter_exceptions: Dict[str, str] = ter.get("exceptions", {})
         self._dsf_dirs: Dict[str, List[str]] = {}
-        for rel in self.files:
+        for rel in self._names:
             if rel.startswith(DSF_DIR + "/") and rel.endswith(".dsf"):
                 _, folder, fname = rel.split("/")
                 self._dsf_dirs.setdefault(folder, []).append(fname)
+
+    def __len__(self) -> int:
+        return len(self._names) + len(self._mask_keys)
+
+    @property
+    def dsf_count(self) -> int:
+        return sum(len(names) for names in self._dsf_dirs.values())
 
     @classmethod
     def load(cls, path: str) -> "TileIndex":
@@ -354,7 +426,18 @@ class TileIndex:
             return cls(json.load(fh))
 
     def lookup(self, rel: str) -> Optional[list]:
-        return self.files.get(rel)
+        """The entry of a file, or None if the index doesn't have it."""
+        slot = self._names.get(rel)
+        if slot is None:
+            key = _mask_key(rel)
+            if key is None:
+                return None
+            keys = self._mask_keys
+            pos = bisect.bisect_left(keys, key)
+            if pos == len(keys) or keys[pos] != key:
+                return None
+            slot = len(self._names) + pos
+        return list(_PACKED_ENTRY.unpack_from(self._entries, slot * _PACKED_ENTRY.size))
 
     def dsf_folders(self) -> List[str]:
         return sorted(self._dsf_dirs)
@@ -1277,11 +1360,9 @@ def empty_overlay_dsf(lat: int, lon: int) -> bytes:
 # Setting packages up
 # ---------------------------------------------------------------------------
 
-def _parse_index_bytes(data: bytes) -> dict:
+def _parse_index_bytes(data: bytes) -> TileIndex:
     with gzip.GzipFile(fileobj=io.BytesIO(data)) as fh:
-        parsed = json.load(fh)
-    TileIndex(parsed)  # validates the format
-    return parsed
+        return TileIndex(json.load(fh))  # validates the format
 
 
 def download_index(url: str, dest: str, session: Optional[requests.Session] = None,
@@ -1295,8 +1376,7 @@ def download_index(url: str, dest: str, session: Optional[requests.Session] = No
     with open(dest + ".part", "wb") as fh:
         fh.write(r.content)
     os.replace(dest + ".part", dest)
-    return {"name": parsed.get("name"), "built": parsed.get("built"),
-            "dsfs": sum(1 for f in parsed["files"] if f.endswith(".dsf")),
+    return {"name": parsed.name, "built": parsed.built, "dsfs": parsed.dsf_count,
             "last_modified": r.headers.get("Last-Modified", "")}
 
 

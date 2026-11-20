@@ -706,7 +706,7 @@ class SceneryPage(_BasePage):
             message = LOCKED_HELP
         elif self.stream_check.isChecked():
             message = (
-                "Finish downloads the tile index (a few megabytes) and sets up "
+                "Finish downloads the tile index (up to about 30 MB) and sets up "
                 "streaming."
             )
         else:

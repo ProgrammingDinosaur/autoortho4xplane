@@ -270,7 +270,13 @@ stream the rest. See
 ### I use simHeaven. Should I include overlays when streaming?
 No. Untick **Include overlays** in the Stream scenery panel. simHeaven
 already provides roads, forests and buildings, and streaming AutoOrtho's
-overlays as well would duplicate them.
+overlays as well would duplicate them. The XP12 set has no overlays, so the
+option is off for it anyway.
+
+### Do streamed XP12 tiles need the Seasons patch?
+No. The XP12 set's tiles already include X-Plane 12's seasonal data. The
+Seasons patch in **Scenery Patches** is for installed regions from the XP11
+legacy set.
 
 ### Scenery streaming is on, but I see default X-Plane terrain in some places
 Those tiles couldn't be downloaded when X-Plane asked for them, so X-Plane
