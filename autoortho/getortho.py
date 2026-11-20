@@ -4881,6 +4881,13 @@ def _cleanup_temp(path: str):
 # Consulted by _save_to_dir to choose the right LT cache backoff interval.
 _atomic_write_last_errno: dict[str, int] = {}
 
+# Write directories _atomic_write has already created. os.makedirs costs three
+# file-system calls (about 0.1 ms on Windows) and ran once per chunk written; a
+# directory removed later (cache cleanup) is dropped from here on the failed
+# write and created again.
+_known_write_dirs: set[str] = set()
+_MAX_KNOWN_WRITE_DIRS = 65_536
+
 
 def _atomic_write(target_path: str, data: bytes) -> bool:
     """Atomically write ``data`` to ``target_path`` via tempfile + ``os.replace``.
@@ -4890,11 +4897,16 @@ def _atomic_write(target_path: str, data: bytes) -> bool:
     failure. Bookkeeping (disk budget, stats) is the caller's responsibility.
     """
     write_dir = os.path.dirname(target_path)
-    try:
-        os.makedirs(write_dir, exist_ok=True)
-    except OSError as e:
-        log.debug(f"_atomic_write: makedirs failed for {write_dir}: {e}")
-        return False
+    dir_was_known = write_dir in _known_write_dirs
+    if not dir_was_known:
+        try:
+            os.makedirs(write_dir, exist_ok=True)
+        except OSError as e:
+            log.debug(f"_atomic_write: makedirs failed for {write_dir}: {e}")
+            return False
+        if len(_known_write_dirs) >= _MAX_KNOWN_WRITE_DIRS:
+            _known_write_dirs.clear()
+        _known_write_dirs.add(write_dir)
 
     if os.path.exists(target_path):
         try:
@@ -4910,12 +4922,17 @@ def _atomic_write(target_path: str, data: bytes) -> bool:
         with open(temp_filename, 'wb') as h:
             h.write(data)
     except FileNotFoundError:
+        _known_write_dirs.discard(write_dir)
+        if dir_was_known:
+            # The directory went away after it was created: create it again.
+            return _atomic_write(target_path, data)
         try:
             _chunk_cache_index.invalidate(target_path)
         except NameError:
             pass
         return False
     except OSError as e:
+        _known_write_dirs.discard(write_dir)
         _atomic_write_last_errno[write_dir] = e.errno
         _cleanup_temp(temp_filename)
         log.warning(f"_atomic_write: failed to write temp for {target_path}: {e}")
@@ -4952,6 +4969,7 @@ def _atomic_write(target_path: str, data: bytes) -> bool:
             if getattr(e, 'winerror', None) in (5, 32, 33) and attempt < max_attempts:
                 time.sleep(0.05 * attempt)
                 continue
+            _known_write_dirs.discard(write_dir)
             _cleanup_temp(temp_filename)
             log.warning(f"_atomic_write: failed to replace {target_path}: {e}")
             return False

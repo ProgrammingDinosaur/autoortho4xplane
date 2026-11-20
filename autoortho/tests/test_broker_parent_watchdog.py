@@ -220,3 +220,18 @@ def test_broker_process_exits_after_parent_is_killed(tmp_path, broker_count):
                     proc.kill()
             except psutil.Error:
                 pass
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only shortcut")
+def test_watchdog_does_not_ask_windows_for_the_parent_status(monkeypatch):
+    # status() lists every process on the system on Windows; there are no
+    # zombies there, so a running parent is alive without asking.
+    watchdog = hb._ParentWatchdog(
+        os.getpid(), lambda: None, interval=0.05, hard_exit_after=None
+    )
+
+    def no_status(self):
+        raise AssertionError("status() was called")
+
+    monkeypatch.setattr(psutil.Process, "status", no_status)
+    assert watchdog._pid_alive()

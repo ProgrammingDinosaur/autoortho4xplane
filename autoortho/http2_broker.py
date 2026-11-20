@@ -3334,6 +3334,10 @@ class _ParentWatchdog:
         try:
             if not proc.is_running():
                 return False
+            if sys.platform == "win32":
+                # Windows has no zombies, and status() there lists every process
+                # on the system (a few ms each second in every broker).
+                return True
             # A zombie parent on POSIX has exited but not been reaped yet.
             status = proc.status()
             return status != "zombie"

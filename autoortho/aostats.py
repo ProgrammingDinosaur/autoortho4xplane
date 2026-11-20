@@ -203,6 +203,67 @@ _macos_lib = None
 _macos_phys_footprint_ok = None  # None = untested, True/False = cached result
 
 
+_win_memory_info = None
+
+
+def _get_windows_private_working_set():
+    """Return the current process's private working set in bytes (Windows only).
+
+    This is the same figure as psutil's USS, read in microseconds from
+    ``GetProcessMemoryInfo`` (``PROCESS_MEMORY_COUNTERS_EX2``, Windows 10 1809
+    and later) instead of walking the whole working set, which takes several
+    milliseconds per call for a process of a few GB. Returns 0 when unavailable.
+    """
+    global _win_memory_info
+    if sys.platform != 'win32':
+        return 0
+    try:
+        if _win_memory_info is None:
+            from ctypes import wintypes
+
+            class _Counters(ctypes.Structure):
+                _fields_ = [('cb', wintypes.DWORD), ('PageFaultCount', wintypes.DWORD)] + [
+                    (name, ctypes.c_size_t) for name in (
+                        'PeakWorkingSetSize', 'WorkingSetSize',
+                        'QuotaPeakPagedPoolUsage', 'QuotaPagedPoolUsage',
+                        'QuotaPeakNonPagedPoolUsage', 'QuotaNonPagedPoolUsage',
+                        'PagefileUsage', 'PeakPagefileUsage', 'PrivateUsage',
+                        'PrivateWorkingSetSize', 'SharedCommitUsage',
+                    )
+                ]
+
+            kernel32 = ctypes.WinDLL('kernel32')
+            psapi = ctypes.WinDLL('psapi')
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            _win_memory_info = (_Counters, kernel32.GetCurrentProcess, psapi.GetProcessMemoryInfo)
+        counters_type, current_process, get_memory_info = _win_memory_info
+        counters = counters_type()
+        counters.cb = ctypes.sizeof(counters)
+        if not get_memory_info(current_process(), ctypes.byref(counters), counters.cb):
+            return 0
+        return int(counters.PrivateWorkingSetSize)
+    except Exception:
+        return 0
+
+
+# A thread count on Windows lists every process on the system (about 1.5 ms), so
+# the published count is refreshed at most this often.
+_THREAD_COUNT_SECONDS = 10.0
+_thread_count = (0.0, 0)
+
+
+def _cached_thread_count(proc):
+    global _thread_count
+    taken, count = _thread_count
+    now = time.monotonic()
+    if not taken or now - taken >= _THREAD_COUNT_SECONDS:
+        count = proc.num_threads()
+        _thread_count = (now, count)
+    return count
+
+
 def _get_macos_phys_footprint():
     """Return the current process physical footprint in bytes (macOS only).
 
@@ -288,8 +349,10 @@ def update_process_memory_stat():
 
     Priority order for the memory metric:
       1. ``phys_footprint`` via ctypes (macOS only -- matches Activity Monitor)
-      2. ``psutil.memory_full_info().uss`` (cross-platform best-effort)
-      3. ``psutil.memory_info().rss`` (universal fallback)
+      2. VmRSS + VmSwap from ``/proc/<pid>/status`` (Linux)
+      3. Private working set via ``GetProcessMemoryInfo`` (Windows -- equal to USS)
+      4. ``psutil.memory_full_info().uss`` (cross-platform best-effort)
+      5. ``psutil.memory_info().rss`` (universal fallback)
 
     Returns:
         int: memory value in bytes that was published, or 0 on error.
@@ -333,7 +396,12 @@ def update_process_memory_stat():
             except Exception:
                 pass
 
-        # 3) USS via psutil (unique set size, excludes shared libs)
+        # 3) Windows: the private working set, i.e. USS without the
+        #    working-set walk that memory_full_info() does.
+        if mem_bytes <= 0 and sys.platform == 'win32':
+            mem_bytes = _get_windows_private_working_set()
+
+        # 4) USS via psutil (unique set size, excludes shared libs)
         if mem_bytes <= 0:
             try:
                 full_info = proc.memory_full_info()
@@ -343,16 +411,17 @@ def update_process_memory_stat():
                     NotImplementedError, psutil.NoSuchProcess):
                 pass
 
-        # 4) RSS fallback
+        # 5) RSS fallback
         if mem_bytes <= 0:
             mem_bytes = proc.memory_info().rss
 
         set_stat(f"proc_mem_effective_bytes:{pid}", int(mem_bytes))
         set_stat(f"proc_alive_ts:{pid}", now_ts)
         set_stat(f"proc_mem_mb:{pid}", int(mem_bytes // (1024 * 1024)))
-        set_stat(f"proc_threads:{pid}", proc.num_threads())
+        threads = _cached_thread_count(proc)
+        set_stat(f"proc_threads:{pid}", threads)
         profile_gauge("process.memory_bytes", mem_bytes)
-        profile_gauge("process.threads", proc.num_threads())
+        profile_gauge("process.threads", threads)
 
         return int(mem_bytes)
 
