@@ -221,6 +221,8 @@ def validate_configuration(
             root.relative_to(selected_scenery_path)
         except ValueError:
             continue
+        if (root / "ao_stream.json").is_file():
+            continue  # a streaming package starts empty and fills as you fly
         try:
             has_dsf = any(root.glob("Earth nav data/*/*.dsf"))
         except OSError:

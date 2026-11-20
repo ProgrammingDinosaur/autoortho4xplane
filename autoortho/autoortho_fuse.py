@@ -812,6 +812,7 @@ class AutoOrtho(Operations):
     _virtual_files = {}
     _virtual_lock = threading.Lock()
     _stream_fallback = set()
+    _stream_placeholders = set()
 
     def __init__(self, root, cache_dir='.cache', *args, **kwargs):
         log.info(f"ROOT: {root}")
@@ -894,6 +895,7 @@ class AutoOrtho(Operations):
         self._virtual_lock = threading.Lock()
         self._virtual_fh = itertools.count(1 << 40)
         self._stream_fallback = set()
+        self._stream_placeholders = set()  # masks served as blank stand-ins
         marker = tile_stream.read_marker(self.root)
         if marker is not None:
             try:
@@ -1252,6 +1254,9 @@ class AutoOrtho(Operations):
         size = stream.remote_size(rel)
         if size is None:
             return None
+        if rel.endswith(".png") and (rel in self._stream_placeholders
+                                     or stream.remote.in_cooldown()):
+            return self._virtual_attrs(len(stream.placeholder_png(rel)))
         if rel.endswith(".dsf") and (rel in self._stream_fallback or stream.unavailable(rel)):
             if stream.kind == "overlay":
                 lat, lon = self._dsf_latlon(rel)
@@ -1707,7 +1712,16 @@ class AutoOrtho(Operations):
                 return fh
             if rel.endswith(".png") and self._stream.entry(rel) is not None:
                 if self._stream.ensure_local(rel) is None:
-                    raise FuseOSError(errno.ENOENT)
+                    # X-Plane stops with an error on a missing terrain mask;
+                    # a blank one keeps it flying (default water on that tile).
+                    log.warning(f"OPEN: water mask [{path}] could not be streamed "
+                                "in time; serving a blank stand-in until the scenery reloads")
+                    self._stream_placeholders.add(rel)
+                    fh = next(self._virtual_fh)
+                    with self._virtual_lock:
+                        self._virtual_files[fh] = self._stream.placeholder_png(rel)
+                    return fh
+                self._stream_placeholders.discard(rel)
         elif self._stream is not None and path.endswith(".png"):
             self._stream.touch(full_path)
 

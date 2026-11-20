@@ -17,13 +17,16 @@ The index is a gzipped JSON file written by ``scripts/build_tile_index.py``.
 
 from __future__ import annotations
 
+import functools
 import gzip
 import hashlib
 import io
+import itertools
 import json
 import logging
 import math
 import os
+import queue
 import re
 import struct
 import threading
@@ -316,11 +319,36 @@ class RemoteAssets:
     DEFAULT_SIGNED_TTL = 600.0
     MIN_COOLDOWN = 60.0
     MAX_COOLDOWN = 900.0
+    # (connect, read) seconds. The read timeout is the longest silence
+    # allowed between bytes, not the whole download, so it can be short: a
+    # dropped CDN connection then costs seconds, not the OS's ~20 s reset.
+    DEFAULT_TIMEOUT = (5.0, 10.0)
+    ATTEMPTS = 3
+    RETRY_ERRORS = (requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.Timeout)
+    # Pooled connections idle longer than this are closed before the next
+    # request. CDNs and home routers drop idle connections without telling
+    # either end; reusing one then stalls until the read timeout. A fresh
+    # TLS connection costs ~0.1 s.
+    IDLE_RESET = 30.0
 
     def __init__(self, session: Optional[requests.Session] = None,
-                 timeout: float = 30.0, clock: Callable[[], float] = time.time):
-        self.session = session or requests.Session()
+                 timeout=None, clock: Callable[[], float] = time.time):
+        if session is None:
+            session = requests.Session()
+            # Room for every download thread of a package to keep a connection.
+            adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=16)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+        self.session = session
         self.session.headers.setdefault("User-Agent", "autoortho-tile-stream")
+        self._active = 0
+        self._last_used = 0.0
+        if timeout is None:
+            timeout = self.DEFAULT_TIMEOUT
+        elif isinstance(timeout, (int, float)):
+            timeout = (min(5.0, float(timeout)), float(timeout))
         self.timeout = timeout
         self._clock = clock
         self._signed: Dict[str, Tuple[str, float]] = {}
@@ -374,14 +402,47 @@ class RemoteAssets:
             self._signed[url] = (signed, expires - self.SIGNED_URL_MARGIN)
         return signed
 
+    def _begin(self) -> None:
+        """Start a request, first dropping connections that sat idle."""
+        now = time.monotonic()
+        with self._lock:
+            stale = (self._active == 0 and self._last_used
+                     and now - self._last_used > self.IDLE_RESET)
+            self._active += 1
+            self._last_used = now
+        if stale:
+            close = getattr(self.session, "close", None)
+            if close is not None:
+                close()  # the session reconnects on the next request
+            self.stats["idle_resets"] = self.stats.get("idle_resets", 0) + 1
+
+    def _end(self) -> None:
+        with self._lock:
+            self._active -= 1
+            self._last_used = time.monotonic()
+
     def read_range(self, url: str, start: int, end: int) -> bytes:
         """Bytes ``start`` to ``end`` inclusive."""
         if self.in_cooldown():
             raise ThrottledError("cooling down")
-        for attempt in (0, 1):
-            signed = self._resolve(url)
-            r = self.session.get(signed, headers={"Range": f"bytes={start}-{end}"},
-                                 timeout=self.timeout)
+        self._begin()
+        try:
+            return self._read_range(url, start, end)
+        finally:
+            self._end()
+
+    def _read_range(self, url: str, start: int, end: int) -> bytes:
+        refreshed = False
+        last_error: Optional[Exception] = None
+        for _attempt in range(self.ATTEMPTS):
+            try:
+                signed = self._resolve(url)
+                r = self.session.get(signed, headers={"Range": f"bytes={start}-{end}"},
+                                     timeout=self.timeout)
+            except self.RETRY_ERRORS as exc:  # dropped or stalled connection
+                last_error = exc
+                log.debug("Tile stream: reading %s failed (%s), retrying", url, exc)
+                continue
             if r.status_code == 206:
                 self._ok()
                 self.stats["ranges"] += 1
@@ -390,7 +451,8 @@ class RemoteAssets:
             if r.status_code == 200 and start == 0:
                 self._ok()
                 return r.content[:end + 1]
-            if r.status_code in (401, 403) and attempt == 0 and signed != url:
+            if r.status_code in (401, 403) and not refreshed and signed != url:
+                refreshed = True
                 with self._lock:  # signed URL expired early; get a new one
                     self._signed.pop(url, None)
                 continue
@@ -398,7 +460,7 @@ class RemoteAssets:
                 self._throttle(r)
                 raise ThrottledError(f"{r.status_code} reading {url}")
             raise IOError(f"HTTP {r.status_code} reading {url} [{start}-{end}]")
-        raise IOError(f"Could not read {url}")
+        raise IOError(f"Could not read {url}: {last_error}")
 
 
 def _signed_expiry(url: str, now: float) -> Optional[float]:
@@ -504,21 +566,67 @@ def read_marker(root: str) -> Optional[dict]:
         return None
 
 
+class PriorityWorkers:
+    """A small thread pool that runs the lowest priority number first.
+
+    Jobs of equal priority run in submission order.
+    """
+
+    def __init__(self, workers: int, name: str):
+        self._queue: "queue.PriorityQueue" = queue.PriorityQueue()
+        self._order = itertools.count()
+        self._stopped = False
+        self._threads = [threading.Thread(target=self._run, name=f"{name}-{i}", daemon=True)
+                         for i in range(max(1, workers))]
+        for t in self._threads:
+            t.start()
+
+    def submit(self, priority: int, fn: Callable, *args) -> None:
+        if self._stopped:
+            raise RuntimeError("PriorityWorkers is shut down")
+        self._queue.put((priority, next(self._order), fn, args))
+
+    def _run(self) -> None:
+        while True:
+            _, _, fn, args = self._queue.get()
+            if fn is None:
+                return
+            try:
+                fn(*args)
+            except Exception as exc:  # jobs handle their own errors
+                log.debug("Tile stream: background job failed: %s", exc)
+
+    def shutdown(self) -> None:
+        self._stopped = True
+        for _ in self._threads:  # sorts after every queued job
+            self._queue.put((float("inf"), next(self._order), None, ()))
+
+
 class StreamPackage:
     """Runtime for one streaming scenery folder.
 
     Fetched files are written into the package folder itself, so once a tile
     has been fetched every other part of AutoOrtho sees an ordinary file.
 
-    Two queues keep a tile X-Plane is waiting for ahead of prefetches: opens
-    go to the foreground pool, neighbour tiles and water masks to the
-    background one. The folder is kept under ``disk_limit_gb`` by deleting the
-    least recently used files.
+    Three queues keep what X-Plane needs soonest first:
+
+    - opens (X-Plane is waiting) go to the foreground pool;
+    - water masks go to their own pool, never capped, with the masks of
+      tiles X-Plane has opened ahead of those of prefetched tiles. X-Plane
+      reads a tile's masks seconds after its DSF, and masks are tiny, so they
+      must not wait behind (or be dropped for) 15 MB neighbour DSFs;
+    - neighbour DSFs go to the background pool, at most ``MAX_BACKGROUND``
+      queued.
+
+    The folder is kept under ``disk_limit_gb`` by deleting the least
+    recently used files.
     """
 
     PROTECT_SECONDS = 2 * 3600   # never evict files used in the last two hours
     EVICT_INTERVAL = 60.0
-    MAX_BACKGROUND = 32
+    MAX_BACKGROUND = 32          # neighbour DSFs queued at once
+    MASK_URGENT = 0              # masks of a tile X-Plane has opened
+    MASK_AHEAD = 1               # masks of a prefetched tile
 
     def __init__(self, root: str, marker: dict, index: Optional[TileIndex] = None,
                  remote: Optional[RemoteAssets] = None,
@@ -528,7 +636,7 @@ class StreamPackage:
         self.marker = marker
         self.kind = marker.get("kind", "ortho")
         self.index = index or TileIndex.load(self._index_path(marker))
-        self.remote = remote or RemoteAssets(timeout=float(marker.get("http_timeout", 30)))
+        self.remote = remote or RemoteAssets(timeout=marker.get("http_timeout"))
         self.open_timeout = float(marker.get("open_timeout", 30))
         self.roughness = marker.get("roughness")
         self.prefetch_ring = int(marker.get("prefetch_ring", 1))
@@ -540,11 +648,17 @@ class StreamPackage:
                                         thread_name_prefix="tile-stream")
         self._bg_pool = ThreadPoolExecutor(max_workers=int(marker.get("prefetch_workers", 2)),
                                            thread_name_prefix="tile-prefetch")
-        self._inflight: Dict[str, threading.Event] = {}
+        self._mask_pool = PriorityWorkers(int(marker.get("mask_workers", 4)), "tile-mask")
+        self._mask_priority: Dict[str, int] = {}  # queued masks -> priority
+        # Foreground (X-Plane is waiting) and background downloads are tracked
+        # apart, so an open never waits on, or is woken by, a prefetch.
+        self._inflight_fg: Dict[str, threading.Event] = {}
+        self._inflight_bg: Dict[str, threading.Event] = {}
         self._inflight_lock = threading.Lock()
-        self._rel_locks: Dict[str, threading.Lock] = {}
+        self._replace_lock = threading.Lock()
         self._background_pending = 0
         self._failed: Dict[str, float] = {}
+        self._failed_open: Dict[str, float] = {}
         self._noted: set = set()
         self._ter_cache: Dict[str, bytes] = {}
         self._ter_lock = threading.Lock()
@@ -571,6 +685,11 @@ class StreamPackage:
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
         self._bg_pool.shutdown(wait=False, cancel_futures=True)
+        self._mask_pool.shutdown()
+
+    @staticmethod
+    def _is_mask(rel: str) -> bool:
+        return rel.startswith("textures/")
 
     # -- listing --------------------------------------------------------
     def dsf_names(self, folder: str) -> List[str]:
@@ -587,8 +706,7 @@ class StreamPackage:
         return e[_ENTRY_SIZE] if e else None
 
     def recently_failed(self, rel: str, window: float = 300.0) -> bool:
-        t = self._failed.get(rel)
-        return t is not None and time.time() - t < window
+        return self._recent(self._failed, rel, window)
 
     def unavailable(self, rel: str) -> bool:
         """True if a fetch now would not be tried (throttled or just failed)."""
@@ -598,26 +716,69 @@ class StreamPackage:
         return os.path.join(self.root, *rel.split("/"))
 
     # -- fetching -------------------------------------------------------
+    OPEN_ATTEMPTS = 3
+
     def ensure_local(self, rel: str, timeout: Optional[float] = None) -> Optional[str]:
-        """Path to ``rel`` on disk, fetching it first if needed."""
+        """Path to ``rel`` on disk, fetching it first if needed.
+
+        X-Plane is waiting, so this uses its own download (never one queued
+        behind a prefetch of the same file) and retries a failed download
+        while time remains. A prefetch that failed doesn't stop it; an open
+        that failed in the last minutes does, so an offline sim doesn't wait
+        on every file.
+        """
         local = self.local_path(rel)
         if os.path.exists(local):
             return local
-        if self.entry(rel) is None or self.unavailable(rel):
+        if (self.entry(rel) is None or self.remote.in_cooldown()
+                or self._recent(self._failed_open, rel)):
             return None
-        event = self._start_fetch(rel, background=False)
-        event.wait(self.open_timeout if timeout is None else timeout)
-        return local if os.path.exists(local) else None
+        deadline = time.monotonic() + (self.open_timeout if timeout is None else timeout)
+        for _ in range(self.OPEN_ATTEMPTS):
+            event = self._start_fetch(rel, background=False)
+            event.wait(max(0.0, deadline - time.monotonic()))
+            if os.path.exists(local):
+                return local
+            if time.monotonic() >= deadline or self.remote.in_cooldown():
+                break
+        self._failed_open[rel] = time.time()
+        return None
 
-    def prefetch(self, rel: str) -> bool:
-        """Fetch ``rel`` in the background if it isn't on disk yet."""
+    @staticmethod
+    def _recent(failures: Dict[str, float], rel: str, window: float = 300.0) -> bool:
+        t = failures.get(rel)
+        return t is not None and time.time() - t < window
+
+    def prefetch(self, rel: str, priority: int = MASK_AHEAD) -> bool:
+        """Fetch ``rel`` in the background if it isn't on disk yet.
+
+        ``priority`` orders water masks (lower first); neighbour DSFs are
+        skipped while ``MAX_BACKGROUND`` of them are already queued.
+        """
         if (os.path.exists(self.local_path(rel)) or self.entry(rel) is None
                 or self.unavailable(rel)):
             return False
-        if self._background_pending >= self.MAX_BACKGROUND:
+        if not self._is_mask(rel) and self._background_pending >= self.MAX_BACKGROUND:
             return False
-        self._start_fetch(rel, background=True)
+        self._start_fetch(rel, background=True, priority=priority)
         return True
+
+    def placeholder_png(self, rel: str) -> bytes:
+        """A stand-in for a water mask that couldn't be fetched in time.
+
+        X-Plane stops with an error when a terrain file's mask is missing.
+        An all-black mask (all sea) of the expected size keeps it flying;
+        that tile shows default water until the scenery reloads.
+        """
+        size = 256
+        m = re.search(r"_ZL(\d+)\.png$", rel)
+        if m:
+            params = dict(DEFAULT_TER_PARAMS, **(self.index.ter_params or {}))
+            try:
+                size = max(1, 4096 // 2 ** (int(m.group(1)) - int(params["mask_zl"])))
+            except (KeyError, ValueError):
+                pass
+        return blank_mask_png(min(size, 4096))
 
     def prefetch_neighbors(self, rel: str) -> int:
         """Queue the DSFs around ``rel``; X-Plane loads them next.
@@ -641,52 +802,82 @@ class StreamPackage:
                 queued += self.prefetch(dsf_rel(lat, lon))
         return queued
 
-    def _start_fetch(self, rel: str, background: bool) -> threading.Event:
+    def _start_fetch(self, rel: str, background: bool,
+                     priority: int = MASK_AHEAD) -> threading.Event:
+        """Queue a download of ``rel``; the event is set when it ends.
+
+        A foreground request for a file already being prefetched starts its
+        own download rather than waiting: the prefetch may be stuck on a
+        dropped connection. Whichever finishes first stores the file. A mask
+        already queued is queued again if it has become more urgent.
+        """
+        mask = background and self._is_mask(rel)
         with self._inflight_lock:
-            event = self._inflight.get(rel)
-            fresh = event is None
-            if fresh:
+            inflight = self._inflight_bg if background else self._inflight_fg
+            event = inflight.get(rel)
+            if event is None and background:
+                event = self._inflight_fg.get(rel)  # already being opened
+            if event is not None:
+                if not (mask and rel in self._mask_priority
+                        and priority < self._mask_priority[rel]):
+                    return event
+                self._mask_priority[rel] = priority  # bump: run it sooner
+            else:
                 event = threading.Event()
-                self._inflight[rel] = event
-                self._rel_locks.setdefault(rel, threading.Lock())
-                if background:
+                inflight[rel] = event
+                if mask:
+                    self._mask_priority[rel] = priority
+                elif background:
                     self._background_pending += 1
-        if not fresh and background:
-            return event
-        # A foreground request for a tile already queued as a prefetch also
-        # goes to the foreground pool; whichever runs second finds the file.
-        pool = self._bg_pool if background else self._pool
         try:
-            pool.submit(self._fetch, rel, event, background)
+            if mask:
+                self._mask_pool.submit(priority, self._fetch, rel, event, True)
+            else:
+                pool = self._bg_pool if background else self._pool
+                pool.submit(self._fetch, rel, event, background)
         except RuntimeError:  # pool shut down
-            with self._inflight_lock:
-                if background:
-                    self._background_pending -= 1
-            event.set()
+            self._fetch_done(rel, event, background)
         return event
 
-    def _fetch(self, rel: str, event: threading.Event, counted: bool = False) -> None:
+    def _fetch_done(self, rel: str, event: threading.Event, background: bool) -> None:
+        with self._inflight_lock:
+            inflight = self._inflight_bg if background else self._inflight_fg
+            owner = inflight.get(rel) is event
+            if owner:
+                inflight.pop(rel, None)
+            if background and self._is_mask(rel):
+                if owner:
+                    self._mask_priority.pop(rel, None)
+            elif background:
+                self._background_pending -= 1
+        event.set()
+
+    def _fetch(self, rel: str, event: threading.Event, background: bool = False) -> None:
         started = time.monotonic()
         local = self.local_path(rel)
-        lock = self._rel_locks.get(rel) or threading.Lock()
+        tmp = f"{local}.part{threading.get_ident()}"
         try:
-            with lock:
-                if os.path.exists(local):
-                    return
-                data = fetch_member(self.remote, self.index, self.index.lookup(rel))
-                tmp = f"{local}.part{threading.get_ident()}"
-                os.makedirs(os.path.dirname(local), exist_ok=True)
-                with open(tmp, "wb") as fh:
-                    fh.write(data)
-                os.replace(tmp, local)
+            if os.path.exists(local):
+                return
+            data = fetch_member(self.remote, self.index, self.index.lookup(rel))
+            os.makedirs(os.path.dirname(local), exist_ok=True)
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            with self._replace_lock:
+                stored = not os.path.exists(local)
+                if stored:
+                    os.replace(tmp, local)
+            if not stored:  # the other download of this file finished first
+                return
             self._failed.pop(rel, None)
-            self.stats["prefetched" if counted else "fetched"] += 1
+            self._failed_open.pop(rel, None)
+            self.stats["prefetched" if background else "fetched"] += 1
             log.info("Tile stream: %s %s (%.1f MB) in %.2fs",
-                     "prefetched" if counted else "fetched", rel,
+                     "prefetched" if background else "fetched", rel,
                      len(data) / 1e6, time.monotonic() - started)
             self._account(len(data))
             if rel.endswith(".dsf"):
-                self._after_dsf(data, local)
+                self._after_dsf(data, local, urgent=not background)
         except ThrottledError as exc:
             self._failed[rel] = time.time()
             self.stats["failed"] += 1
@@ -694,14 +885,15 @@ class StreamPackage:
         except Exception as exc:
             self._failed[rel] = time.time()
             self.stats["failed"] += 1
-            log.warning("Tile stream: fetching %s failed: %s", rel, exc)
+            log.warning("Tile stream: %s %s failed: %s",
+                        "prefetching" if background else "fetching", rel, exc)
         finally:
-            with self._inflight_lock:
-                if self._inflight.get(rel) is event:
-                    self._inflight.pop(rel, None)
-                if counted:
-                    self._background_pending -= 1
-            event.set()
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            self._fetch_done(rel, event, background)
 
     # -- disk budget ----------------------------------------------------
     def touch(self, local: str) -> None:
@@ -783,7 +975,11 @@ class StreamPackage:
         return removed
 
     def note_local_dsf(self, local_path: str) -> None:
-        """Read the terrain list of a DSF fetched in an earlier session."""
+        """X-Plane opened a DSF already on disk: make sure its masks follow.
+
+        Its masks were queued when it was prefetched, unless that was in an
+        earlier session; queuing them again as urgent is cheap either way.
+        """
         key = os.path.normcase(local_path)
         with self._inflight_lock:
             if key in self._noted:
@@ -793,24 +989,25 @@ class StreamPackage:
         def work():
             try:
                 with open(local_path, "rb") as fh:
-                    self._after_dsf(fh.read(), local_path)
+                    self._after_dsf(fh.read(), local_path, urgent=True)
             except OSError as exc:
                 log.debug("Tile stream: could not read %s: %s", local_path, exc)
         try:
-            self._bg_pool.submit(work)
+            self._mask_pool.submit(self.MASK_URGENT, work)
         except RuntimeError:
             pass
 
-    def _after_dsf(self, data: bytes, path: Optional[str] = None) -> None:
+    def _after_dsf(self, data: bytes, path: Optional[str] = None,
+                   urgent: bool = False) -> None:
         """Queue the tile's water masks and report its textures."""
         if data.startswith(SEVENZIP_MAGIC) and path:
             data = unpack_7z_dsf(path) or b""
         names = dsf_terrain_names(data)
         if names is None:
             return
-        self.note_terrain(names)
+        self.note_terrain(names, urgent=urgent)
 
-    def note_terrain(self, names: List[str]) -> None:
+    def note_terrain(self, names: List[str], urgent: bool = False) -> None:
         tiles = terrain_tiles(names)
         if tiles and self.on_terrain:
             try:
@@ -823,7 +1020,7 @@ class StreamPackage:
             ter = self.ter_bytes(name.split("/", 1)[1])
             if ter:
                 for tex in border_textures(ter):
-                    self.prefetch(tex)
+                    self.prefetch(tex, self.MASK_URGENT if urgent else self.MASK_AHEAD)
 
     # -- terrain --------------------------------------------------------
     def ter_bytes(self, name: str) -> Optional[bytes]:
@@ -899,6 +1096,23 @@ def _atom(atom_id: str, payload: bytes) -> bytes:
 
 def _string_table(strings: Iterable[str]) -> bytes:
     return b"".join(s.encode("utf-8") + b"\0" for s in strings)
+
+
+@functools.lru_cache(maxsize=8)
+def blank_mask_png(size: int) -> bytes:
+    """An all-black 8-bit grayscale PNG, ``size`` pixels square.
+
+    Ortho4XP water masks are 255 on land (photo shown) and 0 on sea (X-Plane
+    water shows through), so black means "all water".
+    """
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", size, size, 8, 0, 0, 0, 0)
+    pixels = zlib.compress((b"\x00" * (size + 1)) * size, 9)  # filter byte + row
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", pixels)
+            + chunk(b"IEND", b""))
 
 
 def empty_overlay_dsf(lat: int, lon: int) -> bytes:

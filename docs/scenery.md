@@ -102,7 +102,11 @@ haven't used for the longest time, down to 90% of the limit.
 - If a tile can't be downloaded (no connection, or GitHub is unavailable),
   X-Plane gets the tile from its default Global Scenery instead, so you see
   default terrain there rather than an error. A missing overlay tile is
-  served empty.
+  served empty, and a missing water mask is served blank, which shows
+  X-Plane's default water along that stretch of coast until the scenery
+  reloads.
+- Dropped connections are retried straight away, so a hiccup costs a
+  second or two rather than a fallback.
 - If GitHub throttles downloads, AutoOrtho pauses downloads (from one minute
   up to 15 minutes) and then tries again. Tiles needed during the pause
   come from Global Scenery.

@@ -43,13 +43,27 @@ deletes folders that contain a marker.
 2. When X-Plane opens a DSF that isn't stored yet, it is fetched (zip local
    header + member) and stored; 7z-compressed DSFs are unpacked. The DSF's
    terrain list registers its imagery tiles with `TerrainTileLookup` and
-   queues its water masks. The 8 neighbouring tiles are prefetched in a
-   background pool that never delays foreground requests.
+   queues its water masks. The 8 neighbouring tiles are prefetched, and
+   their masks are queued as soon as each one arrives.
+
+   Downloads run in three queues so what X-Plane needs soonest goes first:
+   opens in the foreground pool; water masks in their own pool
+   (`PriorityWorkers`, never capped), masks of tiles X-Plane opened ahead of
+   masks of prefetched tiles; neighbour DSFs in the background pool, at most
+   `MAX_BACKGROUND` (32) queued. X-Plane reads a tile's masks seconds after
+   its DSF, so masks must never wait behind, or be dropped for, 15 MB DSFs.
 3. `.ter` files are generated from their names with the Ortho4XP template
    (`synthesize_ter`). Index builds check every published `.ter` against
    it; the few that differ are stored in the index as exceptions.
-4. If a fetch fails, an ortho DSF is served from X-Plane's Global Scenery and
-   an overlay DSF as a valid empty overlay, so X-Plane never sees an error.
+4. If a fetch fails, an ortho DSF is served from X-Plane's Global Scenery,
+   an overlay DSF as a valid empty overlay, and a water mask as a blank
+   (all-sea) PNG of the mask's size. X-Plane must never see a missing file:
+   a `.ter` whose mask is missing stops it with a fatal error.
+5. An open (X-Plane waiting) always gets its own download and retries it
+   until `open_timeout` (30 s) runs out. It never waits behind a prefetch of
+   the same file, which may be stuck on a dropped connection; whichever
+   download finishes first stores the file. An open that failed is
+   remembered for 5 minutes so an offline sim falls back immediately.
 
 ### GitHub access
 
@@ -58,6 +72,14 @@ deletes folders that contain a marker.
 normal flying makes about one request to github.com per zip per hour; the
 rest go to the asset CDN. On 403, 429 or 5xx, fetches pause (honouring
 `Retry-After`, 60 s doubling up to 15 min) and opens fall back meanwhile.
+
+The CDN and home routers drop idle connections without telling either end;
+reusing one stalls until Windows reports the reset, about 20 s later. So
+pooled connections idle for more than 30 s are closed before the next
+request (`RemoteAssets.IDLE_RESET`; a new TLS connection costs about
+0.1 s), requests use a 5 s connect and 10 s read timeout (the read timeout
+is the longest silence between bytes, not the whole download), and a
+dropped or stalled connection is retried up to 3 times.
 
 ### Disk limit
 

@@ -10,8 +10,10 @@ import sys
 import threading
 import time
 import zipfile
+import zlib
 
 import pytest
+import requests
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 AUTOORTHO_DIR = os.path.join(ROOT, "autoortho")
@@ -257,13 +259,47 @@ def test_expired_signed_url_is_resolved_again(release):
 # Package runtime
 # ---------------------------------------------------------------------------
 
-def make_package(tmp_path, release, hidden=()):
+class DroppingHost(FakeHost):
+    """Drops connections the way GitHub's CDN sometimes does.
+
+    ``stall_offsets``: the first read at each offset hangs until ``release``
+    is set, then fails with a connection reset. ``drop_first``: that many
+    reads fail with a reset straight away.
+    """
+
+    def __init__(self, files):
+        super().__init__(files)
+        self.stall_offsets = set()
+        self.drop_first = 0
+        self.release = threading.Event()
+        self.stalled = threading.Event()
+        self.range_calls = 0
+
+    def get(self, url, headers=None, allow_redirects=True, timeout=None):
+        if headers and "Range" in headers and url.startswith("https://storage"):
+            start = int(headers["Range"].split("=")[1].split("-")[0])
+            with self.lock:
+                self.range_calls += 1
+                stall = start in self.stall_offsets
+                self.stall_offsets.discard(start)
+                drop = self.drop_first > 0
+                self.drop_first -= drop
+            if stall:
+                self.stalled.set()
+                self.release.wait(10)
+            if stall or drop:
+                raise requests.exceptions.ConnectionError(
+                    "An existing connection was forcibly closed by the remote host")
+        return super().get(url, headers, allow_redirects, timeout)
+
+
+def make_package(tmp_path, release, hidden=(), host=None):
     root = tmp_path / "z_ao_stream"
     root.mkdir()
     with gzip.open(root / "tile_index.json.gz", "wt") as fh:
         json.dump(release["index"], fh)
     (root / ts.MARKER_NAME).write_text(json.dumps({"index": "tile_index.json.gz"}))
-    host = FakeHost({release["url"]: release["blob"]})
+    host = host or FakeHost({release["url"]: release["blob"]})
     seen = []
     pkg = ts.StreamPackage(str(root), ts.read_marker(str(root)),
                            remote=ts.RemoteAssets(session=host),
@@ -311,6 +347,182 @@ def test_failed_fetch_returns_none_and_backs_off(tmp_path, release):
         assert pkg.unavailable(DSF_REL)
     finally:
         pkg.shutdown()
+
+
+MASK_REL = "textures/100000_148176_ZL18.png"
+
+
+def wait_until(predicate, timeout=5.0):
+    deadline = time.time() + timeout
+    while not predicate() and time.time() < deadline:
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_open_does_not_wait_for_a_stalled_prefetch(tmp_path, release):
+    # The X-Plane crash of 2026-11-19: a mask prefetch hung on a dropped CDN
+    # connection, the open waited behind it, was woken by its failure and
+    # reported the mask missing.
+    host = DroppingHost({release["url"]: release["blob"]})
+    pkg, host, _, root = make_package(tmp_path, release, host=host)
+    host.stall_offsets = {pkg.entry(MASK_REL)[1]}
+    try:
+        assert pkg.prefetch(MASK_REL)
+        assert host.stalled.wait(5)
+        started = time.monotonic()
+        local = pkg.ensure_local(MASK_REL, timeout=5)
+        assert local and open(local, "rb").read() == release["mask"]
+        assert time.monotonic() - started < 2
+        host.release.set()  # now the prefetch's connection drops
+        assert wait_until(lambda: not pkg._inflight_bg)
+        assert open(local, "rb").read() == release["mask"]
+        assert not list(root.rglob("*.part*"))
+    finally:
+        host.release.set()
+        pkg.shutdown()
+
+
+def test_dropped_connection_is_retried(release):
+    host = DroppingHost({release["url"]: release["blob"]})
+    host.drop_first = 1
+    remote = ts.RemoteAssets(session=host)
+    index = ts.TileIndex(release["index"])
+    assert ts.fetch_member(remote, index, index.lookup(DSF_REL)) == release["dsf"]
+    assert host.range_calls == 2
+
+
+def test_open_retries_and_then_remembers_a_failure(tmp_path, release):
+    host = DroppingHost({release["url"]: release["blob"]})
+    pkg, host, _, _ = make_package(tmp_path, release, host=host)
+    try:
+        # A file that can't be fetched at all: the open gives up, and the
+        # next open of it falls back at once instead of waiting again.
+        host.drop_first = 1000
+        assert pkg.ensure_local(MASK_REL, timeout=5) is None
+        calls = host.range_calls
+        assert pkg.ensure_local(MASK_REL, timeout=5) is None
+        assert host.range_calls == calls
+        # Every read of the first download fails; the open tries again.
+        host.drop_first = ts.RemoteAssets.ATTEMPTS
+        assert pkg.ensure_local(DSF_REL, timeout=5)
+    finally:
+        pkg.shutdown()
+
+
+def test_masks_are_not_dropped_when_the_dsf_queue_is_full(tmp_path, release):
+    # In the 2026-11-19 flight a burst of neighbour DSFs filled the queue and
+    # the masks of prefetched tiles were silently skipped.
+    pkg, _, _, root = make_package(tmp_path, release)
+    try:
+        pkg._background_pending = pkg.MAX_BACKGROUND
+        assert not pkg.prefetch("Earth nav data/+30+000/+39-009.dsf")
+        assert pkg.prefetch(MASK_REL)
+        assert wait_until(lambda: (root / MASK_REL).exists())
+        assert (root / MASK_REL).read_bytes() == release["mask"]
+        assert pkg._background_pending == pkg.MAX_BACKGROUND
+        assert not pkg._mask_priority
+    finally:
+        pkg.shutdown()
+
+
+def test_priority_workers_run_urgent_jobs_first():
+    workers = ts.PriorityWorkers(1, "test")
+    gate, ran = threading.Event(), []
+    try:
+        workers.submit(0, gate.wait, 5)  # occupies the only worker
+        workers.submit(ts.StreamPackage.MASK_AHEAD, ran.append, "ahead-1")
+        workers.submit(ts.StreamPackage.MASK_AHEAD, ran.append, "ahead-2")
+        workers.submit(ts.StreamPackage.MASK_URGENT, ran.append, "urgent")
+        gate.set()
+        assert wait_until(lambda: len(ran) == 3)
+        assert ran == ["urgent", "ahead-1", "ahead-2"]
+    finally:
+        workers.shutdown()
+    with pytest.raises(RuntimeError):
+        workers.submit(0, ran.append, "late")
+
+
+class ClosingHost(FakeHost):
+    def __init__(self, files):
+        super().__init__(files)
+        self.closes = 0
+
+    def close(self):
+        self.closes += 1
+
+
+def test_idle_connections_are_dropped_before_the_next_request(release):
+    host = ClosingHost({release["url"]: release["blob"]})
+    remote = ts.RemoteAssets(session=host)
+    index = ts.TileIndex(release["index"])
+    entry = index.lookup(DSF_REL)
+    ts.fetch_member(remote, index, entry)
+    ts.fetch_member(remote, index, entry)
+    assert host.closes == 0  # busy: keep the connections
+    remote._last_used -= ts.RemoteAssets.IDLE_RESET + 1  # idle for a while
+    assert ts.fetch_member(remote, index, entry) == release["dsf"]
+    assert host.closes == 1 and remote.stats["idle_resets"] == 1
+
+
+@pytest.fixture
+def fuse_module(monkeypatch):
+    """autoortho_fuse with the FUSE library stubbed out (callbacks only)."""
+    import importlib.util
+    from types import SimpleNamespace
+    stub = SimpleNamespace(
+        FUSE=object, Operations=object, FuseOSError=OSError,
+        fuse_get_context=lambda: (0, 0, 0), _libfuse=SimpleNamespace(),
+    )
+    monkeypatch.setitem(sys.modules, "autoortho.mfusepy", stub)
+    path = os.path.join(AUTOORTHO_DIR, "autoortho_fuse.py")
+    spec = importlib.util.spec_from_file_location("_test_fuse_stream", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_unfetchable_mask_is_served_as_a_blank_stand_in(tmp_path, release, fuse_module):
+    import itertools
+    import re
+    host = DroppingHost({release["url"]: release["blob"]})
+    host.drop_first = 1000  # the CDN keeps dropping the connection
+    pkg, host, _, root = make_package(tmp_path, release, host=host)
+    ao = fuse_module.AutoOrtho.__new__(fuse_module.AutoOrtho)
+    never = re.compile(r"(?!)")
+    ao.root, ao.dsf_re, ao.dds_re, ao.ter_tile_re = str(root), never, never, never
+    ao.default_uid = ao.default_gid = 0
+    ao._stream = pkg
+    ao._virtual_fh = itertools.count(1 << 40)
+    ao._virtual_lock = threading.Lock()
+    ao._virtual_files = {}
+    ao._stream_placeholders = set()
+    path = "/" + MASK_REL
+    try:
+        fh = ao.open(path, os.O_RDONLY)  # used to raise ENOENT and crash X-Plane
+        data = ao.read(path, 1 << 20, 0, fh)
+        assert data == pkg.placeholder_png(MASK_REL)
+        assert ao._getattr_stream(path)["st_size"] == len(data)
+        # Once the real mask arrives, it is served from disk again.
+        (root / MASK_REL).write_bytes(release["mask"])
+        assert ao._getattr_stream(path) is None
+    finally:
+        pkg.shutdown()
+
+
+def test_placeholder_mask_is_a_blank_png_of_the_mask_size(tmp_path, release):
+    import struct
+    pkg, _, _, _ = make_package(tmp_path, release)
+    try:
+        data = pkg.placeholder_png(MASK_REL)
+    finally:
+        pkg.shutdown()
+    assert data.startswith(b"\x89PNG\r\n\x1a\n") and data.endswith(b"IEND\xaeB`\x82")
+    width, height, depth, color = struct.unpack(">IIBB", data[16:26])
+    assert (width, height, depth, color) == (256, 256, 8, 0)  # ZL18, mask_zl 14
+    idat_len = struct.unpack(">I", data[33:37])[0]
+    assert data[37:41] == b"IDAT"
+    pixels = zlib.decompress(data[41:41 + idat_len])
+    assert pixels == b"\x00" * (257 * 256)
 
 
 def test_installed_dsfs_lists_other_packages(tmp_path):

@@ -5177,7 +5177,14 @@ class TerrainTileLookup:
             else:
                 self._load_or_build_highzoom_index()
         else:
-            log.warning(f"TerrainTileLookup: Folder not found: {terrain_folder}")
+            streaming = os.path.isfile(
+                os.path.join(os.path.dirname(terrain_folder), "ao_stream.json")
+            )
+            # A streaming package generates its .ter files; its tiles arrive
+            # through add_virtual_tiles instead.
+            (log.debug if streaming else log.warning)(
+                f"TerrainTileLookup: Folder not found: {terrain_folder}"
+            )
             self._index_ready.set()
     
     def get_tiles_for_position(self, lat: float, lon: float,
