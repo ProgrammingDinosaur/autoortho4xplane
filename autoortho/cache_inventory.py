@@ -22,7 +22,9 @@ import logging
 import math
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -34,6 +36,10 @@ else:  # running from inside the autoortho folder
 log = logging.getLogger(__name__)
 
 Cell = Tuple[int, int]
+
+# Tiles Keep Offline downloads at once. Each tile is two requests (its DSF,
+# then its masks in one read), so a few in parallel fill the connection.
+KEEP_WORKERS = 4
 
 CHUNK_RE = re.compile(r"^(\d+)_(\d+)_(\d+)_([A-Za-z0-9]+)\.jpg$")
 DDS_DIR = "dds_cache"
@@ -535,24 +541,41 @@ def keep_offline(ao_scenery_dir: str, cells: Iterable[Cell],
             if not set(available) <= pins:
                 tile_stream.write_pins(root, pins | set(available))
             done += len(cells) - len(available)
-            for cell in available:
-                if cancelled():
-                    result.cancelled = True
-                    break
+            stop = threading.Event()  # throttled: start no more tiles
+
+            def fetch(cell):
+                if stop.is_set() or cancelled():
+                    return None
                 try:
-                    got, files = pkg.download_tile(*cell, cancelled=cancelled)
-                except tile_stream.ThrottledError as exc:
-                    result.errors.append(f"{cell_name(cell)}: {exc}")
-                    result.cancelled = True
-                    break
-                except Exception as exc:
-                    result.errors.append(f"{cell_name(cell)}: {exc}")
-                    got = files = 0
-                result.bytes += got
-                result.files += files
-                done += 1
-                if progress:
-                    progress(done, total, result.bytes)
+                    return pkg.download_tile(*cell, cancelled=cancelled)
+                except tile_stream.ThrottledError:
+                    stop.set()  # before this worker picks up the next tile
+                    raise
+
+            with ThreadPoolExecutor(max_workers=KEEP_WORKERS,
+                                    thread_name_prefix="keep-offline") as pool:
+                futures = {pool.submit(fetch, cell): cell for cell in available}
+                for future in as_completed(futures):
+                    cell = futures[future]
+                    try:
+                        got = future.result()
+                    except tile_stream.ThrottledError as exc:
+                        result.errors.append(f"{cell_name(cell)}: {exc}")
+                        result.cancelled = True
+                        stop.set()
+                        continue
+                    except Exception as exc:
+                        result.errors.append(f"{cell_name(cell)}: {exc}")
+                        got = (0, 0)
+                    if got is None:  # skipped: cancelled or throttled
+                        if not stop.is_set():
+                            result.cancelled = True
+                        continue
+                    result.bytes += got[0]
+                    result.files += got[1]
+                    done += 1
+                    if progress:
+                        progress(done, total, result.bytes)
         finally:
             pkg.shutdown()
         if result.cancelled:

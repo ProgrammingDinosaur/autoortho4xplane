@@ -841,3 +841,88 @@ def test_packed_index_finds_every_file_and_nothing_else():
         ts.TileIndex(dict(data, format=2, files=dict(packed, names=packed["names"][:-1])))
     with pytest.raises(ValueError):
         ts.TileIndex(dict(data, format=3))
+
+
+# ---------------------------------------------------------------------------
+# Coalesced reads (Keep Offline)
+# ---------------------------------------------------------------------------
+
+def test_coalesce_runs_groups_neighbours_of_one_asset():
+    def e(asset, offset, csize=100):
+        return [asset, offset, csize, csize, 0, 0]
+    entries = [e(0, 5000), e(0, 0), e(1, 0), e(0, 10_000_000), e(0, 1000)]
+    runs = ts.coalesce_runs(entries, max_gap=64 * 1024)
+    assert runs == [[1, 4, 0], [3], [2]]
+    # A span limit splits a run that would read too much at once.
+    assert ts.coalesce_runs(entries[:2] + [entries[4]], max_gap=64 * 1024,
+                            max_span=1700) == [[1, 2], [0]]
+
+
+MASK_COLS = (148176, 148192, 148208, 148224, 148240)
+
+
+def mask_rel(col):
+    return f"textures/100000_{col}_ZL18.png"
+
+
+@pytest.fixture
+def many_masks_release():
+    dsf = make_dsf([f"terrain/100000_{c}_BI18_sea_overlay.ter" for c in MASK_COLS]
+                   + ["terrain/100000_125184_BI18.ter"]) + os.urandom(5000)
+    masks = {mask_rel(c): b"\x89PNG" + os.urandom(300 + i) for i, c in enumerate(MASK_COLS)}
+    members = [("z_test_00/" + ts.dsf_rel(39, -9), dsf, zipfile.ZIP_DEFLATED)]
+    for rel, data in masks.items():
+        members.append(("z_test_00/" + rel, data, zipfile.ZIP_STORED))
+    blob = build_release_zip(members)
+    url = "https://github.com/o/r/releases/download/t/z_test_00.zip"
+    return {"url": url, "blob": blob, "dsf": dsf, "masks": masks,
+            "index": index_for({url: blob})}
+
+
+def test_download_tile_reads_all_masks_with_one_request(tmp_path, many_masks_release):
+    rel = many_masks_release
+    pkg, host, _seen, root = make_package(tmp_path, rel)
+    try:
+        got, files = pkg.download_tile(39, -9)
+    finally:
+        pkg.shutdown()
+    assert files == 1 + len(MASK_COLS)
+    assert got == len(rel["dsf"]) + sum(len(m) for m in rel["masks"].values())
+    assert host.ranges == 2  # the DSF, then every mask in one read
+    for m, data in rel["masks"].items():
+        assert (root / m).read_bytes() == data
+
+
+def test_fetch_many_skips_stored_and_unknown_files(tmp_path, many_masks_release):
+    rel = many_masks_release
+    pkg, host, _seen, root = make_package(tmp_path, rel)
+    first = mask_rel(MASK_COLS[0])
+    (root / first).write_bytes(rel["masks"][first])
+    try:
+        got, files = pkg.fetch_many([first, "textures/1_1_ZL16.png"]
+                                    + [mask_rel(c) for c in MASK_COLS[1:]])
+    finally:
+        pkg.shutdown()
+    assert files == len(MASK_COLS) - 1
+    assert got == sum(len(rel["masks"][mask_rel(c)]) for c in MASK_COLS[1:])
+    assert host.ranges == 1
+
+
+def test_fetch_run_falls_back_when_an_extra_field_is_long():
+    big_extra = struct.pack("<HH", 0xCAFE, 2000) + b"\0" * 2000
+    members = []
+    buf = io.BytesIO()
+    datas = [b"\x89PNG" + os.urandom(200) for _ in range(3)]
+    with zipfile.ZipFile(buf, "w") as zf:
+        for i, data in enumerate(datas):
+            info = zipfile.ZipInfo(f"z_test_00/textures/1_{i}_ZL16.png")
+            if i == 1:
+                info.extra = big_extra
+            zf.writestr(info, data)
+    blob = buf.getvalue()
+    url = "https://github.com/o/r/releases/download/t/z_test_00.zip"
+    index = ts.TileIndex(index_for({url: blob}))
+    host = FakeHost({url: blob})
+    remote = ts.RemoteAssets(session=host)
+    entries = [index.lookup(f"textures/1_{i}_ZL16.png") for i in range(3)]
+    assert ts.fetch_run(remote, index, entries) == datas

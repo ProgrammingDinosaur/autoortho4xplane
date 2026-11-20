@@ -772,6 +772,63 @@ def fetch_member(remote: RemoteAssets, index: TileIndex, entry: list) -> bytes:
     return data
 
 
+# Members closer than this are read in one request, the bytes between them
+# discarded. A tile's water masks are usually one unbroken run in the zip
+# (XP12 set: 48 masks per tile, one run for 90% of tiles), so a tile costs
+# two requests instead of fifty.
+COALESCE_GAP = 256 * 1024
+COALESCE_SPAN = 64 * 1024 * 1024   # largest single read
+
+
+def _member_span(entry: list) -> int:
+    """Bytes from a member's local header to the end of its data, assuming
+    the name and extra fields fit the usual slack."""
+    return _LOCAL_HEADER.size + _LOCAL_HEADER_SLACK + entry[_ENTRY_CSIZE]
+
+
+def coalesce_runs(entries: List[list], max_gap: int = COALESCE_GAP,
+                  max_span: int = COALESCE_SPAN) -> List[List[int]]:
+    """Group entries (by position in ``entries``) into runs that one Range
+    request each can read: same asset, in offset order, gaps under
+    ``max_gap``, at most ``max_span`` bytes unless one member alone is
+    larger."""
+    order = sorted(range(len(entries)),
+                   key=lambda i: (entries[i][_ENTRY_ASSET], entries[i][_ENTRY_OFFSET]))
+    runs: List[List[int]] = []
+    start = end = 0
+    for i in order:
+        e = entries[i]
+        e_start, e_end = e[_ENTRY_OFFSET], e[_ENTRY_OFFSET] + _member_span(e)
+        if (runs and e[_ENTRY_ASSET] == entries[runs[-1][0]][_ENTRY_ASSET]
+                and e_start - end <= max_gap and max(end, e_end) - start <= max_span):
+            runs[-1].append(i)
+            end = max(end, e_end)
+        else:
+            runs.append([i])
+            start, end = e_start, e_end
+    return runs
+
+
+def fetch_run(remote: RemoteAssets, index: TileIndex, entries: List[list]) -> List[bytes]:
+    """Download several members of one asset with a single Range request
+    (see ``coalesce_runs``). Returns their data in the order given."""
+    if len(entries) == 1:
+        return [fetch_member(remote, index, entries[0])]
+    asset = index.assets[entries[0][_ENTRY_ASSET]]
+    start = min(e[_ENTRY_OFFSET] for e in entries)
+    end = max(e[_ENTRY_OFFSET] + _member_span(e) for e in entries)
+    if asset.get("size"):
+        end = min(end, asset["size"])
+    raw = asset_read(remote, asset, start, end - 1)
+    out = []
+    for e in entries:
+        data, _ = extract_member(raw[e[_ENTRY_OFFSET] - start:], e)
+        if data is None:  # long extra field ran past the read
+            data = fetch_member(remote, index, e)
+        out.append(data)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Package runtime
 # ---------------------------------------------------------------------------
@@ -1142,6 +1199,40 @@ class StreamPackage:
         self._account(len(data))
         return len(data)
 
+    def fetch_many(self, rels: Iterable[str],
+                   cancelled: Callable[[], bool] = lambda: False) -> Tuple[int, int]:
+        """Download files not on disk yet, neighbours in a zip read with one
+        request (``coalesce_runs``). Returns (bytes, files) stored. Raises
+        on failure; files stored before it stay."""
+        wanted, entries = [], []
+        for rel in dict.fromkeys(rels):
+            entry = self.entry(rel)
+            if entry is None or os.path.exists(self.local_path(rel)):
+                continue
+            wanted.append(rel)
+            entries.append(entry)
+        total = files = 0
+        for run in coalesce_runs(entries):
+            if cancelled():
+                break
+            datas = fetch_run(self.remote, self.index, [entries[i] for i in run])
+            for i, data in zip(run, datas):
+                local = self.local_path(wanted[i])
+                tmp = f"{local}.part{threading.get_ident()}"
+                try:
+                    stored = self._store(local, tmp, data)
+                finally:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+                if stored:
+                    self._account(len(data))
+                    total += len(data)
+                    files += 1
+        return total, files
+
     def tile_masks(self, lat: int, lon: int) -> List[str]:
         """Water masks the stored DSF of a tile needs (package-relative)."""
         local = self.local_path(dsf_rel(lat, lon))
@@ -1173,16 +1264,10 @@ class StreamPackage:
         if self.entry(rel) is None:
             return 0, 0
         got = self.fetch_now(rel)
-        total, files = got, int(got > 0)
-        for mask in self.tile_masks(lat, lon):
-            if cancelled():
-                break
-            if self.entry(mask) is None:
-                continue
-            got = self.fetch_now(mask)
-            total += got
-            files += got > 0
-        return total, files
+        if cancelled():
+            return got, int(got > 0)
+        mask_bytes, mask_files = self.fetch_many(self.tile_masks(lat, lon), cancelled)
+        return got + mask_bytes, int(got > 0) + mask_files
 
     # -- disk budget ----------------------------------------------------
     def touch(self, local: str) -> None:

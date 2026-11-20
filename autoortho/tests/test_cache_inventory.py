@@ -5,6 +5,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 import zipfile
 
@@ -287,3 +288,63 @@ def test_keep_offline_stops_when_cancelled(tmp_path, release_for_keep):
             r, m, remote=ts.RemoteAssets(session=host), hidden=hidden))
     assert result.cancelled and result.files == 0 and host.ranges == 0
     assert ts.read_pins(root) == {(39, 23)}
+
+
+class FakeKeepPackage:
+    """Every tile is in the index; download_tile is scripted per tile."""
+
+    def __init__(self, behaviour):
+        self.behaviour = behaviour
+        self.started = []
+        self.lock = threading.Lock()
+
+    def entry(self, rel):
+        return [0, 0, 1, 1, 0, 0]
+
+    def download_tile(self, lat, lon, cancelled=lambda: False):
+        with self.lock:
+            self.started.append((lat, lon))
+        return self.behaviour(lat, lon)
+
+    def shutdown(self):
+        pass
+
+
+def test_keep_offline_downloads_tiles_in_parallel(tmp_path):
+    ao_dir = str(tmp_path / "scenery")
+    make_stream_package(ao_dir, "z_ao_stream_xp11")
+    cells = [(40, c) for c in range(8)]
+    barrier = threading.Barrier(ci.KEEP_WORKERS, timeout=5)
+
+    def behaviour(lat, lon):
+        barrier.wait()  # only passes if KEEP_WORKERS tiles run at once
+        return 10, 2
+
+    pkg = FakeKeepPackage(behaviour)
+    steps = []
+    result = ci.keep_offline(ao_dir, cells, package_factory=lambda *a, **k: pkg,
+                             progress=lambda *a: steps.append(a))
+    assert not result.errors and not result.cancelled
+    assert (result.bytes, result.files) == (80, 16)
+    assert sorted(pkg.started) == cells
+    assert [s[0] for s in steps] == list(range(1, 9)) and steps[-1][2] == 80
+
+
+def test_keep_offline_stops_starting_tiles_when_throttled(tmp_path, monkeypatch):
+    ao_dir = str(tmp_path / "scenery")
+    root = make_stream_package(ao_dir, "z_ao_stream_xp11")
+    monkeypatch.setattr(ci, "KEEP_WORKERS", 1)
+    cells = [(40, c) for c in range(5)]
+
+    def behaviour(lat, lon):
+        if lon == 1:
+            raise ts.ThrottledError("429")
+        return 10, 1
+
+    pkg = FakeKeepPackage(behaviour)
+    result = ci.keep_offline(ao_dir, cells, package_factory=lambda *a, **k: pkg)
+    assert result.cancelled
+    assert pkg.started == [(40, 0), (40, 1)]
+    assert len(result.errors) == 1 and "429" in result.errors[0]
+    assert (result.bytes, result.files) == (10, 1)
+    assert ts.read_pins(root) == set(cells)  # pins stay; a later run resumes

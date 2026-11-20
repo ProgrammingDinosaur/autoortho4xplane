@@ -132,11 +132,18 @@ deletes and pins what is stored per 1x1 degree tile. The file work is in
   next open (`note_local_dsf`).
 - `keep_offline(...)` creates a `StreamPackage` per package (with the same
   `hidden` set the mount uses, so installed tiles aren't fetched), pins the
-  tiles its index has, and calls `StreamPackage.download_tile` for each:
-  `fetch_now` (synchronous fetch) of the DSF, then of the masks its terrain
-  list names (`tile_masks` / `mask_rels`). A throttled host stops the run;
-  what was fetched stays pinned. Progress goes to the Activity panel as a
-  `TaskType.CACHE` task, cancellable between files.
+  tiles its index has, and calls `StreamPackage.download_tile` for each,
+  `KEEP_WORKERS` (4) tiles at a time: `fetch_now` (synchronous fetch) of
+  the DSF, then `fetch_many` of the masks its terrain list names
+  (`tile_masks` / `mask_rels`). `fetch_many` groups members that sit close
+  together in one zip (`coalesce_runs`: gaps under 256 KB, reads up to
+  64 MB) and reads each group with one Range request (`fetch_run`). A tile's
+  masks are mostly one run (XP12 set: 48 masks per tile, one run for 90% of
+  tiles), so a coastal tile takes 6 to 16 requests instead of 170 to 430.
+  Measured on the XP12 set: 0.96 s per tile with 4 workers against 2.7 s
+  one at a time. A throttled host stops new tiles from starting; what was
+  fetched stays pinned. Progress goes to the Activity panel as a
+  `TaskType.CACHE` task, cancellable between tiles and between reads.
 - `mesh_download_estimate` sums the index sizes of DSFs not on disk yet, and
   `estimate_imagery` counts web-mercator tiles per tile and zoom
   (`chunks_in_cell`) times the average chunk size already in the cache
