@@ -1020,32 +1020,88 @@ def enable_streaming(ao_scenery_dir: str, source: str, overlays: bool = True,
     spec = SOURCES.get(source)
     if not spec or not spec.get("available"):
         raise ValueError(f"Scenery source {source!r} is not available yet")
-    wanted = [(ORTHO_PACKAGE.format(source=source), "ortho", spec["ortho_index"],
-               float(disk_limit_gb))]
+    created = [_create_package(ao_scenery_dir, source, "ortho", float(disk_limit_gb),
+                               roughness=roughness, session=session)]
     if overlays and spec.get("overlay_index"):
-        wanted.append((OVERLAY_PACKAGE.format(source=source), "overlay",
-                       spec["overlay_index"], max(1.0, float(disk_limit_gb) / 4)))
-    created = []
-    for name, kind, url, limit in wanted:
-        root = os.path.join(ao_scenery_dir, name)
-        is_new = not os.path.isdir(root)
-        os.makedirs(root, exist_ok=True)
-        try:
-            info = download_index(url, os.path.join(root, INDEX_NAME), session=session)
-        except Exception:
-            if is_new:  # don't leave an empty folder that would be mounted
-                import shutil
-                shutil.rmtree(root, ignore_errors=True)
-            raise
-        marker = {"source": source, "kind": kind, "index": INDEX_NAME,
-                  "index_url": url, "index_last_modified": info["last_modified"],
-                  "disk_limit_gb": limit}
-        if roughness is not None and kind == "ortho":
-            marker["roughness"] = roughness
-        write_marker(root, marker)
-        created.append(name)
-    if not overlays:
+        created.append(_create_package(ao_scenery_dir, source, "overlay",
+                                       _overlay_limit(disk_limit_gb), session=session))
+    else:
         _remove_package(ao_scenery_dir, OVERLAY_PACKAGE.format(source=source))
+    return created
+
+
+def _overlay_limit(disk_limit_gb: float) -> float:
+    return max(1.0, float(disk_limit_gb) / 4)
+
+
+def _create_package(ao_scenery_dir: str, source: str, kind: str, limit: float,
+                    roughness: Optional[float] = None,
+                    session: Optional[requests.Session] = None) -> str:
+    """Create (or refresh) one streaming package folder and download its index."""
+    spec = SOURCES[source]
+    if kind == "overlay":
+        name, url = OVERLAY_PACKAGE.format(source=source), spec.get("overlay_index")
+    else:
+        name, url = ORTHO_PACKAGE.format(source=source), spec["ortho_index"]
+    if not url:
+        raise ValueError(f"{spec['label']} has no {kind} tiles")
+    root = os.path.join(ao_scenery_dir, name)
+    is_new = not os.path.isdir(root)
+    os.makedirs(root, exist_ok=True)
+    try:
+        info = download_index(url, os.path.join(root, INDEX_NAME), session=session)
+    except Exception:
+        if is_new:  # don't leave an empty folder that would be mounted
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
+        raise
+    marker = {"source": source, "kind": kind, "index": INDEX_NAME,
+              "index_url": url, "index_last_modified": info["last_modified"],
+              "disk_limit_gb": float(limit)}
+    if roughness is not None and kind == "ortho":
+        marker["roughness"] = roughness
+    write_marker(root, marker)
+    return name
+
+
+def _streamed_ortho(ao_scenery_dir: str) -> Tuple[str, dict]:
+    for name, marker in stream_packages(ao_scenery_dir).items():
+        if marker.get("kind", "ortho") == "ortho":
+            return name, marker
+    raise ValueError("Scenery streaming is off")
+
+
+def set_stream_overlays(ao_scenery_dir: str, enabled: bool,
+                        session: Optional[requests.Session] = None) -> Optional[str]:
+    """Add or remove the overlay package of the scenery set being streamed.
+
+    Removing it deletes the overlay tiles stored so far. Returns the folder
+    name added or removed.
+    """
+    _, ortho = _streamed_ortho(ao_scenery_dir)
+    source = ortho.get("source", "")
+    name = OVERLAY_PACKAGE.format(source=source)
+    if not enabled:
+        return name if _remove_package(ao_scenery_dir, name) else None
+    limit = _overlay_limit(ortho.get("disk_limit_gb") or 20)
+    return _create_package(ao_scenery_dir, source, "overlay", limit, session=session)
+
+
+def change_stream_source(ao_scenery_dir: str, source: str,
+                         session: Optional[requests.Session] = None) -> List[str]:
+    """Stream another scenery set, keeping the overlay choice and disk limit.
+
+    The new set is set up first; the old set's packages and tiles are removed
+    only once that worked, so a failed download leaves streaming as it was.
+    """
+    _, ortho = _streamed_ortho(ao_scenery_dir)
+    if ortho.get("source") == source:
+        return []
+    overlays = any(m.get("kind") == "overlay" for m in stream_packages(ao_scenery_dir).values())
+    created = enable_streaming(ao_scenery_dir, source, overlays=overlays,
+                               disk_limit_gb=ortho.get("disk_limit_gb") or 20,
+                               roughness=ortho.get("roughness"), session=session)
+    disable_streaming(ao_scenery_dir, keep_source=source)
     return created
 
 
@@ -1054,7 +1110,7 @@ def update_stream_settings(ao_scenery_dir: str, disk_limit_gb: float) -> None:
     for name, marker in stream_packages(ao_scenery_dir).items():
         limit = float(disk_limit_gb)
         if marker.get("kind") == "overlay":
-            limit = max(1.0, limit / 4)
+            limit = _overlay_limit(limit)
         write_marker(os.path.join(ao_scenery_dir, name), dict(marker, disk_limit_gb=limit))
 
 
@@ -1067,34 +1123,66 @@ def _remove_package(ao_scenery_dir: str, name: str) -> bool:
     return True
 
 
-def disable_streaming(ao_scenery_dir: str, source: Optional[str] = None) -> List[str]:
-    """Delete streaming packages (all, or one source's) and their tiles."""
+def disable_streaming(ao_scenery_dir: str, source: Optional[str] = None,
+                      keep_source: Optional[str] = None) -> List[str]:
+    """Delete streaming packages and their tiles: all, one source's, or all
+    but ``keep_source``'s."""
     removed = []
     for name, marker in stream_packages(ao_scenery_dir).items():
-        if source is None or marker.get("source") == source:
-            if _remove_package(ao_scenery_dir, name):
-                removed.append(name)
+        if source is not None and marker.get("source") != source:
+            continue
+        if keep_source is not None and marker.get("source") == keep_source:
+            continue
+        if _remove_package(ao_scenery_dir, name):
+            removed.append(name)
     return removed
+
+
+def stream_summary(ao_scenery_dir: str) -> dict:
+    """What the Scenery Library shows: whether streaming is on, its settings,
+    and the tiles stored per package kind."""
+    packages = stream_packages(ao_scenery_dir)
+    summary = {"enabled": False, "source": None, "overlays": False,
+               "disk_limit_gb": None, "ortho": (0, 0), "overlay": (0, 0)}
+    for name, marker in packages.items():
+        kind = marker.get("kind", "ortho")
+        if kind not in ("ortho", "overlay"):
+            continue
+        summary[kind] = _package_usage(os.path.join(ao_scenery_dir, name))
+        if kind == "overlay":
+            summary["overlays"] = True
+        else:
+            summary.update(enabled=True, source=marker.get("source"),
+                           disk_limit_gb=marker.get("disk_limit_gb"))
+    return summary
 
 
 def stream_usage(ao_scenery_dir: str) -> Tuple[int, int]:
     """(bytes, DSF count) stored by all streaming packages."""
     total = count = 0
     for name in stream_packages(ao_scenery_dir):
-        dsf_root = os.path.join(ao_scenery_dir, name, DSF_DIR)
-        dirs = []
+        size, dsfs = _package_usage(os.path.join(ao_scenery_dir, name))
+        total += size
+        count += dsfs
+    return total, count
+
+
+def _package_usage(root: str) -> Tuple[int, int]:
+    """(bytes, DSF count) of the tiles stored in one streaming package."""
+    total = count = 0
+    dirs = []
+    try:
+        dirs = [e.path for e in os.scandir(os.path.join(root, DSF_DIR)) if e.is_dir()]
+    except OSError:
+        pass
+    for d in dirs + [os.path.join(root, "textures")]:
         try:
-            dirs = [e.path for e in os.scandir(dsf_root) if e.is_dir()]
+            for f in os.scandir(d):
+                if f.is_file() and f.name.endswith((".dsf", ".png")):
+                    total += f.stat().st_size
+                    count += f.name.endswith(".dsf")
         except OSError:
-            pass
-        for d in dirs + [os.path.join(ao_scenery_dir, name, "textures")]:
-            try:
-                for f in os.scandir(d):
-                    if f.is_file() and f.name.endswith((".dsf", ".png")):
-                        total += f.stat().st_size
-                        count += f.name.endswith(".dsf")
-            except OSError:
-                continue
+            continue
     return total, count
 
 

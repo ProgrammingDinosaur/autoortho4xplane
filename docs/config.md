@@ -13,7 +13,9 @@ On a new installation, AutoOrtho opens a guided setup wizard that:
 1. **Welcome and checks:** the required FUSE backend for this platform.
 2. **X-Plane:** detected, or browse for it.
 3. **Scenery:** the scenery folder, and regions to install (or use scenery
-   you already have).
+   you already have). To fly without installing regions, turn on
+   [scenery streaming](scenery.md#streaming-scenery-instead-of-installing-regions)
+   in the Scenery Library after setup.
 4. **Image cache:** one folder, its free space, and a disk cache limit
    (with a suggestion for that drive). The long-term cache and download
    folders are under **More folders…**.
@@ -35,8 +37,9 @@ changes are discarded and the last applied configuration remains active.
 The application is organized around five primary destinations:
 
 - **Home** — what AutoOrtho is doing now (see [Home](#home) below).
-- **Scenery Library** — scenery search, filters, installation, updates, and
-  package details.
+- **Scenery Library** — scenery search, filters, installation, updates,
+  package details, and [scenery streaming](scenery.md#streaming-scenery-instead-of-installing-regions)
+  (fly without installing regions).
 - **Flight Plan & Map** — SimBrief controls, loaded-flight details, and the
   local Custom Map Editor.
 - **Settings** — Essentials first, every setting with **Show all settings**,

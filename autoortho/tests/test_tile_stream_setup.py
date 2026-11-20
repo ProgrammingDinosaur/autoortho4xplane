@@ -228,6 +228,56 @@ def test_enable_and_disable_streaming(tmp_path, grid_release):
         ts.enable_streaming(str(scenery), "xp12", session=host)
 
 
+def test_overlays_can_be_added_and_removed_while_streaming(tmp_path, grid_release):
+    spec = ts.SOURCES["xp11"]
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
+                      spec["overlay_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    with pytest.raises(ValueError):  # streaming is off
+        ts.set_stream_overlays(scenery, True, session=host)
+    ts.enable_streaming(scenery, "xp11", overlays=False, disk_limit_gb=12, session=host)
+    assert ts.set_stream_overlays(scenery, True, session=host) == "yAO_stream_xp11_overlays"
+    overlay = ts.stream_packages(scenery)["yAO_stream_xp11_overlays"]
+    assert overlay["kind"] == "overlay" and overlay["disk_limit_gb"] == 3
+    stored = tmp_path / "yAO_stream_xp11_overlays" / "Earth nav data" / "+40-010"
+    stored.mkdir(parents=True)
+    (stored / "+40-009.dsf").write_bytes(b"x" * 50)
+    summary = ts.stream_summary(scenery)
+    assert summary["enabled"] and summary["overlays"] and summary["source"] == "xp11"
+    assert summary["overlay"] == (50, 1) and summary["ortho"] == (0, 0)
+    assert summary["disk_limit_gb"] == 12
+    assert ts.set_stream_overlays(scenery, False) == "yAO_stream_xp11_overlays"
+    assert list(ts.stream_packages(scenery)) == ["z_ao_stream_xp11"]
+    assert ts.set_stream_overlays(scenery, False) is None
+
+
+def test_change_source_keeps_settings_and_old_tiles_until_ready(tmp_path, grid_release,
+                                                               monkeypatch):
+    spec = ts.SOURCES["xp11"]
+    other = {"label": "Other set", "available": True,
+             "ortho_index": "https://example.invalid/other.json.gz", "overlay_index": None}
+    monkeypatch.setitem(ts.SOURCES, "other", other)
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
+                      spec["overlay_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    ts.enable_streaming(scenery, "xp11", overlays=True, disk_limit_gb=30, session=host)
+    # The new set's index can't be downloaded: streaming stays as it was.
+    with pytest.raises(IOError):
+        ts.change_stream_source(scenery, "other", session=host)
+    assert set(ts.stream_packages(scenery)) == {"z_ao_stream_xp11", "yAO_stream_xp11_overlays"}
+    host.payloads[other["ortho_index"]] = gz_index(grid_release)
+    assert ts.change_stream_source(scenery, "other", session=host) == ["z_ao_stream_other"]
+    packages = ts.stream_packages(scenery)
+    assert list(packages) == ["z_ao_stream_other"]  # it has no overlays
+    assert packages["z_ao_stream_other"]["disk_limit_gb"] == 30
+    assert ts.change_stream_source(scenery, "other", session=host) == []
+
+
+def test_stream_summary_when_off(tmp_path):
+    summary = ts.stream_summary(str(tmp_path / "missing"))
+    assert summary["enabled"] is False and summary["ortho"] == (0, 0)
+
+
 def test_enable_streaming_rejects_bad_index(tmp_path):
     spec = ts.SOURCES["xp11"]
     host = IndexHost({spec["ortho_index"]: gzip.compress(b'{"format": 99}')})
@@ -313,22 +363,49 @@ def test_stream_panel_states(qt_app):
     xp12 = panel.source_combo.findData("xp12")
     assert not panel.source_combo.model().item(xp12).isEnabled()
     assert "Soon" in panel.source_combo.itemText(xp12)
-    requests = []
-    panel.enable_requested.connect(lambda *a: requests.append(a))
-    panel.toggle_button.click()
-    assert requests == [("xp11", True, 20)]
-    panel.set_state({"z_ao_stream_xp11": {"source": "xp11", "kind": "ortho",
-                                          "disk_limit_gb": 30}}, 3_000_000_000, 120)
-    assert panel.enabled and panel.toggle_button.text() == "Turn off streaming"
-    assert not panel.overlays_check.isChecked()
+    assert panel.source_combo.currentData() == "xp11"
+    events = []
+    for name in ("enable_requested", "disable_requested", "source_change_requested",
+                 "overlays_change_requested", "limit_changed", "refresh_requested"):
+        getattr(panel, name).connect(lambda *a, n=name: events.append((n,) + a))
+
+    # Off: settings can be picked before turning streaming on, without requests.
+    panel.overlays_check.click()
+    assert panel.overlays_check.isEnabled() and events == []
+    assert panel.usage_bar.isHidden() and panel.status_label.isHidden()
+    panel.enable_check.click()
+    assert events == [("enable_requested", "xp11", False, 20)]
+
+    # On: each change is requested right away.
+    events.clear()
+    panel.set_state({"enabled": True, "source": "xp11", "overlays": False,
+                     "disk_limit_gb": 30, "ortho": (3_000_000_000, 120),
+                     "overlay": (0, 0)})
+    assert panel.enabled and panel.enable_check.isChecked()
+    assert panel.overlays_check.isEnabled() and not panel.overlays_check.isChecked()
     assert panel.limit_spin.value() == 30
-    assert "120 tiles" in panel.status_label.text()
+    assert "120 tiles" in panel.usage_label.text() and not panel.usage_bar.isHidden()
+    assert "next time AutoOrtho starts" in panel.status_label.text()
+    panel.overlays_check.click()
+    assert events == [("overlays_change_requested", True)]
+    panel.restore()  # e.g. the user cancelled
+    assert not panel.overlays_check.isChecked()
+    panel.limit_spin.setValue(45)
+    panel.limit_spin.editingFinished.emit()
+    assert events[-1] == ("limit_changed", 45)
+
+    # Busy and running lock everything; unlocking asks for fresh usage.
+    panel.set_busy(True, "Downloading the overlay index…")
+    assert not panel.enable_check.isEnabled() and not panel.overlays_check.isEnabled()
+    assert panel.status_label.text() == "Downloading the overlay index…"
+    panel.restore()
     panel.set_runtime_locked(True)
-    assert not panel.toggle_button.isEnabled()
+    assert not panel.enable_check.isEnabled() and not panel.source_combo.isEnabled()
+    assert "locked while AutoOrtho" in panel.status_label.text()
     panel.set_runtime_locked(False)
-    off = []
-    panel.disable_requested.connect(lambda: off.append(True))
-    panel.toggle_button.click()
-    assert off == [True]
-    panel.set_state({})
-    assert not panel.enabled and panel.status_label.text() == "Streaming is off."
+    assert events[-1] == ("refresh_requested",)
+    panel.enable_check.click()
+    assert events[-1] == ("disable_requested",)
+    panel.set_state({"enabled": False})
+    assert not panel.enabled and not panel.enable_check.isChecked()
+    assert panel.usage_bar.isHidden()

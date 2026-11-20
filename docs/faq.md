@@ -260,6 +260,37 @@ If in doubt, re-install the scenery packs.
 ### Something went wrong with scenery setup and I'd like to start again.  How do I reinstall?
 AutoOrtho checks for metadata for installed scenery packs in `Custom Scenery/z_autoorth/**_info.json`  Where '**' is a shortname for each scenery pack installed.  You can delete the corresponding .json file, and re-run the configuration utility and should be able to reinstall the scenery pack
 
+### Do I have to download whole scenery regions?
+No. Turn on **Stream scenery you haven't installed** in the Scenery Library
+and AutoOrtho downloads each tile the first time X-Plane needs it. Installed
+regions are still used first, so you can install the areas you fly most and
+stream the rest. See
+[Streaming scenery instead of installing regions](scenery.md#streaming-scenery-instead-of-installing-regions).
+
+### I use simHeaven. Should I include overlays when streaming?
+No. Untick **Include overlays** in the Stream scenery panel. simHeaven
+already provides roads, forests and buildings, and streaming AutoOrtho's
+overlays as well would duplicate them.
+
+### Scenery streaming is on, but I see default X-Plane terrain in some places
+Those tiles couldn't be downloaded when X-Plane asked for them, so X-Plane
+got them from its Global Scenery instead. Check that:
+
+- AutoOrtho was running before X-Plane started, and streaming was turned on
+  before AutoOrtho started. Streaming changes take effect on the next start.
+- Your connection to GitHub works.
+
+The log says which tiles fell back and why: look for
+`not streamed yet; using Global Scenery` and
+`Tile stream: host returned ..., pausing fetches`. The second means GitHub
+throttled downloads; AutoOrtho tries again after a pause. Reload the scenery
+or restart the flight once the tiles have downloaded.
+
+### Why can't I change the Stream scenery settings?
+They're locked while AutoOrtho or X-Plane is running, because the streaming
+folders are mounted when AutoOrtho starts. Stop AutoOrtho, change the
+settings, and start it again.
+
 ### I installed scenery, clicked "Start Streaming," but X-Plane did not automatically start
 You have to start X-Plane separately from this tool.  It's also best to start X-Plane _after_ starting autoortho so that all new files and directories are picked up.
 
