@@ -56,6 +56,7 @@ jobs:
   build:
     needs: prepare-rc
     uses: ./.github/workflows/build_release.yml
+    secrets: inherit
     with:
       version: ${{ needs.prepare-rc.outputs.tag }}
       relname: ${{ needs.prepare-rc.outputs.tag }}
