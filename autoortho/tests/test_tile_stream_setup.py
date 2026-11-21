@@ -618,3 +618,67 @@ def test_switching_sets_first_downloads_textures_kept_tiles_lack(tmp_path, grid_
         ts.change_stream_source(scenery, "other", session=host)
     assert fetched == ["textures/100000_148176_ZL18.png"]
     assert path.exists()   # nothing moved; the old set is still in use
+
+
+def test_switching_with_replace_keeps_tiles_for_the_new_set_to_download(
+        tmp_path, grid_release, monkeypatch):
+    """Replace: tiles the new set has stay kept there (to be downloaded from
+    it) and the old files go; tiles it lacks are still moved."""
+    other = {"label": "Other set", "available": True,
+             "ortho_index": "https://example.invalid/other.json.gz", "overlay_index": None}
+    monkeypatch.setitem(ts.SOURCES, "other", other)
+    spec = ts.SOURCES["xp11"]
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
+                      other["ortho_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    ts.enable_streaming(scenery, "xp11", overlays=False, session=host)
+    old = tmp_path / "z_ao_stream_xp11"
+    for cell in ((40, -9), (10, 10)):      # (10, 10): not in the new set
+        path = old.joinpath(*ts.dsf_rel(*cell).split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(make_dsf([]))
+    ts.write_pins(str(old), {(40, -9), (10, 10)})
+
+    ts.change_stream_source(scenery, "other", session=host, replace_kept=True)
+
+    new = tmp_path / "z_ao_stream_other"
+    assert ts.read_pins(str(new)) == {(40, -9), (10, 10)}
+    assert not new.joinpath(*ts.dsf_rel(40, -9).split("/")).exists()   # downloads anew
+    assert new.joinpath(*ts.dsf_rel(10, 10).split("/")).exists()       # kept as it was
+    assert not old.exists()
+
+
+def test_switch_dialog_offers_keep_or_replace_with_a_size(qt_app, monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QMessageBox
+    from aoconfig import AOConfig
+    from config_ui_qt import ConfigUI
+    monkeypatch.setattr(ConfigUI, "refresh_scenery_list",
+                        lambda self: self.scenery_layout.addStretch())
+    monkeypatch.setattr(ConfigUI, "start_update_check", lambda self, manual=False: None)
+    cfg = AOConfig(str(tmp_path / ".autoortho"))
+    for key, sub in (("scenery_path", "scenery"), ("cache_dir", "cache"),
+                     ("download_dir", "downloads"), ("xplane_path", "X-Plane")):
+        setattr(cfg.paths, key, str(tmp_path / sub))
+    cfg.general.setup_complete = True
+    cfg.save()
+    cfg.get_config()
+    ui = ConfigUI(cfg)
+    seen = {}
+
+    def exec_box(box):
+        seen["text"] = box.informativeText()
+        seen["buttons"] = [b.text() for b in box.buttons()]
+        box._clicked = [b for b in box.buttons() if b.text().startswith("Replace")][0]
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", exec_box)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda box: box._clicked)
+    try:
+        choice = ui._ask_switch("XP12 set", "XP11 set", {(1, 1), (1, 2)}, 0, "xp12")
+        assert choice == "replace"
+        assert "2 tiles downloaded on the map" in seen["text"]
+        assert "about 22.9 MB" in seen["text"]          # 2 x 12 MB
+        assert set(seen["buttons"]) == {"Keep My Tiles", "Replace with XP12 set", "Cancel"}
+    finally:
+        ui.close()
+        ui.deleteLater()

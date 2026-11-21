@@ -7761,9 +7761,11 @@ class ConfigUI(QMainWindow):
         self._region_check_running = True
         page.set_adopt_checks(None)
 
+        custom = self.cfg.xplane_custom_scenery_path
+
         def checks():
             try:
-                return region_adopt.check_regions(scenery_dir)
+                return region_adopt.check_regions(scenery_dir, custom)
             except ValueError:  # no scenery set chosen
                 return [region_adopt.RegionCheck(
                     name=name, region_id=name[len(region_adopt.REGION_PREFIX):],
@@ -7891,29 +7893,89 @@ class ConfigUI(QMainWindow):
             "Could not change streamed overlays",
         )
 
+    def _kept_tiles(self):
+        """Tiles downloaded on the map (pinned) in the ortho package."""
+        scenery_dir = self.cfg.ao_scenery_path
+        for name, marker in tile_stream.stream_packages(scenery_dir).items():
+            if marker.get("kind", "ortho") == "ortho":
+                return tile_stream.read_pins(os.path.join(scenery_dir, name))
+        return set()
+
+    def _ask_switch(self, label, old_label, kept, stored, source):
+        """Ask how to switch sets: "keep" (kept tiles move along as they
+        are), "replace" (they download again from the new set), or None."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(f"Switch to {label}")
+        box.setText(f"Switch to {label}?")
+        tile_mb = tile_stream.SOURCES.get(source, {}).get("tile_mb")
+        size = (f" (about {format_bytes(len(kept) * tile_mb * 1e6)})"
+                if tile_mb else "")
+        if kept:
+            box.setInformativeText(
+                f"You have {len(kept):,} tiles downloaded on the map from "
+                f"{old_label} (regions you installed earlier included).\n\n"
+                f"Keep them: they move to {label} and look as they do now.\n"
+                f"Replace them: {label}'s version of each downloads again"
+                f"{size}, in the background, and the old files are deleted. "
+                f"Tiles {label} doesn't have are kept as they are.\n\n"
+                f"Tiles downloaded while flying are deleted either way.")
+            keep = box.addButton("Keep My Tiles", QMessageBox.ButtonRole.AcceptRole)
+            replace = box.addButton(f"Replace with {label}",
+                                    QMessageBox.ButtonRole.DestructiveRole)
+        else:
+            box.setInformativeText(
+                f"The tiles {old_label} downloaded while flying "
+                f"({format_bytes(stored)}) are deleted once {label} is ready.")
+            keep = box.addButton("Switch", QMessageBox.ButtonRole.AcceptRole)
+            replace = None
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(keep)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is cancel or clicked is None:
+            return None
+        return "replace" if clicked is replace else "keep"
+
     def _on_stream_source(self, source):
         panel = self.scenery_library_page.stream_panel
         label = self._stream_source_label(source)
         old_label = self._stream_source_label(panel.state.get("source"))
         stored = self._streamed_bytes()
-        if stored and not self._confirm_stream_delete(
-            f"Switch to {label}?",
-            f"Tiles you downloaded on the map move to {label} and stay as they "
-            f"are. Tiles {old_label} downloaded while flying are deleted once "
-            f"{label} is ready.",
-            "Switch",
-        ):
-            panel.restore()
-            return
+        kept = self._kept_tiles()
+        choice = "keep"
+        if kept or stored:
+            choice = self._ask_switch(label, old_label, kept, stored, source)
+            if choice is None:
+                panel.restore()
+                return
+        replace = choice == "replace"
         scenery_dir = self.cfg.ao_scenery_path
         self._apply_stream_change(
-            lambda: tile_stream.change_stream_source(scenery_dir, source),
+            lambda: tile_stream.change_stream_source(
+                scenery_dir, source, replace_kept=replace),
             "Downloading the tile index…",
             f"Now streaming {label}.",
             "Could not switch the streamed scenery set",
             task_title="Switch streamed scenery set",
             package=label,
+            on_success=(lambda cells=sorted(kept): self._download_kept(cells))
+            if replace and kept else None,
         )
+
+    def _download_kept(self, cells):
+        """Download kept tiles from the scenery set now in use (after
+        switching with Replace); tiles already stored are skipped."""
+        editor = getattr(self, "custom_map_editor", None)
+        panel = editor.cache_panel if editor is not None else None
+        if panel is None or not cells:
+            return
+        ao_dir, _cache, custom = panel.paths()
+        panel._start_keep(ao_dir, custom, list(cells), 0, None)
+        self.update_status_bar(
+            f"Downloading {len(cells):,} tiles from the new scenery set (see "
+            "Activity). Until a tile is done, X-Plane shows its default scenery "
+            "there if downloading while flying is off.")
 
     def _on_stream_roughness(self, roughness):
         try:

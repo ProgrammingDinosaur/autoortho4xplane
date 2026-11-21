@@ -149,27 +149,48 @@ on **Home** says what moved, and **Activity** shows the progress. Starting
 AutoOrtho waits until it's done.
 
 - If you didn't use AutoOrtho scenery yet, the **XP11 legacy set** is set
-  up for you (your regions are from it, and it has their overlays), with
-  **Download tiles while flying** off, so everything works as before:
-  your regions' tiles, and X-Plane's default scenery elsewhere. That needs
+  up for you (your regions are from it), with **Download tiles while
+  flying** off, so everything works as before: your regions' tiles, and
+  X-Plane's default scenery elsewhere. If your regions had the Seasons
+  patch, **Add seasons to downloaded tiles** is turned on too. That needs
   an internet connection once, for the 6 MB tile index; without one, your
   regions keep working and AutoOrtho tries again on the next start.
 - If you already used a scenery set, your regions move into it, whichever
   set it is. In the XP12 set, the XP11 tiles keep their own terrain files
   and water textures, so they look exactly as before; download a tile again
   on the map to get its XP12 version.
-- Overlays in `Custom Scenery/yAutoOrtho_Overlays` move into the overlay
-  folder when you use the XP11 set with overlays.
+- Overlays in `Custom Scenery/yAutoOrtho_Overlays` stay where they are and
+  keep working with any scenery set.
 - Seasons and terrain reflectivity the regions had are kept.
+- A region on another drive (a junction or symlink) is copied over when the
+  scenery drive has room for it, and the link is removed; what's left on
+  the other drive is yours to delete.
 
-A region that can't move (for example one the scenery set barely covers)
-stays installed and keeps working. The Scenery Library lists it under
-**Installed regions** with the reason, **Scenery Options**, **Remove** and
-**Move into AutoOrtho Scenery**.
+A region stays installed, and keeps working, when it's turned off in
+X-Plane's scenery list (moving it would turn it back on), when it's on
+another drive and the scenery drive hasn't room for it, or when the scenery
+set barely covers it. The Scenery Library lists it under **Installed
+regions** with the reason, **Scenery Options**, **Remove** and **Move into
+AutoOrtho Scenery**.
 
-Switching the scenery set later keeps your downloaded tiles, including
-moved regions: they move to the new set's folder with their own files. Only
-tiles downloaded while flying are deleted.
+### Switching the scenery set
+
+When you pick another **Scenery set**, AutoOrtho asks what to do with the
+tiles you downloaded on the map (moved regions included):
+
+- **Keep My Tiles:** they move to the new set's folder with their own
+  files and look as they do now. Use this to keep your XP11 regions while
+  streaming the XP12 set everywhere else.
+- **Replace:** the new set's version of each downloads again in the
+  background (the dialog shows about how much), and the old files are
+  deleted. Use this to go from XP11 regions to XP12 offline. Until a tile
+  has downloaded, X-Plane shows its default scenery there if downloading
+  while flying is off; if you close AutoOrtho before it's done, select the
+  tiles on the map and click **Download** to finish. Tiles the new set
+  doesn't have are kept as they are.
+
+Tiles downloaded while flying are deleted either way. To drop old tiles
+entirely instead, delete them on the map.
 
 ### Overlays and simHeaven
 

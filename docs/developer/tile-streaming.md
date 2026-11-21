@@ -230,8 +230,16 @@ for five regions) behind the Installed regions section.
 starts (`MainWindow._migrate_installed_regions`), or once AutoOrtho and
 X-Plane have stopped if they were running; `on_run` waits while it runs.
 Without an ortho package it first sets up the XP11 set with `fetch_missing`
-off, which behaves like installed regions did; if that index download fails
-nothing changes and the next start tries again. Into a package of another
+off (and no overlay package), which behaves like installed regions did, and
+turns `seasons` on if a moved region had the Seasons patch; if that index
+download fails nothing changes and the next start tries again.
+`yAutoOrtho_Overlays` is never moved: it works with any set, and moving it
+into an XP11 overlay package would lose it on a switch to XP12. A region
+stays installed when `scenery_packs.ini` has it as `SCENERY_PACK_DISABLED`
+(`disabled_packs`), or when it is on another drive (`st_dev` differs) and
+the package drive lacks its size plus 2 GB; with room, `_move` copies to a
+`.part` name and swaps it in, and a junction or symlink region is unlinked
+rather than emptied with `rmtree`. Into a package of another
 set, a region brings its own `terrain/*.ter` (a real file in the package
 wins in `ter_bytes`) and every texture in its `textures/` (XP11 water edges
 use `water_transition.png`, which the XP12 index doesn't have). Masks and
@@ -242,7 +250,11 @@ leaves a DSF without its files.
 (`carry_kept_tiles`): it reads each kept DSF's terrain list, downloads any
 texture the old folder never stored (failing before anything moves),
 writes the terrain files with the old set's settings as real files, links
-the textures, then moves the DSFs and the seasons record.
+the textures, then moves the DSFs and the seasons record. With
+`replace_kept` (the switch dialog's Replace), tiles the new index has are
+only pinned in the new package and `MainWindow._download_kept` downloads
+them from it through the Scenery & Cache panel; tiles it lacks are carried
+as above.
 
 Moved files the new index doesn't have can't be downloaded again, so
 `evict` skips them and the map's Delete leaves masks the index lacks.

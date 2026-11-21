@@ -34,9 +34,15 @@ DSFs move, and the region folder goes last. Until its last DSF has moved
 the region still has all its files, and every moved DSF finds its files in
 the package. Running it again finishes the job.
 
-Overlays installed in ``Custom Scenery/yAutoOrtho_Overlays`` move into the
-streamed overlay package DSF by DSF (that folder is shared by all regions);
-DSFs the overlay index doesn't have stay.
+A region stays installed, with the reason, when it is turned off in
+``scenery_packs.ini`` (moving would turn its tiles back on), or when it is on
+another drive (a junction or symlink, as the docs once suggested) and the
+scenery drive hasn't room for a copy. With room it is copied over and the
+link removed; the link's target is never deleted.
+
+Overlays installed in ``Custom Scenery/yAutoOrtho_Overlays`` are left where
+they are: that folder works with any scenery set, and an XP12 set has no
+overlay package that could hold them.
 
 No Qt here; callers must only use it while AutoOrtho is stopped.
 """
@@ -95,6 +101,7 @@ class AdoptResult:
     cancelled: bool = False
     errors: List[str] = field(default_factory=list)
     created: List[str] = field(default_factory=list)   # packages set up first
+    seasons: bool = False      # a moved region had the Seasons patch
 
     def __str__(self) -> str:
         parts = []
@@ -175,8 +182,39 @@ def _size(path: str) -> int:
         return 0
 
 
+SPACE_MARGIN = 2 * 1024 ** 3   # left free on the scenery drive after a copy
+
+
+def disabled_packs(custom_scenery_dir: str) -> set:
+    """Folder names turned off in X-Plane's scenery_packs.ini."""
+    out = set()
+    try:
+        with open(os.path.join(custom_scenery_dir, "scenery_packs.ini"), "r",
+                  encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("SCENERY_PACK_DISABLED "):
+                    path = line.split(None, 1)[1].strip().replace("\\", "/")
+                    out.add(path.rstrip("/").rsplit("/", 1)[-1])
+    except OSError:
+        pass
+    return out
+
+
+def _same_drive(a: str, b: str) -> bool:
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return True
+
+
+def _is_link(path: str) -> bool:
+    isjunction = getattr(os.path, "isjunction", lambda _p: False)
+    return os.path.islink(path) or isjunction(path)
+
+
 def check_region(ao_scenery_dir: str, name: str, index: "tile_stream.TileIndex",
-                 variant: str = "") -> RegionCheck:
+                 variant: str = "", pkg_root: str = "",
+                 disabled: Optional[set] = None) -> RegionCheck:
     """Whether a region can move into a package with ``index`` (cheap: lists
     and stats files only)."""
     root = os.path.join(ao_scenery_dir, name)
@@ -196,9 +234,18 @@ def check_region(ao_scenery_dir: str, name: str, index: "tile_stream.TileIndex",
         check.size += _size(os.path.join(root, *rel.split("/")))
     if not dsfs:
         check.reason = "It has no DSFs."
+    elif disabled and name in disabled:
+        check.reason = ("It's turned off in X-Plane's scenery list. Turn it on "
+                        "to move it, or remove it.")
     elif check.known < MIN_KNOWN * check.dsfs:
-        check.reason = (f"The streamed set has only {check.known} of its "
+        check.reason = (f"The scenery set has only {check.known} of its "
                         f"{check.dsfs} tiles.")
+    elif pkg_root and not _same_drive(root, pkg_root):
+        free = shutil.disk_usage(pkg_root).free
+        if free < check.size + SPACE_MARGIN:
+            check.reason = (f"It's on another drive, and the scenery drive has "
+                            f"{free / 1024 ** 3:.0f} GB free for its "
+                            f"{check.size / 1024 ** 3:.0f} GB.")
     return check
 
 
@@ -220,14 +267,16 @@ def _variant(marker: dict, index: "tile_stream.TileIndex") -> str:
     return marker.get("source") or index.variant
 
 
-def check_regions(ao_scenery_dir: str) -> List[RegionCheck]:
+def check_regions(ao_scenery_dir: str, custom_scenery_dir: str = "") -> List[RegionCheck]:
     """Check every installed region against the streamed set."""
     names = installed_regions(ao_scenery_dir)
     if not names:
         return []
     root, marker = _ortho_package(ao_scenery_dir)
     index = _load_index(root, marker)
-    return [check_region(ao_scenery_dir, n, index, _variant(marker, index))
+    disabled = disabled_packs(custom_scenery_dir) if custom_scenery_dir else set()
+    return [check_region(ao_scenery_dir, n, index, _variant(marker, index),
+                         pkg_root=root, disabled=disabled)
             for n in names]
 
 
@@ -259,7 +308,15 @@ def _move(src: str, dst: str) -> bool:
     if os.path.exists(dst):
         os.remove(src)
         return False
-    os.replace(src, dst)
+    try:
+        os.replace(src, dst)
+    except OSError:
+        # Another drive: copy to a temporary name, then swap it in, so the
+        # package never holds half a DSF.
+        tmp = dst + ".part"
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+        os.remove(src)
     return True
 
 
@@ -268,8 +325,7 @@ def adopt_regions(ao_scenery_dir: str, region_names: Optional[List[str]] = None,
                   progress: Optional[Callable[[str, int, int], None]] = None,
                   cancelled: Callable[[], bool] = lambda: False) -> AdoptResult:
     """Move installed regions (all, or the folders in ``region_names``) into
-    the streaming package, pin their tiles and remove them. Then move
-    installed overlays the streamed overlay index has.
+    the streaming package, pin their tiles and remove them.
 
     ``progress(region_id, done, total)`` is called as files move.
     """
@@ -281,11 +337,13 @@ def adopt_regions(ao_scenery_dir: str, region_names: Optional[List[str]] = None,
     if region_names is not None:
         wanted = set(region_names)
         names = [n for n in names if n in wanted]
+    disabled = disabled_packs(custom_scenery_dir) if custom_scenery_dir else set()
     for name in names:
         if cancelled():
             result.cancelled = True
             break
-        check = check_region(ao_scenery_dir, name, index, variant)
+        check = check_region(ao_scenery_dir, name, index, variant,
+                             pkg_root=pkg_root, disabled=disabled)
         if not check.movable:
             result.kept[check.region_id] = check.reason
             log.info("Adopt: keeping %s installed: %s", name, check.reason)
@@ -305,12 +363,7 @@ def adopt_regions(ao_scenery_dir: str, region_names: Optional[List[str]] = None,
         result.tiles += len(check.tiles)
         result.files += moved[0]
         result.bytes += moved[1]
-    if not result.cancelled and custom_scenery_dir:
-        try:
-            result.overlays = adopt_overlays(ao_scenery_dir, custom_scenery_dir,
-                                             progress, cancelled)
-        except (OSError, ValueError) as exc:
-            result.errors.append(f"overlays: {exc}")
+        result.seasons = result.seasons or check.seasons
     log.info("Adopt: %s", result)
     return result
 
@@ -347,7 +400,15 @@ def _adopt_checked(ao_scenery_dir: str, check: RegionCheck, pkg_root: str,
     if not own_terrain and roughness is not None and marker.get("roughness") is None:
         tile_stream.set_stream_roughness(ao_scenery_dir, roughness)
         marker["roughness"] = roughness
-    shutil.rmtree(root)
+    if _is_link(root):
+        # A junction or symlink to another drive: remove the link only;
+        # what is left at its target (terrain files) is the user's.
+        try:
+            os.unlink(root)
+        except OSError:
+            os.rmdir(root)
+    else:
+        shutil.rmtree(root)
     if os.path.exists(info_path):
         os.remove(info_path)
     log.info("Adopt: moved %s into %s (%d tiles, %d files, %.1f GB)", check.name,
@@ -378,9 +439,11 @@ def migrate(ao_scenery_dir: str, custom_scenery_dir: str = "",
     does on its first start.
 
     Without a scenery set yet (an install that never streamed), the XP11 set
-    is set up first: the regions are from it, it has their overlays, and with
-    downloading while flying off it behaves as before (tiles not installed
-    come from Global Scenery). That downloads its index (about 6 MB); if it
+    is set up first: the regions are from it, and with downloading while
+    flying off it behaves as before (tiles not installed come from Global
+    Scenery). No overlay package is set up: installed overlays stay in
+    ``yAutoOrtho_Overlays``, which keeps working. If a moved region had the
+    Seasons patch, the XP11 package adds seasons to tiles downloaded later. That downloads its index (about 6 MB); if it
     fails this raises and nothing has changed, so the next start tries again.
     Regions that can't move stay installed and are listed in the Scenery
     Library.
@@ -391,45 +454,15 @@ def migrate(ao_scenery_dir: str, custom_scenery_dir: str = "",
     try:
         _ortho_package(ao_scenery_dir)
     except ValueError:
-        overlays = bool(custom_scenery_dir) and os.path.isdir(
-            os.path.join(custom_scenery_dir, tile_stream.LEGACY_OVERLAY_FOLDER))
         created = tile_stream.enable_streaming(
-            ao_scenery_dir, MIGRATION_SET, overlays=overlays,
+            ao_scenery_dir, MIGRATION_SET, overlays=False,
             fetch_missing=False, session=session)
         log.info("Adopt: set up %s for the installed regions", ", ".join(created))
     result = adopt_regions(ao_scenery_dir, custom_scenery_dir=custom_scenery_dir,
                            progress=progress, cancelled=cancelled)
     result.created = list(created)
+    if result.seasons:
+        root, marker = _ortho_package(ao_scenery_dir)
+        if marker.get("source") == MIGRATION_SET and not marker.get("seasons"):
+            tile_stream.set_stream_seasons(ao_scenery_dir, True)
     return result
-
-
-def adopt_overlays(ao_scenery_dir: str, custom_scenery_dir: str,
-                   progress=None, cancelled: Callable[[], bool] = lambda: False) -> int:
-    """Move installed overlay DSFs the streamed overlay index has into the
-    overlay package and pin them. Returns the number moved."""
-    target = None
-    for name, marker in tile_stream.stream_packages(ao_scenery_dir).items():
-        if marker.get("kind") == "overlay":
-            target = (os.path.join(ao_scenery_dir, name), marker)
-    src_root = os.path.join(custom_scenery_dir, tile_stream.LEGACY_OVERLAY_FOLDER)
-    if target is None or not os.path.isdir(src_root):
-        return 0
-    pkg_root, marker = target
-    index = _load_index(pkg_root, marker)
-    if _variant(marker, index) != REGION_SET:
-        return 0
-    known = [rel for rel in _dsfs(src_root) if index.lookup(rel) is not None]
-    tiles = {tile_stream.dsf_cell(os.path.basename(r)) for r in known} - {None}
-    pins = tile_stream.read_pins(pkg_root)
-    if not tiles <= pins:
-        tile_stream.write_pins(pkg_root, pins | tiles)
-    moved = 0
-    for i, rel in enumerate(known, 1):
-        if cancelled():
-            break
-        _move(os.path.join(src_root, *rel.split("/")),
-              os.path.join(pkg_root, *rel.split("/")))
-        moved += 1
-        if progress and (i % 50 == 0 or i == len(known)):
-            progress("overlays", i, len(known))
-    return moved

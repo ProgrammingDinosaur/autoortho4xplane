@@ -63,12 +63,14 @@ SOURCES = OrderedDict([
     ("xp12", {
         "label": "XP12 set (flightwusel v1.4, by jonaseberle)",
         "available": True,
+        "tile_mb": 12,          # average base mesh per tile, for estimates
         "ortho_index": INDEX_BASE_URL + "tile_index_xp12.json.gz",
         "overlay_index": None,  # base mesh only; pair with simHeaven
     }),
     ("xp11", {
         "label": "XP11 legacy set (kubilus1/autoortho-scenery)",
         "available": True,
+        "tile_mb": 3,
         "ortho_index": INDEX_BASE_URL + "tile_index_xp11.json.gz",
         "overlay_index": INDEX_BASE_URL + "overlay_index_xp11.json.gz",
     }),
@@ -1768,7 +1770,8 @@ def set_stream_overlays(ao_scenery_dir: str, enabled: bool,
 
 
 def change_stream_source(ao_scenery_dir: str, source: str,
-                         session: Optional[requests.Session] = None) -> List[str]:
+                         session: Optional[requests.Session] = None,
+                         replace_kept: bool = False) -> List[str]:
     """Stream another scenery set, keeping the overlay choice and disk limit.
 
     The new set is set up first; the old set's packages and tiles are removed
@@ -1783,8 +1786,10 @@ def change_stream_source(ao_scenery_dir: str, source: str,
                                roughness=ortho.get("roughness"), session=session,
                                fetch_missing=ortho.get("fetch_missing", True))
     # Tiles downloaded on the map (and regions moved in) aren't the old
-    # set's to delete: they go into the new set's folder first.
-    carry_kept_tiles(ao_scenery_dir, old_name, ORTHO_PACKAGE.format(source=source))
+    # set's to delete: they go into the new set's folder first, or with
+    # ``replace_kept`` stay kept there to be downloaded from the new set.
+    carry_kept_tiles(ao_scenery_dir, old_name, ORTHO_PACKAGE.format(source=source),
+                     replace=replace_kept)
     disable_streaming(ao_scenery_dir, keep_source=source)
     return created
 
@@ -1813,9 +1818,14 @@ def _carry_seasons_record(old_root: str, new_root: str, cells) -> None:
 
 
 def carry_kept_tiles(ao_scenery_dir: str, old_name: str, new_name: str,
-                     workers: int = 4) -> int:
+                     workers: int = 4, replace: bool = False) -> int:
     """Move the kept (pinned) tiles of one ortho package into another, of
     another scenery set. Returns the number of tiles moved.
+
+    With ``replace``, tiles the new set has aren't moved: they stay kept in
+    the new package, which downloads its own version (the caller starts
+    that), and the old files go with the old package. Tiles the new set
+    doesn't have are moved either way, so nothing kept is lost.
 
     Each DSF's terrain list names the terrain files and masks it uses. The
     terrain files are written into the new package as real files (with the
@@ -1831,6 +1841,19 @@ def carry_kept_tiles(ao_scenery_dir: str, old_name: str, new_name: str,
     old_marker, new_marker = read_marker(old_root), read_marker(new_root)
     if not pins or old_marker is None or new_marker is None:
         return 0
+    replaced = set()
+    if replace:
+        path = new_marker.get("index", INDEX_NAME)
+        if not os.path.isabs(path):
+            path = os.path.join(new_root, path)
+        new_cells = TileIndex.load(path).cells()
+        replaced = {c for c in pins if c in new_cells}
+        write_pins(new_root, read_pins(new_root) | replaced)
+        pins = pins - replaced
+        if not pins:
+            log.info("Tile stream: %d kept tiles will download from %s",
+                     len(replaced), new_name)
+            return 0
     old = StreamPackage(old_root, old_marker, remote=RemoteAssets())
     try:
         def terrain_of(cell):

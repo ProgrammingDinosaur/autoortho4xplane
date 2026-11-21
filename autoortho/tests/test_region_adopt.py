@@ -215,21 +215,80 @@ def test_streaming_off_raises(ao_dir):
         ra.adopt_regions(ao_dir)
 
 
-def test_installed_overlays_move_into_the_overlay_package(ao_dir, tmp_path):
+def test_installed_overlays_are_left_where_they_are(ao_dir, tmp_path):
+    """yAutoOrtho_Overlays works with any set; moving it into an XP11
+    overlay package would lose it when switching to XP12 (no overlays)."""
     make_streaming(ao_dir)
-    over = make_streaming(ao_dir, kind="overlay", tiles=TILES[:1])
+    make_streaming(ao_dir, kind="overlay")
+    make_region(ao_dir, "eur", TILES)
     custom = tmp_path / "Custom Scenery"
-    legacy = custom / ts.LEGACY_OVERLAY_FOLDER
-    for cell in TILES[:2]:
-        path = legacy.joinpath(*ts.dsf_rel(*cell).split("/"))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"overlay")
+    path = custom.joinpath(ts.LEGACY_OVERLAY_FOLDER, *ts.dsf_rel(*TILES[0]).split("/"))
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"overlay")
     result = ra.adopt_regions(ao_dir, custom_scenery_dir=str(custom))
-    assert result.overlays == 1
-    assert os.path.exists(os.path.join(over, *ts.dsf_rel(*TILES[0]).split("/")))
-    # The overlay index doesn't have the second tile: it stays installed.
-    assert legacy.joinpath(*ts.dsf_rel(*TILES[1]).split("/")).exists()
-    assert ts.read_pins(over) == {TILES[0]}
+    assert result.regions == ["eur"] and path.exists()
+
+
+def write_packs(custom, lines):
+    custom.mkdir(parents=True, exist_ok=True)
+    (custom / "scenery_packs.ini").write_text(
+        "I\n1000 Version\nSCENERY\n\n" + "".join(l + "\n" for l in lines))
+
+
+def test_region_turned_off_in_xplane_stays_installed(ao_dir, tmp_path):
+    make_streaming(ao_dir)
+    off, _ = make_region(ao_dir, "eur", TILES[:2])
+    make_region(ao_dir, "afr", TILES[2:])
+    custom = tmp_path / "Custom Scenery"
+    write_packs(custom, ["SCENERY_PACK_DISABLED Custom Scenery/z_ao_eur/",
+                         "SCENERY_PACK Custom Scenery/z_ao_afr/"])
+    assert ra.disabled_packs(str(custom)) == {"z_ao_eur"}
+    checks = {c.region_id: c for c in ra.check_regions(ao_dir, str(custom))}
+    assert "turned off" in checks["eur"].reason and checks["afr"].movable
+    result = ra.adopt_regions(ao_dir, custom_scenery_dir=str(custom))
+    assert result.regions == ["afr"] and "eur" in result.kept
+    assert os.path.isdir(off)
+
+
+def test_region_on_another_drive_is_copied_when_there_is_room(ao_dir, monkeypatch):
+    pkg = make_streaming(ao_dir)
+    region, _ = make_region(ao_dir, "eur", TILES)
+    monkeypatch.setattr(ra, "_same_drive", lambda a, b: False)
+    real_replace = os.replace
+
+    def replace(src, dst):
+        if src.startswith(region):          # a move off the "other drive"
+            raise OSError(17, "not the same device")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(ra.os, "replace", replace)
+    result = ra.adopt_regions(ao_dir)
+    assert result.regions == ["eur"] and not os.path.exists(region)
+    for cell in TILES:
+        assert os.path.exists(os.path.join(pkg, *ts.dsf_rel(*cell).split("/")))
+    assert not any(n.endswith(".part") for _d, _s, files in os.walk(pkg) for n in files)
+
+
+def test_region_on_another_drive_stays_without_room(ao_dir, monkeypatch):
+    make_streaming(ao_dir)
+    region, _ = make_region(ao_dir, "eur", TILES)
+    monkeypatch.setattr(ra, "_same_drive", lambda a, b: False)
+    monkeypatch.setattr(ra.shutil, "disk_usage",
+                        lambda p: type("U", (), {"free": 1024 ** 3})())
+    result = ra.adopt_regions(ao_dir)
+    assert "another drive" in result.kept["eur"] and os.path.isdir(region)
+
+
+def test_a_linked_region_is_unlinked_not_emptied(ao_dir, tmp_path, monkeypatch):
+    make_streaming(ao_dir)
+    region, _ = make_region(ao_dir, "eur", TILES)
+    monkeypatch.setattr(ra, "_is_link", lambda p: p == region)
+    removed = []
+    monkeypatch.setattr(ra.os, "unlink", lambda p: removed.append(p))
+    monkeypatch.setattr(ra.shutil, "rmtree",
+                        lambda p: pytest.fail("rmtree on a link target"))
+    ra.adopt_regions(ao_dir)
+    assert removed == [region]
 
 
 # ---------------------------------------------------------------------------
@@ -264,8 +323,10 @@ def test_migration_sets_up_the_xp11_set_offline_only_and_moves_everything(ao_dir
 
     result = ra.migrate(ao_dir, str(custom), session=_index_host())
 
-    assert result.created == ["z_ao_stream_xp11", "yAO_stream_xp11_overlays"]
-    assert sorted(result.regions) == ["afr", "eur"] and result.overlays == 1
+    # No overlay package: the installed overlays keep working where they are.
+    assert result.created == ["z_ao_stream_xp11"] and path.exists()
+    assert sorted(result.regions) == ["afr", "eur"]
+    assert "seasons" not in ts.read_marker(os.path.join(ao_dir, "z_ao_stream_xp11"))
     assert not ra.needs_migration(ao_dir)
     packages = ts.stream_packages(ao_dir)
     # Behaves as before: only the tiles that were installed are offered.
@@ -301,3 +362,9 @@ def test_shared_textures_move_with_the_region(ao_dir):
     ra.adopt_regions(ao_dir)
     assert os.path.exists(os.path.join(pkg, "textures", "water_transition.png"))
     assert not os.path.exists(region)
+
+
+def test_migration_keeps_seasons_on_for_regions_that_had_them(ao_dir):
+    make_region(ao_dir, "eur", TILES, backups=True)
+    ra.migrate(ao_dir, session=_index_host())
+    assert ts.read_marker(os.path.join(ao_dir, "z_ao_stream_xp11"))["seasons"] is True
