@@ -75,6 +75,7 @@ class CompactHeader(QFrame):
     updateRemindRequested = Signal()
     updateDismissRequested = Signal()
     updateCheckRequested = Signal()
+    updateNotesRequested = Signal()
 
     def __init__(
         self,
@@ -199,6 +200,13 @@ class CompactHeader(QFrame):
         self.update_banner_button.setProperty("role", "primary")
         self.update_banner_button.setAccessibleName("View update release")
         self.update_banner_button.clicked.connect(self.updateRequested.emit)
+        self.update_notes_button = QPushButton("Release notes")
+        self.update_notes_button.setProperty("role", "quiet")
+        self.update_notes_button.setAccessibleName("Show the release notes")
+        self.update_notes_button.setVisible(False)
+        self.update_notes_button.clicked.connect(
+            self.updateNotesRequested.emit
+        )
         self.update_remind_button = QPushButton("Remind me later")
         self.update_remind_button.setProperty("role", "quiet")
         self.update_remind_button.clicked.connect(
@@ -211,6 +219,7 @@ class CompactHeader(QFrame):
         )
         banner_layout.addWidget(self.update_banner_label, 1)
         banner_layout.addWidget(self.update_banner_button)
+        banner_layout.addWidget(self.update_notes_button)
         banner_layout.addWidget(self.update_remind_button)
         banner_layout.addWidget(self.update_dismiss_button)
         outer.addWidget(self.update_banner)
@@ -342,11 +351,45 @@ class CompactHeader(QFrame):
         version_text: str,
         message: str | None = None,
     ) -> None:
+        self.set_update_banner(
+            version_text,
+            message or f"ⓘ Update available: {version_text}",
+            primary_label="View release",
+            primary_accessible="View update release",
+            show_notes=False,
+        )
+
+    def set_update_banner(
+        self,
+        version_text: str,
+        message: str,
+        *,
+        primary_label: str = "",
+        primary_accessible: str = "",
+        show_notes: bool = True,
+        remind_label: str = "Remind me later",
+        show_remind: bool = True,
+        show_dismiss: bool = True,
+        tooltip: str = "",
+    ) -> None:
+        """Show the update banner in one of its states.
+
+        An empty ``primary_label`` hides the primary button (for example
+        while unpacking, when there is nothing to press).
+        """
         self._update_version_text = version_text
         self.update_available = True
-        self.update_banner_label.setText(
-            message or f"ⓘ Update available: {version_text}"
+        self.update_banner_label.setText(message)
+        self.update_banner_label.setToolTip(tooltip)
+        self.update_banner_button.setText(primary_label)
+        self.update_banner_button.setAccessibleName(
+            primary_accessible or primary_label
         )
+        self.update_banner_button.setVisible(bool(primary_label))
+        self.update_notes_button.setVisible(show_notes)
+        self.update_remind_button.setText(remind_label)
+        self.update_remind_button.setVisible(show_remind)
+        self.update_dismiss_button.setVisible(show_dismiss)
         self.update_banner.setVisible(True)
 
     def clear_update_available(self) -> None:
@@ -368,6 +411,7 @@ class ApplicationShell(QMainWindow):
     updateRemindRequested = Signal()
     updateDismissRequested = Signal()
     updateCheckRequested = Signal()
+    updateNotesRequested = Signal()
     fixConfigRequested = Signal()
     installSceneryRequested = Signal()
     openDiagnosticsRequested = Signal()
@@ -433,6 +477,9 @@ class ApplicationShell(QMainWindow):
         )
         self.header.updateCheckRequested.connect(
             self.updateCheckRequested.emit
+        )
+        self.header.updateNotesRequested.connect(
+            self.updateNotesRequested.emit
         )
 
         self.navigation.destinationChanged.connect(self.set_page)
@@ -613,6 +660,9 @@ class ApplicationShell(QMainWindow):
         message: str | None = None,
     ) -> None:
         self.header.set_update_available(version_text, message=message)
+
+    def set_update_banner(self, version_text: str, message: str, **options) -> None:
+        self.header.set_update_banner(version_text, message, **options)
 
     def clear_update_available(self) -> None:
         self.header.clear_update_available()

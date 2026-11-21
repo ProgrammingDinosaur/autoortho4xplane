@@ -93,6 +93,48 @@ Assumptions:
 
 ---
 
+## Updating AutoOrtho
+
+AutoOrtho checks GitHub for a new version a moment after it starts. When it
+finds one, a banner appears at the top of the window:
+
+1. Click **Update Now**. AutoOrtho downloads the new version in the
+   background and checks it against the release's published checksum. You
+   can keep using AutoOrtho meanwhile. **Release notes** shows what changed.
+2. When the banner says the new version is ready, click **Restart Now**.
+   AutoOrtho stops streaming if needed, quits, installs the new version and
+   starts it again. Your settings, cache and scenery are not touched.
+
+If the new version closes right after starting, AutoOrtho puts the previous
+version back and starts that instead. The previous version is also kept so
+you can return to it later: **Settings → General → Software Updates → Go
+Back to *version***.
+
+How each download type updates:
+
+* **Windows zip, macOS app, Linux tarball:** the install folder is replaced
+  in place. The previous version stays next to it (for example
+  `autoortho_release.previous-3.4.0`) until the next update.
+* **Windows installer:** AutoOrtho runs the new installer silently. Windows
+  may ask for administrator rights.
+
+Settings → General → Software Updates also lets you turn off the startup
+check, get release candidates (test builds of the next version) as well, and
+download new versions automatically so they are ready to install. **Check for
+Updates** in the ⋮ menu checks at any time.
+
+AutoOrtho opens the release page instead of installing by itself when:
+
+* it runs from source code, or is a development build;
+* it cannot write to the folder that holds it (move it to a folder you own);
+* on macOS, it runs from the read-only copy macOS makes for apps that still
+  carry the quarantine flag. Move `AutoOrtho.app` to another folder (for
+  example Applications), open it from there, and try again.
+
+The updater writes a log to `~/.autoortho-data/logs/updater.log`.
+
+---
+
 
 ## Configuring your scenery_packs.ini
 

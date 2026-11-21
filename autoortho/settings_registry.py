@@ -293,6 +293,9 @@ _USER_SECTIONS = (
 _USER = {
     "autoortho.maptype_override",
     "general.hide",
+    "general.update_check",
+    "general.update_channel",
+    "general.update_auto_download",
 }
 # Picked up by a running mount: read at call time (streaming options, cache
 # write buffer, per-tile image cache for new tiles) or resized through

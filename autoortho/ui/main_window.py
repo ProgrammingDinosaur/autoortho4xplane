@@ -10,7 +10,6 @@ import dataclasses
 import threading
 import time
 import logging
-import re
 import webbrowser
 from packaging import version
 
@@ -59,6 +58,7 @@ if __package__ and __package__.startswith("autoortho."):
         InstallationReview,
     )
     from autoortho.ui.dialogs.roughness_dialog import RoughnessValueDialog
+    from autoortho.ui.dialogs.release_notes_dialog import ReleaseNotesDialog
     from autoortho.ui.widgets.scenery_patches import SceneryPatchesWidget
     from autoortho.ui.shell import ApplicationShell
     from autoortho.ui.pages.scenery_page import SceneryLibraryPage
@@ -97,6 +97,15 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho import downloader
     from autoortho.version import __version__
     from autoortho import worker_restart
+    from autoortho.updater.assets import KIND_NSIS
+    from autoortho.updater.releases import (
+        CHANNEL_RC,
+        CHANNEL_STABLE,
+        normalize_channel,
+        releases_page,
+    )
+    from autoortho.updater.service import UpdateManager
+    from autoortho.updater.versions import parse_version as parse_update_version
 else:
     import utils.resources_rc
     from utils.constants import MAPTYPES, system_type
@@ -137,6 +146,7 @@ else:
         InstallationReview,
     )
     from ui.dialogs.roughness_dialog import RoughnessValueDialog
+    from ui.dialogs.release_notes_dialog import ReleaseNotesDialog
     from ui.widgets.scenery_patches import SceneryPatchesWidget
     from ui.shell import ApplicationShell
     from ui.pages.scenery_page import SceneryLibraryPage
@@ -178,6 +188,15 @@ else:
     import downloader
     from version import __version__
     import worker_restart
+    from updater.assets import KIND_NSIS
+    from updater.releases import (
+        CHANNEL_RC,
+        CHANNEL_STABLE,
+        normalize_channel,
+        releases_page,
+    )
+    from updater.service import UpdateManager
+    from updater.versions import parse_version as parse_update_version
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -234,6 +253,7 @@ if __package__ and __package__.startswith("autoortho."):
         SimBriefFetchWorker,
         StorageScanWorker,
         UpdateCheckWorker,
+        UpdatePrepareWorker,
     )
 else:
     from ui.dialogs.dynamic_zoom_dialog import (
@@ -257,6 +277,7 @@ else:
         SimBriefFetchWorker,
         StorageScanWorker,
         UpdateCheckWorker,
+        UpdatePrepareWorker,
     )
 
 
@@ -336,6 +357,9 @@ class ConfigUI(QMainWindow):
         "format_combo",
         "gui_check",
         "hide_check",
+        "update_check_check",
+        "update_channel_combo",
+        "update_auto_download_check",
         "console_log_level_combo",
         "file_log_level_combo",
         "performance_profiling_check",
@@ -482,6 +506,9 @@ class ConfigUI(QMainWindow):
         "general.console_log_level",
         "general.file_log_level",
         "general.hide",
+        "general.update_auto_download",
+        "general.update_channel",
+        "general.update_check",
         "paths.cache_dir",
         "paths.download_dir",
         "paths.long_term_cache_dir",
@@ -622,6 +649,15 @@ class ConfigUI(QMainWindow):
         self._latest_update_url = ""
         self._latest_update_version = ""
         self._update_check_manual = False
+        self._update_worker = None
+        self._update_manager = None
+        self._update_offer = None
+        self._update_ui_state = ""
+        self._prepared_update = None
+        self._update_prepare_worker = None
+        self._update_progress_percent = None
+        self._update_handover = None
+        self._update_close_confirmed = False
         self._settings_observe_scheduled = False
         self._setup_wizard_checked = False
         self.phase3_active = False
@@ -669,8 +705,10 @@ class ConfigUI(QMainWindow):
 
         self.ready.set()
 
-        # Kick off asynchronous update check shortly after startup
+        # Report a just-finished update (and confirm to the update helper
+        # that this version starts), then check for a newer one.
         try:
+            QTimer.singleShot(0, self._run_update_startup)
             QTimer.singleShot(250, self.start_update_check)
         except Exception:
             pass
@@ -1163,7 +1201,11 @@ class ConfigUI(QMainWindow):
         )
         self.categorized_settings_page.add_category(
             "General",
-            [self.options_group, self.general_settings_group],
+            [
+                self.options_group,
+                self.general_settings_group,
+                self.updates_settings_group,
+            ],
             recommendation=(
                 "Control how the desktop app opens and behaves while "
                 "streaming."
@@ -1403,6 +1445,7 @@ class ConfigUI(QMainWindow):
         self.shell.updateCheckRequested.connect(
             lambda: self.start_update_check(manual=True)
         )
+        self.shell.updateNotesRequested.connect(self._show_update_notes)
 
         self.shell_status_timer = QTimer(self)
         self.shell_status_timer.setInterval(1000)
@@ -2606,6 +2649,9 @@ class ConfigUI(QMainWindow):
                 "showconfig_check": True,
                 "gui_check": True,
                 "hide_check": True,
+                "update_check_check": True,
+                "update_channel_combo": "Stable releases",
+                "update_auto_download_check": False,
             },
             "Scenery": {
                 "simheaven_compat_check": False,
@@ -6333,6 +6379,8 @@ class ConfigUI(QMainWindow):
 
         self.settings_layout.addWidget(general_group)
 
+        self._build_updates_settings_group()
+
         logging_group = QGroupBox("Log Detail")
         self.logging_settings_group = logging_group
         logging_layout = QVBoxLayout(logging_group)
@@ -9214,6 +9262,7 @@ class ConfigUI(QMainWindow):
                 QTimer.singleShot(0, self.close)
         else:
             self._close_after_stop = False
+            self._cancel_update_restart()
             self._runtime_error_message = message
             self._set_runtime_state(RuntimeState.ERROR, message)
             self.display_error(
@@ -10592,6 +10641,11 @@ class ConfigUI(QMainWindow):
             # General settings
             self.cfg.general.gui = self.gui_check.isChecked()
             self.cfg.general.hide = self.hide_check.isChecked()
+            self.cfg.general.update_check = self.update_check_check.isChecked()
+            self.cfg.general.update_channel = self._update_channel_value()
+            self.cfg.general.update_auto_download = (
+                self.update_auto_download_check.isChecked()
+            )
             self.cfg.general.console_log_level = self.console_log_level_combo.currentText()
             self.cfg.general.file_log_level = self.file_log_level_combo.currentText()
 
@@ -10921,28 +10975,221 @@ class ConfigUI(QMainWindow):
         
         self.refresh_scenery_list()
 
+    # -- software updates ------------------------------------------------
+    #
+    # States of the header banner (self._update_ui_state):
+    #   "offer"        a newer release exists ("Update Now" / "View release")
+    #   "downloading"  UpdatePrepareWorker is downloading and unpacking
+    #   "ready"        verified and staged; "Restart Now" hands over to the
+    #                  update helper, which runs once AutoOrtho has quit
+
     def _parse_version(self, text):
         """Extract and parse a semantic version from arbitrary text.
         Returns packaging.version.Version or None if not found.
         """
+        return parse_update_version(text)
+
+    def _get_update_manager(self):
+        if self._update_manager is None:
+            self._update_manager = UpdateManager()
+        return self._update_manager
+
+    def _update_channel_value(self):
+        combo = getattr(self, "update_channel_combo", None)
+        if combo is None:
+            return normalize_channel(
+                getattr(self.cfg.general, "update_channel", CHANNEL_STABLE)
+            )
+        return CHANNEL_RC if combo.currentIndex() == 1 else CHANNEL_STABLE
+
+    def _build_updates_settings_group(self):
+        group = QGroupBox("Software Updates")
+        self.updates_settings_group = group
+        layout = QVBoxLayout(group)
+
+        self.update_check_check = QCheckBox(
+            "Check for a new AutoOrtho version when AutoOrtho starts"
+        )
+        self.update_check_check.setObjectName("update_check")
+        self.update_check_check.setChecked(
+            bool(getattr(self.cfg.general, "update_check", True))
+        )
+        self.update_check_check.setToolTip(
+            "Ask GitHub for a newer release a moment after AutoOrtho starts.\n"
+            "Check for Updates in the ⋮ menu works either way."
+        )
+        layout.addWidget(self.update_check_check)
+
+        channel_row = QHBoxLayout()
+        channel_label = QLabel("Versions to offer:")
+        self.update_channel_combo = QComboBox()
+        self.update_channel_combo.setObjectName("update_channel")
+        self.update_channel_combo.setFocusPolicy(Qt.StrongFocus)
+        self.update_channel_combo.addItems(
+            ["Stable releases", "Release candidates"]
+        )
+        self.update_channel_combo.setAccessibleName("Versions to offer")
+        self.update_channel_combo.setCurrentIndex(
+            1
+            if normalize_channel(
+                getattr(self.cfg.general, "update_channel", CHANNEL_STABLE)
+            ) == CHANNEL_RC
+            else 0
+        )
+        self.update_channel_combo.setToolTip(
+            "Release candidates are test builds of the next version, made "
+            "before it is released.\nThey get fixes sooner but may have "
+            "problems the stable release will not."
+        )
+        channel_label.setBuddy(self.update_channel_combo)
+        channel_row.addWidget(channel_label)
+        channel_row.addWidget(self.update_channel_combo)
+        channel_row.addStretch()
+        layout.addLayout(channel_row)
+
+        self.update_auto_download_check = QCheckBox(
+            "Download new versions in the background"
+        )
+        self.update_auto_download_check.setObjectName("update_auto_download")
+        self.update_auto_download_check.setChecked(
+            bool(getattr(self.cfg.general, "update_auto_download", False))
+        )
+        self.update_auto_download_check.setToolTip(
+            "Download and check a new version as soon as it is found, so it "
+            "is ready to install.\nNothing is installed until you choose "
+            "Restart Now."
+        )
+        layout.addWidget(self.update_auto_download_check)
+
+        self.update_install_label = QLabel("")
+        self.update_install_label.setWordWrap(True)
+        self.update_install_label.setProperty("textRole", "secondary")
+        layout.addWidget(self.update_install_label)
+
+        button_row = QHBoxLayout()
+        self.update_check_now_button = QPushButton("Check Now")
+        self.update_check_now_button.clicked.connect(
+            lambda: self.start_update_check(manual=True)
+        )
+        self.update_rollback_button = QPushButton("Go Back to Previous Version")
+        self.update_rollback_button.setVisible(False)
+        self.update_rollback_button.clicked.connect(self._confirm_update_rollback)
+        button_row.addWidget(self.update_check_now_button)
+        button_row.addWidget(self.update_rollback_button)
+        button_row.addStretch()
+        layout.addLayout(button_row)
+
+        self.settings_layout.addWidget(group)
+        self._refresh_updates_settings()
+
+    def _refresh_updates_settings(self):
+        label = getattr(self, "update_install_label", None)
+        if label is None:
+            return
         try:
-            if not text:
-                return None
-            match = re.search(r"\d+(?:\.\d+){1,3}(?:[-._]rc[-._]?\d+)?", str(text), re.IGNORECASE)
-            if not match:
-                return None
-            ver_str = match.group(0)
-            # Normalize rc format for packaging.version
-            ver_str = re.sub(r"[-._]rc[-._]?(\d+)", r"rc\1", ver_str, flags=re.IGNORECASE)
-            return version.parse(ver_str)
+            manager = self._get_update_manager()
         except Exception:
-            return None
+            log.exception("Could not inspect this install for updates")
+            label.setText("AutoOrtho could not tell how it was installed.")
+            self.update_rollback_button.setVisible(False)
+            return
+        install = manager.install
+        if not install.can_self_update:
+            label.setText(
+                f"{install.unsupported_reason} New versions open their "
+                "release page instead."
+            )
+        elif install.kind == KIND_NSIS:
+            label.setText(
+                "New versions install with the AutoOrtho installer. Windows "
+                "may ask for administrator rights."
+            )
+        else:
+            label.setText(
+                "New versions install in place. The previous version is kept "
+                "so you can go back to it."
+            )
+        target = manager.rollback_target()
+        if target is None:
+            self.update_rollback_button.setVisible(False)
+        else:
+            self.update_rollback_button.setText(f"Go Back to {target[1]}")
+            self.update_rollback_button.setAccessibleName(
+                f"Go back to AutoOrtho {target[1]}"
+            )
+            self.update_rollback_button.setVisible(True)
+
+    def _run_update_startup(self):
+        """Report what the update helper did and tidy the updates folder.
+
+        Runs once the window is up: for an update that just finished, this
+        is what tells the helper the new version starts properly.
+        """
+        if not getattr(sys, "frozen", False):
+            return  # source runs are never started by the update helper
+        try:
+            report = self._get_update_manager().startup(__version__)
+        except Exception:
+            log.exception("Update startup check failed")
+            return
+        started = report.started
+        if started:
+            if started.get("rollback"):
+                title = f"Went back to AutoOrtho {__version__}"
+            else:
+                title = f"Updated to AutoOrtho {__version__}"
+            log.info(title)
+            self.task_manager.create_task(
+                "update-installed",
+                TaskType.UPDATE,
+                title,
+                stage="Installed",
+            )
+            self.task_manager.complete_task("update-installed", stage="Installed")
+            self.update_status_bar(title)
+        result = report.result
+        if result and result.get("status") != "success":
+            message = str(result.get("message") or "The update did not finish.")
+            log.warning("Update helper reported: %s", message)
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("AutoOrtho Update")
+            box.setText(message)
+            box.setInformativeText(
+                "Details are in ~/.autoortho-data/logs/updater.log."
+            )
+            box.setModal(False)
+            box.show()
+            self._update_result_box = box
+        self._refresh_updates_settings()
 
     def start_update_check(self, manual=False):
         """Start background update check against GitHub releases"""
+        if not manual and not getattr(self.cfg.general, "update_check", True):
+            return
+        worker = self._update_worker
+        if worker is not None and worker.isRunning():
+            return
+        if manual and self._update_ui_state in ("downloading", "ready"):
+            self._show_update_banner()
+            return
         self._update_check_manual = bool(manual)
+        current = self._parse_version(__version__)
+        if current is None:
+            if manual:
+                self.update_status_bar(
+                    "AutoOrtho cannot tell which version this is, so it "
+                    "cannot check for updates."
+                )
+            return
         try:
-            self._update_worker = UpdateCheckWorker()
+            self._update_worker = UpdateCheckWorker(
+                self._get_update_manager(),
+                normalize_channel(
+                    getattr(self.cfg.general, "update_channel", CHANNEL_STABLE)
+                ),
+                current,
+            )
             self.task_manager.create_task(
                 "update-check",
                 TaskType.UPDATE,
@@ -10969,40 +11216,39 @@ class ConfigUI(QMainWindow):
                 )
                 self.task_manager.dismiss_task("update-check")
 
-    def on_update_check_result(self, data):
-        """Handle result from update check worker"""
+    def on_update_check_result(self, offer):
+        """Handle result from update check worker (an UpdateOffer or None)"""
         self.task_manager.complete_task(
             "update-check",
-            stage=("Update available" if data else "Up to date"),
+            stage=("Update available" if offer else "Up to date"),
         )
         try:
-            if not data:
+            if offer is None:
                 if self._update_check_manual:
-                    self.update_status_bar("No update information available.")
+                    self.update_status_bar("AutoOrtho is up to date.")
                 return
-            latest_tag, html_url = data
-            latest_ver = self._parse_version(latest_tag)
-            current_ver = self._parse_version(__version__)
-            if latest_ver is None or current_ver is None:
+            tag = offer.version_text
+            self._update_offer = offer
+            self._latest_update_version = tag
+            self._latest_update_url = offer.release.html_url or releases_page()
+            dismissed = str(
+                getattr(self.cfg.general, "dismissed_update_version", "")
+            )
+            # Older versions stored the normalized form (3.5.0rc1).
+            if not self._update_check_manual and dismissed in (
+                tag,
+                str(offer.release.version),
+            ):
                 return
-            if latest_ver > current_ver:
-                normalized = str(latest_ver)
-                dismissed = str(
-                    getattr(
-                        self.cfg.general,
-                        "dismissed_update_version",
-                        "",
-                    )
-                )
-                self._latest_update_version = normalized
-                self._latest_update_url = (
-                    html_url
-                    or "https://github.com/ProgrammingDinosaur/autoortho4xplane/releases"
-                )
-                if dismissed != normalized:
-                    self.shell.set_update_available(normalized)
-            elif self._update_check_manual:
-                self.update_status_bar("AutoOrtho is up to date.")
+            if self._update_ui_state not in ("downloading", "ready"):
+                self._update_ui_state = "offer"
+            self._show_update_banner()
+            if (
+                offer.can_install
+                and self._update_ui_state == "offer"
+                and getattr(self.cfg.general, "update_auto_download", False)
+            ):
+                self._start_update_download()
         except Exception:
             log.exception("Failed to process update check result")
 
@@ -11016,9 +11262,82 @@ class ConfigUI(QMainWindow):
             )
             self.task_manager.dismiss_task("update-check")
 
+    def _show_update_banner(self, percent=None):
+        offer = self._update_offer
+        if offer is None:
+            return
+        tag = offer.version_text
+        has_notes = bool(offer.release.notes.strip())
+        state = self._update_ui_state
+        if state == "downloading":
+            progress = "" if percent is None else f" {percent}%"
+            self.shell.set_update_banner(
+                tag,
+                f"⇣ Downloading AutoOrtho {tag}…{progress}",
+                primary_label="Cancel",
+                primary_accessible="Cancel the update download",
+                show_notes=has_notes,
+                remind_label="Hide",
+                show_dismiss=False,
+            )
+        elif state == "ready":
+            self.shell.set_update_banner(
+                tag,
+                f"✓ AutoOrtho {tag} is ready. AutoOrtho restarts to finish "
+                "installing it.",
+                primary_label="Restart Now",
+                primary_accessible=f"Restart and install AutoOrtho {tag}",
+                show_notes=has_notes,
+                remind_label="Later",
+                show_dismiss=False,
+            )
+        elif offer.can_install:
+            self.shell.set_update_banner(
+                tag,
+                f"ⓘ AutoOrtho {tag} is available.",
+                primary_label="Update Now",
+                primary_accessible=f"Download and install AutoOrtho {tag}",
+                show_notes=has_notes,
+            )
+        else:
+            self.shell.set_update_banner(
+                tag,
+                f"ⓘ Update available: {tag}",
+                primary_label="View release",
+                primary_accessible="View update release",
+                show_notes=has_notes,
+                tooltip=offer.reason,
+            )
+
     def _open_available_update(self):
+        """The banner's main button; what it does depends on the state."""
+        state = self._update_ui_state
+        offer = self._update_offer
+        if state == "downloading":
+            worker = self._update_prepare_worker
+            if worker is not None:
+                worker.cancel()
+            return
+        if state == "ready":
+            self._restart_to_update()
+            return
+        if offer is not None and offer.can_install:
+            self._start_update_download()
+            return
         if self._latest_update_url:
             webbrowser.open(self._latest_update_url)
+
+    def _show_update_notes(self):
+        offer = self._update_offer
+        if offer is None:
+            return
+        dialog = ReleaseNotesDialog(
+            f"AutoOrtho {offer.version_text}",
+            offer.release.notes,
+            offer.release.html_url or releases_page(),
+            self,
+        )
+        dialog.exec()
 
     def _remind_update_later(self):
         self.shell.clear_update_available()
@@ -11035,6 +11354,166 @@ class ConfigUI(QMainWindow):
         task = self.task_manager.task("update-check")
         if task is not None and task.state == TaskState.CANCELLING:
             self.task_manager.mark_cancelled("update-check")
+
+    def _start_update_download(self):
+        offer = self._update_offer
+        worker = self._update_prepare_worker
+        if offer is None or not offer.can_install:
+            return
+        if worker is not None and worker.isRunning():
+            return
+        tag = offer.version_text
+        worker = UpdatePrepareWorker(self._get_update_manager(), offer)
+        self._update_prepare_worker = worker
+        self._update_progress_percent = None
+        self.task_manager.create_task(
+            "update-download",
+            TaskType.UPDATE,
+            f"Download AutoOrtho {tag}",
+            stage="Downloading",
+            cancellable=True,
+            cancel_callback=worker.cancel,
+            retry_callback=self._start_update_download,
+        )
+        worker.progress.connect(self._on_update_download_progress)
+        worker.stage.connect(
+            lambda stage: self.task_manager.update_task(
+                "update-download", stage=stage
+            )
+        )
+        worker.prepared.connect(self._on_update_prepared)
+        worker.failed.connect(self._on_update_prepare_failed)
+        worker.cancelled.connect(self._on_update_prepare_cancelled)
+        self._update_ui_state = "downloading"
+        self._show_update_banner()
+        worker.start()
+
+    def _on_update_download_progress(self, done, total):
+        total = int(total or 0)
+        done = int(done or 0)
+        percent = int(100 * done / total) if total else 0
+        self.task_manager.update_task(
+            "update-download",
+            progress=float(percent),
+            bytes_completed=done,
+            bytes_total=total,
+        )
+        if percent != self._update_progress_percent:
+            self._update_progress_percent = percent
+            if self.shell.header.update_banner.isVisible():
+                self._show_update_banner(percent)
+
+    def _on_update_prepared(self, prepared):
+        self._prepared_update = prepared
+        self._update_ui_state = "ready"
+        self.task_manager.complete_task(
+            "update-download",
+            stage="Ready to install",
+        )
+        self._show_update_banner()
+        self.update_status_bar(
+            f"AutoOrtho {prepared.version_text} is ready to install."
+        )
+
+    def _on_update_prepare_failed(self, message):
+        self._update_ui_state = "offer"
+        self.task_manager.fail_task("update-download", message)
+        self._show_update_banner()
+        self.update_status_bar(f"The update could not be downloaded: {message}")
+
+    def _on_update_prepare_cancelled(self):
+        self._update_ui_state = "offer"
+        self.task_manager.mark_cancelled("update-download")
+        self._show_update_banner()
+
+    def _confirm_update_rollback(self):
+        manager = self._get_update_manager()
+        target = manager.rollback_target()
+        if target is None:
+            self._refresh_updates_settings()
+            return
+        reply = QMessageBox.question(
+            self,
+            "Go Back to Previous Version?",
+            f"AutoOrtho restarts as version {target[1]}, the version you "
+            f"used before {__version__}.\n\nYour settings and scenery stay "
+            "as they are.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            prepared = manager.prepare_rollback()
+        except Exception as exc:
+            self.display_error(f"AutoOrtho could not go back:\n{exc}")
+            return
+        self._restart_to_update(prepared)
+
+    def _restart_to_update(self, prepared=None):
+        """Quit (stopping streaming first) and let the helper install."""
+        prepared = prepared or self._prepared_update
+        if prepared is None:
+            return
+        if self.runtime_state in (RuntimeState.STARTING, RuntimeState.STOPPING):
+            QMessageBox.information(
+                self,
+                "Operation In Progress",
+                "Wait for the streaming operation to finish, then try again.",
+            )
+            return
+        if self._has_active_ui_jobs():
+            QMessageBox.warning(
+                self,
+                "Background Operation In Progress",
+                "Wait for active scenery or cache operations to finish, then "
+                "restart to install the update.",
+            )
+            return
+        if self.runtime_state == RuntimeState.RUNNING:
+            reply = QMessageBox.question(
+                self,
+                "Stop Streaming and Restart?",
+                "AutoOrtho is streaming scenery. Stop streaming and restart "
+                f"to install AutoOrtho {prepared.version_text}?\n\nIf X-Plane "
+                "is running, it loses the scenery until AutoOrtho is back.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self._update_handover = prepared
+        self._update_close_confirmed = True
+        self.close()
+
+    def _cancel_update_restart(self):
+        """A quit for an update was stopped: forget the hand-over."""
+        if self._update_handover is None and not self._update_close_confirmed:
+            return
+        self._update_handover = None
+        self._update_close_confirmed = False
+        self.update_status_bar(
+            "The update was not installed. Choose Restart Now to try again."
+        )
+
+    def _launch_update_handover(self):
+        """Last step of closing: start the helper that installs the update."""
+        prepared = self._update_handover
+        self._update_handover = None
+        self._update_close_confirmed = False
+        if prepared is None:
+            return
+        try:
+            self._get_update_manager().hand_over(prepared)
+        except Exception as exc:
+            log.exception("Could not start the update helper")
+            QMessageBox.critical(
+                self,
+                "Update Not Started",
+                f"AutoOrtho could not start installing version "
+                f"{prepared.version_text}:\n{exc}\n\nStart AutoOrtho again "
+                "to keep using this version.",
+            )
 
 
     def update_status_bar(self, message):
@@ -11247,6 +11726,7 @@ class ConfigUI(QMainWindow):
             panel = getattr(self, "connection_test_panel", None)
             if panel is not None:
                 panel.stop()
+            self._launch_update_handover()
             event.accept()
             return
 
@@ -11256,14 +11736,18 @@ class ConfigUI(QMainWindow):
             self._restore_from_tray()
 
         if self.runtime_state == RuntimeState.RUNNING:
-            reply = QMessageBox.question(
-                self,
-                "Stop Streaming and Quit?",
-                "AutoOrtho is currently streaming scenery.\n\n"
-                "Stop streaming and quit the application?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
+            if self._update_close_confirmed:
+                # "Restart Now" already asked to stop streaming.
+                reply = QMessageBox.StandardButton.Yes
+            else:
+                reply = QMessageBox.question(
+                    self,
+                    "Stop Streaming and Quit?",
+                    "AutoOrtho is currently streaming scenery.\n\n"
+                    "Stop streaming and quit the application?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
             if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
@@ -11281,6 +11765,7 @@ class ConfigUI(QMainWindow):
                 "Operation In Progress",
                 "Wait for the streaming operation to finish before quitting.",
             )
+            self._cancel_update_restart()
             event.ignore()
             return
 
@@ -11291,10 +11776,12 @@ class ConfigUI(QMainWindow):
                 "Wait for active scenery or cache operations to finish before "
                 "quitting. This prevents partial installations and cache damage.",
             )
+            self._cancel_update_restart()
             event.ignore()
             return
 
         if not self._resolve_pending_settings(for_start=False):
+            self._cancel_update_restart()
             event.ignore()
             return
 
@@ -11335,6 +11822,7 @@ class ConfigUI(QMainWindow):
                 unmounted = self.unmount_sceneries()
             except Exception as exc:
                 self._closing = False
+                self._cancel_update_restart()
                 self.display_error(
                     f"AutoOrtho could not stop all scenery mounts:\n{exc}"
                 )
@@ -11342,6 +11830,7 @@ class ConfigUI(QMainWindow):
                 return
             if unmounted is False:
                 self._closing = False
+                self._cancel_update_restart()
                 self.display_error(
                     "AutoOrtho could not stop all scenery mounts. "
                     "The application will remain open to avoid leaving "
@@ -11379,6 +11868,16 @@ class ConfigUI(QMainWindow):
                 self._update_worker.cancel()
                 self._update_worker.wait()
                 self._update_worker = None
+        except Exception:
+            pass
+
+        # Stop an update download (the partial file resumes next time)
+        try:
+            worker = getattr(self, "_update_prepare_worker", None)
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                worker.wait()
+            self._update_prepare_worker = None
         except Exception:
             pass
 
@@ -11433,6 +11932,7 @@ class ConfigUI(QMainWindow):
             return
 
         # No auto-clean requested or already handled; proceed to close
+        self._launch_update_handover()
         event.accept()
 
     def _finalize_shutdown(self):
