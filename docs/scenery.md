@@ -71,6 +71,9 @@ where you download scenery.
    XP12 set: Africa North, Europe West, North America South and so on),
    which selects every tile of it and zooms the map there. Right-drag pans
    the map and the wheel zooms; **Clear** or Esc clears the selection.
+   Only tiles the scenery set has can be selected, so open water and areas
+   it doesn't cover are left out (tiles with something stored can always be
+   selected, so you can delete it).
 2. Click **Download N tiles…**. AutoOrtho shows how much scenery it will
    download and lets you add imagery (next section).
 3. Progress shows in the **Activity** panel, where you can cancel it.

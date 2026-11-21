@@ -535,6 +535,16 @@ class TileIndex:
     def asset_url(self, asset: int) -> str:
         return self.assets[asset]["url"]
 
+    def cells(self) -> set:
+        """Every tile the index has a DSF for."""
+        out = set()
+        for names in self._dsf_dirs.values():
+            for name in names:
+                cell = dsf_cell(name)
+                if cell is not None:
+                    out.add(cell)
+        return out
+
     def regions(self) -> Dict[str, List[Tuple[int, int]]]:
         """Tiles per area (the ``region`` of the zip each DSF is in)."""
         out: Dict[str, List[Tuple[int, int]]] = {}

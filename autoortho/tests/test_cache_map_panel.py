@@ -228,8 +228,8 @@ def test_flight_plan_page_retitles_the_map_box(setup):
 def test_regions_menu_selects_a_whole_region(setup, monkeypatch):
     editor, panel, _, _ = setup
     cells = [(47, -123), (47, -122), (48, -123)]
-    monkeypatch.setattr(ci, "stream_regions",
-                        lambda _ao: [("na-n", "North America North", cells)])
+    monkeypatch.setattr(ci, "stream_coverage", lambda _ao: (
+        [("na-n", "North America North", cells)], set(cells)))
     panel._read_regions("ao")
     combo = panel.region_combo
     assert [combo.itemText(i) for i in range(combo.count())] == [
@@ -245,7 +245,7 @@ def test_regions_menu_selects_a_whole_region(setup, monkeypatch):
 
 def test_regions_menu_without_a_scenery_set(setup, monkeypatch):
     _, panel, _, _ = setup
-    monkeypatch.setattr(ci, "stream_regions", lambda _ao: [])
+    monkeypatch.setattr(ci, "stream_coverage", lambda _ao: ([], None))
     panel._read_regions("ao")
     assert not panel.region_combo.isEnabled()
     assert "scenery set" in panel.region_combo.itemText(0)
@@ -315,3 +315,38 @@ def test_delete_dialog_offers_what_is_stored(setup, monkeypatch):
     assert seen["button"] == "Delete 2.6 KB"
     monkeypatch.setattr(QDialog, "exec", lambda d: QDialog.DialogCode.Rejected)
     assert panel._ask_delete() is None
+
+
+def test_only_tiles_of_the_set_or_with_something_stored_can_be_selected(setup, monkeypatch):
+    editor, panel, _, _ = setup
+    covered = {(47, -122), (48, -123)}
+    monkeypatch.setattr(ci, "stream_coverage", lambda _ao: (
+        [("na-n", "North America North", sorted(covered))], covered))
+    panel._read_regions("ao")
+    editor.set_view(cme.CACHE_VIEW)
+    canvas = editor.canvas
+
+    canvas.cellsPicked.emit([(0, -30)], False)          # open ocean
+    assert panel.selection == set()
+    assert "+00-030 has no scenery in the scenery set" in editor.status.text()
+    assert "Not in the scenery set" in panel.hover_text((0, -30))
+
+    canvas.cellsPicked.emit([(47, -122)], False)
+    assert panel.selection == {(47, -122)}
+    canvas.cellsPicked.emit([(0, -30), (1, -30), (48, -123)], True)   # a box
+    assert panel.selection == {(47, -122), (48, -123)}
+    assert "2 tiles without scenery in the set left out" in editor.status.text()
+
+    # Stored tiles stay selectable even outside the set, so they can be deleted.
+    canvas.cellsPicked.emit([(39, 23)], False)
+    assert panel.selection == {(39, 23)}
+    assert "Not in the scenery set" not in panel.hover_text((39, 23))
+
+
+def test_switching_sets_drops_tiles_the_new_one_lacks(setup, monkeypatch):
+    editor, panel, _, _ = setup
+    editor.set_view(cme.CACHE_VIEW)
+    panel.set_selection({(10, 10), (47, -122)})       # coverage not known yet
+    monkeypatch.setattr(ci, "stream_coverage", lambda _ao: ([], {(47, -122)}))
+    panel._read_regions("ao")
+    assert panel.selection == {(47, -122)}

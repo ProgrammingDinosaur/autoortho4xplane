@@ -129,7 +129,7 @@ class CachePanel(QWidget):
     _scanned = Signal(int, object)    # generation, CacheInventory or Exception
     _finished = Signal(object, object)  # callback, result
     _progress = Signal(int, int, int)   # done, total, bytes
-    _regions_read = Signal(object)      # list of regions, or Exception
+    _regions_read = Signal(object)      # (regions, covered tiles) or Exception
     _imagery_progress = Signal(int, int, int)  # chunks done, total, bytes
 
     def __init__(self, canvas, paths: Callable[[], tuple[str, str, str]],
@@ -170,6 +170,8 @@ class CachePanel(QWidget):
             QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.region_combo.activated.connect(self._region_picked)
         self.regions: list = []           # (region id, label, cells)
+        # Tiles the scenery set has; None until read (or with no set).
+        self.coverage: Optional[set] = None
         bar.addWidget(self.region_combo)
 
         self.keep_button = QPushButton("Download…")
@@ -278,16 +280,18 @@ class CachePanel(QWidget):
     def _read_regions(self, ao_dir: str):
         """Read the scenery set's regions (on the scan thread)."""
         try:
-            regions = ci.stream_regions(ao_dir) if ao_dir else []
+            result = ci.stream_coverage(ao_dir) if ao_dir else ([], None)
         except Exception as exc:
             log.warning("Cache view: could not read the regions", exc_info=True)
-            regions = exc
-        self._regions_read.emit(regions)
+            result = exc
+        self._regions_read.emit(result)
 
-    def _on_regions(self, regions):
-        if isinstance(regions, Exception):
-            regions = []
+    def _on_regions(self, result):
+        regions, coverage = ([], None) if isinstance(result, Exception) else result
         self.regions = regions
+        self.coverage = set(coverage) if coverage is not None else None
+        if self.selection:  # a set change may leave tiles it doesn't have
+            self.set_selection(c for c in self.selection if self.selectable(c))
         combo = self.region_combo
         combo.blockSignals(True)
         combo.clear()
@@ -365,13 +369,31 @@ class CachePanel(QWidget):
     def hover_text(self, cell) -> str:
         if self.inventory is None:
             return f"{cell_label(*cell)}\nReading the cache…"
+        if not self.selectable(cell):
+            return (f"{cell_label(*cell)}\nNot in the scenery set (open water "
+                    "or not covered)")
         return describe_cell(cell, self.usage(cell))
 
     # -- selection ------------------------------------------------------------
+    def covered(self, cell) -> bool:
+        """Whether the scenery set has the tile (True while unknown)."""
+        return self.coverage is None or cell in self.coverage
+
+    def selectable(self, cell) -> bool:
+        """Tiles of the scenery set, and tiles with something stored (so it
+        can be deleted). Open water and areas the set doesn't cover can't
+        be selected: there would be nothing to download."""
+        if self.covered(cell):
+            return True
+        usage = self.usage(cell)
+        return usage is not None and bool(usage.total or usage.pinned)
+
     def _on_picked(self, cells: list, additive: bool):
         if not self.active:
             return
-        cells = set(cells)
+        picked = set(cells)
+        cells = {c for c in picked if self.selectable(c)}
+        left_out = len(picked) - len(cells)
         if not additive:
             selection = cells
         elif len(cells) == 1:
@@ -379,6 +401,14 @@ class CachePanel(QWidget):
         else:
             selection = self.selection | cells
         self.set_selection(selection)
+        if left_out:
+            if len(picked) == 1:
+                self._message = (f"{cell_label(*next(iter(picked)))} has no scenery "
+                                 "in the scenery set (open water or not covered)")
+            else:
+                self._message = (f"{left_out:,} tile{'s' if left_out != 1 else ''} "
+                                 "without scenery in the set left out")
+            self._emit_status()
 
     def set_selection(self, cells: Iterable[tuple[int, int]]):
         self.selection = set(cells)
