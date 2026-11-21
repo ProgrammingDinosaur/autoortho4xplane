@@ -201,3 +201,55 @@ jobs:
         tag_name: ${{ inputs.relname }}
         prerelease: ${{ inputs.prerelease }}
         body: ${{ inputs.releasebody }}
+
+
+  # The self-updater reads this manifest to find the file for each install
+  # and its SHA-256. Signed when the AO_UPDATE_SIGNING_KEY secret is set
+  # (callers pass secrets with "secrets: inherit").
+  update-manifest:
+    if: ${{ inputs.relname != '' }}
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.14'
+
+    - name: Download Linux builds
+      uses: actions/download-artifact@v4
+      with:
+        pattern: linbin_*
+        path: release-files
+        merge-multiple: true
+
+    - name: Download macOS build
+      uses: actions/download-artifact@v4
+      with:
+        name: macbin
+        path: release-files
+
+    - name: Download Windows builds
+      uses: actions/download-artifact@v4
+      with:
+        name: winbin
+        path: release-files
+
+    - name: Write update manifest
+      env:
+        AO_UPDATE_SIGNING_KEY: ${{ secrets.AO_UPDATE_SIGNING_KEY }}
+      run: |
+        ls -l release-files
+        python scripts/make_update_manifest.py --tag "${{ inputs.relname }}" --out dist-manifest release-files/*
+
+    - name: Attach manifest to the release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist-manifest/*
+        tag_name: ${{ inputs.relname }}
+        prerelease: ${{ inputs.prerelease }}
+        body: ${{ inputs.releasebody }}

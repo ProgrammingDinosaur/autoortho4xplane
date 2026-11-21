@@ -156,6 +156,12 @@ kept_values =
 # offering to hand these back; a newly pinned one is offered again).
 dismissed_pinned =
 dismissed_update_version =
+# Check GitHub for a newer AutoOrtho when the app starts
+update_check = True
+# Which releases to offer: stable, or rc to also get release candidates
+update_channel = stable
+# Download a new version in the background so it is ready to install
+update_auto_download = False
 # Hide the window to the system tray / menu bar while streaming
 hide = False
 # Console/UI log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)

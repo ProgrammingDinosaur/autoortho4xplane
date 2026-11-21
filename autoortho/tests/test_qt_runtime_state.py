@@ -18,6 +18,8 @@ from aoconfig import AOConfig
 from config_ui_qt import ConfigUI
 from ui.runtime_state import RuntimeState
 from ui.services.common import ServiceResult
+from updater.releases import Release, UpdateOffer
+from updater.versions import parse_release_version
 
 
 @pytest.fixture
@@ -295,7 +297,11 @@ def test_settings_schema_renders_and_each_category_is_navigable(
             "Imagery and Look",
             "Flight Plan and App",
         },
-        "General": {"Startup and Window", "Application Window"},
+        "General": {
+            "Startup and Window",
+            "Application Window",
+            "Software Updates",
+        },
         "Setup & Storage": {"Paths Configuration", "Cache Settings"},
         "Scenery": {
             "Scenery Compatibility",
@@ -432,8 +438,16 @@ def test_update_result_uses_nonmodal_header_banner(
         lambda *args: pytest.fail("update checks must not open a modal"),
     )
 
+    release = Release(
+        tag="2.0.0",
+        version=parse_release_version("2.0.0"),
+        title="2.0.0",
+        notes="",
+        html_url="https://example.test/release",
+        prerelease=False,
+    )
     config_ui.on_update_check_result(
-        ("v2.0.0", "https://example.test/release")
+        UpdateOffer(release=release, asset=None, reason="source build")
     )
 
     assert not config_ui.shell.header.update_banner.isHidden()

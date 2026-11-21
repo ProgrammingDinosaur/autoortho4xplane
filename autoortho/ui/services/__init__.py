@@ -16,7 +16,6 @@ from .storage_service import (
     StorageService,
     StorageSummary,
 )
-from .update_service import UpdateInfo, UpdateService
 
 __all__ = [
     "CatalogService",
@@ -34,6 +33,4 @@ __all__ = [
     "SimBriefService",
     "StorageService",
     "StorageSummary",
-    "UpdateInfo",
-    "UpdateService",
 ]
