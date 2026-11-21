@@ -49,7 +49,7 @@ def _build_wizard(tmp_path, monkeypatch, scenery_choices=None, installed=False):
     return wizard
 
 
-def test_wizard_tracks_selected_regions(qt_app, tmp_path, monkeypatch):
+def test_wizard_offers_autoortho_scenery_instead_of_regions(qt_app, tmp_path, monkeypatch):
     wizard = _build_wizard(
         tmp_path,
         monkeypatch,
@@ -59,16 +59,14 @@ def test_wizard_tracks_selected_regions(qt_app, tmp_path, monkeypatch):
         ],
     )
     qt_app.processEvents()
+    page = wizard.scenery_page
 
     assert wizard.selected_paths["xplane_path"].endswith("X-Plane 12")
-    assert wizard.readiness.can_finish is False
-    assert wizard.review_page.isComplete() is False
-
-    item = wizard.scenery_page.list_widget.item(0)
-    item.setCheckState(Qt.CheckState.Checked)
-    qt_app.processEvents()
-
-    assert wizard.selected_region_ids == ("na",)
+    # Regions are downloaded on the map now: no installer list, and
+    # AutoOrtho scenery is on by default so Finish works right away.
+    assert page.list_widget.isHidden()
+    assert page.stream_check.isChecked()
+    assert wizard.selected_region_ids == ()
     assert wizard.readiness.can_finish is True
     assert wizard.review_page.isComplete() is True
 
@@ -103,7 +101,7 @@ def test_wizard_accepts_established_install_without_selection(qt_app, tmp_path, 
 
 import tile_stream
 from ui.dialogs.setup_wizard import existing_stream
-from ui.widgets.stream_panel import LOCKED_HELP, OVERLAY_HELP
+from ui.widgets.stream_panel import LOCKED_HELP, NO_OVERLAY_HELP, OVERLAY_HELP
 
 
 def _region_choices():
@@ -124,11 +122,14 @@ def test_streaming_without_regions_enables_finish(qt_app, tmp_path, monkeypatch)
     page = wizard.scenery_page
     qt_app.processEvents()
 
-    assert page.stream_check.isChecked() is False
+    assert page.stream_check.isChecked() is True  # on by default
+    page.stream_check.setChecked(False)
+    qt_app.processEvents()
     assert wizard.selected_streaming() is None
     assert wizard.readiness.can_finish is False
-    # The settings wait until streaming is ticked.
+    # The settings wait until AutoOrtho scenery is ticked.
     assert page.stream_source_combo.isEnabled() is False
+    assert page.stream_fetch_check.isEnabled() is False
 
     page.stream_check.setChecked(True)
     qt_app.processEvents()
@@ -139,37 +140,20 @@ def test_streaming_without_regions_enables_finish(qt_app, tmp_path, monkeypatch)
     assert wizard.review_page.isComplete() is True
     assert wizard.button(QWizard.WizardButton.FinishButton).isEnabled()
     assert wizard.selected_streaming() == {
-        "source": "xp11", "overlays": True, "disk_limit_gb": 20,
+        "source": "xp12", "overlays": False, "disk_limit_gb": 20,
+        "fetch_missing": True,
     }
+    page.stream_fetch_check.setChecked(False)
+    assert wizard.selected_streaming()["fetch_missing"] is False
     assert "finish without selecting a region" in page.note_label.text()
     assert wizard.readiness.by_id("setup-scenery").message.startswith(
-        "Scenery streaming"
+        "AutoOrtho scenery"
     )
     assert "Scenery streaming: turn on" in wizard.limits_page.details.toPlainText()
 
     page.stream_check.setChecked(False)
     qt_app.processEvents()
     assert wizard.readiness.can_finish is False
-
-    wizard.close()
-    wizard.deleteLater()
-
-
-def test_streaming_alongside_regions(qt_app, tmp_path, monkeypatch):
-    wizard = _build_wizard(tmp_path, monkeypatch, scenery_choices=_region_choices())
-    page = wizard.scenery_page
-    page.list_widget.item(1).setCheckState(Qt.CheckState.Checked)
-    page.stream_check.setChecked(True)
-    page.stream_limit_spin.setValue(50)
-    page.stream_overlays_check.setChecked(False)
-    qt_app.processEvents()
-
-    assert wizard.selected_region_ids == ("eu",)
-    assert wizard.selected_streaming() == {
-        "source": "xp11", "overlays": False, "disk_limit_gb": 50,
-    }
-    assert wizard.readiness.can_finish is True
-    assert "Streaming covers the rest" in wizard.readiness.by_id("setup-scenery").message
 
     wizard.close()
     wizard.deleteLater()
@@ -188,7 +172,14 @@ def test_streaming_offers_only_available_sets(qt_app, tmp_path, monkeypatch):
         if not spec.get("available"):
             assert combo.itemText(index).endswith("Soon")
     assert tile_stream.SOURCES[combo.currentData()]["available"] is True
-    # The overlays question carries the simHeaven hint.
+    # XP12 is the default and has no overlays; the XP11 set's overlays
+    # question carries the simHeaven hint.
+    assert combo.currentData() == "xp12"
+    assert page.stream_overlays_help.text() == NO_OVERLAY_HELP
+    page.stream_check.setChecked(True)
+    combo.setCurrentIndex(combo.findData("xp11"))
+    qt_app.processEvents()
+    assert page.stream_overlays_check.isEnabled()
     assert page.stream_overlays_help.text() == OVERLAY_HELP
     assert "simHeaven" in OVERLAY_HELP
 
@@ -197,10 +188,11 @@ def test_streaming_offers_only_available_sets(qt_app, tmp_path, monkeypatch):
 
 
 def test_unavailable_set_is_never_chosen(qt_app, tmp_path, monkeypatch):
-    monkeypatch.setitem(
-        tile_stream.SOURCES, "xp11",
-        dict(tile_stream.SOURCES["xp11"], available=False),
-    )
+    for key in list(tile_stream.SOURCES):
+        monkeypatch.setitem(
+            tile_stream.SOURCES, key,
+            dict(tile_stream.SOURCES[key], available=False),
+        )
     wizard = _build_wizard(tmp_path, monkeypatch, scenery_choices=_region_choices())
     wizard.scenery_page.stream_check.setChecked(True)
     qt_app.processEvents()
@@ -253,7 +245,7 @@ def test_existing_streaming_is_shown_and_not_set_up_again(qt_app, tmp_path, monk
     assert page.stream_check.isEnabled() is False
     assert page.stream_limit_spin.value() == 40
     assert page.stream_overlays_check.isChecked() is False
-    assert "already on" in page.stream_status_label.text()
+    assert "already set up" in page.stream_status_label.text()
     assert wizard.selected_streaming() is None
     assert wizard.readiness.can_finish is True
 

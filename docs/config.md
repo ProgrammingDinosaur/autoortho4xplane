@@ -12,19 +12,18 @@ On a new installation, AutoOrtho opens a guided setup wizard that:
 
 1. **Welcome and checks:** the required FUSE backend for this platform.
 2. **X-Plane:** detected, or browse for it.
-3. **Scenery:** the scenery folder, whether to
-   [stream scenery](scenery.md#streaming-scenery-instead-of-installing-regions),
-   and regions to install (or use scenery you already have). Tick **Stream
-   scenery you haven't installed** to fly without installing regions, or
-   stream as well as install: installed regions are always used first.
-   Choose the **Scenery set** (sets marked **Soon** can't be picked yet),
-   the **Disk limit**, and whether to **Include overlays**; turn overlays off
-   if you use simHeaven X-World or another overlay package. With streaming
-   on, you can finish without selecting a region. When you click **Finish**,
-   AutoOrtho downloads the tile index (a few megabytes) in the background;
-   if that fails, it shows the error and the task in the task list, and you
-   can turn streaming on later from the Scenery Library. Streaming can't be
-   changed here while AutoOrtho or X-Plane is running.
+3. **Scenery:** the scenery folder and
+   [AutoOrtho scenery](scenery.md#autoortho-scenery), ticked by default
+   (or use scenery you already have). Choose the **Scenery set** (the XP12
+   set by default, or the XP11 legacy set), whether to **Download tiles
+   while flying**, the **Disk limit**, and whether to **Include overlays**
+   (XP11 legacy set only); turn overlays off if you use simHeaven X-World or
+   another overlay package. After setup, download the areas you fly on the
+   map, or just fly. When you click **Finish**, AutoOrtho downloads the tile
+   index (about 30 MB) in the background; if that fails, it shows the error
+   and the task in the task list, and you can set it up later from the
+   Scenery Library. It can't be changed here while AutoOrtho or X-Plane is
+   running.
 4. **Image cache:** one folder, its free space, and a disk cache limit
    (with a suggestion for that drive). The long-term cache and download
    folders are under **More folders…**.
@@ -47,13 +46,13 @@ changes are discarded and the last applied configuration remains active.
 The application is organized around five primary destinations:
 
 - **Home** — what AutoOrtho is doing now (see [Home](#home) below).
-- **Scenery Library** — scenery search, filters, installation, updates,
-  package details, and [scenery streaming](scenery.md#streaming-scenery-instead-of-installing-regions)
-  (fly without installing regions).
+- **Scenery Library** — the [AutoOrtho scenery](scenery.md#autoortho-scenery)
+  set and its settings, and regions installed with earlier versions.
 - **Flight Plan & Map** — SimBrief controls, loaded-flight details, and a map
   with two views: the Custom Map editor and the
-  [Cache view](scenery.md#seeing-and-managing-stored-tiles-on-the-map) of
-  what AutoOrtho has stored per tile.
+  [Scenery & Cache view](scenery.md#downloading-tiles-and-regions-on-the-map),
+  where you download tiles or whole regions and see what AutoOrtho has
+  stored per tile.
 - **Settings** — Essentials first, every setting with **Show all settings**,
   search, exact numeric inputs, and Apply/Revert.
 - **Diagnostics** — health checks, searchable logs, export actions, and

@@ -261,23 +261,60 @@ If in doubt, re-install the scenery packs.
 AutoOrtho checks for metadata for installed scenery packs in `Custom Scenery/z_autoorth/**_info.json`  Where '**' is a shortname for each scenery pack installed.  You can delete the corresponding .json file, and re-run the configuration utility and should be able to reinstall the scenery pack
 
 ### Do I have to download whole scenery regions?
-No. Turn on **Stream scenery you haven't installed** in the Scenery Library
-and AutoOrtho downloads each tile the first time X-Plane needs it. Installed
-regions are still used first, so you can install the areas you fly most and
-stream the rest. See
-[Streaming scenery instead of installing regions](scenery.md#streaming-scenery-instead-of-installing-regions).
+No. Tiles download the first time X-Plane needs them. To fly an area
+offline or skip the wait, download it on the map: **Flight Plan & Map** >
+**Scenery & Cache**, select tiles or a whole area in **Select a region…**, and
+click **Download**. See [AutoOrtho scenery](scenery.md#autoortho-scenery).
 
-### I use simHeaven. Should I include overlays when streaming?
-No. Untick **Include overlays** in the Stream scenery panel. simHeaven
-already provides roads, forests and buildings, and streaming AutoOrtho's
-overlays as well would duplicate them.
+### Where did the region installer go?
+Regions are downloaded on the map now (see above): the same scenery, tile by
+tile or a whole region at once, and you can choose any area, not just the
+predefined regions. Regions you installed earlier are moved into AutoOrtho
+scenery when this version first starts, without downloading anything again,
+and show on the map as downloaded tiles. See
+[Regions installed with earlier versions](scenery.md#regions-installed-with-earlier-versions).
 
-### Scenery streaming is on, but I see default X-Plane terrain in some places
-Those tiles couldn't be downloaded when X-Plane asked for them, so X-Plane
-got them from its Global Scenery instead. Check that:
+### Can I fly only the tiles I downloaded, with nothing downloading while I fly?
+Yes. Untick **Download tiles while flying** in the AutoOrtho scenery panel.
+X-Plane then shows its default scenery outside the tiles you downloaded. See
+[Using only downloaded tiles](scenery.md#using-only-downloaded-tiles).
 
-- AutoOrtho was running before X-Plane started, and streaming was turned on
-  before AutoOrtho started. Streaming changes take effect on the next start.
+### Can I download the imagery ahead too?
+Yes. In the Download dialog, choose **Imagery** up to the zoom you fly
+with. The imagery is kept: the cache limit doesn't remove it. See
+[Downloading imagery ahead](scenery.md#downloading-imagery-ahead).
+
+### I use simHeaven. Should I include overlays?
+No. Untick **Include overlays** in the AutoOrtho scenery panel. simHeaven
+already provides roads, forests and buildings, and AutoOrtho's overlays as
+well would duplicate them. The XP12 set has no overlays, so the option is
+off for it anyway.
+
+### Do XP12 tiles need the Seasons patch?
+No. The XP12 set's tiles already include X-Plane 12's seasons. For the XP11
+set, tick **Add seasons to downloaded tiles**; see
+[Seasons for the XP11 set](scenery.md#seasons-for-the-xp11-set). An
+installed package that already has seasonal data shows Seasons as
+**Included** and doesn't offer the patch.
+
+### The Seasons patch says Applied, but I see no seasons
+On X-Plane 12.1 and later the Seasons patch added only an elevation
+reference and no seasons. That's fixed. Restore the region's default DSFs in
+**Scenery Options** and apply Seasons again.
+
+### Can I set terrain reflectivity for AutoOrtho scenery?
+Yes. In the AutoOrtho scenery panel, tick **Set terrain reflectivity** and
+pick a value. It applies to all tiles from the next start. See
+[Terrain reflectivity](scenery.md#terrain-reflectivity).
+
+### AutoOrtho scenery is on, but I see default X-Plane terrain in some places
+Those tiles weren't downloaded, or couldn't be when X-Plane asked for them,
+so X-Plane got them from its Global Scenery instead. Check that:
+
+- **Download tiles while flying** is on, or that you downloaded that area
+  on the map.
+- AutoOrtho was running before X-Plane started, and the scenery was set up
+  before AutoOrtho started. Changes take effect on the next start.
 - Your connection to GitHub works.
 
 The log says which tiles fell back and why: look for
@@ -286,10 +323,10 @@ The log says which tiles fell back and why: look for
 throttled downloads; AutoOrtho tries again after a pause. Reload the scenery
 or restart the flight once the tiles have downloaded.
 
-### Why can't I change the Stream scenery settings?
-They're locked while AutoOrtho or X-Plane is running, because the streaming
-folders are mounted when AutoOrtho starts. Stop AutoOrtho, change the
-settings, and start it again.
+### Why can't I change the AutoOrtho scenery settings or download tiles?
+They're locked while AutoOrtho or X-Plane is running, because the scenery
+folders are mounted when AutoOrtho starts. Stop AutoOrtho, make the change,
+and start it again.
 
 ### I installed scenery, clicked "Start Streaming," but X-Plane did not automatically start
 You have to start X-Plane separately from this tool.  It's also best to start X-Plane _after_ starting autoortho so that all new files and directories are picked up.

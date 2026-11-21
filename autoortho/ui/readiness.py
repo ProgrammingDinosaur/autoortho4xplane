@@ -654,7 +654,7 @@ def _check_scenery(
                 id="setup-scenery",
                 title="Scenery",
                 status=ReadinessStatus.SUCCESS,
-                message="Scenery streaming: tiles download as you fly.",
+                message="AutoOrtho scenery: download tiles on the map or as you fly.",
                 fix_action="",
                 last_checked=_now(),
                 details={"installed": False, "selected": selected_region_ids,
@@ -671,8 +671,7 @@ def _check_scenery(
             status=ReadinessStatus.WARNING,
             message="No scenery is selected yet.",
             fix_action=(
-                "Select at least one region, turn on scenery streaming, "
-                "or point to an existing install."
+                "Turn on AutoOrtho scenery, or point to an existing install."
             ),
             last_checked=_now(),
             details={"installed": False, "selected": selected_region_ids},
