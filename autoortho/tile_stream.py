@@ -64,6 +64,7 @@ SOURCES = OrderedDict([
         "label": "XP12 set (flightwusel v1.4, by jonaseberle)",
         "available": True,
         "tile_mb": 12,          # average base mesh per tile, for estimates
+        "short": "XP12",
         "ortho_index": INDEX_BASE_URL + "tile_index_xp12.json.gz",
         "overlay_index": None,  # base mesh only; pair with simHeaven
     }),
@@ -71,6 +72,7 @@ SOURCES = OrderedDict([
         "label": "XP11 legacy set (kubilus1/autoortho-scenery)",
         "available": True,
         "tile_mb": 3,
+        "short": "XP11",
         "ortho_index": INDEX_BASE_URL + "tile_index_xp11.json.gz",
         "overlay_index": INDEX_BASE_URL + "overlay_index_xp11.json.gz",
     }),
@@ -125,6 +127,168 @@ def mask_cell(name: str) -> Optional[Tuple[int, int]]:
     row, col, zoom = int(m.group(1)), int(m.group(2)), int(m.group(3))
     lat, lon, _ = ter_geometry(row, col, zoom)
     return math.floor(lat), math.floor(lon)
+
+
+def texture_cells(row: int, col: int, zoom: int) -> set:
+    """The 1x1 degree tiles a 16x16-chunk texture (or its water mask)
+    touches. Textures straddle degree lines, so neighbours share some."""
+    n = 2.0 ** zoom
+    lon0 = col / n * 360.0 - 180.0
+    lon1 = (col + 16) / n * 360.0 - 180.0
+
+    def lat(r):
+        return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * r / n))))
+
+    north, south = lat(row), lat(row + 16)
+    eps = 1e-9
+    return {(la, lo)
+            for la in range(math.floor(south), math.floor(north - eps) + 1)
+            for lo in range(math.floor(lon0), math.floor(lon1 - eps) + 1)}
+
+
+def short_label(source: str) -> str:
+    return SOURCES.get(source, {}).get("short") or source.upper()
+
+
+# Tiles in a package that came from another scenery set (a region moved in,
+# or kept tiles carried over a switch): {"tiles": {"+47-123": "xp11"}}.
+# Every other stored tile is the package's own set. Such tiles bring their
+# own terrain files, which win over generated ones (ter_bytes).
+SOURCES_NAME = "tile_sources.json"
+
+
+def read_tile_sources(root: str) -> Dict[Tuple[int, int], str]:
+    try:
+        with open(os.path.join(root, SOURCES_NAME), "r", encoding="utf-8") as fh:
+            tiles = json.load(fh).get("tiles", {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+    out = {}
+    for key, source in tiles.items():
+        cell = dsf_cell(f"{key}.dsf")
+        if cell is not None and isinstance(source, str):
+            out[cell] = source
+    return out
+
+
+def write_tile_sources(root: str, sources: Dict[Tuple[int, int], str]) -> None:
+    path = os.path.join(root, SOURCES_NAME)
+    if not sources:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    tiles = {os.path.basename(dsf_rel(*c))[:-4]: s for c, s in sorted(sources.items())}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"tiles": tiles}, fh)
+    os.replace(tmp, path)
+
+
+def backfill_tile_sources(root: str, marker: dict,
+                          index: Optional["TileIndex"] = None) -> int:
+    """Record the tiles of another set in a package that has none recorded
+    (moved in before the record existed). A package's own downloads are
+    stored exactly as the index lists them, so a kept DSF of another size
+    is from the other set. Only runs where real terrain files show tiles of
+    another set exist. Returns the number recorded."""
+    if os.path.exists(os.path.join(root, SOURCES_NAME)):
+        return 0
+    try:
+        with os.scandir(os.path.join(root, "terrain")) as it:
+            if not any(e.name.endswith(".ter") for e in it):
+                return 0
+    except OSError:
+        return 0
+    own = marker.get("source", "")
+    others = [k for k in SOURCES if k != own]
+    if not others:
+        return 0
+    if index is None:
+        path = marker.get("index", INDEX_NAME)
+        if not os.path.isabs(path):
+            path = os.path.join(root, path)
+        try:
+            index = TileIndex.load(path)
+        except (OSError, ValueError):
+            return 0
+    found = {}
+    for cell in read_pins(root):
+        rel = dsf_rel(*cell)
+        try:
+            size = os.path.getsize(os.path.join(root, *rel.split("/")))
+        except OSError:
+            continue
+        entry = index.lookup(rel)
+        if entry is None or entry[_ENTRY_SIZE] != size:
+            found[cell] = others[0]
+    if found:
+        write_tile_sources(root, found)
+        log.info("Tile stream: recorded %d tiles of another set in %s",
+                 len(found), os.path.basename(root))
+    return len(found)
+
+
+def tile_set(root: str, marker: dict, cell, sources=None) -> str:
+    """The scenery set a stored tile is from."""
+    sources = read_tile_sources(root) if sources is None else sources
+    return sources.get(cell) or marker.get("source", "")
+
+
+def forget_foreign_tiles(root: str, cells: Iterable[Tuple[int, int]],
+                         index: Optional["TileIndex"] = None) -> Tuple[int, int]:
+    """Delete the DSFs of ``cells`` that came from another set, with the
+    terrain files and textures only they used, and drop them from the
+    record. Returns (files, bytes) removed.
+
+    A terrain file or texture goes when its area touches one of ``cells``
+    and no other tile of another set: a neighbour from another set still
+    needs what it shares, and a tile of the package's own set must get the
+    generated terrain again, not the old set's. Textures the index has are
+    left (it can fetch them again).
+    """
+    sources = read_tile_sources(root)
+    gone = {c for c in cells if c in sources}
+    if not gone:
+        return 0, 0
+    remaining = set(sources) - gone
+    files = size = 0
+
+    def remove(path):
+        nonlocal files, size
+        try:
+            n = os.path.getsize(path)
+            os.remove(path)
+        except OSError:
+            return
+        files += 1
+        size += n
+
+    for cell in gone:
+        remove(os.path.join(root, *dsf_rel(*cell).split("/")))
+
+    def only_ours(area):
+        return bool(area & gone) and not (area & remaining)
+
+    try:
+        terrain = list(os.scandir(os.path.join(root, "terrain")))
+    except OSError:
+        terrain = []
+    for e in terrain:
+        m = TER_NAME_RE.match(e.name)
+        if m and only_ours(texture_cells(int(m["row"]), int(m["col"]), int(m["zoom"]))):
+            remove(e.path)
+    try:
+        textures = list(os.scandir(os.path.join(root, "textures")))
+    except OSError:
+        textures = []
+    for e in textures:
+        m = MASK_NAME_RE.match(e.name)
+        if not m or (index is not None and index.lookup(f"textures/{e.name}") is not None):
+            continue
+        if only_ours(texture_cells(int(m.group(1)), int(m.group(2)), int(m.group(3)))):
+            remove(e.path)
+    write_tile_sources(root, {c: s for c, s in sources.items() if c not in gone})
+    return files, size
 
 
 # Tiles the user chose to keep for offline flying. Eviction skips them and
@@ -1909,6 +2073,16 @@ def carry_kept_tiles(ao_scenery_dir: str, old_name: str, new_name: str,
             carried.append(cell)
         write_pins(new_root, read_pins(new_root) | set(carried))
         _carry_seasons_record(old_root, new_root, carried)
+        old_sources = read_tile_sources(old_root)
+        new_source = new_marker.get("source", "")
+        sources = read_tile_sources(new_root)
+        for cell in carried:
+            origin = old_sources.get(cell) or old_marker.get("source", "")
+            if origin and origin != new_source:
+                sources[cell] = origin
+            else:
+                sources.pop(cell, None)
+        write_tile_sources(new_root, sources)
         log.info("Tile stream: moved %d kept tiles from %s to %s",
                  len(carried), old_name, new_name)
         return len(carried)

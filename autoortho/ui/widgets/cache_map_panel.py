@@ -68,7 +68,10 @@ SIZE_BINS = [
     (8e9, "#d43d51", "2–8 GB"),
     (float("inf"), "#8e1b5f", "Over 8 GB"),
 ]
-BY_STATE, BY_SIZE = "state", "size"
+BY_STATE, BY_SIZE, BY_SET = "state", "size", "set"
+# Colours for "Colour by: Scenery set", per set id; others get the last one.
+SET_COLORS = {"xp12": "#3fa7d6", "xp11": "#c77dff"}
+OTHER_SET_COLOR = "#9aa0a6"
 ESTIMATE_ZOOMS = (16, 17, 18)
 LOCKED_TIP = "Stop AutoOrtho and X-Plane to delete or download tiles."
 RESCAN_AFTER = 30.0  # seconds before showing the view scans again
@@ -81,7 +84,11 @@ def size_color(total: int) -> tuple[str, str]:
     return SIZE_BINS[-1][1], SIZE_BINS[-1][2]
 
 
-def describe_cell(cell, usage: Optional["ci.CellUsage"]) -> str:
+def set_label(source: str) -> str:
+    return f"{ci.tile_stream.short_label(source)} set" if source else ""
+
+
+def describe_cell(cell, usage: Optional["ci.CellUsage"], current_set: str = "") -> str:
     """Hover text for one tile."""
     title = cell_label(*cell)
     if usage is None or (usage.total == 0 and not usage.pinned):
@@ -97,7 +104,12 @@ def describe_cell(cell, usage: Optional["ci.CellUsage"]) -> str:
             parts.append(f"{usage.mask_files} water mask"
                          f"{'s' if usage.mask_files != 1 else ''} "
                          f"{format_bytes(usage.mask_bytes)}")
-        lines.append(f"Scenery: {format_bytes(usage.mesh_bytes)}")
+        scenery = f"Scenery: {format_bytes(usage.mesh_bytes)}"
+        if usage.mesh_set:
+            scenery += f"  ·  {set_label(usage.mesh_set)}"
+            if current_set and usage.mesh_set != current_set:
+                scenery += f" (you use the {set_label(current_set)})"
+        lines.append(scenery)
         lines.append("  " + ", ".join(parts))
     elif usage.pinned:
         lines.append("Scenery: not downloaded yet")
@@ -191,6 +203,12 @@ class CachePanel(QWidget):
         self.unkeep_button.clicked.connect(self.unkeep_selected)
         bar.addWidget(self.unkeep_button)
 
+        self.switch_button = QPushButton()
+        self.switch_button.setAccessibleName(
+            "Replace the selected tiles with the scenery set in use")
+        self.switch_button.clicked.connect(self.switch_selected)
+        bar.addWidget(self.switch_button)
+
         self.clear_button = QPushButton("Clear")
         self.clear_button.setAccessibleName("Clear the selection")
         self.clear_button.setToolTip("Clear the selection (Esc)")
@@ -205,6 +223,7 @@ class CachePanel(QWidget):
         self.colour_combo.setAccessibleName("Colour tiles by")
         self.colour_combo.addItem("What's stored", BY_STATE)
         self.colour_combo.addItem("Size", BY_SIZE)
+        self.colour_combo.addItem("Scenery set", BY_SET)
         self.colour_combo.currentIndexChanged.connect(self._paint_layer)
         colour_label.setBuddy(self.colour_combo)
         bar.addWidget(self.colour_combo)
@@ -346,13 +365,20 @@ class CachePanel(QWidget):
         for cell, usage in inv.cells.items():
             if usage.total == 0:
                 continue
-            if by == BY_SIZE:
+            if by == BY_SET:
+                if not usage.dsf_bytes:
+                    continue        # imagery only: no scenery set
+                color = SET_COLORS.get(usage.mesh_set, OTHER_SET_COLOR)
+                label = set_label(usage.mesh_set) or "Other"
+            elif by == BY_SIZE:
                 color, label = size_color(usage.total)
             else:
                 color, label = STATE_COLORS[usage.state], STATE_LABELS[usage.state]
             groups.setdefault(color, []).append(cell)
             labels[color] = label
-        if by == BY_SIZE:
+        if by == BY_SET:
+            order = list(dict.fromkeys(list(SET_COLORS.values()) + [OTHER_SET_COLOR]))
+        elif by == BY_SIZE:
             order = [c for _l, c, _t in SIZE_BINS]
         else:
             order = [STATE_COLORS[k] for k in ("mesh", "imagery", "both")]
@@ -372,7 +398,7 @@ class CachePanel(QWidget):
         if not self.selectable(cell):
             return (f"{cell_label(*cell)}\nNot in the scenery set (open water "
                     "or not covered)")
-        return describe_cell(cell, self.usage(cell))
+        return describe_cell(cell, self.usage(cell), self.inventory.ortho_source)
 
     # -- selection ------------------------------------------------------------
     def covered(self, cell) -> bool:
@@ -466,6 +492,19 @@ class CachePanel(QWidget):
             if stored else "Nothing is stored for the selected tiles"
             if has_selection else "Select stored tiles on the map first"))
         self.unkeep_button.setVisible(kept)
+        other = (ci.other_set_cells(self.inventory, self.selection)
+                 if self.inventory is not None else [])
+        current = set_label(self.inventory.ortho_source) if self.inventory else ""
+        self.switch_button.setVisible(bool(other))
+        self.switch_button.setEnabled(self._can_change() and bool(other))
+        if other:
+            n = len(other)
+            self.switch_button.setText(
+                f"Use {ci.tile_stream.short_label(self.inventory.ortho_source)} "
+                f"for {n:,} tile{'s' if n != 1 else ''}…")
+            self.switch_button.setToolTip(locked or (
+                f"Download the {current}'s version of the selected tiles that "
+                "are from another set, and delete their old files"))
         self.unkeep_button.setEnabled(can_change and kept)
         self.clear_button.setVisible(has_selection)
         self.region_combo.setEnabled(bool(self.regions))
@@ -615,6 +654,52 @@ class CachePanel(QWidget):
 
         self._run(lambda: ci.delete_cells(ao_dir, cache_dir, cells,
                                           mesh=mesh, imagery=imagery), done)
+
+    def switch_selected(self):
+        """Replace selected tiles of another set with the set in use: their
+        old files go (with the terrain only they used), they stay kept, and
+        the set in use downloads its version."""
+        if not self._can_change() or self.inventory is None:
+            return
+        cells = ci.other_set_cells(self.inventory, self.selection)
+        if not cells:
+            return
+        current = self.inventory.ortho_source
+        label = set_label(current)
+        olds = sorted({set_label(self.usage(c).mesh_set) for c in cells})
+        n = len(cells)
+        tiles = f"{n:,} tile{'s' if n != 1 else ''}"
+        tile_mb = ci.tile_stream.SOURCES.get(current, {}).get("tile_mb")
+        size = f" (about {format_bytes(n * tile_mb * 1e6)})" if tile_mb else ""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(f"Use the {label}")
+        box.setText(f"Use the {label} for {tiles}?")
+        box.setInformativeText(
+            f"Their {' and '.join(olds)} files are deleted and the {label}'s "
+            f"version downloads{size}. They stay downloaded (kept). Until a "
+            "tile is done, X-Plane shows its default scenery there if "
+            "downloading while flying is off.")
+        ok = box.addButton(f"Use {label}", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(ok)
+        box.exec()
+        if box.clickedButton() is not ok:
+            return
+        ao_dir, _cache, custom = self.paths()
+        self._set_busy(f"Removing the old files of {tiles}…")
+
+        def removed(result):
+            self.busy = ""
+            if isinstance(result, Exception):
+                self._message = f"Could not switch the tiles: {result}"
+                self._update_actions()
+                self._emit_status()
+                return
+            # Imagery doesn't depend on the scenery set: it stays as it is.
+            self._start_keep(ao_dir, custom, cells, int(n * (tile_mb or 0) * 1e6), None)
+
+        self._run(lambda: ci.switch_to_current_set(ao_dir, cells), removed)
 
     def unkeep_selected(self):
         if not self._can_change() or not self.selection:

@@ -586,6 +586,7 @@ def test_switching_sets_moves_kept_tiles_with_their_files(tmp_path, grid_release
     assert "BORDER_TEX ../textures/100000_148176_ZL18.png" in sea   # the old set's
     assert ts.read_pins(str(new)) == {(40, -9)}
     assert json.loads((new / "seasons_tiles.json").read_text())["tiles"] == {"+40-009": [1, 2]}
+    assert ts.read_tile_sources(str(new)) == {(40, -9): "xp11"}   # shown as XP11 on the map
 
 
 def test_switching_sets_first_downloads_textures_kept_tiles_lack(tmp_path, grid_release,

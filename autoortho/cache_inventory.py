@@ -78,6 +78,7 @@ class CellUsage:
     imagery_used: float = 0.0   # newest mtime of the imagery files
     pinned: bool = False
     imagery_kept: int = 0       # highest zoom of imagery kept (0: none)
+    mesh_set: str = ""          # scenery set of the stored base mesh
 
     @property
     def mesh_bytes(self) -> int:
@@ -124,6 +125,7 @@ class CacheInventory:
     seconds: float = 0.0
     # zoom -> [chunk files, chunk bytes], for size estimates.
     chunk_zooms: Dict[int, List[int]] = field(default_factory=dict)
+    ortho_source: str = ""      # the scenery set in use
 
     def cell(self, cell: Cell) -> CellUsage:
         usage = self.cells.get(cell)
@@ -271,6 +273,11 @@ def _scan_packages(inv: CacheInventory, ao_scenery_dir: str) -> None:
         inv.packages.append((name, kind))
         for cell in tile_stream.read_pins(root):
             inv.cell(cell).pinned = True
+        sources = {}
+        if kind == "ortho":
+            inv.ortho_source = marker.get("source", "")
+            tile_stream.backfill_tile_sources(root, marker)
+            sources = tile_stream.read_tile_sources(root)
         for f, cell in _package_files(root):
             try:
                 st = f.stat()
@@ -285,6 +292,7 @@ def _scan_packages(inv: CacheInventory, ao_scenery_dir: str) -> None:
                 usage.overlay_bytes += st.st_size
             else:
                 usage.dsf_bytes += st.st_size
+                usage.mesh_set = sources.get(cell) or inv.ortho_source
             usage.mesh_used = max(usage.mesh_used, st.st_mtime)
 
 
@@ -398,6 +406,12 @@ def _remove(path: str, result: ChangeResult) -> None:
 def _delete_mesh(ao_scenery_dir: str, cells: Set[Cell], result: ChangeResult) -> None:
     for name, marker in tile_stream.stream_packages(ao_scenery_dir).items():
         root = os.path.join(ao_scenery_dir, name)
+        if marker.get("kind", "ortho") == "ortho":
+            # Tiles of another set take their own terrain files along, so a
+            # tile downloaded there later gets this set's.
+            files, size = tile_stream.forget_foreign_tiles(root, cells)
+            result.files += files
+            result.bytes += size
         for cell in cells:
             _remove(os.path.join(root, *tile_stream.dsf_rel(*cell).split("/")), result)
         # A mask on a degree line may also serve a neighbouring tile. Only
@@ -482,6 +496,37 @@ def pin_cells(ao_scenery_dir: str, cells: Iterable[Cell], pinned: bool = True) -
             tile_stream.write_pins(root, new)
             changed += 1
     return changed
+
+
+def other_set_cells(inventory: "CacheInventory", cells: Iterable[Cell]) -> List[Cell]:
+    """The cells whose stored base mesh is from another set than the one in
+    use."""
+    out = []
+    for cell in cells:
+        usage = inventory.cells.get(cell)
+        if (usage is not None and usage.dsf_bytes and usage.mesh_set
+                and usage.mesh_set != inventory.ortho_source):
+            out.append(cell)
+    return sorted(out)
+
+
+def switch_to_current_set(ao_scenery_dir: str, cells: Iterable[Cell]) -> ChangeResult:
+    """Remove the stored tiles of ``cells`` that are from another set (with
+    the terrain and textures only they used), keeping them pinned, so the
+    set in use downloads its own version (``keep_offline``)."""
+    cells = set(cells)
+    result = ChangeResult(tiles=len(cells))
+    for name, marker in tile_stream.stream_packages(ao_scenery_dir).items():
+        if marker.get("kind", "ortho") != "ortho":
+            continue
+        root = os.path.join(ao_scenery_dir, name)
+        files, size = tile_stream.forget_foreign_tiles(root, cells)
+        result.files += files
+        result.bytes += size
+        pins = tile_stream.read_pins(root)
+        if not cells <= pins:
+            tile_stream.write_pins(root, pins | cells)
+    return result
 
 
 def mesh_download_estimate(ao_scenery_dir: str, cells: Iterable[Cell]) -> Tuple[int, int, int]:

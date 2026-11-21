@@ -255,12 +255,21 @@ tiles. Hover over a tile to see its sizes, imagery zoom levels and sources,
 kept imagery, and when it was last used. The line under the map shows the
 totals. **Show Stored** zooms the map to the tiles that are stored.
 
+Choose **Colour by: Scenery set** to see which set each stored tile is from,
+for example XP11 tiles of a region you installed earlier among XP12 tiles;
+hovering a tile says it too. When the selection has tiles from a set other
+than the one you use, **Use XP12 for N tiles…** (or XP11) appears: it
+deletes their old files and downloads the set's version, and they stay
+downloaded. Imagery isn't affected.
+
 To delete, select tiles and click **Delete N tiles…**. Tick **Scenery**,
 **Imagery** or both; each shows how much it would free, and nothing is
 deleted until you click **Delete**.
 
 - Deleted scenery is downloaded again the next time you fly there if
   downloading while flying is on. Deleting it also stops keeping the tile.
+  A tile from another set (an XP11 region in the XP12 set) takes its own
+  terrain files along, so the set you use gets its own there again.
 - Deleted imagery is downloaded again when X-Plane needs it.
 - Installed regions aren't affected.
 

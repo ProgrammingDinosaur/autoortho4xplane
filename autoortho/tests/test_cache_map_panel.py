@@ -350,3 +350,34 @@ def test_switching_sets_drops_tiles_the_new_one_lacks(setup, monkeypatch):
     monkeypatch.setattr(ci, "stream_coverage", lambda _ao: ([], {(47, -122)}))
     panel._read_regions("ao")
     assert panel.selection == {(47, -122)}
+
+
+def test_colour_by_scenery_set_and_switching_tiles(setup, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    editor, panel, _, (ao_dir, cache, ortho, _) = setup
+    # The ortho package here is the XP11 set; mark one stored tile as XP12.
+    ts.write_tile_sources(ortho, {(47, -123): "xp12"})
+    panel.refresh()
+    editor.set_view(cme.CACHE_VIEW)
+    panel.colour_combo.setCurrentIndex(panel.colour_combo.findData(cmp.BY_SET))
+    legend = [t for _c, t in editor.canvas._cache_legend]
+    assert legend[:2] == ["XP12 set", "XP11 set"]
+    assert "XP12 set (you use the XP11 set)" in panel.hover_text((47, -123))
+    assert "XP11 set" in panel.hover_text((39, 23))
+
+    panel.set_selection({(47, -123), (39, 23)})
+    assert not panel.switch_button.isHidden()
+    assert panel.switch_button.text() == "Use XP11 for 1 tile…"
+    panel.set_selection({(39, 23)})
+    assert panel.switch_button.isHidden()
+
+    panel.set_selection({(47, -123)})
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: 0)
+    monkeypatch.setattr(QMessageBox, "clickedButton",
+                        lambda box: [b for b in box.buttons() if b.text().startswith("Use")][0])
+    started = []
+    monkeypatch.setattr(panel, "_start_keep", lambda *a: started.append(a))
+    panel.switch_button.click()
+    assert started and started[0][2] == [(47, -123)] and started[0][4] is None
+    assert not os.path.exists(os.path.join(ortho, *ts.dsf_rel(47, -123).split("/")))
+    assert ts.read_pins(ortho) >= {(47, -123)}

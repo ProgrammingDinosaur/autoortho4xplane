@@ -259,6 +259,26 @@ as above.
 Moved files the new index doesn't have can't be downloaded again, so
 `evict` skips them and the map's Delete leaves masks the index lacks.
 
+### Tiles of another set
+
+`tile_sources.json` in a package lists the tiles from another set
+(`{"tiles": {"+47-123": "xp11"}}`, `read_tile_sources`); every other stored
+tile is the package's own set. `_adopt_checked` (with its own terrain) and
+`carry_kept_tiles` write it. Packages migrated before it existed are filled
+in once by `backfill_tile_sources` from the inventory scan: a package stores
+its own downloads exactly as the index sizes them (34 of 34 on a real XP12
+install), so a kept DSF of another size is from the other set; it only runs
+where real terrain files exist.
+
+`forget_foreign_tiles` deletes such tiles' DSFs with the real terrain files
+and unindexed masks only they used: a file goes when its texture area
+(`texture_cells`) touches a tile being removed and no other tile of another
+set. Leaving one would make a tile of the package's own set downloaded
+there later use the old set's terrain. The map's Delete calls it, and so
+does **Use XP12 for N tiles…** (`switch_to_current_set`, then Download).
+The Scenery & Cache view shows the set per tile (`CellUsage.mesh_set`,
+Colour by: Scenery set, hover text).
+
 ## Seasons for downloaded XP11 tiles
 
 `stream_seasons.patch_tile` runs `DsfUtils.add_seasons_to_dsf_file` on a

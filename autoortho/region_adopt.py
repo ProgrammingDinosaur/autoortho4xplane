@@ -394,6 +394,12 @@ def _adopt_checked(ao_scenery_dir: str, check: RegionCheck, pkg_root: str,
             size += n
         if progress and (i % 50 == 0 or i == total):
             progress(check.region_id, i, total)
+    if own_terrain:
+        # Its tiles are another set's than the package's: say so (the map
+        # shows it, and deleting one removes its own terrain files too).
+        sources = tile_stream.read_tile_sources(pkg_root)
+        sources.update({c: REGION_SET for c in check.tiles})
+        tile_stream.write_tile_sources(pkg_root, sources)
     info_path = _info_path(ao_scenery_dir, check.region_id)
     roughness = _region_roughness(_read_info(info_path))
     # With its own terrain files the region keeps its reflectivity in them.
