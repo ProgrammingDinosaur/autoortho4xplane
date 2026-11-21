@@ -174,6 +174,22 @@ class SeasonsApplyStatus(Enum):
     NOT_APPLIED = "not_applied"
     PARTIALLY_APPLIED = "partially_applied"
     APPLIED = "applied"
+    # The package was built with X-Plane 12's seasonal rasters (e.g. the XP12
+    # set): there is nothing to apply.
+    INCLUDED = "included"
+
+
+def _has_native_seasons(package_dir) -> bool:
+    """Whether an installed package's DSFs already have seasonal rasters."""
+    try:
+        try:
+            from autoortho import tile_stream
+        except ImportError:
+            import tile_stream
+        return tile_stream.package_has_native_seasons(package_dir)
+    except Exception as exc:
+        log.debug(f"Could not check {package_dir} for native seasons: {exc}")
+        return False
 
 
 class RoughnessApplyStatus(Enum):
@@ -765,7 +781,10 @@ class Release(object):
             else:
                 merged_sets[folder].update(files)
 
-        if (not expected_sets and not self.processed_dsf_seasons
+        if not self.processed_dsf_seasons and not self.missing_xp_tiles \
+                and _has_native_seasons(self.subfolder_dir):
+            self.seasons_apply_status = SeasonsApplyStatus.INCLUDED
+        elif (not expected_sets and not self.processed_dsf_seasons
                 and not self.missing_xp_tiles):
             self.seasons_apply_status = SeasonsApplyStatus.NOT_APPLIED
         elif merged_sets == expected_sets:

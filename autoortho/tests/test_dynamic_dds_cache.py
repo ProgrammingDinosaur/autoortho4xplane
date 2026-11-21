@@ -2527,3 +2527,25 @@ def test_dds_skeleton_is_sized_without_writing_the_gap(dds_cache, cache_dir):
     if os.name == "nt" and _volume_supports_sparse(path):
         attrs = os.stat(path).st_file_attributes
         assert attrs & stat.FILE_ATTRIBUTE_SPARSE_FILE
+
+
+def test_lru_eviction_skips_kept_tiles(cache_dir, monkeypatch):
+    """Built textures of tiles whose imagery is kept (downloaded on the
+    map) are never evicted to make room."""
+    from autoortho.aopipeline import dynamic_dds_cache as ddc
+    cache = ddc.DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+    kept = os.path.join(cache_dir, "dds_cache", "+40-130", "+47-123", "BI", "a.dds")
+    other = os.path.join(cache_dir, "dds_cache", "+40-130", "+48-123", "BI", "b.dds")
+    for path in (kept, other):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"DDS " + b"\0" * 1000)
+    with cache._lock:
+        cache._entries["kept"] = (kept, kept + ".ddm", 1004, 0)
+        cache._entries["other"] = (other, other + ".ddm", 1004, 0)
+        cache._current_size += 2008
+    monkeypatch.setattr(ddc, "protect_dds", lambda path: "+47-123" in path)
+    freed = cache.evict_lru(5000)
+    assert freed == 1004
+    assert os.path.exists(kept) and not os.path.exists(other)
+    assert list(cache._entries) == ["kept"]

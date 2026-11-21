@@ -22,7 +22,9 @@ import logging
 import math
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -34,6 +36,10 @@ else:  # running from inside the autoortho folder
 log = logging.getLogger(__name__)
 
 Cell = Tuple[int, int]
+
+# Tiles Keep Offline downloads at once. Each tile is two requests (its DSF,
+# then its masks in one read), so a few in parallel fill the connection.
+KEEP_WORKERS = 4
 
 CHUNK_RE = re.compile(r"^(\d+)_(\d+)_(\d+)_([A-Za-z0-9]+)\.jpg$")
 DDS_DIR = "dds_cache"
@@ -71,6 +77,8 @@ class CellUsage:
     mesh_used: float = 0.0      # newest mtime of the mesh files
     imagery_used: float = 0.0   # newest mtime of the imagery files
     pinned: bool = False
+    imagery_kept: int = 0       # highest zoom of imagery kept (0: none)
+    mesh_set: str = ""          # scenery set of the stored base mesh
 
     @property
     def mesh_bytes(self) -> int:
@@ -117,6 +125,7 @@ class CacheInventory:
     seconds: float = 0.0
     # zoom -> [chunk files, chunk bytes], for size estimates.
     chunk_zooms: Dict[int, List[int]] = field(default_factory=dict)
+    ortho_source: str = ""      # the scenery set in use
 
     def cell(self, cell: Cell) -> CellUsage:
         usage = self.cells.get(cell)
@@ -264,6 +273,11 @@ def _scan_packages(inv: CacheInventory, ao_scenery_dir: str) -> None:
         inv.packages.append((name, kind))
         for cell in tile_stream.read_pins(root):
             inv.cell(cell).pinned = True
+        sources = {}
+        if kind == "ortho":
+            inv.ortho_source = marker.get("source", "")
+            tile_stream.backfill_tile_sources(root, marker)
+            sources = tile_stream.read_tile_sources(root)
         for f, cell in _package_files(root):
             try:
                 st = f.stat()
@@ -278,6 +292,7 @@ def _scan_packages(inv: CacheInventory, ao_scenery_dir: str) -> None:
                 usage.overlay_bytes += st.st_size
             else:
                 usage.dsf_bytes += st.st_size
+                usage.mesh_set = sources.get(cell) or inv.ortho_source
             usage.mesh_used = max(usage.mesh_used, st.st_mtime)
 
 
@@ -353,6 +368,8 @@ def scan(ao_scenery_dir: str, cache_dir: str,
     if cache_dir and os.path.isdir(cache_dir):
         _scan_chunks(inv, cache_dir, cancelled)
         _scan_dds(inv, cache_dir, cancelled)
+        for cell, zoom in _kept_imagery().read_kept(cache_dir).items():
+            inv.cell(cell).imagery_kept = zoom
     inv.seconds = time.monotonic() - started
     log.debug("Cache inventory: %d files in %d tiles scanned in %.2fs",
               inv.files, len(inv.cells), inv.seconds)
@@ -387,12 +404,30 @@ def _remove(path: str, result: ChangeResult) -> None:
 
 
 def _delete_mesh(ao_scenery_dir: str, cells: Set[Cell], result: ChangeResult) -> None:
-    for name in tile_stream.stream_packages(ao_scenery_dir):
+    for name, marker in tile_stream.stream_packages(ao_scenery_dir).items():
         root = os.path.join(ao_scenery_dir, name)
+        if marker.get("kind", "ortho") == "ortho":
+            # Tiles of another set take their own terrain files along, so a
+            # tile downloaded there later gets this set's.
+            files, size = tile_stream.forget_foreign_tiles(root, cells)
+            result.files += files
+            result.bytes += size
         for cell in cells:
             _remove(os.path.join(root, *tile_stream.dsf_rel(*cell).split("/")), result)
+        # A mask on a degree line may also serve a neighbouring tile. Only
+        # masks the index can download again are removed: a tile moved in
+        # from an installed region has masks it can't get back.
+        path = marker.get("index", tile_stream.INDEX_NAME)
+        if not os.path.isabs(path):
+            path = os.path.join(root, path)
+        try:
+            index = tile_stream.TileIndex.load(path)
+        except (OSError, ValueError):
+            index = None
         for f in _scandir(os.path.join(root, "textures")):
-            if f.name.endswith(".png") and tile_stream.mask_cell(f.name) in cells:
+            if (f.name.endswith(".png") and tile_stream.mask_cell(f.name) in cells
+                    and index is not None
+                    and index.lookup(f"textures/{f.name}") is not None):
                 _remove(f.path, result)
         pins = tile_stream.read_pins(root)
         if pins & cells:
@@ -440,6 +475,9 @@ def delete_cells(ao_scenery_dir: str, cache_dir: str, cells: Iterable[Cell],
         _delete_mesh(ao_scenery_dir, cells, result)
     if imagery and cache_dir and os.path.isdir(cache_dir):
         _delete_imagery(cache_dir, cells, result)
+        kept = _kept_imagery()
+        if set(kept.read_kept(cache_dir)) & cells:
+            kept.set_kept(cache_dir, cells, None)  # nothing left to keep
     log.info("Cache: deleted %d files (%.1f MB) from %d tiles (mesh=%s, imagery=%s)",
              result.files, result.bytes / 1e6, len(cells), mesh, imagery)
     return result
@@ -458,6 +496,37 @@ def pin_cells(ao_scenery_dir: str, cells: Iterable[Cell], pinned: bool = True) -
             tile_stream.write_pins(root, new)
             changed += 1
     return changed
+
+
+def other_set_cells(inventory: "CacheInventory", cells: Iterable[Cell]) -> List[Cell]:
+    """The cells whose stored base mesh is from another set than the one in
+    use."""
+    out = []
+    for cell in cells:
+        usage = inventory.cells.get(cell)
+        if (usage is not None and usage.dsf_bytes and usage.mesh_set
+                and usage.mesh_set != inventory.ortho_source):
+            out.append(cell)
+    return sorted(out)
+
+
+def switch_to_current_set(ao_scenery_dir: str, cells: Iterable[Cell]) -> ChangeResult:
+    """Remove the stored tiles of ``cells`` that are from another set (with
+    the terrain and textures only they used), keeping them pinned, so the
+    set in use downloads its own version (``keep_offline``)."""
+    cells = set(cells)
+    result = ChangeResult(tiles=len(cells))
+    for name, marker in tile_stream.stream_packages(ao_scenery_dir).items():
+        if marker.get("kind", "ortho") != "ortho":
+            continue
+        root = os.path.join(ao_scenery_dir, name)
+        files, size = tile_stream.forget_foreign_tiles(root, cells)
+        result.files += files
+        result.bytes += size
+        pins = tile_stream.read_pins(root)
+        if not cells <= pins:
+            tile_stream.write_pins(root, pins | cells)
+    return result
 
 
 def mesh_download_estimate(ao_scenery_dir: str, cells: Iterable[Cell]) -> Tuple[int, int, int]:
@@ -491,6 +560,46 @@ def mesh_download_estimate(ao_scenery_dir: str, cells: Iterable[Cell]) -> Tuple[
     return size, files, len(covered)
 
 
+def stream_coverage(ao_scenery_dir: str
+                    ) -> Tuple[List[Tuple[str, str, List[Cell]]], Optional[Set[Cell]]]:
+    """The scenery set's areas as (region id, label, tiles) by label, for
+    selecting a whole area on the map, and every tile it has. The tiles are
+    None when no scenery set is set up."""
+    for name, marker in tile_stream.stream_packages(ao_scenery_dir).items():
+        if marker.get("kind", "ortho") != "ortho":
+            continue
+        root = os.path.join(ao_scenery_dir, name)
+        path = marker.get("index", tile_stream.INDEX_NAME)
+        if not os.path.isabs(path):
+            path = os.path.join(root, path)
+        index = tile_stream.TileIndex.load(path)
+        out = [(rid, tile_stream.region_label(rid), sorted(cells))
+               for rid, cells in index.regions().items() if rid]
+        return sorted(out, key=lambda r: r[1]), index.cells()
+    return [], None
+
+
+def stream_regions(ao_scenery_dir: str) -> List[Tuple[str, str, List[Cell]]]:
+    """Areas of the scenery set (see :func:`stream_coverage`)."""
+    return stream_coverage(ao_scenery_dir)[0]
+
+
+def _kept_imagery():
+    if __package__:
+        from . import kept_imagery
+    else:
+        import kept_imagery
+    return kept_imagery
+
+
+def _seasons():
+    if __package__:
+        from . import stream_seasons
+    else:
+        import stream_seasons
+    return stream_seasons
+
+
 def _hidden_for(ao_scenery_dir: str, root: str, marker: dict,
                 custom_scenery_dir: str) -> set:
     """DSFs the mount hides because an installed package already has them
@@ -505,8 +614,14 @@ def keep_offline(ao_scenery_dir: str, cells: Iterable[Cell],
                  progress: Optional[Callable[[int, int, int], None]] = None,
                  cancelled: Optional[Callable[[], bool]] = None,
                  package_factory: Optional[Callable[..., "tile_stream.StreamPackage"]] = None,
+                 seasons_patcher: Optional[Callable[[str, Cell], bool]] = None,
                  ) -> ChangeResult:
     """Pin ``cells`` and download their streamed DSFs and water masks now.
+
+    When the package has Seasons turned on (XP11 set), each downloaded tile
+    then gets X-Plane 12's season rasters (``seasons_patcher``, by default
+    :func:`stream_seasons.patch_tile`); a tile it fails on stays as
+    downloaded.
 
     ``progress(done, total, bytes)`` is called after each tile of each
     package. Tiles none of the indexes have (open water, no coverage) end up
@@ -527,6 +642,9 @@ def keep_offline(ao_scenery_dir: str, cells: Iterable[Cell],
         root = os.path.join(ao_scenery_dir, name)
         hidden = _hidden_for(ao_scenery_dir, root, marker, custom_scenery_dir)
         pkg = factory(root, marker, hidden=hidden)
+        patcher = None
+        if marker.get("seasons") and _seasons().applies(marker):
+            patcher = seasons_patcher or _seasons().patch_tile
         try:
             available = [c for c in cells
                          if pkg.entry(tile_stream.dsf_rel(*c)) is not None]
@@ -535,24 +653,47 @@ def keep_offline(ao_scenery_dir: str, cells: Iterable[Cell],
             if not set(available) <= pins:
                 tile_stream.write_pins(root, pins | set(available))
             done += len(cells) - len(available)
-            for cell in available:
-                if cancelled():
-                    result.cancelled = True
-                    break
+            stop = threading.Event()  # throttled: start no more tiles
+
+            def fetch(cell):
+                if stop.is_set() or cancelled():
+                    return None
                 try:
-                    got, files = pkg.download_tile(*cell, cancelled=cancelled)
-                except tile_stream.ThrottledError as exc:
-                    result.errors.append(f"{cell_name(cell)}: {exc}")
-                    result.cancelled = True
-                    break
-                except Exception as exc:
-                    result.errors.append(f"{cell_name(cell)}: {exc}")
-                    got = files = 0
-                result.bytes += got
-                result.files += files
-                done += 1
-                if progress:
-                    progress(done, total, result.bytes)
+                    got = pkg.download_tile(*cell, cancelled=cancelled)
+                except tile_stream.ThrottledError:
+                    stop.set()  # before this worker picks up the next tile
+                    raise
+                if patcher is not None and not cancelled():
+                    try:
+                        patcher(root, cell)
+                    except Exception as exc:  # the tile stays as downloaded
+                        log.warning("Cache: seasons for %s failed: %s", cell_name(cell), exc)
+                return got
+
+            with ThreadPoolExecutor(max_workers=KEEP_WORKERS,
+                                    thread_name_prefix="keep-offline") as pool:
+                futures = {pool.submit(fetch, cell): cell for cell in available}
+                for future in as_completed(futures):
+                    cell = futures[future]
+                    try:
+                        got = future.result()
+                    except tile_stream.ThrottledError as exc:
+                        result.errors.append(f"{cell_name(cell)}: {exc}")
+                        result.cancelled = True
+                        stop.set()
+                        continue
+                    except Exception as exc:
+                        result.errors.append(f"{cell_name(cell)}: {exc}")
+                        got = (0, 0)
+                    if got is None:  # skipped: cancelled or throttled
+                        if not stop.is_set():
+                            result.cancelled = True
+                        continue
+                    result.bytes += got[0]
+                    result.files += got[1]
+                    done += 1
+                    if progress:
+                        progress(done, total, result.bytes)
         finally:
             pkg.shutdown()
         if result.cancelled:

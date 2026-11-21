@@ -104,6 +104,71 @@ def test_dsf_terrain_names_and_tiles():
     assert ts.dsf_terrain_names(b"7z\xbc\xaf'\x1c" + b"\0" * 40) is None
 
 
+def make_raster_dsf(rasters):
+    nmed = _atom(b"NMED", b"".join(n.encode() + b"\0" for n in rasters))
+    tert = _atom(b"TRET", b"terrain/1_2_BI16.ter\0")
+    return (b"XPLNEDSF" + struct.pack("<I", 1) + _atom(b"DAEH", b"")
+            + _atom(b"NFED", tert + nmed) + b"\0" * 16)
+
+
+def make_installed_package(root, dsf_bytes):
+    folder = root / "Earth nav data" / "+40-010"
+    folder.mkdir(parents=True)
+    (folder / "+40-010.dsf").write_bytes(dsf_bytes)
+    return str(root)
+
+
+XP12_RASTERS = ["elevation", "sea_level", "soundscape", "spr1", "spr2",
+                "sum1", "sum2", "fal1", "fal2", "win1", "win2"]
+
+
+def test_dsf_raster_names_and_native_seasons(tmp_path):
+    dsf = make_raster_dsf(XP12_RASTERS)
+    assert ts.dsf_raster_names(dsf) == XP12_RASTERS
+    assert ts.dsf_terrain_names(dsf) == ["terrain/1_2_BI16.ter"]
+    assert ts.dsf_raster_names(make_dsf([])) == []
+
+    assert ts.package_has_native_seasons(make_installed_package(tmp_path / "xp12", dsf))
+    assert not ts.package_has_native_seasons(
+        make_installed_package(tmp_path / "xp11", make_dsf(["terrain/1_2_BI16.ter"])))
+    assert not ts.package_has_native_seasons(
+        make_installed_package(tmp_path / "elev", make_raster_dsf(["elevation"])))
+    assert not ts.package_has_native_seasons(str(tmp_path / "missing"))
+
+    # The answer is kept next to the package while its first DSF is unchanged.
+    cache = tmp_path / "xp11" / ts.NATIVE_SEASONS_CACHE
+    stored = json.loads(cache.read_text())
+    assert stored["seasons"] is False and stored["dsf"] == "+40-010/+40-010.dsf"
+    cache.write_text(json.dumps(dict(stored, seasons=True)))
+    assert ts.package_has_native_seasons(str(tmp_path / "xp11"))  # read, not rechecked
+    cache.write_text(json.dumps(dict(stored, seasons=True, size=1)))
+    assert not ts.package_has_native_seasons(str(tmp_path / "xp11"))  # stale: rechecked
+
+
+def test_installed_package_with_native_seasons_shows_included(tmp_path):
+    import downloader
+    scenery = tmp_path / "Custom Scenery"
+    info = scenery / "z_autoortho" / "xp12area_info.json"
+    info.parent.mkdir(parents=True)
+    info.write_text('{"name": "xp12area"}')
+
+    def status():
+        release = downloader.Release("xp12area", install_dir=str(scenery))
+        release.load(str(info))
+        return release.seasons_apply_status
+
+    package = scenery / "z_autoortho" / "scenery" / "z_ao_xp12area"
+    make_installed_package(package, make_dsf(["terrain/1_2_BI16.ter"]))
+    assert status() == downloader.SeasonsApplyStatus.NOT_APPLIED
+    dsf = package / "Earth nav data" / "+40-010" / "+40-010.dsf"
+    dsf.write_bytes(make_raster_dsf(XP12_RASTERS) + b"x")  # new size: not cached
+    assert status() == downloader.SeasonsApplyStatus.INCLUDED
+    # Seasons applied by the patch keep their own status.
+    info.write_text('{"name": "xp12area", "processed_dsf_seasons": {"+40-010": ["+40-010.dsf"]},'
+                    ' "dsf_folders_files": {"+40-010": ["+40-010.dsf"]}}')
+    assert status() == downloader.SeasonsApplyStatus.APPLIED
+
+
 # ---------------------------------------------------------------------------
 # Fake release host
 # ---------------------------------------------------------------------------
@@ -730,7 +795,134 @@ def test_builder_indexes_local_release_with_final_urls(tmp_path):
     index = ts.TileIndex.load(str(index_path))
     assert index.variant == "xp12"
     assert index.asset_url(0) == "https://github.com/o/r/releases/download/test_v1/z_test_00.zip"
-    assert "Earth nav data/+30-010/+39-009.dsf" in index.files
-    assert "textures/100000_125184_ZL18.png" in index.files
+    assert index.lookup("Earth nav data/+30-010/+39-009.dsf") is not None
+    assert index.lookup("textures/100000_125184_ZL18.png") is not None
     data = json.load(gzip.open(index_path, "rt"))
+    assert data["format"] == ts.INDEX_FORMAT == 2
     assert data["ter"]["verified"] == 4 and data["ter"]["exceptions"] == {}
+
+    # An index in the old format converts without reading the releases.
+    old = dict(data, format=1, files={rel: index.lookup(rel) for rel in (
+        "Earth nav data/+30-010/+39-009.dsf", "textures/100000_125184_ZL18.png")})
+    old_path, new_path = tmp_path / "old.json.gz", tmp_path / "new.json.gz"
+    with gzip.open(old_path, "wt") as fh:
+        json.dump(old, fh)
+    bti.main(["--convert", str(old_path), "--out", str(new_path)])
+    converted = ts.TileIndex.load(str(new_path))
+    assert json.load(gzip.open(new_path, "rt"))["format"] == 2
+    assert len(converted) == 2 and converted.name == old["name"]
+    assert converted.lookup("textures/100000_125184_ZL18.png") ==         index.lookup("textures/100000_125184_ZL18.png")
+
+
+def test_packed_index_finds_every_file_and_nothing_else():
+    files = {
+        "Earth nav data/+30-010/+39-009.dsf": [0, 10, 20, 30, 93, 0xFFFFFFFF],
+        "Earth nav data/+30-010/+38-009.dsf": [1, 2**40, 5, 6, 0, 7],
+        "textures/100000_125184_ZL18.png": [2, 99, 8, 9, 8, 123],
+        "textures/25000_31296_ZL16.png": [131, 1, 2, 3, 0, 4],
+        "textures/0_0_ZL0.png": [3, 4, 5, 6, 0, 7],
+        "textures/0100_5_ZL16.png": [4, 5, 6, 7, 0, 8],   # not a mask name
+        "textures/water_overlay.png": [5, 6, 7, 8, 0, 9],
+    }
+    data = {"format": 1, "assets": [], "files": files}
+    old = ts.TileIndex(data)
+    new = ts.TileIndex(dict(data, format=2, files=ts.pack_files(files)))
+    for index in (old, new):
+        assert len(index) == len(files)
+        assert all(index.lookup(rel) == entry for rel, entry in files.items())
+        assert index.lookup("textures/100_5_ZL16.png") is None
+        assert index.lookup("textures/100000_125184_ZL17.png") is None
+        assert index.lookup("Earth nav data/+30-010/+30-010.dsf") is None
+        assert index.dsf_count == 2
+        assert index.dsf_names("+30-010") == ["+38-009.dsf", "+39-009.dsf"]
+    packed = ts.pack_files(files)
+    assert len(packed["names"]) == 4  # DSFs and non-mask textures keep names
+    with pytest.raises(ValueError):
+        ts.TileIndex(dict(data, format=2, files=dict(packed, names=packed["names"][:-1])))
+    with pytest.raises(ValueError):
+        ts.TileIndex(dict(data, format=3))
+
+
+# ---------------------------------------------------------------------------
+# Coalesced reads (Keep Offline)
+# ---------------------------------------------------------------------------
+
+def test_coalesce_runs_groups_neighbours_of_one_asset():
+    def e(asset, offset, csize=100):
+        return [asset, offset, csize, csize, 0, 0]
+    entries = [e(0, 5000), e(0, 0), e(1, 0), e(0, 10_000_000), e(0, 1000)]
+    runs = ts.coalesce_runs(entries, max_gap=64 * 1024)
+    assert runs == [[1, 4, 0], [3], [2]]
+    # A span limit splits a run that would read too much at once.
+    assert ts.coalesce_runs(entries[:2] + [entries[4]], max_gap=64 * 1024,
+                            max_span=1700) == [[1, 2], [0]]
+
+
+MASK_COLS = (148176, 148192, 148208, 148224, 148240)
+
+
+def mask_rel(col):
+    return f"textures/100000_{col}_ZL18.png"
+
+
+@pytest.fixture
+def many_masks_release():
+    dsf = make_dsf([f"terrain/100000_{c}_BI18_sea_overlay.ter" for c in MASK_COLS]
+                   + ["terrain/100000_125184_BI18.ter"]) + os.urandom(5000)
+    masks = {mask_rel(c): b"\x89PNG" + os.urandom(300 + i) for i, c in enumerate(MASK_COLS)}
+    members = [("z_test_00/" + ts.dsf_rel(39, -9), dsf, zipfile.ZIP_DEFLATED)]
+    for rel, data in masks.items():
+        members.append(("z_test_00/" + rel, data, zipfile.ZIP_STORED))
+    blob = build_release_zip(members)
+    url = "https://github.com/o/r/releases/download/t/z_test_00.zip"
+    return {"url": url, "blob": blob, "dsf": dsf, "masks": masks,
+            "index": index_for({url: blob})}
+
+
+def test_download_tile_reads_all_masks_with_one_request(tmp_path, many_masks_release):
+    rel = many_masks_release
+    pkg, host, _seen, root = make_package(tmp_path, rel)
+    try:
+        got, files = pkg.download_tile(39, -9)
+    finally:
+        pkg.shutdown()
+    assert files == 1 + len(MASK_COLS)
+    assert got == len(rel["dsf"]) + sum(len(m) for m in rel["masks"].values())
+    assert host.ranges == 2  # the DSF, then every mask in one read
+    for m, data in rel["masks"].items():
+        assert (root / m).read_bytes() == data
+
+
+def test_fetch_many_skips_stored_and_unknown_files(tmp_path, many_masks_release):
+    rel = many_masks_release
+    pkg, host, _seen, root = make_package(tmp_path, rel)
+    first = mask_rel(MASK_COLS[0])
+    (root / first).write_bytes(rel["masks"][first])
+    try:
+        got, files = pkg.fetch_many([first, "textures/1_1_ZL16.png"]
+                                    + [mask_rel(c) for c in MASK_COLS[1:]])
+    finally:
+        pkg.shutdown()
+    assert files == len(MASK_COLS) - 1
+    assert got == sum(len(rel["masks"][mask_rel(c)]) for c in MASK_COLS[1:])
+    assert host.ranges == 1
+
+
+def test_fetch_run_falls_back_when_an_extra_field_is_long():
+    big_extra = struct.pack("<HH", 0xCAFE, 2000) + b"\0" * 2000
+    members = []
+    buf = io.BytesIO()
+    datas = [b"\x89PNG" + os.urandom(200) for _ in range(3)]
+    with zipfile.ZipFile(buf, "w") as zf:
+        for i, data in enumerate(datas):
+            info = zipfile.ZipInfo(f"z_test_00/textures/1_{i}_ZL16.png")
+            if i == 1:
+                info.extra = big_extra
+            zf.writestr(info, data)
+    blob = buf.getvalue()
+    url = "https://github.com/o/r/releases/download/t/z_test_00.zip"
+    index = ts.TileIndex(index_for({url: blob}))
+    host = FakeHost({url: blob})
+    remote = ts.RemoteAssets(session=host)
+    entries = [index.lookup(f"textures/1_{i}_ZL16.png") for i in range(3)]
+    assert ts.fetch_run(remote, index, entries) == datas

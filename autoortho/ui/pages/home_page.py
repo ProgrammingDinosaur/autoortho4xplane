@@ -571,7 +571,7 @@ class HomePage(QWidget):
         self.open_map_button = QPushButton("Open map")
         self.library_button = QPushButton("Scenery library")
         self.open_diagnostics_button = QPushButton("Diagnostics")
-        self.install_scenery_button = QPushButton("Install scenery")
+        self.install_scenery_button = QPushButton("Get scenery")
         self.fix_config_button = QPushButton("Fix config")
         for button in (self.open_map_button, self.library_button,
                        self.open_diagnostics_button, self.install_scenery_button,

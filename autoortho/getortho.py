@@ -153,6 +153,11 @@ except ImportError:
     import provider_urls
 
 try:
+    from autoortho import kept_imagery
+except ImportError:
+    import kept_imagery
+
+try:
     from autoortho import hardware
     from autoortho import limits as limits_module
     from autoortho.live_settings import LiveSettings, ResizableGate
@@ -9754,10 +9759,15 @@ def start_predictive_dds(tile_cacher=None) -> None:
             from autoortho.aopipeline import dynamic_dds_cache as _ddc_module
         except ImportError:
             from aopipeline import dynamic_dds_cache as _ddc_module
-        _ddc_module.protect_jpeg = low_zoom_base.protector(
-            streaming_options.flag("low_zoom_base"),
-            streaming_options.number("low_zoom_base_max_zoom"),
+        _cache_dir = str(CFG.paths.cache_dir)
+        _ddc_module.protect_jpeg = kept_imagery.protector(
+            _cache_dir,
+            low_zoom_base.protector(
+                streaming_options.flag("low_zoom_base"),
+                streaming_options.number("low_zoom_base_max_zoom"),
+            ),
         )
+        _ddc_module.protect_dds = kept_imagery.dds_protector(_cache_dir)
 
         if persistent_dds_mb > 0:
             size_desc = f"max={persistent_dds_mb}MB"
@@ -9809,9 +9819,12 @@ def start_predictive_dds(tile_cacher=None) -> None:
                 dds_cache=dynamic_dds_cache
             )
             
-            disk_budget_manager.protect_jpeg = low_zoom_base.protector(
-                streaming_options.flag("low_zoom_base"),
-                streaming_options.number("low_zoom_base_max_zoom"),
+            disk_budget_manager.protect_jpeg = kept_imagery.protector(
+                cache_dir,
+                low_zoom_base.protector(
+                    streaming_options.flag("low_zoom_base"),
+                    streaming_options.number("low_zoom_base_max_zoom"),
+                ),
             )
 
             if dynamic_dds_cache is not None:

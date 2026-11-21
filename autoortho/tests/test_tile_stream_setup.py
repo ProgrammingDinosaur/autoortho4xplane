@@ -225,7 +225,7 @@ def test_enable_and_disable_streaming(tmp_path, grid_release):
     assert ts.disable_streaming(str(scenery)) == ["z_ao_stream_xp11"]
     assert (scenery / "z_ao_eur").is_dir()  # never touched
     with pytest.raises(ValueError):
-        ts.enable_streaming(str(scenery), "xp12", session=host)
+        ts.enable_streaming(str(scenery), "no-such-set", session=host)
 
 
 def test_overlays_can_be_added_and_removed_while_streaming(tmp_path, grid_release):
@@ -260,7 +260,8 @@ def test_change_source_keeps_settings_and_old_tiles_until_ready(tmp_path, grid_r
     host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
                       spec["overlay_index"]: gz_index(grid_release)})
     scenery = str(tmp_path)
-    ts.enable_streaming(scenery, "xp11", overlays=True, disk_limit_gb=30, session=host)
+    ts.enable_streaming(scenery, "xp11", overlays=True, disk_limit_gb=30,
+                        roughness=0.8, session=host)
     # The new set's index can't be downloaded: streaming stays as it was.
     with pytest.raises(IOError):
         ts.change_stream_source(scenery, "other", session=host)
@@ -270,7 +271,40 @@ def test_change_source_keeps_settings_and_old_tiles_until_ready(tmp_path, grid_r
     packages = ts.stream_packages(scenery)
     assert list(packages) == ["z_ao_stream_other"]  # it has no overlays
     assert packages["z_ao_stream_other"]["disk_limit_gb"] == 30
+    assert packages["z_ao_stream_other"]["roughness"] == 0.8
     assert ts.change_stream_source(scenery, "other", session=host) == []
+
+
+def test_terrain_reflectivity_of_streamed_tiles(tmp_path, grid_release):
+    spec = ts.SOURCES["xp11"]
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    with pytest.raises(ValueError):  # streaming is off
+        ts.set_stream_roughness(scenery, 0.5)
+    ts.enable_streaming(scenery, "xp11", overlays=False, session=host)
+    assert ts.stream_summary(scenery)["roughness"] is None
+    with pytest.raises(ValueError):
+        ts.set_stream_roughness(scenery, 1.5)
+
+    assert ts.set_stream_roughness(scenery, 0.7) == "z_ao_stream_xp11"
+    root = tmp_path / "z_ao_stream_xp11"
+    marker = ts.read_marker(str(root))
+    assert marker["roughness"] == 0.7 and ts.stream_summary(scenery)["roughness"] == 0.7
+    # Generated .ter files carry it; the package reads it when mounted.
+    package = ts.StreamPackage(str(root), marker, remote=host)
+    try:
+        ter = package.ter_bytes("25000_31296_BI16.ter").decode()
+        assert ter.endswith("SUPER_ROUGHNESS 0.7\n")
+    finally:
+        package.shutdown()
+
+    ts.set_stream_roughness(scenery, None)
+    assert "roughness" not in ts.read_marker(str(root))
+    package = ts.StreamPackage(str(root), ts.read_marker(str(root)), remote=host)
+    try:
+        assert "SUPER_ROUGHNESS" not in package.ter_bytes("25000_31296_BI16.ter").decode()
+    finally:
+        package.shutdown()
 
 
 def test_stream_summary_when_off(tmp_path):
@@ -360,21 +394,31 @@ def test_pack_order_without_ini_does_nothing(tmp_path):
 def test_stream_panel_states(qt_app):
     from ui.widgets.stream_panel import StreamPanel
     panel = StreamPanel()
-    xp12 = panel.source_combo.findData("xp12")
-    assert not panel.source_combo.model().item(xp12).isEnabled()
-    assert "Soon" in panel.source_combo.itemText(xp12)
-    assert panel.source_combo.currentData() == "xp11"
+    from ui.widgets.stream_panel import NO_OVERLAY_HELP, OVERLAY_HELP
     events = []
     for name in ("enable_requested", "disable_requested", "source_change_requested",
-                 "overlays_change_requested", "limit_changed", "refresh_requested"):
+                 "overlays_change_requested", "limit_changed",
+                 "roughness_change_requested", "refresh_requested"):
         getattr(panel, name).connect(lambda *a, n=name: events.append((n,) + a))
 
+    # XP12 is the default; it has no overlays, so that option is off.
+    assert panel.source_combo.currentData() == "xp12"
+    assert all(panel.source_combo.model().item(i).isEnabled()
+               for i in range(panel.source_combo.count()))
+    assert not panel.overlays_check.isEnabled()
+    assert panel.overlays_help.text() == NO_OVERLAY_HELP
+
     # Off: settings can be picked before turning streaming on, without requests.
+    xp11 = panel.source_combo.findData("xp11")
+    panel.source_combo.setCurrentIndex(xp11)
+    panel.source_combo.activated.emit(xp11)  # what a user's pick sends
+    assert panel.overlays_check.isEnabled()
+    assert panel.overlays_help.text() == OVERLAY_HELP
     panel.overlays_check.click()
     assert panel.overlays_check.isEnabled() and events == []
     assert panel.usage_bar.isHidden() and panel.status_label.isHidden()
     panel.enable_check.click()
-    assert events == [("enable_requested", "xp11", False, 20)]
+    assert events == [("enable_requested", "xp11", True, 20)]
 
     # On: each change is requested right away.
     events.clear()
@@ -394,6 +438,23 @@ def test_stream_panel_states(qt_app):
     panel.limit_spin.editingFinished.emit()
     assert events[-1] == ("limit_changed", 45)
 
+    # Terrain reflectivity: unset by default, applied right away while on.
+    assert panel.roughness is None and not panel.roughness_spin.isEnabled()
+    panel.roughness_check.click()
+    assert events[-1] == ("roughness_change_requested", 1.0)
+    assert panel.roughness_spin.isEnabled()
+    panel.roughness_spin.setValue(0.6)
+    panel.roughness_spin.editingFinished.emit()
+    assert events[-1] == ("roughness_change_requested", 0.6)
+    panel.set_state(dict(panel.state, roughness=0.6))
+    count = len(events)
+    panel.roughness_spin.editingFinished.emit()  # nothing changed
+    assert len(events) == count
+    panel.roughness_check.click()
+    assert events[-1] == ("roughness_change_requested", None)
+    panel.set_state(dict(panel.state, roughness=None))
+    assert not panel.roughness_check.isChecked()
+
     # Busy and running lock everything; unlocking asks for fresh usage.
     panel.set_busy(True, "Downloading the overlay index…")
     assert not panel.enable_check.isEnabled() and not panel.overlays_check.isEnabled()
@@ -409,3 +470,216 @@ def test_stream_panel_states(qt_app):
     panel.set_state({"enabled": False})
     assert not panel.enabled and not panel.enable_check.isChecked()
     assert panel.usage_bar.isHidden()
+
+
+# ---------------------------------------------------------------------------
+# Only stored tiles (downloading while flying off)
+# ---------------------------------------------------------------------------
+
+def test_offline_only_offers_stored_tiles_and_fetches_nothing(tmp_path, grid_release):
+    host = FakeHost({URL: grid_release["blob"]})
+    pkg, root = make_pkg(tmp_path, grid_release, host, fetch_missing=False)
+    try:
+        folder = "+30-010"
+        assert pkg.dsf_names(folder) == []  # the mount lists stored ones itself
+        rel = ts.dsf_rel(40, -9)
+        assert not pkg.streams(rel) and pkg.remote_size(rel) is None
+        assert pkg.prefetch_neighbors(rel) == 0
+        assert pkg.streams("textures/1_1_ZL16.png") is False  # not in the index
+        # Downloading on the map still works.
+        assert pkg.fetch_now(rel) > 0
+        assert host.ranges >= 1
+    finally:
+        pkg.shutdown()
+    pkg, _ = make_pkg(tmp_path, grid_release, host)
+    try:
+        assert pkg.streams(ts.dsf_rel(40, -9)) and pkg.dsf_names("+30-010")
+    finally:
+        pkg.shutdown()
+
+
+def test_offline_only_choice_survives_refreshes_and_set_changes(tmp_path, grid_release,
+                                                               monkeypatch):
+    spec = ts.SOURCES["xp11"]
+    other = {"label": "Other set", "available": True,
+             "ortho_index": "https://example.invalid/other.json.gz", "overlay_index": None}
+    monkeypatch.setitem(ts.SOURCES, "other", other)
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
+                      spec["overlay_index"]: gz_index(grid_release),
+                      other["ortho_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    ts.enable_streaming(scenery, "xp11", overlays=True, fetch_missing=False, session=host)
+    assert all(m.get("fetch_missing") is False for m in ts.stream_packages(scenery).values())
+    assert ts.stream_summary(scenery)["fetch_missing"] is False
+    ts.set_stream_overlays(scenery, True, session=host)  # rewrites the marker
+    assert ts.stream_packages(scenery)["yAO_stream_xp11_overlays"]["fetch_missing"] is False
+    ts.change_stream_source(scenery, "other", session=host)
+    assert ts.stream_packages(scenery)["z_ao_stream_other"]["fetch_missing"] is False
+    ts.set_fetch_missing(scenery, True)
+    assert "fetch_missing" not in ts.stream_packages(scenery)["z_ao_stream_other"]
+    assert ts.stream_summary(scenery)["fetch_missing"] is True
+
+
+def test_index_lists_tiles_per_region(grid_release):
+    data = dict(grid_release["index"])
+    data["assets"] = [dict(a, region="eur-w") for a in data["assets"]]
+    regions = ts.TileIndex(data).regions()
+    assert list(regions) == ["eur-w"] and len(regions["eur-w"]) == 9
+    assert ts.region_label("eur-w") == "Europe West"
+    assert ts.region_label("new_area") == "New Area"
+
+
+def test_stream_panel_fetch_toggle_and_map_button(qt_app):
+    from ui.widgets.stream_panel import StreamPanel
+    panel = StreamPanel()
+    events = []
+    panel.fetch_missing_change_requested.connect(lambda v: events.append(("fetch", v)))
+    panel.open_map_requested.connect(lambda: events.append(("map",)))
+    assert not panel.map_button.isEnabled()
+    panel.fetch_check.click()  # off: picked before turning on, no request
+    assert events == [] and panel.fetch_missing is False
+    panel.set_state({"enabled": True, "source": "xp12", "fetch_missing": True,
+                     "ortho": (0, 0), "overlay": (0, 0)})
+    assert panel.fetch_check.isChecked() and panel.map_button.isEnabled()
+    panel.fetch_check.click()
+    assert events == [("fetch", False)]
+    panel.map_button.click()
+    assert events[-1] == ("map",)
+    panel.set_runtime_locked(True)
+    assert not panel.fetch_check.isEnabled()
+
+
+# ---------------------------------------------------------------------------
+# Switching sets keeps kept tiles
+# ---------------------------------------------------------------------------
+
+def test_switching_sets_moves_kept_tiles_with_their_files(tmp_path, grid_release, monkeypatch):
+    other = {"label": "Other set", "available": True,
+             "ortho_index": "https://example.invalid/other.json.gz", "overlay_index": None}
+    monkeypatch.setitem(ts.SOURCES, "other", other)
+    spec = ts.SOURCES["xp11"]
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
+                      other["ortho_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    ts.enable_streaming(scenery, "xp11", overlays=False, session=host)
+    old = tmp_path / "z_ao_stream_xp11"
+    kept_names = ["terrain/100000_125184_BI18.ter",
+                  "terrain/100000_148176_BI18_sea_overlay.ter"]
+    for cell, names in (((40, -9), kept_names), ((41, -9), [])):
+        path = old.joinpath(*ts.dsf_rel(*cell).split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(make_dsf(names))
+    (old / "textures").mkdir(exist_ok=True)
+    mask = old / "textures" / "100000_148176_ZL18.png"   # named after the texture
+    mask.write_bytes(b"\x89PNG mask")
+    ts.write_pins(str(old), {(40, -9)})
+    (old / "seasons_tiles.json").write_text(json.dumps({"tiles": {"+40-009": [1, 2]}}))
+
+    ts.change_stream_source(scenery, "other", session=host)
+
+    new = tmp_path / "z_ao_stream_other"
+    assert not old.exists()
+    assert new.joinpath(*ts.dsf_rel(40, -9).split("/")).exists()     # kept: moved
+    assert not new.joinpath(*ts.dsf_rel(41, -9).split("/")).exists()  # fetched: gone
+    assert (new / "textures" / "100000_148176_ZL18.png").read_bytes() == b"\x89PNG mask"
+    sea = (new / "terrain" / "100000_148176_BI18_sea_overlay.ter").read_text()
+    assert "BORDER_TEX ../textures/100000_148176_ZL18.png" in sea   # the old set's
+    assert ts.read_pins(str(new)) == {(40, -9)}
+    assert json.loads((new / "seasons_tiles.json").read_text())["tiles"] == {"+40-009": [1, 2]}
+    assert ts.read_tile_sources(str(new)) == {(40, -9): "xp11"}   # shown as XP11 on the map
+
+
+def test_switching_sets_first_downloads_textures_kept_tiles_lack(tmp_path, grid_release,
+                                                                monkeypatch):
+    """A texture a kept tile uses but the old folder never stored is
+    downloaded before anything moves; if that fails, nothing moves."""
+    other = {"label": "Other set", "available": True,
+             "ortho_index": "https://example.invalid/other.json.gz", "overlay_index": None}
+    monkeypatch.setitem(ts.SOURCES, "other", other)
+    spec = ts.SOURCES["xp11"]
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
+                      other["ortho_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    ts.enable_streaming(scenery, "xp11", overlays=False, session=host)
+    old = tmp_path / "z_ao_stream_xp11"
+    path = old.joinpath(*ts.dsf_rel(40, -9).split("/"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(make_dsf(["terrain/100000_148176_BI18_sea_overlay.ter"]))
+    ts.write_pins(str(old), {(40, -9)})
+    fetched = []
+    monkeypatch.setattr(ts.StreamPackage, "entry",
+                        lambda self, rel: [0, 0, 1, 1, 0, 0])
+
+    def failing_fetch(self, rel):
+        fetched.append(rel)
+        raise IOError("offline")
+
+    monkeypatch.setattr(ts.StreamPackage, "fetch_now", failing_fetch)
+    with pytest.raises(IOError):
+        ts.change_stream_source(scenery, "other", session=host)
+    assert fetched == ["textures/100000_148176_ZL18.png"]
+    assert path.exists()   # nothing moved; the old set is still in use
+
+
+def test_switching_with_replace_keeps_tiles_for_the_new_set_to_download(
+        tmp_path, grid_release, monkeypatch):
+    """Replace: tiles the new set has stay kept there (to be downloaded from
+    it) and the old files go; tiles it lacks are still moved."""
+    other = {"label": "Other set", "available": True,
+             "ortho_index": "https://example.invalid/other.json.gz", "overlay_index": None}
+    monkeypatch.setitem(ts.SOURCES, "other", other)
+    spec = ts.SOURCES["xp11"]
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
+                      other["ortho_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    ts.enable_streaming(scenery, "xp11", overlays=False, session=host)
+    old = tmp_path / "z_ao_stream_xp11"
+    for cell in ((40, -9), (10, 10)):      # (10, 10): not in the new set
+        path = old.joinpath(*ts.dsf_rel(*cell).split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(make_dsf([]))
+    ts.write_pins(str(old), {(40, -9), (10, 10)})
+
+    ts.change_stream_source(scenery, "other", session=host, replace_kept=True)
+
+    new = tmp_path / "z_ao_stream_other"
+    assert ts.read_pins(str(new)) == {(40, -9), (10, 10)}
+    assert not new.joinpath(*ts.dsf_rel(40, -9).split("/")).exists()   # downloads anew
+    assert new.joinpath(*ts.dsf_rel(10, 10).split("/")).exists()       # kept as it was
+    assert not old.exists()
+
+
+def test_switch_dialog_offers_keep_or_replace_with_a_size(qt_app, monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QMessageBox
+    from aoconfig import AOConfig
+    from config_ui_qt import ConfigUI
+    monkeypatch.setattr(ConfigUI, "refresh_scenery_list",
+                        lambda self: self.scenery_layout.addStretch())
+    monkeypatch.setattr(ConfigUI, "start_update_check", lambda self, manual=False: None)
+    cfg = AOConfig(str(tmp_path / ".autoortho"))
+    for key, sub in (("scenery_path", "scenery"), ("cache_dir", "cache"),
+                     ("download_dir", "downloads"), ("xplane_path", "X-Plane")):
+        setattr(cfg.paths, key, str(tmp_path / sub))
+    cfg.general.setup_complete = True
+    cfg.save()
+    cfg.get_config()
+    ui = ConfigUI(cfg)
+    seen = {}
+
+    def exec_box(box):
+        seen["text"] = box.informativeText()
+        seen["buttons"] = [b.text() for b in box.buttons()]
+        box._clicked = [b for b in box.buttons() if b.text().startswith("Replace")][0]
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", exec_box)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda box: box._clicked)
+    try:
+        choice = ui._ask_switch("XP12 set", "XP11 set", {(1, 1), (1, 2)}, 0, "xp12")
+        assert choice == "replace"
+        assert "2 tiles downloaded on the map" in seen["text"]
+        assert "about 22.9 MB" in seen["text"]          # 2 x 12 MB
+        assert set(seen["buttons"]) == {"Keep My Tiles", "Replace with XP12 set", "Cancel"}
+    finally:
+        ui.close()
+        ui.deleteLater()

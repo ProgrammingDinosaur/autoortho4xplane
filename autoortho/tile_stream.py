@@ -17,6 +17,9 @@ The index is a gzipped JSON file written by ``scripts/build_tile_index.py``.
 
 from __future__ import annotations
 
+import array
+import base64
+import bisect
 import functools
 import gzip
 import hashlib
@@ -29,6 +32,7 @@ import os
 import queue
 import re
 import struct
+import sys
 import threading
 import time
 import zlib
@@ -42,7 +46,9 @@ import requests
 
 log = logging.getLogger(__name__)
 
-INDEX_FORMAT = 1
+# Format 2 stores entries packed (see pack_files); format 1 is still read.
+INDEX_FORMAT = 2
+READABLE_INDEX_FORMATS = (1, 2)
 MARKER_NAME = "ao_stream.json"
 INDEX_NAME = "tile_index.json.gz"
 DSF_DIR = "Earth nav data"
@@ -52,20 +58,41 @@ DSF_DIR = "Earth nav data"
 INDEX_BASE_URL = (
     "https://github.com/ProgrammingDinosaur/autoortho4xplane/releases/download/tile-index/"
 )
+# The first available source is the default in the UI.
 SOURCES = OrderedDict([
-    ("xp11", {
-        "label": "XP11 legacy set (kubilus1/autoortho-scenery)",
-        "available": True,
-        "ortho_index": INDEX_BASE_URL + "tile_index_xp11.json.gz",
-        "overlay_index": INDEX_BASE_URL + "overlay_index_xp11.json.gz",
-    }),
     ("xp12", {
-        "label": "XP12 set (ProgrammingDinosaur/autoortho-scenery-xp12)",
-        "available": False,  # waiting on the repackaged release zips
+        "label": "XP12 set (flightwusel v1.4, by jonaseberle)",
+        "available": True,
+        "tile_mb": 12,          # average base mesh per tile, for estimates
+        "short": "XP12",
         "ortho_index": INDEX_BASE_URL + "tile_index_xp12.json.gz",
         "overlay_index": None,  # base mesh only; pair with simHeaven
     }),
+    ("xp11", {
+        "label": "XP11 legacy set (kubilus1/autoortho-scenery)",
+        "available": True,
+        "tile_mb": 3,
+        "short": "XP11",
+        "ortho_index": INDEX_BASE_URL + "tile_index_xp11.json.gz",
+        "overlay_index": INDEX_BASE_URL + "overlay_index_xp11.json.gz",
+    }),
 ])
+# Names of the areas the release zips are grouped by (the index's
+# ``assets[].region``), for picking a whole area on the map.
+REGION_LABELS = {
+    "afr": "Africa", "asi": "Asia", "aus_pac": "Australia & Pacific",
+    "eur": "Europe", "na": "North America", "sa": "South America",
+    "afr-n": "Africa North", "afr-s": "Africa South", "asi-c": "Asia Central",
+    "asi-n": "Asia North", "asi-s": "Asia South", "aus-pac": "Australia & Pacific",
+    "eur-e": "Europe East", "eur-w": "Europe West", "greenland": "Greenland",
+    "na-n": "North America North", "na-s": "North America South",
+}
+
+
+def region_label(region: str) -> str:
+    return REGION_LABELS.get(region, region.replace("_", " ").replace("-", " ").title())
+
+
 ORTHO_PACKAGE = "z_ao_stream_{source}"
 OVERLAY_PACKAGE = "yAO_stream_{source}_overlays"
 LEGACY_OVERLAY_FOLDER = "yAutoOrtho_Overlays"
@@ -100,6 +127,168 @@ def mask_cell(name: str) -> Optional[Tuple[int, int]]:
     row, col, zoom = int(m.group(1)), int(m.group(2)), int(m.group(3))
     lat, lon, _ = ter_geometry(row, col, zoom)
     return math.floor(lat), math.floor(lon)
+
+
+def texture_cells(row: int, col: int, zoom: int) -> set:
+    """The 1x1 degree tiles a 16x16-chunk texture (or its water mask)
+    touches. Textures straddle degree lines, so neighbours share some."""
+    n = 2.0 ** zoom
+    lon0 = col / n * 360.0 - 180.0
+    lon1 = (col + 16) / n * 360.0 - 180.0
+
+    def lat(r):
+        return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * r / n))))
+
+    north, south = lat(row), lat(row + 16)
+    eps = 1e-9
+    return {(la, lo)
+            for la in range(math.floor(south), math.floor(north - eps) + 1)
+            for lo in range(math.floor(lon0), math.floor(lon1 - eps) + 1)}
+
+
+def short_label(source: str) -> str:
+    return SOURCES.get(source, {}).get("short") or source.upper()
+
+
+# Tiles in a package that came from another scenery set (a region moved in,
+# or kept tiles carried over a switch): {"tiles": {"+47-123": "xp11"}}.
+# Every other stored tile is the package's own set. Such tiles bring their
+# own terrain files, which win over generated ones (ter_bytes).
+SOURCES_NAME = "tile_sources.json"
+
+
+def read_tile_sources(root: str) -> Dict[Tuple[int, int], str]:
+    try:
+        with open(os.path.join(root, SOURCES_NAME), "r", encoding="utf-8") as fh:
+            tiles = json.load(fh).get("tiles", {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+    out = {}
+    for key, source in tiles.items():
+        cell = dsf_cell(f"{key}.dsf")
+        if cell is not None and isinstance(source, str):
+            out[cell] = source
+    return out
+
+
+def write_tile_sources(root: str, sources: Dict[Tuple[int, int], str]) -> None:
+    path = os.path.join(root, SOURCES_NAME)
+    if not sources:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    tiles = {os.path.basename(dsf_rel(*c))[:-4]: s for c, s in sorted(sources.items())}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"tiles": tiles}, fh)
+    os.replace(tmp, path)
+
+
+def backfill_tile_sources(root: str, marker: dict,
+                          index: Optional["TileIndex"] = None) -> int:
+    """Record the tiles of another set in a package that has none recorded
+    (moved in before the record existed). A package's own downloads are
+    stored exactly as the index lists them, so a kept DSF of another size
+    is from the other set. Only runs where real terrain files show tiles of
+    another set exist. Returns the number recorded."""
+    if os.path.exists(os.path.join(root, SOURCES_NAME)):
+        return 0
+    try:
+        with os.scandir(os.path.join(root, "terrain")) as it:
+            if not any(e.name.endswith(".ter") for e in it):
+                return 0
+    except OSError:
+        return 0
+    own = marker.get("source", "")
+    others = [k for k in SOURCES if k != own]
+    if not others:
+        return 0
+    if index is None:
+        path = marker.get("index", INDEX_NAME)
+        if not os.path.isabs(path):
+            path = os.path.join(root, path)
+        try:
+            index = TileIndex.load(path)
+        except (OSError, ValueError):
+            return 0
+    found = {}
+    for cell in read_pins(root):
+        rel = dsf_rel(*cell)
+        try:
+            size = os.path.getsize(os.path.join(root, *rel.split("/")))
+        except OSError:
+            continue
+        entry = index.lookup(rel)
+        if entry is None or entry[_ENTRY_SIZE] != size:
+            found[cell] = others[0]
+    if found:
+        write_tile_sources(root, found)
+        log.info("Tile stream: recorded %d tiles of another set in %s",
+                 len(found), os.path.basename(root))
+    return len(found)
+
+
+def tile_set(root: str, marker: dict, cell, sources=None) -> str:
+    """The scenery set a stored tile is from."""
+    sources = read_tile_sources(root) if sources is None else sources
+    return sources.get(cell) or marker.get("source", "")
+
+
+def forget_foreign_tiles(root: str, cells: Iterable[Tuple[int, int]],
+                         index: Optional["TileIndex"] = None) -> Tuple[int, int]:
+    """Delete the DSFs of ``cells`` that came from another set, with the
+    terrain files and textures only they used, and drop them from the
+    record. Returns (files, bytes) removed.
+
+    A terrain file or texture goes when its area touches one of ``cells``
+    and no other tile of another set: a neighbour from another set still
+    needs what it shares, and a tile of the package's own set must get the
+    generated terrain again, not the old set's. Textures the index has are
+    left (it can fetch them again).
+    """
+    sources = read_tile_sources(root)
+    gone = {c for c in cells if c in sources}
+    if not gone:
+        return 0, 0
+    remaining = set(sources) - gone
+    files = size = 0
+
+    def remove(path):
+        nonlocal files, size
+        try:
+            n = os.path.getsize(path)
+            os.remove(path)
+        except OSError:
+            return
+        files += 1
+        size += n
+
+    for cell in gone:
+        remove(os.path.join(root, *dsf_rel(*cell).split("/")))
+
+    def only_ours(area):
+        return bool(area & gone) and not (area & remaining)
+
+    try:
+        terrain = list(os.scandir(os.path.join(root, "terrain")))
+    except OSError:
+        terrain = []
+    for e in terrain:
+        m = TER_NAME_RE.match(e.name)
+        if m and only_ours(texture_cells(int(m["row"]), int(m["col"]), int(m["zoom"]))):
+            remove(e.path)
+    try:
+        textures = list(os.scandir(os.path.join(root, "textures")))
+    except OSError:
+        textures = []
+    for e in textures:
+        m = MASK_NAME_RE.match(e.name)
+        if not m or (index is not None and index.lookup(f"textures/{e.name}") is not None):
+            continue
+        if only_ours(texture_cells(int(m.group(1)), int(m.group(2)), int(m.group(3)))):
+            remove(e.path)
+    write_tile_sources(root, {c: s for c, s in sources.items() if c not in gone})
+    return files, size
 
 
 # Tiles the user chose to keep for offline flying. Eviction skips them and
@@ -152,6 +341,10 @@ _LOCAL_HEADER_SIG = 0x04034B50
 
 # Index entry fields: [asset, header_offset, compressed_size, size, method, crc]
 _ENTRY_ASSET, _ENTRY_OFFSET, _ENTRY_CSIZE, _ENTRY_SIZE, _ENTRY_METHOD, _ENTRY_CRC = range(6)
+_PACKED_ENTRY = struct.Struct("<HQIIHI")
+# Water masks are almost all of an index's files; format 2 keys them by
+# (row, col, zoom) instead of by name.
+_MASK_NAME = re.compile(r"textures/(0|[1-9]\d*)_(0|[1-9]\d*)_ZL(0|[1-9]\d*)\.png")
 
 EARTH_RADIUS = 6378137.0
 
@@ -262,11 +455,10 @@ def border_textures(ter_bytes: bytes) -> List[str]:
 # DSF terrain list
 # ---------------------------------------------------------------------------
 
-def dsf_terrain_names(data: bytes) -> Optional[List[str]]:
-    """Terrain definitions listed in an uncompressed DSF, or None.
+def _defn_table(data: bytes, table_id: bytes) -> Optional[List[str]]:
+    """A string table inside the DEFN atom of an uncompressed DSF, or None.
 
-    Reads the TERT table inside the DEFN atom (atom ids are stored
-    byte-reversed). 7z-compressed DSFs return None.
+    Atom ids are stored byte-reversed. 7z-compressed DSFs return None.
     """
     if len(data) < 12 or data[:8] != b"XPLNEDSF":
         return None
@@ -285,13 +477,85 @@ def dsf_terrain_names(data: bytes) -> Optional[List[str]]:
                 sub_len = struct.unpack_from("<I", data, sub + 4)[0]
                 if sub_len < 8:
                     return None
-                if sub_id == b"TRET":
+                if sub_id == table_id:
                     table = data[sub + 8:sub + sub_len]
                     return [n.decode("utf-8", "replace") for n in table.split(b"\0") if n]
                 sub += sub_len
             return []
         pos += length
     return None
+
+
+def dsf_terrain_names(data: bytes) -> Optional[List[str]]:
+    """Terrain definitions (TERT table) listed in an uncompressed DSF, or None."""
+    return _defn_table(data, b"TRET")
+
+
+def dsf_raster_names(data: bytes) -> Optional[List[str]]:
+    """Raster layers (DEMN table) of an uncompressed DSF, or None."""
+    return _defn_table(data, b"NMED")
+
+
+# X-Plane 12 seasonal rasters are named spr1, sum1, fal1, win1, ...
+_SEASON_RASTERS = ("spr", "sum", "fal", "win")
+
+
+def package_has_native_seasons(package_dir: str) -> bool:
+    """Whether a scenery package's DSFs already carry X-Plane 12's seasonal
+    rasters, so the Seasons patch has nothing to add. Checks the first DSF
+    (packages are built with one tool and settings); cached per file."""
+    dsf_root = os.path.join(package_dir, DSF_DIR)
+    try:
+        folders = sorted(e.name for e in os.scandir(dsf_root) if e.is_dir())
+    except OSError:
+        return False
+    for folder in folders:
+        try:
+            names = sorted(e.name for e in os.scandir(os.path.join(dsf_root, folder))
+                           if e.is_file() and e.name.lower().endswith(".dsf"))
+        except OSError:
+            continue
+        if names:
+            path = os.path.join(dsf_root, folder, names[0])
+            try:
+                st = os.stat(path)
+            except OSError:
+                return False
+            # Unpacking a 7z DSF takes seconds, so the answer is kept in the
+            # package for as long as that DSF is unchanged.
+            key = {"dsf": f"{folder}/{names[0]}", "size": st.st_size,
+                   "mtime_ns": st.st_mtime_ns}
+            cache = os.path.join(package_dir, NATIVE_SEASONS_CACHE)
+            try:
+                with open(cache, encoding="utf-8") as fh:
+                    cached = json.load(fh)
+                if {k: cached.get(k) for k in key} == key:
+                    return bool(cached.get("seasons"))
+            except (OSError, ValueError, AttributeError):
+                pass
+            found = _dsf_has_seasons(path)
+            try:
+                with open(cache, "w", encoding="utf-8") as fh:
+                    json.dump(dict(key, seasons=found), fh)
+            except OSError:
+                pass
+            return found
+    return False
+
+
+NATIVE_SEASONS_CACHE = ".ao_native_seasons.json"
+
+
+def _dsf_has_seasons(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return False
+    if data.startswith(SEVENZIP_MAGIC):
+        data = unpack_7z_dsf(path) or b""
+    rasters = dsf_raster_names(data) or []
+    return any(name.startswith(_SEASON_RASTERS) for name in rasters)
 
 
 SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
@@ -327,25 +591,86 @@ def terrain_tiles(names: Iterable[str]) -> List[Tuple[int, int, str, int]]:
 # Index
 # ---------------------------------------------------------------------------
 
+def _mask_key(rel: str) -> Optional[int]:
+    """Integer key of a water mask path, or None for any other file."""
+    match = _MASK_NAME.fullmatch(rel)
+    if not match:
+        return None
+    row, col, zoom = (int(g) for g in match.groups())
+    if row >= 1 << 28 or col >= 1 << 28 or zoom >= 1 << 8:
+        return None
+    return (row << 36) | (col << 8) | zoom
+
+
+def _u64_array(raw: bytes) -> array.array:
+    keys = array.array("Q")
+    keys.frombytes(raw)
+    if sys.byteorder == "big":
+        keys.byteswap()  # stored little-endian
+    return keys
+
+
+def pack_files(files: Dict[str, list]) -> dict:
+    """Format 2 ``files`` block from a {path: entry} mapping.
+
+    Parsing a million entries as JSON lists costs about 500 MB that Python
+    keeps after they are freed, so entries are packed into one blob
+    (24 bytes each): first those of ``names``, sorted, then the water masks
+    in the order of ``masks``, their sorted integer keys (little-endian
+    uint64).
+    """
+    names, masks = [], []
+    for rel, entry in files.items():
+        key = _mask_key(rel)
+        if key is None:
+            names.append((rel, entry))
+        else:
+            masks.append((key, entry))
+    names.sort()
+    masks.sort()
+    keys = array.array("Q", (key for key, _ in masks))
+    if sys.byteorder == "big":
+        keys.byteswap()
+    entries = b"".join(_PACKED_ENTRY.pack(*entry) for _, entry in names + masks)
+    return {
+        "names": [rel for rel, _ in names],
+        "masks": base64.b64encode(keys.tobytes()).decode("ascii"),
+        "entries": base64.b64encode(entries).decode("ascii"),
+    }
+
+
 class TileIndex:
     """Where each streamable file lives inside the published zips."""
 
     def __init__(self, data: dict):
-        if data.get("format") != INDEX_FORMAT:
-            raise ValueError(f"Unsupported tile index format {data.get('format')!r}")
+        fmt = data.get("format")
+        if fmt not in READABLE_INDEX_FORMATS:
+            raise ValueError(f"Unsupported tile index format {fmt!r}")
         self.name = data.get("name", "")
         self.variant = data.get("variant", "")
         self.built = data.get("built", 0)
         self.assets: List[dict] = data["assets"]
-        self.files: Dict[str, list] = data["files"]
+        files = data["files"] if fmt == 2 else pack_files(data["files"])
+        self._names: Dict[str, int] = {rel: i for i, rel in enumerate(files["names"])}
+        self._mask_keys = _u64_array(base64.b64decode(files["masks"]))
+        self._entries = base64.b64decode(files["entries"])
+        if len(self._entries) != len(self) * _PACKED_ENTRY.size:
+            raise ValueError("Tile index entries don't match its file list")
         ter = data.get("ter", {})
         self.ter_params: dict = ter.get("params", {})
         self.ter_exceptions: Dict[str, str] = ter.get("exceptions", {})
         self._dsf_dirs: Dict[str, List[str]] = {}
-        for rel in self.files:
+        for rel in self._names:
             if rel.startswith(DSF_DIR + "/") and rel.endswith(".dsf"):
                 _, folder, fname = rel.split("/")
                 self._dsf_dirs.setdefault(folder, []).append(fname)
+
+    def __len__(self) -> int:
+        return len(self._names) + len(self._mask_keys)
+
+    @property
+    def dsf_count(self) -> int:
+        return sum(len(names) for names in self._dsf_dirs.values())
 
     @classmethod
     def load(cls, path: str) -> "TileIndex":
@@ -354,7 +679,18 @@ class TileIndex:
             return cls(json.load(fh))
 
     def lookup(self, rel: str) -> Optional[list]:
-        return self.files.get(rel)
+        """The entry of a file, or None if the index doesn't have it."""
+        slot = self._names.get(rel)
+        if slot is None:
+            key = _mask_key(rel)
+            if key is None:
+                return None
+            keys = self._mask_keys
+            pos = bisect.bisect_left(keys, key)
+            if pos == len(keys) or keys[pos] != key:
+                return None
+            slot = len(self._names) + pos
+        return list(_PACKED_ENTRY.unpack_from(self._entries, slot * _PACKED_ENTRY.size))
 
     def dsf_folders(self) -> List[str]:
         return sorted(self._dsf_dirs)
@@ -364,6 +700,30 @@ class TileIndex:
 
     def asset_url(self, asset: int) -> str:
         return self.assets[asset]["url"]
+
+    def cells(self) -> set:
+        """Every tile the index has a DSF for."""
+        out = set()
+        for names in self._dsf_dirs.values():
+            for name in names:
+                cell = dsf_cell(name)
+                if cell is not None:
+                    out.add(cell)
+        return out
+
+    def regions(self) -> Dict[str, List[Tuple[int, int]]]:
+        """Tiles per area (the ``region`` of the zip each DSF is in)."""
+        out: Dict[str, List[Tuple[int, int]]] = {}
+        for folder, names in self._dsf_dirs.items():
+            for name in names:
+                entry = self.lookup(f"{DSF_DIR}/{folder}/{name}")
+                cell = dsf_cell(name)
+                if entry is None or cell is None:
+                    continue
+                asset = self.assets[entry[_ENTRY_ASSET]]
+                region = asset.get("region") or ""
+                out.setdefault(region, []).append(cell)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +978,63 @@ def fetch_member(remote: RemoteAssets, index: TileIndex, entry: list) -> bytes:
     return data
 
 
+# Members closer than this are read in one request, the bytes between them
+# discarded. A tile's water masks are usually one unbroken run in the zip
+# (XP12 set: 48 masks per tile, one run for 90% of tiles), so a tile costs
+# two requests instead of fifty.
+COALESCE_GAP = 256 * 1024
+COALESCE_SPAN = 64 * 1024 * 1024   # largest single read
+
+
+def _member_span(entry: list) -> int:
+    """Bytes from a member's local header to the end of its data, assuming
+    the name and extra fields fit the usual slack."""
+    return _LOCAL_HEADER.size + _LOCAL_HEADER_SLACK + entry[_ENTRY_CSIZE]
+
+
+def coalesce_runs(entries: List[list], max_gap: int = COALESCE_GAP,
+                  max_span: int = COALESCE_SPAN) -> List[List[int]]:
+    """Group entries (by position in ``entries``) into runs that one Range
+    request each can read: same asset, in offset order, gaps under
+    ``max_gap``, at most ``max_span`` bytes unless one member alone is
+    larger."""
+    order = sorted(range(len(entries)),
+                   key=lambda i: (entries[i][_ENTRY_ASSET], entries[i][_ENTRY_OFFSET]))
+    runs: List[List[int]] = []
+    start = end = 0
+    for i in order:
+        e = entries[i]
+        e_start, e_end = e[_ENTRY_OFFSET], e[_ENTRY_OFFSET] + _member_span(e)
+        if (runs and e[_ENTRY_ASSET] == entries[runs[-1][0]][_ENTRY_ASSET]
+                and e_start - end <= max_gap and max(end, e_end) - start <= max_span):
+            runs[-1].append(i)
+            end = max(end, e_end)
+        else:
+            runs.append([i])
+            start, end = e_start, e_end
+    return runs
+
+
+def fetch_run(remote: RemoteAssets, index: TileIndex, entries: List[list]) -> List[bytes]:
+    """Download several members of one asset with a single Range request
+    (see ``coalesce_runs``). Returns their data in the order given."""
+    if len(entries) == 1:
+        return [fetch_member(remote, index, entries[0])]
+    asset = index.assets[entries[0][_ENTRY_ASSET]]
+    start = min(e[_ENTRY_OFFSET] for e in entries)
+    end = max(e[_ENTRY_OFFSET] + _member_span(e) for e in entries)
+    if asset.get("size"):
+        end = min(end, asset["size"])
+    raw = asset_read(remote, asset, start, end - 1)
+    out = []
+    for e in entries:
+        data, _ = extract_member(raw[e[_ENTRY_OFFSET] - start:], e)
+        if data is None:  # long extra field ran past the read
+            data = fetch_member(remote, index, e)
+        out.append(data)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Package runtime
 # ---------------------------------------------------------------------------
@@ -708,6 +1125,9 @@ class StreamPackage:
         self.open_timeout = float(marker.get("open_timeout", 30))
         self.roughness = marker.get("roughness")
         self.prefetch_ring = int(marker.get("prefetch_ring", 1))
+        # False: only tiles already stored are offered to X-Plane (the rest
+        # come from Global Scenery) and no DSF is downloaded while flying.
+        self.fetch_missing = bool(marker.get("fetch_missing", True))
         limit_gb = marker.get("disk_limit_gb")
         self.disk_limit = int(float(limit_gb) * 1e9) if limit_gb else 0
         self.on_terrain = on_terrain
@@ -761,8 +1181,19 @@ class StreamPackage:
 
     # -- listing --------------------------------------------------------
     def dsf_names(self, folder: str) -> List[str]:
+        """DSFs to list beside the stored ones (none when only stored tiles
+        are offered)."""
+        if not self.fetch_missing:
+            return []
         return [n for n in self.index.dsf_names(folder)
                 if f"{DSF_DIR}/{folder}/{n}" not in self.hidden]
+
+    def streams(self, rel: str) -> bool:
+        """Whether X-Plane may be offered ``rel`` before it is stored. Masks
+        always are: a stored tile must never miss one."""
+        if self.fetch_missing or not rel.endswith(".dsf"):
+            return self.entry(rel) is not None
+        return False
 
     def entry(self, rel: str) -> Optional[list]:
         if rel in self.hidden:
@@ -770,7 +1201,8 @@ class StreamPackage:
         return self.index.lookup(rel)
 
     def remote_size(self, rel: str) -> Optional[int]:
-        e = self.entry(rel)
+        """Size of a file X-Plane may be offered before it is stored."""
+        e = self.entry(rel) if self.streams(rel) else None
         return e[_ENTRY_SIZE] if e else None
 
     def recently_failed(self, rel: str, window: float = 300.0) -> bool:
@@ -855,7 +1287,7 @@ class StreamPackage:
         heading that way, so the ring around it also covers the tiles ahead.
         """
         m = re.search(r"([+-]\d{2})([+-]\d{3})\.dsf$", rel)
-        if not m or self.prefetch_ring <= 0:
+        if not m or self.prefetch_ring <= 0 or not self.fetch_missing:
             return 0
         lat0, lon0 = int(m.group(1)), int(m.group(2))
         queued = 0
@@ -988,6 +1420,40 @@ class StreamPackage:
         self._account(len(data))
         return len(data)
 
+    def fetch_many(self, rels: Iterable[str],
+                   cancelled: Callable[[], bool] = lambda: False) -> Tuple[int, int]:
+        """Download files not on disk yet, neighbours in a zip read with one
+        request (``coalesce_runs``). Returns (bytes, files) stored. Raises
+        on failure; files stored before it stay."""
+        wanted, entries = [], []
+        for rel in dict.fromkeys(rels):
+            entry = self.entry(rel)
+            if entry is None or os.path.exists(self.local_path(rel)):
+                continue
+            wanted.append(rel)
+            entries.append(entry)
+        total = files = 0
+        for run in coalesce_runs(entries):
+            if cancelled():
+                break
+            datas = fetch_run(self.remote, self.index, [entries[i] for i in run])
+            for i, data in zip(run, datas):
+                local = self.local_path(wanted[i])
+                tmp = f"{local}.part{threading.get_ident()}"
+                try:
+                    stored = self._store(local, tmp, data)
+                finally:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+                if stored:
+                    self._account(len(data))
+                    total += len(data)
+                    files += 1
+        return total, files
+
     def tile_masks(self, lat: int, lon: int) -> List[str]:
         """Water masks the stored DSF of a tile needs (package-relative)."""
         local = self.local_path(dsf_rel(lat, lon))
@@ -1019,16 +1485,10 @@ class StreamPackage:
         if self.entry(rel) is None:
             return 0, 0
         got = self.fetch_now(rel)
-        total, files = got, int(got > 0)
-        for mask in self.tile_masks(lat, lon):
-            if cancelled():
-                break
-            if self.entry(mask) is None:
-                continue
-            got = self.fetch_now(mask)
-            total += got
-            files += got > 0
-        return total, files
+        if cancelled():
+            return got, int(got > 0)
+        mask_bytes, mask_files = self.fetch_many(self.tile_masks(lat, lon), cancelled)
+        return got + mask_bytes, int(got > 0) + mask_files
 
     # -- disk budget ----------------------------------------------------
     def touch(self, local: str) -> None:
@@ -1053,6 +1513,14 @@ class StreamPackage:
             except OSError:
                 continue
         return out
+
+    @staticmethod
+    def _stored_rel(entry: os.DirEntry) -> str:
+        """Package-relative path of a stored DSF or mask."""
+        if entry.name.endswith(".png"):
+            return f"textures/{entry.name}"
+        folder = os.path.basename(os.path.dirname(entry.path))
+        return f"{DSF_DIR}/{folder}/{entry.name}"
 
     def usage(self) -> Tuple[int, int]:
         """(bytes, DSF count) stored in the package folder."""
@@ -1091,6 +1559,8 @@ class StreamPackage:
         for e in self._stored_files():
             if pins and stored_file_cell(e.name) in pins:
                 continue
+            if self.index.lookup(self._stored_rel(e)) is None:
+                continue  # can't be downloaded again (moved in from a region)
             try:
                 stats[e.path] = e.stat()
             except OSError:
@@ -1161,12 +1631,21 @@ class StreamPackage:
 
     # -- terrain --------------------------------------------------------
     def ter_bytes(self, name: str) -> Optional[bytes]:
+        """A terrain file: the real one in ``terrain/`` if the package has it
+        (tiles moved in from another set keep their own), else generated."""
         with self._ter_lock:
             cached = self._ter_cache.get(name)
         if cached is not None:
             return cached
-        data = synthesize_ter(name, self.index.ter_params,
-                              self.index.ter_exceptions, self.roughness)
+        data = None
+        try:
+            with open(os.path.join(self.root, "terrain", name), "rb") as fh:
+                data = fh.read()
+        except OSError:
+            pass
+        if data is None:
+            data = synthesize_ter(name, self.index.ter_params,
+                                  self.index.ter_exceptions, self.roughness)
         if data is not None:
             with self._ter_lock:
                 if len(self._ter_cache) > 50000:
@@ -1277,11 +1756,9 @@ def empty_overlay_dsf(lat: int, lon: int) -> bytes:
 # Setting packages up
 # ---------------------------------------------------------------------------
 
-def _parse_index_bytes(data: bytes) -> dict:
+def _parse_index_bytes(data: bytes) -> TileIndex:
     with gzip.GzipFile(fileobj=io.BytesIO(data)) as fh:
-        parsed = json.load(fh)
-    TileIndex(parsed)  # validates the format
-    return parsed
+        return TileIndex(json.load(fh))  # validates the format
 
 
 def download_index(url: str, dest: str, session: Optional[requests.Session] = None,
@@ -1295,8 +1772,7 @@ def download_index(url: str, dest: str, session: Optional[requests.Session] = No
     with open(dest + ".part", "wb") as fh:
         fh.write(r.content)
     os.replace(dest + ".part", dest)
-    return {"name": parsed.get("name"), "built": parsed.get("built"),
-            "dsfs": sum(1 for f in parsed["files"] if f.endswith(".dsf")),
+    return {"name": parsed.name, "built": parsed.built, "dsfs": parsed.dsf_count,
             "last_modified": r.headers.get("Last-Modified", "")}
 
 
@@ -1362,7 +1838,8 @@ def stream_packages(ao_scenery_dir: str) -> Dict[str, dict]:
 
 def enable_streaming(ao_scenery_dir: str, source: str, overlays: bool = True,
                      disk_limit_gb: float = 20.0, roughness: Optional[float] = None,
-                     session: Optional[requests.Session] = None) -> List[str]:
+                     session: Optional[requests.Session] = None,
+                     fetch_missing: Optional[bool] = None) -> List[str]:
     """Create the streaming package(s) for a source and fetch their indexes.
 
     Returns the folder names set up. Overlays get a quarter of the disk
@@ -1372,10 +1849,12 @@ def enable_streaming(ao_scenery_dir: str, source: str, overlays: bool = True,
     if not spec or not spec.get("available"):
         raise ValueError(f"Scenery source {source!r} is not available yet")
     created = [_create_package(ao_scenery_dir, source, "ortho", float(disk_limit_gb),
-                               roughness=roughness, session=session)]
+                               roughness=roughness, session=session,
+                               fetch_missing=fetch_missing)]
     if overlays and spec.get("overlay_index"):
         created.append(_create_package(ao_scenery_dir, source, "overlay",
-                                       _overlay_limit(disk_limit_gb), session=session))
+                                       _overlay_limit(disk_limit_gb), session=session,
+                                       fetch_missing=fetch_missing))
     else:
         _remove_package(ao_scenery_dir, OVERLAY_PACKAGE.format(source=source))
     return created
@@ -1387,8 +1866,10 @@ def _overlay_limit(disk_limit_gb: float) -> float:
 
 def _create_package(ao_scenery_dir: str, source: str, kind: str, limit: float,
                     roughness: Optional[float] = None,
-                    session: Optional[requests.Session] = None) -> str:
-    """Create (or refresh) one streaming package folder and download its index."""
+                    session: Optional[requests.Session] = None,
+                    fetch_missing: Optional[bool] = None) -> str:
+    """Create (or refresh) one streaming package folder and download its index.
+    ``fetch_missing`` None keeps the folder's current choice (default on)."""
     spec = SOURCES[source]
     if kind == "overlay":
         name, url = OVERLAY_PACKAGE.format(source=source), spec.get("overlay_index")
@@ -1398,6 +1879,9 @@ def _create_package(ao_scenery_dir: str, source: str, kind: str, limit: float,
         raise ValueError(f"{spec['label']} has no {kind} tiles")
     root = os.path.join(ao_scenery_dir, name)
     is_new = not os.path.isdir(root)
+    old_marker = read_marker(root) or {}
+    if fetch_missing is None:
+        fetch_missing = old_marker.get("fetch_missing", True)
     os.makedirs(root, exist_ok=True)
     try:
         info = download_index(url, os.path.join(root, INDEX_NAME), session=session)
@@ -1410,9 +1894,20 @@ def _create_package(ao_scenery_dir: str, source: str, kind: str, limit: float,
               "index_url": url, "index_last_modified": info["last_modified"],
               "disk_limit_gb": float(limit)}
     if roughness is not None and kind == "ortho":
-        marker["roughness"] = roughness
+        marker["roughness"] = _check_roughness(roughness)
+    if not fetch_missing:
+        marker["fetch_missing"] = False
+    if kind == "ortho" and old_marker.get("seasons"):
+        marker["seasons"] = True  # a refresh of the same set keeps it
     write_marker(root, marker)
     return name
+
+
+def _check_roughness(value: float) -> float:
+    value = round(float(value), 2)
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"Terrain reflectivity must be between 0 and 1, not {value}")
+    return value
 
 
 def _streamed_ortho(ao_scenery_dir: str) -> Tuple[str, dict]:
@@ -1439,21 +1934,201 @@ def set_stream_overlays(ao_scenery_dir: str, enabled: bool,
 
 
 def change_stream_source(ao_scenery_dir: str, source: str,
-                         session: Optional[requests.Session] = None) -> List[str]:
+                         session: Optional[requests.Session] = None,
+                         replace_kept: bool = False) -> List[str]:
     """Stream another scenery set, keeping the overlay choice and disk limit.
 
     The new set is set up first; the old set's packages and tiles are removed
     only once that worked, so a failed download leaves streaming as it was.
     """
-    _, ortho = _streamed_ortho(ao_scenery_dir)
+    old_name, ortho = _streamed_ortho(ao_scenery_dir)
     if ortho.get("source") == source:
         return []
     overlays = any(m.get("kind") == "overlay" for m in stream_packages(ao_scenery_dir).values())
     created = enable_streaming(ao_scenery_dir, source, overlays=overlays,
                                disk_limit_gb=ortho.get("disk_limit_gb") or 20,
-                               roughness=ortho.get("roughness"), session=session)
+                               roughness=ortho.get("roughness"), session=session,
+                               fetch_missing=ortho.get("fetch_missing", True))
+    # Tiles downloaded on the map (and regions moved in) aren't the old
+    # set's to delete: they go into the new set's folder first, or with
+    # ``replace_kept`` stay kept there to be downloaded from the new set.
+    carry_kept_tiles(ao_scenery_dir, old_name, ORTHO_PACKAGE.format(source=source),
+                     replace=replace_kept)
     disable_streaming(ao_scenery_dir, keep_source=source)
     return created
+
+
+def _carry_seasons_record(old_root: str, new_root: str, cells) -> None:
+    """Keep which moved tiles have seasons (``stream_seasons``; moving a
+    file keeps its size and time, which the record checks)."""
+    name = "seasons_tiles.json"
+    try:
+        with open(os.path.join(old_root, name), "r", encoding="utf-8") as fh:
+            old = json.load(fh).get("tiles", {})
+    except (OSError, ValueError, AttributeError):
+        return
+    keys = {os.path.basename(dsf_rel(*c))[:-4] for c in cells}
+    moved = {k: v for k, v in old.items() if k in keys}
+    if not moved:
+        return
+    try:
+        with open(os.path.join(new_root, name), "r", encoding="utf-8") as fh:
+            tiles = json.load(fh).get("tiles", {})
+    except (OSError, ValueError, AttributeError):
+        tiles = {}
+    tiles.update(moved)
+    with open(os.path.join(new_root, name), "w", encoding="utf-8") as fh:
+        json.dump({"tiles": tiles}, fh)
+
+
+def carry_kept_tiles(ao_scenery_dir: str, old_name: str, new_name: str,
+                     workers: int = 4, replace: bool = False) -> int:
+    """Move the kept (pinned) tiles of one ortho package into another, of
+    another scenery set. Returns the number of tiles moved.
+
+    With ``replace``, tiles the new set has aren't moved: they stay kept in
+    the new package, which downloads its own version (the caller starts
+    that), and the old files go with the old package. Tiles the new set
+    doesn't have are moved either way, so nothing kept is lost.
+
+    Each DSF's terrain list names the terrain files and masks it uses. The
+    terrain files are written into the new package as real files (with the
+    old set's settings, or the real file the old package had), because the
+    new set would generate its own; masks are hard-linked (copied where
+    links don't work). The DSF moves last, so an interrupted run leaves no
+    DSF without its files. Masks and terrain files the new index doesn't
+    have are never evicted.
+    """
+    old_root = os.path.join(ao_scenery_dir, old_name)
+    new_root = os.path.join(ao_scenery_dir, new_name)
+    pins = read_pins(old_root)
+    old_marker, new_marker = read_marker(old_root), read_marker(new_root)
+    if not pins or old_marker is None or new_marker is None:
+        return 0
+    replaced = set()
+    if replace:
+        path = new_marker.get("index", INDEX_NAME)
+        if not os.path.isabs(path):
+            path = os.path.join(new_root, path)
+        new_cells = TileIndex.load(path).cells()
+        replaced = {c for c in pins if c in new_cells}
+        write_pins(new_root, read_pins(new_root) | replaced)
+        pins = pins - replaced
+        if not pins:
+            log.info("Tile stream: %d kept tiles will download from %s",
+                     len(replaced), new_name)
+            return 0
+    old = StreamPackage(old_root, old_marker, remote=RemoteAssets())
+    try:
+        def terrain_of(cell):
+            path = old.local_path(dsf_rel(*cell))
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                return cell, None
+            if data.startswith(SEVENZIP_MAGIC):
+                data = unpack_7z_dsf(path) or b""
+            return cell, dsf_terrain_names(data)
+
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="carry-tiles") as pool:
+            found = list(pool.map(terrain_of, sorted(pins)))
+        # Every texture a kept tile uses must be on disk before anything
+        # moves: the new set's index may not have it (XP11 water edges use
+        # water_transition.png, which the XP12 set doesn't publish). A
+        # failed download stops the switch with nothing moved.
+        for _cell, names in found:
+            for tex in old.mask_rels(names or []):
+                if not os.path.exists(old.local_path(tex)) and old.entry(tex) is not None:
+                    old.fetch_now(tex)
+        carried = []
+        for cell, names in found:
+            if names is None:
+                continue  # kept but not stored
+            for name in names:
+                if not name.startswith("terrain/"):
+                    continue
+                dst = os.path.join(new_root, *name.split("/"))
+                data = old.ter_bytes(name.split("/", 1)[1])
+                if data is not None and not os.path.exists(dst):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    with open(dst, "wb") as fh:
+                        fh.write(data)
+            for mask in old.mask_rels(names):
+                src, dst = old.local_path(mask), os.path.join(new_root, *mask.split("/"))
+                if os.path.exists(src) and not os.path.exists(dst):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    try:
+                        os.link(src, dst)
+                    except OSError:
+                        import shutil
+                        shutil.copy2(src, dst)
+            rel = dsf_rel(*cell)
+            dst = os.path.join(new_root, *rel.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.exists(dst):
+                os.remove(dst)  # the kept tile wins over one fetched while flying
+            os.replace(old.local_path(rel), dst)
+            carried.append(cell)
+        write_pins(new_root, read_pins(new_root) | set(carried))
+        _carry_seasons_record(old_root, new_root, carried)
+        old_sources = read_tile_sources(old_root)
+        new_source = new_marker.get("source", "")
+        sources = read_tile_sources(new_root)
+        for cell in carried:
+            origin = old_sources.get(cell) or old_marker.get("source", "")
+            if origin and origin != new_source:
+                sources[cell] = origin
+            else:
+                sources.pop(cell, None)
+        write_tile_sources(new_root, sources)
+        log.info("Tile stream: moved %d kept tiles from %s to %s",
+                 len(carried), old_name, new_name)
+        return len(carried)
+    finally:
+        old.shutdown()
+
+
+def set_stream_roughness(ao_scenery_dir: str, roughness: Optional[float]) -> str:
+    """Set the terrain reflectivity (SUPER_ROUGHNESS) of streamed tiles, or
+    clear it with None. Their .ter files are generated on demand, so this
+    applies to every streamed tile from the next mount on. Returns the
+    package name."""
+    name, ortho = _streamed_ortho(ao_scenery_dir)
+    marker = dict(ortho)
+    if roughness is None:
+        marker.pop("roughness", None)
+    else:
+        marker["roughness"] = _check_roughness(roughness)
+    write_marker(os.path.join(ao_scenery_dir, name), marker)
+    return name
+
+
+def set_stream_seasons(ao_scenery_dir: str, enabled: bool) -> str:
+    """Whether tiles downloaded on the map get X-Plane 12's season rasters
+    (XP11 set; see :mod:`stream_seasons`). Returns the package name."""
+    name, ortho = _streamed_ortho(ao_scenery_dir)
+    marker = dict(ortho)
+    if enabled:
+        marker["seasons"] = True
+    else:
+        marker.pop("seasons", None)
+    write_marker(os.path.join(ao_scenery_dir, name), marker)
+    return name
+
+
+def set_fetch_missing(ao_scenery_dir: str, enabled: bool) -> None:
+    """Whether tiles not stored yet are offered to X-Plane and downloaded
+    while flying (on), or only stored tiles are used and the rest come from
+    Global Scenery (off). Applies from the next mount."""
+    for name, marker in stream_packages(ao_scenery_dir).items():
+        marker = dict(marker)
+        if enabled:
+            marker.pop("fetch_missing", None)
+        else:
+            marker["fetch_missing"] = False
+        write_marker(os.path.join(ao_scenery_dir, name), marker)
 
 
 def update_stream_settings(ao_scenery_dir: str, disk_limit_gb: float) -> None:
@@ -1494,7 +2169,9 @@ def stream_summary(ao_scenery_dir: str) -> dict:
     and the tiles stored per package kind."""
     packages = stream_packages(ao_scenery_dir)
     summary = {"enabled": False, "source": None, "overlays": False,
-               "disk_limit_gb": None, "ortho": (0, 0), "overlay": (0, 0)}
+               "disk_limit_gb": None, "roughness": None, "fetch_missing": True,
+               "seasons": False,
+               "ortho": (0, 0), "overlay": (0, 0)}
     for name, marker in packages.items():
         kind = marker.get("kind", "ortho")
         if kind not in ("ortho", "overlay"):
@@ -1504,7 +2181,10 @@ def stream_summary(ao_scenery_dir: str) -> dict:
             summary["overlays"] = True
         else:
             summary.update(enabled=True, source=marker.get("source"),
-                           disk_limit_gb=marker.get("disk_limit_gb"))
+                           disk_limit_gb=marker.get("disk_limit_gb"),
+                           roughness=marker.get("roughness"),
+                           fetch_missing=bool(marker.get("fetch_missing", True)),
+                           seasons=bool(marker.get("seasons")))
     return summary
 
 

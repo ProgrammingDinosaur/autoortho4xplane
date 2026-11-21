@@ -78,8 +78,10 @@ except Exception as _cfg_err:
 
 try:
     from autoortho.utils.constants import system_type
+    from autoortho.utils.log_streams import rotating_file_handler, tolerant_console
 except ImportError:
     from utils.constants import system_type
+    from utils.log_streams import rotating_file_handler, tolerant_console
 
 # Install crash handler EARLY, before any C extensions load
 # This allows us to log C-level crashes (segfaults, access violations)
@@ -277,10 +279,10 @@ def setuplogs():
     )
     
     # Create file handler with its own level
-    file_handler = logging.handlers.RotatingFileHandler(
-        filename=os.path.join(log_dir, "autoortho.log"),
-        maxBytes=10485760,
-        backupCount=5
+    file_handler = rotating_file_handler(
+        os.path.join(log_dir, "autoortho.log"),
+        max_bytes=10485760,
+        backup_count=5,
     )
     file_handler.setLevel(file_log_level)
     file_handler.setFormatter(file_formatter)
@@ -288,7 +290,7 @@ def setuplogs():
     # Create console handler with its own level (only if stdout exists)
     handlers = [file_handler]
     if sys.stdout is not None:
-        console_handler = logging.StreamHandler()
+        console_handler = logging.StreamHandler(tolerant_console(sys.stderr))
         console_handler.setLevel(console_log_level)
         console_handler.setFormatter(console_formatter)
         handlers.append(console_handler)

@@ -751,6 +751,7 @@ class CustomMapEditor(QWidget):
         parent=None,
         cache_paths: Optional[Callable[[], tuple[str, str, str]]] = None,
         task_manager=None,
+        imagery_options: Optional[Callable[[], dict]] = None,
     ):
         super().__init__(parent)
         self.config = config
@@ -780,9 +781,9 @@ class CustomMapEditor(QWidget):
             for view, label, tip in (
                 (SOURCES_VIEW, "Imagery Sources",
                  "Choose the imagery source per tile"),
-                (CACHE_VIEW, "Cache",
-                 "See, delete and keep for offline flying what AutoOrtho "
-                 "has stored per tile"),
+                (CACHE_VIEW, "Scenery && Cache",  # && shows one &
+                 "Download scenery tiles or regions, and see or delete what "
+                 "AutoOrtho has stored per tile"),
             ):
                 button = QToolButton()
                 button.setText(label)
@@ -886,7 +887,8 @@ class CustomMapEditor(QWidget):
             else:
                 from ui.widgets.cache_map_panel import CachePanel
             self.cache_panel = CachePanel(self.canvas, cache_paths,
-                                          task_manager=task_manager)
+                                          task_manager=task_manager,
+                                          imagery_options=imagery_options)
             self.cache_panel.statusChanged.connect(self._on_cache_status)
             self.cache_panel.cacheChanged.connect(self.cacheChanged)
             self.toolbars.addWidget(self.cache_panel)

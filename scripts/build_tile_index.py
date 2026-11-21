@@ -278,6 +278,20 @@ def verify_ter_block(remote, asset, infos, checker: TerChecker, kind: str):
         i = j + 1
 
 
+def convert(src: str, out: str) -> None:
+    """Rewrite index ``src`` in the current format, keeping everything else."""
+    with gzip.open(src, "rt", encoding="utf-8") as fh:
+        data = json.load(fh)
+    index = ts.TileIndex(data)  # validates
+    if data["format"] == 1:
+        data["files"] = ts.pack_files(data["files"])
+    data["format"] = ts.INDEX_FORMAT
+    with gzip.open(out, "wt", encoding="utf-8") as fh:
+        json.dump(data, fh, separators=(",", ":"))
+    print(f"{src} -> {out}: {len(index)} files, {index.dsf_count} DSFs "
+          f"({os.path.getsize(out)/1e6:.2f} MB)")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -291,6 +305,8 @@ def main(argv=None):
     ap.add_argument("--name", default="AutoOrtho XP11 legacy set")
     ap.add_argument("--variant", default="xp11")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--convert", metavar="INDEX",
+                    help="Rewrite an existing index in the current format (no downloads)")
     ap.add_argument("--local-dir", action="append",
                     help="Index release files on disk instead (repeat per area); "
                          "needs --url-base")
@@ -298,6 +314,9 @@ def main(argv=None):
                     "uploaded, e.g. https://github.com/o/r/releases/download/<tag>/ "
                     "(use {area} for one release per area)")
     args = ap.parse_args(argv)
+    if args.convert:
+        convert(args.convert, args.out)
+        return
 
     session = requests.Session()
     session.headers["User-Agent"] = "autoortho-tile-index-builder"
@@ -373,7 +392,7 @@ def main(argv=None):
         "source": args.repo,
         "built": int(time.time()),
         "assets": assets,
-        "files": files,
+        "files": ts.pack_files(files),
     }
     if args.kind == "ortho":
         index["ter"] = {"params": checker.params, "exceptions": checker.exceptions,
