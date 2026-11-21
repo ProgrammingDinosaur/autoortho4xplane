@@ -2,11 +2,12 @@
 
 The old region installer put each region in ``z_autoortho/scenery/
 z_ao_<id>`` with ``z_autoortho/<id>_info.json`` beside it. Every region it
-installed comes from kubilus1/autoortho-scenery, the XP11 set, so a region
-can move into an XP11 streaming package: its DSFs and water masks are moved
-(same volume, so nothing is copied), its tiles pinned, and the region folder
-removed. The map's Cache view is then the one place that shows and manages
-stored tiles.
+installed comes from kubilus1/autoortho-scenery, the XP11 set. A region
+moves into the streaming package: its DSFs and water masks go into the
+package folder (same volume, so nothing is copied), its tiles are pinned,
+and the region folder is removed. The map's Scenery & Cache view is then the
+one place that shows and manages stored tiles. AutoOrtho does this by itself
+for every installed region when it starts (``migrate``).
 
 Files are moved as they are, not checked against the index:
 
@@ -17,14 +18,21 @@ Files are moved as they are, not checked against the index:
 - a few tiles of newer releases aren't in the index; the streaming mount
   lists every DSF stored in the package, so they still load.
 
-What must match is the set: XP11 tiles need the XP11 ``.ter`` settings
-(mask zoom 14), which the package generates from its index. A region whose
-DSFs the index mostly doesn't know stays installed.
+Any set works. XP11 tiles need XP11 terrain files (mask zoom 14): in an
+XP11 package they are generated from the index, and in a package of another
+set (XP12) the region's own ``terrain/*.ter`` files go along, since a real
+terrain file in the package wins over a generated one
+(``StreamPackage.ter_bytes``). Moved files the package's index doesn't have
+are never evicted or deleted with a tile's masks, because they can't be
+downloaded again. A region whose DSFs the index mostly doesn't know (not
+the same area) stays installed.
 
-Order matters if the move is interrupted: tiles are pinned first (the
-package never evicts them), then DSFs move, then masks (a DSF still in the
-region keeps its masks until every DSF has moved), and the region folder
-goes last. Running it again finishes the job.
+Nothing may be missing if the move is interrupted: tiles are pinned first
+(never evicted), masks and terrain files are hard-linked into the package
+(instant on the same NTFS volume; copied where links don't work), then the
+DSFs move, and the region folder goes last. Until its last DSF has moved
+the region still has all its files, and every moved DSF finds its files in
+the package. Running it again finishes the job.
 
 Overlays installed in ``Custom Scenery/yAutoOrtho_Overlays`` move into the
 streamed overlay package DSF by DSF (that folder is shared by all regions);
@@ -73,6 +81,9 @@ class RegionCheck:
         return not self.reason
 
 
+MIGRATION_SET = "xp11"   # the set a migrated install starts with
+
+
 @dataclass
 class AdoptResult:
     regions: List[str] = field(default_factory=list)   # moved region ids
@@ -83,6 +94,7 @@ class AdoptResult:
     overlays: int = 0          # overlay DSFs moved
     cancelled: bool = False
     errors: List[str] = field(default_factory=list)
+    created: List[str] = field(default_factory=list)   # packages set up first
 
     def __str__(self) -> str:
         parts = []
@@ -126,11 +138,14 @@ def _dsfs(root: str) -> List[str]:
 
 
 def _masks(root: str) -> List[str]:
+    """Every texture of a region: water masks and the shared ones such as
+    ``water_transition.png``, which XP11 water edges use and another set's
+    index may not have."""
     try:
         names = sorted(os.listdir(os.path.join(root, "textures")))
     except OSError:
         return []
-    return [f"textures/{n}" for n in names if tile_stream.MASK_NAME_RE.match(n)]
+    return [f"textures/{n}" for n in names if n.lower().endswith(".png")]
 
 
 def _has_season_backups(root: str) -> bool:
@@ -179,12 +194,8 @@ def check_region(ao_scenery_dir: str, name: str, index: "tile_stream.TileIndex",
             check.known += 1
     for rel in _masks(root):
         check.size += _size(os.path.join(root, *rel.split("/")))
-    variant = variant or index.variant
     if not dsfs:
         check.reason = "It has no DSFs."
-    elif variant != REGION_SET:
-        check.reason = ("It is part of the XP11 set; switch the streamed set to "
-                        "XP11 to move it, or remove it to use the streamed set there.")
     elif check.known < MIN_KNOWN * check.dsfs:
         check.reason = (f"The streamed set has only {check.known} of its "
                         f"{check.dsfs} tiles.")
@@ -218,6 +229,27 @@ def check_regions(ao_scenery_dir: str) -> List[RegionCheck]:
     index = _load_index(root, marker)
     return [check_region(ao_scenery_dir, n, index, _variant(marker, index))
             for n in names]
+
+
+def _terrain(root: str) -> List[str]:
+    try:
+        names = sorted(os.listdir(os.path.join(root, "terrain")))
+    except OSError:
+        return []
+    return [f"terrain/{n}" for n in names if n.endswith(".ter")]
+
+
+def _link(src: str, dst: str) -> bool:
+    """Put a second name on a file (or copy it where links don't work),
+    unless the destination already has one. Returns True if it was added."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.exists(dst):
+        return False
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+    return True
 
 
 def _move(src: str, dst: str) -> bool:
@@ -260,7 +292,8 @@ def adopt_regions(ao_scenery_dir: str, region_names: Optional[List[str]] = None,
             continue
         try:
             moved = _adopt_checked(ao_scenery_dir, check, pkg_root, marker,
-                                   progress, cancelled)
+                                   progress, cancelled,
+                                   own_terrain=variant != REGION_SET)
         except OSError as exc:
             result.errors.append(f"{check.region_id}: {exc}")
             log.error("Adopt: moving %s failed: %s", name, exc)
@@ -283,28 +316,35 @@ def adopt_regions(ao_scenery_dir: str, region_names: Optional[List[str]] = None,
 
 
 def _adopt_checked(ao_scenery_dir: str, check: RegionCheck, pkg_root: str,
-                   marker: dict, progress, cancelled) -> Optional[Tuple[int, int]]:
-    """Move a checked region. Returns (files moved, bytes), or None if
-    cancelled midway (what moved stays moved and pinned)."""
+                   marker: dict, progress, cancelled,
+                   own_terrain: bool = False) -> Optional[Tuple[int, int]]:
+    """Move a checked region (with its terrain files if ``own_terrain``).
+    Returns (files moved, bytes), or None if cancelled midway: what moved
+    stays moved and pinned, and the region keeps everything it still needs."""
     root = os.path.join(ao_scenery_dir, check.name)
     pins = tile_stream.read_pins(pkg_root)
     if not set(check.tiles) <= pins:
         tile_stream.write_pins(pkg_root, pins | set(check.tiles))
-    rels = _dsfs(root) + _masks(root)   # DSFs first: see the module docstring
+    linked = (_terrain(root) if own_terrain else []) + _masks(root)
+    dsfs = _dsfs(root)
+    total = len(linked) + len(dsfs)
     files = size = 0
-    for i, rel in enumerate(rels, 1):
+    for i, rel in enumerate(linked + dsfs, 1):
         if cancelled():
             return None
         src = os.path.join(root, *rel.split("/"))
+        dst = os.path.join(pkg_root, *rel.split("/"))
         n = _size(src)
-        if _move(src, os.path.join(pkg_root, *rel.split("/"))):
+        added = _link(src, dst) if i <= len(linked) else _move(src, dst)
+        if added and not rel.startswith("terrain/"):
             files += 1
             size += n
-        if progress and (i % 50 == 0 or i == len(rels)):
-            progress(check.region_id, i, len(rels))
+        if progress and (i % 50 == 0 or i == total):
+            progress(check.region_id, i, total)
     info_path = _info_path(ao_scenery_dir, check.region_id)
     roughness = _region_roughness(_read_info(info_path))
-    if roughness is not None and marker.get("roughness") is None:
+    # With its own terrain files the region keeps its reflectivity in them.
+    if not own_terrain and roughness is not None and marker.get("roughness") is None:
         tile_stream.set_stream_roughness(ao_scenery_dir, roughness)
         marker["roughness"] = roughness
     shutil.rmtree(root)
@@ -324,6 +364,43 @@ def _region_roughness(info: dict) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def needs_migration(ao_scenery_dir: str) -> bool:
+    """Whether regions installed with an earlier version are still there."""
+    return bool(ao_scenery_dir) and bool(installed_regions(ao_scenery_dir))
+
+
+def migrate(ao_scenery_dir: str, custom_scenery_dir: str = "",
+            session=None, progress=None,
+            cancelled: Callable[[], bool] = lambda: False) -> AdoptResult:
+    """Move every installed region into AutoOrtho scenery, as a new version
+    does on its first start.
+
+    Without a scenery set yet (an install that never streamed), the XP11 set
+    is set up first: the regions are from it, it has their overlays, and with
+    downloading while flying off it behaves as before (tiles not installed
+    come from Global Scenery). That downloads its index (about 6 MB); if it
+    fails this raises and nothing has changed, so the next start tries again.
+    Regions that can't move stay installed and are listed in the Scenery
+    Library.
+    """
+    if not needs_migration(ao_scenery_dir):
+        return AdoptResult()
+    created = []
+    try:
+        _ortho_package(ao_scenery_dir)
+    except ValueError:
+        overlays = bool(custom_scenery_dir) and os.path.isdir(
+            os.path.join(custom_scenery_dir, tile_stream.LEGACY_OVERLAY_FOLDER))
+        created = tile_stream.enable_streaming(
+            ao_scenery_dir, MIGRATION_SET, overlays=overlays,
+            fetch_missing=False, session=session)
+        log.info("Adopt: set up %s for the installed regions", ", ".join(created))
+    result = adopt_regions(ao_scenery_dir, custom_scenery_dir=custom_scenery_dir,
+                           progress=progress, cancelled=cancelled)
+    result.created = list(created)
+    return result
 
 
 def adopt_overlays(ao_scenery_dir: str, custom_scenery_dir: str,

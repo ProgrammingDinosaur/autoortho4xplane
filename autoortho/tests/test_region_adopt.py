@@ -113,14 +113,55 @@ def test_patched_overlapping_and_unindexed_tiles_move_as_they_are(ao_dir):
     assert (41, 23) in ts.read_pins(pkg)
 
 
-def test_region_stays_when_the_streamed_set_is_not_xp11(ao_dir):
-    make_streaming(ao_dir, source="xp12")
-    region, _ = make_region(ao_dir, "eur", TILES)
+def test_region_moves_into_another_set_with_its_own_terrain(ao_dir):
+    """An XP11 region in an XP12 package keeps its terrain files, which the
+    package serves ahead of the XP12 ones it would generate."""
+    pkg = make_streaming(ao_dir, source="xp12")
+    region, info = make_region(ao_dir, "eur", TILES, info={
+        "roughness_value": 0.4, "processed_ter_roughness": {"z": {"a.ter": 1}}})
     check = ra.check_regions(ao_dir)[0]
-    assert not check.movable and "XP11" in check.reason
+    assert check.movable
     result = ra.adopt_regions(ao_dir)
-    assert result.regions == [] and "eur" in result.kept
-    assert os.path.isdir(region)
+    assert result.regions == ["eur"] and not os.path.exists(region)
+    ter = os.path.join(pkg, "terrain", "100000_125184_BI18.ter")
+    region_ter = "A\n800\nTERRAIN\n"
+    assert open(ter).read() == region_ter
+    assert "roughness" not in ts.read_marker(pkg)   # kept in its own files
+    package = ts.StreamPackage(pkg, ts.read_marker(pkg), remote=object())
+    try:
+        with open(ter, "rb") as fh:
+            assert package.ter_bytes("100000_125184_BI18.ter") == fh.read()
+        # Other terrain is still generated.
+        assert b"LOAD_CENTER" in package.ter_bytes("100000_125200_BI18.ter")
+    finally:
+        package.shutdown()
+
+
+def test_same_set_regions_leave_terrain_to_the_package(ao_dir):
+    pkg = make_streaming(ao_dir)
+    make_region(ao_dir, "eur", TILES)
+    ra.adopt_regions(ao_dir)
+    assert not os.path.exists(os.path.join(pkg, "terrain", "100000_125184_BI18.ter"))
+
+
+def test_moved_masks_are_in_the_package_before_any_dsf_moves(ao_dir):
+    pkg = make_streaming(ao_dir, source="xp12")
+    region, _ = make_region(ao_dir, "eur", TILES)
+    calls = []
+
+    def cancelled():
+        calls.append(1)
+        return len(calls) > 4  # region check, terrain file, mask, one DSF
+
+    ra.adopt_regions(ao_dir, cancelled=cancelled)
+    moved = [c for c in TILES
+             if os.path.exists(os.path.join(pkg, *ts.dsf_rel(*c).split("/")))]
+    assert len(moved) == 1
+    assert os.path.exists(os.path.join(pkg, *MASK.split("/")))
+    assert os.path.exists(os.path.join(pkg, "terrain", "100000_125184_BI18.ter"))
+    # The region still has everything its remaining DSFs need.
+    assert os.path.exists(os.path.join(region, *MASK.split("/")))
+    assert os.path.exists(os.path.join(region, "terrain", "100000_125184_BI18.ter"))
 
 
 def test_region_stays_when_the_index_lacks_most_tiles(ao_dir):
@@ -189,3 +230,74 @@ def test_installed_overlays_move_into_the_overlay_package(ao_dir, tmp_path):
     # The overlay index doesn't have the second tile: it stays installed.
     assert legacy.joinpath(*ts.dsf_rel(*TILES[1]).split("/")).exists()
     assert ts.read_pins(over) == {TILES[0]}
+
+
+# ---------------------------------------------------------------------------
+# Migration on first start
+# ---------------------------------------------------------------------------
+
+def _index_host(source_tiles=TILES):
+    from test_tile_stream_setup import IndexHost
+    import gzip as _gzip
+    import io
+    members = [("z_test_00/" + ts.dsf_rel(*c), dsf_bytes(c), zipfile.ZIP_STORED)
+               for c in source_tiles]
+    index = index_for({URL: build_release_zip(members)})
+    index["variant"] = "xp11"
+    buf = io.BytesIO()
+    with _gzip.GzipFile(fileobj=buf, mode="wb") as fh:
+        fh.write(json.dumps(index).encode())
+    spec = ts.SOURCES["xp11"]
+    return IndexHost({spec["ortho_index"]: buf.getvalue(),
+                      spec["overlay_index"]: buf.getvalue()})
+
+
+def test_migration_sets_up_the_xp11_set_offline_only_and_moves_everything(ao_dir, tmp_path):
+    make_region(ao_dir, "eur", TILES[:2])
+    make_region(ao_dir, "afr", TILES[2:])
+    custom = tmp_path / "Custom Scenery"
+    legacy = custom / ts.LEGACY_OVERLAY_FOLDER
+    path = legacy.joinpath(*ts.dsf_rel(*TILES[0]).split("/"))
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"overlay")
+    assert ra.needs_migration(ao_dir)
+
+    result = ra.migrate(ao_dir, str(custom), session=_index_host())
+
+    assert result.created == ["z_ao_stream_xp11", "yAO_stream_xp11_overlays"]
+    assert sorted(result.regions) == ["afr", "eur"] and result.overlays == 1
+    assert not ra.needs_migration(ao_dir)
+    packages = ts.stream_packages(ao_dir)
+    # Behaves as before: only the tiles that were installed are offered.
+    assert all(m.get("fetch_missing") is False for m in packages.values())
+    pkg = os.path.join(ao_dir, "z_ao_stream_xp11")
+    assert ts.read_pins(pkg) == set(TILES)
+    assert ra.migrate(ao_dir, str(custom), session=_index_host()).regions == []
+
+
+def test_migration_into_the_set_already_in_use(ao_dir):
+    pkg = make_streaming(ao_dir, source="xp12")
+    make_region(ao_dir, "eur", TILES)
+    result = ra.migrate(ao_dir, session=object())   # no download needed
+    assert result.created == [] and result.regions == ["eur"]
+    assert os.path.exists(os.path.join(pkg, "terrain", "100000_125184_BI18.ter"))
+
+
+def test_migration_waits_when_the_index_cannot_be_downloaded(ao_dir):
+    from test_tile_stream_setup import IndexHost
+    region, _ = make_region(ao_dir, "eur", TILES)
+    with pytest.raises(Exception):
+        ra.migrate(ao_dir, session=IndexHost({}))
+    assert os.path.isdir(region) and ts.stream_packages(ao_dir) == {}
+    assert ra.needs_migration(ao_dir)
+
+
+def test_shared_textures_move_with_the_region(ao_dir):
+    """XP11 water edges use textures/water_transition.png, which the XP12
+    set's index doesn't have: it must come along, or X-Plane stops."""
+    pkg = make_streaming(ao_dir, source="xp12")
+    region, _ = make_region(ao_dir, "eur", TILES,
+                            masks=(MASK, "textures/water_transition.png"))
+    ra.adopt_regions(ao_dir)
+    assert os.path.exists(os.path.join(pkg, "textures", "water_transition.png"))
+    assert not os.path.exists(region)

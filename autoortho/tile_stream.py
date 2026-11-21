@@ -1348,6 +1348,14 @@ class StreamPackage:
                 continue
         return out
 
+    @staticmethod
+    def _stored_rel(entry: os.DirEntry) -> str:
+        """Package-relative path of a stored DSF or mask."""
+        if entry.name.endswith(".png"):
+            return f"textures/{entry.name}"
+        folder = os.path.basename(os.path.dirname(entry.path))
+        return f"{DSF_DIR}/{folder}/{entry.name}"
+
     def usage(self) -> Tuple[int, int]:
         """(bytes, DSF count) stored in the package folder."""
         files = self._stored_files()
@@ -1385,6 +1393,8 @@ class StreamPackage:
         for e in self._stored_files():
             if pins and stored_file_cell(e.name) in pins:
                 continue
+            if self.index.lookup(self._stored_rel(e)) is None:
+                continue  # can't be downloaded again (moved in from a region)
             try:
                 stats[e.path] = e.stat()
             except OSError:
@@ -1455,12 +1465,21 @@ class StreamPackage:
 
     # -- terrain --------------------------------------------------------
     def ter_bytes(self, name: str) -> Optional[bytes]:
+        """A terrain file: the real one in ``terrain/`` if the package has it
+        (tiles moved in from another set keep their own), else generated."""
         with self._ter_lock:
             cached = self._ter_cache.get(name)
         if cached is not None:
             return cached
-        data = synthesize_ter(name, self.index.ter_params,
-                              self.index.ter_exceptions, self.roughness)
+        data = None
+        try:
+            with open(os.path.join(self.root, "terrain", name), "rb") as fh:
+                data = fh.read()
+        except OSError:
+            pass
+        if data is None:
+            data = synthesize_ter(name, self.index.ter_params,
+                                  self.index.ter_exceptions, self.roughness)
         if data is not None:
             with self._ter_lock:
                 if len(self._ter_cache) > 50000:
@@ -1755,7 +1774,7 @@ def change_stream_source(ao_scenery_dir: str, source: str,
     The new set is set up first; the old set's packages and tiles are removed
     only once that worked, so a failed download leaves streaming as it was.
     """
-    _, ortho = _streamed_ortho(ao_scenery_dir)
+    old_name, ortho = _streamed_ortho(ao_scenery_dir)
     if ortho.get("source") == source:
         return []
     overlays = any(m.get("kind") == "overlay" for m in stream_packages(ao_scenery_dir).values())
@@ -1763,8 +1782,115 @@ def change_stream_source(ao_scenery_dir: str, source: str,
                                disk_limit_gb=ortho.get("disk_limit_gb") or 20,
                                roughness=ortho.get("roughness"), session=session,
                                fetch_missing=ortho.get("fetch_missing", True))
+    # Tiles downloaded on the map (and regions moved in) aren't the old
+    # set's to delete: they go into the new set's folder first.
+    carry_kept_tiles(ao_scenery_dir, old_name, ORTHO_PACKAGE.format(source=source))
     disable_streaming(ao_scenery_dir, keep_source=source)
     return created
+
+
+def _carry_seasons_record(old_root: str, new_root: str, cells) -> None:
+    """Keep which moved tiles have seasons (``stream_seasons``; moving a
+    file keeps its size and time, which the record checks)."""
+    name = "seasons_tiles.json"
+    try:
+        with open(os.path.join(old_root, name), "r", encoding="utf-8") as fh:
+            old = json.load(fh).get("tiles", {})
+    except (OSError, ValueError, AttributeError):
+        return
+    keys = {os.path.basename(dsf_rel(*c))[:-4] for c in cells}
+    moved = {k: v for k, v in old.items() if k in keys}
+    if not moved:
+        return
+    try:
+        with open(os.path.join(new_root, name), "r", encoding="utf-8") as fh:
+            tiles = json.load(fh).get("tiles", {})
+    except (OSError, ValueError, AttributeError):
+        tiles = {}
+    tiles.update(moved)
+    with open(os.path.join(new_root, name), "w", encoding="utf-8") as fh:
+        json.dump({"tiles": tiles}, fh)
+
+
+def carry_kept_tiles(ao_scenery_dir: str, old_name: str, new_name: str,
+                     workers: int = 4) -> int:
+    """Move the kept (pinned) tiles of one ortho package into another, of
+    another scenery set. Returns the number of tiles moved.
+
+    Each DSF's terrain list names the terrain files and masks it uses. The
+    terrain files are written into the new package as real files (with the
+    old set's settings, or the real file the old package had), because the
+    new set would generate its own; masks are hard-linked (copied where
+    links don't work). The DSF moves last, so an interrupted run leaves no
+    DSF without its files. Masks and terrain files the new index doesn't
+    have are never evicted.
+    """
+    old_root = os.path.join(ao_scenery_dir, old_name)
+    new_root = os.path.join(ao_scenery_dir, new_name)
+    pins = read_pins(old_root)
+    old_marker, new_marker = read_marker(old_root), read_marker(new_root)
+    if not pins or old_marker is None or new_marker is None:
+        return 0
+    old = StreamPackage(old_root, old_marker, remote=RemoteAssets())
+    try:
+        def terrain_of(cell):
+            path = old.local_path(dsf_rel(*cell))
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                return cell, None
+            if data.startswith(SEVENZIP_MAGIC):
+                data = unpack_7z_dsf(path) or b""
+            return cell, dsf_terrain_names(data)
+
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="carry-tiles") as pool:
+            found = list(pool.map(terrain_of, sorted(pins)))
+        # Every texture a kept tile uses must be on disk before anything
+        # moves: the new set's index may not have it (XP11 water edges use
+        # water_transition.png, which the XP12 set doesn't publish). A
+        # failed download stops the switch with nothing moved.
+        for _cell, names in found:
+            for tex in old.mask_rels(names or []):
+                if not os.path.exists(old.local_path(tex)) and old.entry(tex) is not None:
+                    old.fetch_now(tex)
+        carried = []
+        for cell, names in found:
+            if names is None:
+                continue  # kept but not stored
+            for name in names:
+                if not name.startswith("terrain/"):
+                    continue
+                dst = os.path.join(new_root, *name.split("/"))
+                data = old.ter_bytes(name.split("/", 1)[1])
+                if data is not None and not os.path.exists(dst):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    with open(dst, "wb") as fh:
+                        fh.write(data)
+            for mask in old.mask_rels(names):
+                src, dst = old.local_path(mask), os.path.join(new_root, *mask.split("/"))
+                if os.path.exists(src) and not os.path.exists(dst):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    try:
+                        os.link(src, dst)
+                    except OSError:
+                        import shutil
+                        shutil.copy2(src, dst)
+            rel = dsf_rel(*cell)
+            dst = os.path.join(new_root, *rel.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            if os.path.exists(dst):
+                os.remove(dst)  # the kept tile wins over one fetched while flying
+            os.replace(old.local_path(rel), dst)
+            carried.append(cell)
+        write_pins(new_root, read_pins(new_root) | set(carried))
+        _carry_seasons_record(old_root, new_root, carried)
+        log.info("Tile stream: moved %d kept tiles from %s to %s",
+                 len(carried), old_name, new_name)
+        return len(carried)
+    finally:
+        old.shutdown()
 
 
 def set_stream_roughness(ao_scenery_dir: str, roughness: Optional[float]) -> str:

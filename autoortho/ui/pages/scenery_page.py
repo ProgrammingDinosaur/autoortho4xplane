@@ -202,10 +202,11 @@ class SceneryLibraryPage(QWidget):
         self.regions_group = QGroupBox("Installed regions")
         regions_layout = QVBoxLayout(self.regions_group)
         regions_layout.addWidget(_secondary(
-            "Regions installed with earlier versions of AutoOrtho. They keep "
-            "working and are used before AutoOrtho scenery where both have a "
-            "tile. Moving them into AutoOrtho scenery keeps their files (nothing "
-            "is downloaded again) and shows them on the map as downloaded tiles."))
+            "Regions installed with earlier versions of AutoOrtho move into "
+            "AutoOrtho scenery by themselves when AutoOrtho starts. These "
+            "haven't yet (each says why). They keep working and are used before "
+            "AutoOrtho scenery where both have a tile; moving them keeps their "
+            "files and shows them on the map as downloaded tiles."))
         adopt_row = QHBoxLayout()
         self.adopt_label = _secondary("Checking the installed regions…")
         self.adopt_button = QPushButton("Move into AutoOrtho Scenery…")

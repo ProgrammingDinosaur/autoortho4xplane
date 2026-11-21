@@ -269,9 +269,9 @@ click **Download**. See [AutoOrtho scenery](scenery.md#autoortho-scenery).
 ### Where did the region installer go?
 Regions are downloaded on the map now (see above): the same scenery, tile by
 tile or a whole region at once, and you can choose any area, not just the
-predefined regions. Regions you installed earlier keep working and are
-listed under **Installed regions** in the Scenery Library, where you can
-move them into AutoOrtho scenery or remove them. See
+predefined regions. Regions you installed earlier are moved into AutoOrtho
+scenery when this version first starts, without downloading anything again,
+and show on the map as downloaded tiles. See
 [Regions installed with earlier versions](scenery.md#regions-installed-with-earlier-versions).
 
 ### Can I fly only the tiles I downloaded, with nothing downloading while I fly?

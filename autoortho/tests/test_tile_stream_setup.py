@@ -547,3 +547,74 @@ def test_stream_panel_fetch_toggle_and_map_button(qt_app):
     assert events[-1] == ("map",)
     panel.set_runtime_locked(True)
     assert not panel.fetch_check.isEnabled()
+
+
+# ---------------------------------------------------------------------------
+# Switching sets keeps kept tiles
+# ---------------------------------------------------------------------------
+
+def test_switching_sets_moves_kept_tiles_with_their_files(tmp_path, grid_release, monkeypatch):
+    other = {"label": "Other set", "available": True,
+             "ortho_index": "https://example.invalid/other.json.gz", "overlay_index": None}
+    monkeypatch.setitem(ts.SOURCES, "other", other)
+    spec = ts.SOURCES["xp11"]
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
+                      other["ortho_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    ts.enable_streaming(scenery, "xp11", overlays=False, session=host)
+    old = tmp_path / "z_ao_stream_xp11"
+    kept_names = ["terrain/100000_125184_BI18.ter",
+                  "terrain/100000_148176_BI18_sea_overlay.ter"]
+    for cell, names in (((40, -9), kept_names), ((41, -9), [])):
+        path = old.joinpath(*ts.dsf_rel(*cell).split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(make_dsf(names))
+    (old / "textures").mkdir(exist_ok=True)
+    mask = old / "textures" / "100000_148176_ZL18.png"   # named after the texture
+    mask.write_bytes(b"\x89PNG mask")
+    ts.write_pins(str(old), {(40, -9)})
+    (old / "seasons_tiles.json").write_text(json.dumps({"tiles": {"+40-009": [1, 2]}}))
+
+    ts.change_stream_source(scenery, "other", session=host)
+
+    new = tmp_path / "z_ao_stream_other"
+    assert not old.exists()
+    assert new.joinpath(*ts.dsf_rel(40, -9).split("/")).exists()     # kept: moved
+    assert not new.joinpath(*ts.dsf_rel(41, -9).split("/")).exists()  # fetched: gone
+    assert (new / "textures" / "100000_148176_ZL18.png").read_bytes() == b"\x89PNG mask"
+    sea = (new / "terrain" / "100000_148176_BI18_sea_overlay.ter").read_text()
+    assert "BORDER_TEX ../textures/100000_148176_ZL18.png" in sea   # the old set's
+    assert ts.read_pins(str(new)) == {(40, -9)}
+    assert json.loads((new / "seasons_tiles.json").read_text())["tiles"] == {"+40-009": [1, 2]}
+
+
+def test_switching_sets_first_downloads_textures_kept_tiles_lack(tmp_path, grid_release,
+                                                                monkeypatch):
+    """A texture a kept tile uses but the old folder never stored is
+    downloaded before anything moves; if that fails, nothing moves."""
+    other = {"label": "Other set", "available": True,
+             "ortho_index": "https://example.invalid/other.json.gz", "overlay_index": None}
+    monkeypatch.setitem(ts.SOURCES, "other", other)
+    spec = ts.SOURCES["xp11"]
+    host = IndexHost({spec["ortho_index"]: gz_index(grid_release),
+                      other["ortho_index"]: gz_index(grid_release)})
+    scenery = str(tmp_path)
+    ts.enable_streaming(scenery, "xp11", overlays=False, session=host)
+    old = tmp_path / "z_ao_stream_xp11"
+    path = old.joinpath(*ts.dsf_rel(40, -9).split("/"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(make_dsf(["terrain/100000_148176_BI18_sea_overlay.ter"]))
+    ts.write_pins(str(old), {(40, -9)})
+    fetched = []
+    monkeypatch.setattr(ts.StreamPackage, "entry",
+                        lambda self, rel: [0, 0, 1, 1, 0, 0])
+
+    def failing_fetch(self, rel):
+        fetched.append(rel)
+        raise IOError("offline")
+
+    monkeypatch.setattr(ts.StreamPackage, "fetch_now", failing_fetch)
+    with pytest.raises(IOError):
+        ts.change_stream_source(scenery, "other", session=host)
+    assert fetched == ["textures/100000_148176_ZL18.png"]
+    assert path.exists()   # nothing moved; the old set is still in use

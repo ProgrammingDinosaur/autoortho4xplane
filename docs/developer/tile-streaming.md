@@ -226,6 +226,27 @@ that the overlay index has move into the overlay package.
 `check_regions` is the cheap check (lists and stats files, about 10 s cold
 for five regions) behind the Installed regions section.
 
+`region_adopt.migrate` runs this for every installed region when the app
+starts (`MainWindow._migrate_installed_regions`), or once AutoOrtho and
+X-Plane have stopped if they were running; `on_run` waits while it runs.
+Without an ortho package it first sets up the XP11 set with `fetch_missing`
+off, which behaves like installed regions did; if that index download fails
+nothing changes and the next start tries again. Into a package of another
+set, a region brings its own `terrain/*.ter` (a real file in the package
+wins in `ter_bytes`) and every texture in its `textures/` (XP11 water edges
+use `water_transition.png`, which the XP12 index doesn't have). Masks and
+terrain are hard-linked before DSFs move, so an interrupted move never
+leaves a DSF without its files.
+
+`change_stream_source` carries kept tiles into the new set
+(`carry_kept_tiles`): it reads each kept DSF's terrain list, downloads any
+texture the old folder never stored (failing before anything moves),
+writes the terrain files with the old set's settings as real files, links
+the textures, then moves the DSFs and the seasons record.
+
+Moved files the new index doesn't have can't be downloaded again, so
+`evict` skips them and the map's Delete leaves masks the index lacks.
+
 ## Seasons for downloaded XP11 tiles
 
 `stream_seasons.patch_tile` runs `DsfUtils.add_seasons_to_dsf_file` on a

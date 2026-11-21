@@ -141,19 +141,35 @@ since X-Plane stops with an error on a missing mask.
 
 ### Regions installed with earlier versions
 
-Regions installed with the old region installer keep working, and their
-tiles are used before AutoOrtho scenery where both have one. The Scenery
-Library lists them under **Installed regions**, each with its Seasons and
-terrain reflectivity status, **Scenery Options** and **Remove**.
+When this version first starts, it moves the regions you installed with
+the old region installer into AutoOrtho scenery, so they all live in one
+folder and the map shows them as downloaded tiles. Nothing is downloaded
+again: the files are moved on the same drive, which takes seconds. A notice
+on **Home** says what moved, and **Activity** shows the progress. Starting
+AutoOrtho waits until it's done.
 
-**Move into AutoOrtho Scenery** moves them into the AutoOrtho scenery, so
-the map shows and manages them like downloaded tiles. Their files are
-moved, not downloaded again, and the region folders are removed afterwards.
-Seasons and terrain reflectivity they had are kept.
+- If you didn't use AutoOrtho scenery yet, the **XP11 legacy set** is set
+  up for you (your regions are from it, and it has their overlays), with
+  **Download tiles while flying** off, so everything works as before:
+  your regions' tiles, and X-Plane's default scenery elsewhere. That needs
+  an internet connection once, for the 6 MB tile index; without one, your
+  regions keep working and AutoOrtho tries again on the next start.
+- If you already used a scenery set, your regions move into it, whichever
+  set it is. In the XP12 set, the XP11 tiles keep their own terrain files
+  and water textures, so they look exactly as before; download a tile again
+  on the map to get its XP12 version.
+- Overlays in `Custom Scenery/yAutoOrtho_Overlays` move into the overlay
+  folder when you use the XP11 set with overlays.
+- Seasons and terrain reflectivity the regions had are kept.
 
-All installed regions are from the XP11 legacy set, so they can move only
-while you use the XP11 set; each region says why if it can't. To use the
-XP12 set where you have an XP11 region installed, remove the region.
+A region that can't move (for example one the scenery set barely covers)
+stays installed and keeps working. The Scenery Library lists it under
+**Installed regions** with the reason, **Scenery Options**, **Remove** and
+**Move into AutoOrtho Scenery**.
+
+Switching the scenery set later keeps your downloaded tiles, including
+moved regions: they move to the new set's folder with their own files. Only
+tiles downloaded while flying are deleted.
 
 ### Overlays and simHeaven
 

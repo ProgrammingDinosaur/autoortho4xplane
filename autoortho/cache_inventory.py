@@ -396,12 +396,24 @@ def _remove(path: str, result: ChangeResult) -> None:
 
 
 def _delete_mesh(ao_scenery_dir: str, cells: Set[Cell], result: ChangeResult) -> None:
-    for name in tile_stream.stream_packages(ao_scenery_dir):
+    for name, marker in tile_stream.stream_packages(ao_scenery_dir).items():
         root = os.path.join(ao_scenery_dir, name)
         for cell in cells:
             _remove(os.path.join(root, *tile_stream.dsf_rel(*cell).split("/")), result)
+        # A mask on a degree line may also serve a neighbouring tile. Only
+        # masks the index can download again are removed: a tile moved in
+        # from an installed region has masks it can't get back.
+        path = marker.get("index", tile_stream.INDEX_NAME)
+        if not os.path.isabs(path):
+            path = os.path.join(root, path)
+        try:
+            index = tile_stream.TileIndex.load(path)
+        except (OSError, ValueError):
+            index = None
         for f in _scandir(os.path.join(root, "textures")):
-            if f.name.endswith(".png") and tile_stream.mask_cell(f.name) in cells:
+            if (f.name.endswith(".png") and tile_stream.mask_cell(f.name) in cells
+                    and index is not None
+                    and index.lookup(f"textures/{f.name}") is not None):
                 _remove(f.path, result)
         pins = tile_stream.read_pins(root)
         if pins & cells:
