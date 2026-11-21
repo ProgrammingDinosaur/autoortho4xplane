@@ -781,7 +781,7 @@ class CustomMapEditor(QWidget):
             for view, label, tip in (
                 (SOURCES_VIEW, "Imagery Sources",
                  "Choose the imagery source per tile"),
-                (CACHE_VIEW, "Scenery & Cache",
+                (CACHE_VIEW, "Scenery && Cache",  # && shows one &
                  "Download scenery tiles or regions, and see or delete what "
                  "AutoOrtho has stored per tile"),
             ):

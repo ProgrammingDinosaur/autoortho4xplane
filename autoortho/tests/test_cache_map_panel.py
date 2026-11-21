@@ -112,14 +112,12 @@ def test_delete_imagery_after_confirmation(setup, monkeypatch):
     editor, panel, tasks, (ao_dir, cache, _, _) = setup
     editor.set_view(cme.CACHE_VIEW)
     panel.set_selection({(47, -123)})
-    asked = []
-    monkeypatch.setattr(panel, "_confirm", lambda *a, **k: asked.append(a) or True)
+    monkeypatch.setattr(panel, "_ask_delete", lambda: "imagery")
     changed = []
     editor.cacheChanged.connect(lambda: changed.append(1))
 
-    panel.delete_selected("imagery")
+    panel.delete_button.click()
 
-    assert "Delete 660 B of imagery from 1 tile?" in asked[0][1]
     assert panel.inventory.cells[(47, -123)].imagery_bytes == 0
     assert panel.inventory.cells[(47, -123)].dsf_bytes == 2000
     assert changed == [1]
@@ -131,8 +129,8 @@ def test_delete_cancelled_keeps_files(setup, monkeypatch):
     editor, panel, _, _ = setup
     editor.set_view(cme.CACHE_VIEW)
     panel.set_selection({(39, 23)})
-    monkeypatch.setattr(panel, "_confirm", lambda *a, **k: False)
-    panel.delete_selected("both")
+    monkeypatch.setattr(panel, "_ask_delete", lambda: None)
+    panel.delete_selected()
     assert panel.inventory.cells[(39, 23)].total == 1360
 
 
@@ -147,9 +145,9 @@ def test_locked_blocks_changes(setup, monkeypatch):
     assert not panel.keep_button.isEnabled()
     assert panel.delete_button.toolTip() == cmp.LOCKED_TIP
     assert "stop AutoOrtho" in editor.status.text()
-    monkeypatch.setattr(panel, "_confirm", lambda *a, **k: pytest.fail("asked"))
+    monkeypatch.setattr(panel, "_ask_delete", lambda *a, **k: pytest.fail("asked"))
     monkeypatch.setattr(panel, "_ask_download", lambda *a, **k: pytest.fail("asked"))
-    panel.delete_selected("both")
+    panel.delete_selected()
     panel.keep_selected()
 
     editor.set_runtime_locked(False)
@@ -199,8 +197,8 @@ def test_unkeep_removes_pin(setup):
     editor, panel, _, (_, _, ortho, _) = setup
     editor.set_view(cme.CACHE_VIEW)
     panel.set_selection({(47, -123)})
-    assert panel.unkeep_action.isEnabled()
-    panel.unkeep_selected()
+    assert not panel.unkeep_button.isHidden() and panel.unkeep_button.isEnabled()
+    panel.unkeep_button.click()
     assert ts.read_pins(ortho) == set()
     assert not panel.inventory.cells[(47, -123)].pinned
 
@@ -222,7 +220,7 @@ def test_flight_plan_page_retitles_the_map_box(setup):
     editor, _, _, _ = setup
     page = FlightPlanPage(QWidget(), editor)
     editor.set_view(cme.CACHE_VIEW)
-    assert page.map_group.title() == "Scenery & Cache"
+    assert page.map_group.title() == "Scenery && Cache"   # shown as one &
     editor.set_view(cme.SOURCES_VIEW)
     assert page.map_group.title() == "Custom Map"
 
@@ -233,21 +231,24 @@ def test_regions_menu_selects_a_whole_region(setup, monkeypatch):
     monkeypatch.setattr(ci, "stream_regions",
                         lambda _ao: [("na-n", "North America North", cells)])
     panel._read_regions("ao")
-    actions = panel.regions_menu.actions()
-    assert [a.text() for a in actions] == ["North America North (3 tiles)"]
+    combo = panel.region_combo
+    assert [combo.itemText(i) for i in range(combo.count())] == [
+        "Select a region…", "North America North (3 tiles)"]
     editor.set_view(cme.CACHE_VIEW)
-    actions[0].trigger()
+    combo.setCurrentIndex(1)
+    combo.activated.emit(1)       # what a user's pick sends
     assert panel.selection == set(cells)
+    assert combo.currentIndex() == 0   # a picker, not a setting
     assert "North America North selected" in editor.status.text()
-    assert panel.keep_button.text() == "Download"
+    assert panel.keep_button.isEnabled() and not panel.clear_button.isHidden()
 
 
 def test_regions_menu_without_a_scenery_set(setup, monkeypatch):
     _, panel, _, _ = setup
     monkeypatch.setattr(ci, "stream_regions", lambda _ao: [])
     panel._read_regions("ao")
-    (action,) = panel.regions_menu.actions()
-    assert not action.isEnabled() and "scenery set" in action.text()
+    assert not panel.region_combo.isEnabled()
+    assert "scenery set" in panel.region_combo.itemText(0)
 
 
 def test_download_dialog_offers_imagery_per_zoom(setup, monkeypatch):
@@ -274,3 +275,43 @@ def test_download_dialog_offers_imagery_per_zoom(setup, monkeypatch):
 def test_hover_shows_kept_imagery(setup):
     usage = ci.CellUsage(chunk_bytes=2048, chunk_files=2, zooms={16}, imagery_kept=17)
     assert "kept up to ZL17" in cmp.describe_cell((47, -123), usage)
+
+
+def test_toolbar_shows_only_what_the_selection_allows(setup):
+    editor, panel, _, _ = setup
+    editor.set_view(cme.CACHE_VIEW)
+    assert not panel.keep_button.isEnabled() and not panel.delete_button.isEnabled()
+    assert panel.clear_button.isHidden() and panel.unkeep_button.isHidden()
+    assert "pick a region" in editor.status.text()
+    panel.set_selection({(1, 1)})           # nothing stored there
+    assert panel.keep_button.isEnabled() and not panel.delete_button.isEnabled()
+    assert panel.unkeep_button.isHidden() and not panel.clear_button.isHidden()
+    panel.set_selection({(47, -123)})       # stored and kept
+    assert panel.delete_button.isEnabled() and not panel.unkeep_button.isHidden()
+    panel.clear_button.click()
+    assert panel.selection == set() and panel.clear_button.isHidden()
+
+
+def test_delete_dialog_offers_what_is_stored(setup, monkeypatch):
+    from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox
+    editor, panel, _, _ = setup
+    editor.set_view(cme.CACHE_VIEW)
+    panel.set_selection({(47, -123)})
+    seen = {}
+
+    def exec_dialog(dialog):
+        mesh, imagery = dialog.findChildren(QCheckBox)
+        seen["boxes"] = [(b.text(), b.isEnabled(), b.isChecked()) for b in (mesh, imagery)]
+        imagery.setChecked(True)
+        ok = [b for b in dialog.findChild(QDialogButtonBox).buttons()
+              if b.text().startswith("Delete")][0]
+        seen["button"] = ok.text()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QDialog, "exec", exec_dialog)
+    assert panel._ask_delete() == "both"
+    assert seen["boxes"] == [("&Scenery (2.0 KB)", True, True),
+                             ("&Imagery (660 B)", True, False)]
+    assert seen["button"] == "Delete 2.6 KB"
+    monkeypatch.setattr(QDialog, "exec", lambda d: QDialog.DialogCode.Rejected)
+    assert panel._ask_delete() is None

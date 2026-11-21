@@ -263,8 +263,8 @@ AutoOrtho checks for metadata for installed scenery packs in `Custom Scenery/z_a
 ### Do I have to download whole scenery regions?
 No. Tiles download the first time X-Plane needs them. To fly an area
 offline or skip the wait, download it on the map: **Flight Plan & Map** >
-**Scenery & Cache**, select tiles or a whole area from **Regions**, and click
-**Download**. See [AutoOrtho scenery](scenery.md#autoortho-scenery).
+**Scenery & Cache**, select tiles or a whole area in **Select a region…**, and
+click **Download**. See [AutoOrtho scenery](scenery.md#autoortho-scenery).
 
 ### Where did the region installer go?
 Regions are downloaded on the map now (see above): the same scenery, tile by

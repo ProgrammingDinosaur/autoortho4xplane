@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
-    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -156,8 +155,6 @@ class SceneryCard(QFrame):
         self.options_button.clicked.connect(
             lambda: self.options_requested.emit(self.item.region_id))
         self.remove_button = QPushButton("Remove")
-        self.remove_button.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
         self.remove_button.setProperty("role", "destructive")
         self.remove_button.setAccessibleName(f"Remove {item.name}")
         self.remove_button.clicked.connect(

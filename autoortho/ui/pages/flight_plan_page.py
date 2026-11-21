@@ -108,7 +108,7 @@ class FlightPlanPage(QWidget):
             "Takes effect when Map type is set to Custom Map.",
         ),
         "cache": (
-            "Scenery & Cache",
+            "Scenery && Cache",  # && shows one & in a group box title
             "What AutoOrtho has stored per one-degree tile: scenery and cached "
             "imagery. Select tiles, or a whole region with Regions, to download "
             "their scenery and keep it, or to delete what is stored.",

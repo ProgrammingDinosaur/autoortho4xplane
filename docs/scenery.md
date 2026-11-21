@@ -67,20 +67,21 @@ above it. The **Scenery & Cache** view shows what's stored per tile and is
 where you download scenery.
 
 1. Select tiles: click one or drag a box, with Ctrl or Shift to add to the
-   selection. To take a whole area, choose it from **Regions** (for the XP12
-   set: Africa North, Europe West, North America South and so on), which
-   selects every tile of it and zooms the map there.
-2. Click **Download**. AutoOrtho shows how much scenery it will download
-   and lets you add imagery (next section).
+   selection. To take a whole area, pick it in **Select a region…** (for the
+   XP12 set: Africa North, Europe West, North America South and so on),
+   which selects every tile of it and zooms the map there. Right-drag pans
+   the map and the wheel zooms; **Clear** or Esc clears the selection.
+2. Click **Download N tiles…**. AutoOrtho shows how much scenery it will
+   download and lets you add imagery (next section).
 3. Progress shows in the **Activity** panel, where you can cancel it.
    Downloading runs four tiles at a time; a tile takes about a second on a
    fast connection. If GitHub throttles the download, it stops; run it again
    later and it continues where it stopped.
 
 Downloaded tiles are never removed to make room and don't count toward the
-disk limit. To stop keeping tiles, select them and choose **Download** >
-**Stop Keeping**; their files stay on disk until the disk limit needs the
-space. Tiles with no scenery, such as open water, are skipped.
+disk limit. To stop keeping tiles, select them and click **Stop Keeping**
+(shown when the selection has kept tiles); their files stay on disk until
+the disk limit needs the space. Tiles with no scenery, such as open water, are skipped.
 
 Downloading and deleting only work while AutoOrtho and X-Plane are stopped.
 
@@ -212,11 +213,11 @@ satellite imagery), or **Both**. Choose **Colour by: Size** to colour them by
 how much space they use instead. A white outline marks downloaded (kept)
 tiles. Hover over a tile to see its sizes, imagery zoom levels and sources,
 kept imagery, and when it was last used. The line under the map shows the
-totals. **More** has **Select Stored Tiles in View** and **Zoom to Stored
-Tiles**.
+totals. **Show Stored** zooms the map to the tiles that are stored.
 
-To delete, select tiles, then choose **Delete** > **Scenery**, **Imagery**
-or **Both**. AutoOrtho shows how much it's about to delete and asks first.
+To delete, select tiles and click **Delete N tiles…**. Tick **Scenery**,
+**Imagery** or both; each shows how much it would free, and nothing is
+deleted until you click **Delete**.
 
 - Deleted scenery is downloaded again the next time you fly there if
   downloading while flying is on. Deleting it also stops keeping the tile.

@@ -21,15 +21,14 @@ from typing import Callable, Iterable, Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
     QLabel,
-    QMenu,
     QMessageBox,
-    QToolButton,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -40,14 +39,14 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.readiness import format_bytes
     from autoortho.ui.task_models import TaskType
     from autoortho.ui.widgets.custom_map_editor import (
-        CACHE_VIEW, PAN, PINNED_COLOR, SELECT, cell_label, cells_in_box)
+        CACHE_VIEW, PINNED_COLOR, SELECT, cell_label)
 else:
     import cache_inventory as ci
     import kept_imagery
     from ui.readiness import format_bytes
     from ui.task_models import TaskType
     from ui.widgets.custom_map_editor import (
-        CACHE_VIEW, PAN, PINNED_COLOR, SELECT, cell_label, cells_in_box)
+        CACHE_VIEW, PINNED_COLOR, SELECT, cell_label)
 
 log = logging.getLogger(__name__)
 
@@ -155,26 +154,47 @@ class CachePanel(QWidget):
         self._message = ""
         self.mode = SELECT
 
+        # One row, built around what can be done: pick tiles (on the map or
+        # a whole region), then Download or Delete them. No modes: left
+        # click/drag selects, right-drag pans, the wheel zooms.
         bar = QHBoxLayout(self)
         bar.setContentsMargins(0, 0, 0, 0)
         bar.setSpacing(6)
-        self.mode_group = QButtonGroup(self)
-        self.mode_group.setExclusive(True)
-        self.mode_buttons = {}
-        for mode, label, tip in (
-            (SELECT, "Select", "Click a tile to select it, drag to select "
-             "a box. Ctrl or Shift adds to the selection; Esc clears it."),
-            (PAN, "Pan", "Left-drag moves the map"),
-        ):
-            button = QToolButton()
-            button.setText(label)
-            button.setToolTip(tip)
-            button.setCheckable(True)
-            button.setProperty("chip", True)
-            self.mode_group.addButton(button)
-            self.mode_buttons[mode] = button
-            button.toggled.connect(lambda on, m=mode: on and self._set_mode(m))
-            bar.addWidget(button)
+
+        self.region_combo = QComboBox()
+        self.region_combo.setAccessibleName("Select a whole region of the scenery set")
+        self.region_combo.setToolTip("Selects every tile of a region, so you can "
+                                     "download it in one go")
+        self.region_combo.addItem("Select a region…", None)
+        self.region_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.region_combo.activated.connect(self._region_picked)
+        self.regions: list = []           # (region id, label, cells)
+        bar.addWidget(self.region_combo)
+
+        self.keep_button = QPushButton("Download…")
+        self.keep_button.setAccessibleName("Download the selected tiles and keep them")
+        self.keep_button.clicked.connect(self.keep_selected)
+        bar.addWidget(self.keep_button)
+
+        self.delete_button = QPushButton("Delete…")
+        self.delete_button.setAccessibleName("Delete what is stored for the selected tiles")
+        self.delete_button.clicked.connect(lambda: self.delete_selected())
+        bar.addWidget(self.delete_button)
+
+        self.unkeep_button = QPushButton("Stop Keeping")
+        self.unkeep_button.setAccessibleName("Stop keeping the selected tiles")
+        self.unkeep_button.setToolTip(
+            "The tiles stay on disk, but may be removed to make room again")
+        self.unkeep_button.clicked.connect(self.unkeep_selected)
+        bar.addWidget(self.unkeep_button)
+
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.setAccessibleName("Clear the selection")
+        self.clear_button.setToolTip("Clear the selection (Esc)")
+        self.clear_button.clicked.connect(self.clear_selection)
+        bar.addWidget(self.clear_button)
+        bar.addStretch(1)
 
         colour_label = QLabel("Colour by")
         colour_label.setProperty("textRole", "secondary")
@@ -184,64 +204,14 @@ class CachePanel(QWidget):
         self.colour_combo.addItem("What's stored", BY_STATE)
         self.colour_combo.addItem("Size", BY_SIZE)
         self.colour_combo.currentIndexChanged.connect(self._paint_layer)
+        colour_label.setBuddy(self.colour_combo)
         bar.addWidget(self.colour_combo)
 
-        self.regions_button = QToolButton()
-        self.regions_button.setText("Regions")
-        self.regions_button.setAccessibleName("Select a whole region of the scenery set")
-        self.regions_button.setToolTip("Select every tile of a region, then Download")
-        self.regions_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.regions_menu = QMenu(self.regions_button)
-        self.regions_button.setMenu(self.regions_menu)
-        self.regions: list = []           # (region id, label, cells)
-        bar.addWidget(self.regions_button)
-
-        self.delete_button = QToolButton()
-        self.delete_button.setText("Delete")
-        self.delete_button.setAccessibleName("Delete stored data of the selected tiles")
-        self.delete_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        delete_menu = QMenu(self.delete_button)
-        self.delete_mesh_action = delete_menu.addAction("Scenery…")
-        self.delete_mesh_action.triggered.connect(lambda: self.delete_selected("mesh"))
-        self.delete_imagery_action = delete_menu.addAction("Imagery…")
-        self.delete_imagery_action.triggered.connect(lambda: self.delete_selected("imagery"))
-        self.delete_both_action = delete_menu.addAction("Both…")
-        self.delete_both_action.triggered.connect(lambda: self.delete_selected("both"))
-        self.delete_button.setMenu(delete_menu)
-        bar.addWidget(self.delete_button)
-
-        self.keep_button = QToolButton()
-        self.keep_button.setText("Download")
-        self.keep_button.setAccessibleName("Download the selected tiles and keep them")
-        self.keep_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        self.keep_button.clicked.connect(self.keep_selected)
-        keep_menu = QMenu(self.keep_button)
-        self.keep_action = keep_menu.addAction("Download and Keep…")
-        self.keep_action.triggered.connect(self.keep_selected)
-        self.unkeep_action = keep_menu.addAction("Stop Keeping")
-        self.unkeep_action.setToolTip(
-            "The tiles stay on disk but may be removed to make room again")
-        self.unkeep_action.triggered.connect(self.unkeep_selected)
-        self.keep_button.setMenu(keep_menu)
-        bar.addWidget(self.keep_button)
-        bar.addStretch(1)
-
-        self.more_button = QToolButton()
-        self.more_button.setText("More")
-        self.more_button.setAccessibleName("More cache actions")
-        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        more = QMenu(self.more_button)
-        self.select_visible_action = more.addAction("Select Stored Tiles in View")
-        self.select_visible_action.triggered.connect(self.select_visible)
-        self.clear_selection_action = more.addAction("Clear Selection")
-        self.clear_selection_action.triggered.connect(self.clear_selection)
-        self.fit_action = more.addAction("Zoom to Stored Tiles")
-        self.fit_action.triggered.connect(self.fit_to_cache)
-        more.addSeparator()
-        self.rescan_action = more.addAction("Rescan")
-        self.rescan_action.triggered.connect(self.refresh)
-        self.more_button.setMenu(more)
-        bar.addWidget(self.more_button)
+        self.fit_button = QPushButton("Show Stored")
+        self.fit_button.setAccessibleName("Zoom the map to the tiles that are stored")
+        self.fit_button.setToolTip("Zoom the map to the tiles that are stored")
+        self.fit_button.clicked.connect(self.fit_to_cache)
+        bar.addWidget(self.fit_button)
 
         escape = QShortcut(QKeySequence(Qt.Key.Key_Escape), canvas)
         escape.setContext(Qt.ShortcutContext.WidgetShortcut)
@@ -253,7 +223,6 @@ class CachePanel(QWidget):
         self._progress.connect(self._on_progress)
         self._imagery_progress.connect(self._on_imagery_progress)
         canvas.cellsPicked.connect(self._on_picked)
-        self.mode_buttons[SELECT].setChecked(True)
         self._update_actions()
 
     # -- view ---------------------------------------------------------------
@@ -273,12 +242,6 @@ class CachePanel(QWidget):
     def refresh_if_stale(self):
         if self.inventory is None or time.monotonic() - self._scanned_at > RESCAN_AFTER:
             self.refresh()
-
-    def _set_mode(self, mode: str):
-        self.mode = mode
-        if self.active:
-            self.canvas.set_mode(mode)
-            self._emit_status()
 
     def set_runtime_locked(self, locked: bool):
         self.locked = bool(locked)
@@ -322,16 +285,27 @@ class CachePanel(QWidget):
         self._regions_read.emit(regions)
 
     def _on_regions(self, regions):
-        self.regions_menu.clear()
         if isinstance(regions, Exception):
             regions = []
         self.regions = regions
-        for rid, label, cells in regions:
-            action = self.regions_menu.addAction(f"{label} ({len(cells):,} tiles)")
-            action.triggered.connect(lambda _=False, r=rid: self.select_region(r))
-        if not regions:
-            empty = self.regions_menu.addAction("Choose a scenery set in the Scenery Library first")
-            empty.setEnabled(False)
+        combo = self.region_combo
+        combo.blockSignals(True)
+        combo.clear()
+        if regions:
+            combo.addItem("Select a region…", None)
+            for rid, label, cells in regions:
+                combo.addItem(f"{label} ({len(cells):,} tiles)", rid)
+        else:
+            combo.addItem("No regions: choose a scenery set first", None)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+        self._update_actions()
+
+    def _region_picked(self, index: int):
+        region_id = self.region_combo.itemData(index)
+        self.region_combo.setCurrentIndex(0)  # a picker, not a setting
+        if region_id:
+            self.select_region(region_id)
 
     def select_region(self, region_id: str):
         """Select every tile of a region and show it."""
@@ -421,12 +395,6 @@ class CachePanel(QWidget):
             return []
         return [c for c, u in self.inventory.cells.items() if u.total or u.pinned]
 
-    def select_visible(self):
-        south, north, west, east = self.canvas.visible_bounds()
-        stored = set(self.stored_cells())
-        self.set_selection(c for c in cells_in_box(south, north, west, east)
-                           if c in stored)
-
     def fit_to_cache(self):
         self.canvas.fit_cells(self.stored_cells())
 
@@ -449,26 +417,29 @@ class CachePanel(QWidget):
     def _update_actions(self):
         has_selection = bool(self.selection)
         can_change = self._can_change() and has_selection
-        tip = LOCKED_TIP if self.locked else ""
-        for widget in (self.delete_button, self.keep_button):
-            widget.setEnabled(can_change)
-            widget.setToolTip(tip or (
-                "Select tiles on the map first" if not has_selection else ""))
-        if not self.locked and has_selection:
-            self.delete_button.setToolTip("Delete what is stored for the selected tiles")
-            self.keep_button.setToolTip(
-                "Download the scenery of the selected tiles now and keep it: "
-                "it works offline and is never removed to make room")
-        self.delete_mesh_action.setEnabled(can_change and self.selection_bytes("mesh") > 0)
-        self.delete_imagery_action.setEnabled(
-            can_change and self.selection_bytes("imagery") > 0)
-        self.delete_both_action.setEnabled(can_change and self.selection_bytes("both") > 0)
-        pinned = any(u.pinned for u in (self.usage(c) for c in self.selection) if u)
-        self.unkeep_action.setEnabled(can_change and pinned)
-        self.clear_selection_action.setEnabled(has_selection)
-        has_stored = bool(self.stored_cells())
-        self.select_visible_action.setEnabled(has_stored)
-        self.fit_action.setEnabled(has_stored)
+        stored = self.selection_bytes("both") > 0
+        kept = any(u.pinned for u in (self.usage(c) for c in self.selection) if u)
+        locked = LOCKED_TIP if self.locked else ""
+        count = len(self.selection)
+        tiles = f" {count:,} tile{'s' if count != 1 else ''}" if count else ""
+        self.keep_button.setText(f"Download{tiles}…")
+        self.delete_button.setText(f"Delete{tiles if stored else ''}…")
+        self.keep_button.setEnabled(can_change)
+        self.keep_button.setToolTip(locked or (
+            "Download the scenery of the selected tiles (and their imagery, if "
+            "you like) and keep it: it works offline and is never removed to "
+            "make room" if has_selection else
+            "Select tiles on the map, or a region, first"))
+        self.delete_button.setEnabled(can_change and stored)
+        self.delete_button.setToolTip(locked or (
+            "Delete the scenery or imagery stored for the selected tiles"
+            if stored else "Nothing is stored for the selected tiles"
+            if has_selection else "Select stored tiles on the map first"))
+        self.unkeep_button.setVisible(kept)
+        self.unkeep_button.setEnabled(can_change and kept)
+        self.clear_button.setVisible(has_selection)
+        self.region_combo.setEnabled(bool(self.regions))
+        self.fit_button.setEnabled(bool(self.stored_cells()))
 
     def _emit_status(self):
         parts = []
@@ -488,8 +459,8 @@ class CachePanel(QWidget):
             count = len(self.selection)
             parts.append(f"{count} selected ({format_bytes(self.selection_bytes('both'))})")
         elif inv is not None and not self.busy:
-            parts.append("click or drag to select tiles" if self.mode == SELECT
-                         else "drag to pan")
+            parts.append("click a tile or drag a box to select, or pick a region; "
+                         "right-drag pans, the wheel zooms")
         if self.locked:
             parts.append("stop AutoOrtho to delete or download tiles")
         if self._message:
@@ -517,24 +488,66 @@ class CachePanel(QWidget):
         self._update_actions()
         self._emit_status()
 
-    def _confirm(self, title: str, text: str, detail: str, accept: str,
-                 destructive: bool = True) -> bool:
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Warning if destructive else QMessageBox.Icon.Question)
-        box.setWindowTitle(title)
-        box.setText(text)
-        box.setInformativeText(detail)
-        role = (QMessageBox.ButtonRole.DestructiveRole if destructive
-                else QMessageBox.ButtonRole.AcceptRole)
-        ok = box.addButton(accept, role)
-        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(cancel)
-        box.exec()
-        return box.clickedButton() is ok
+    def _ask_delete(self) -> Optional[str]:
+        """Ask what to delete from the selection: "mesh", "imagery", "both",
+        or None if cancelled."""
+        mesh, imagery = self.selection_bytes("mesh"), self.selection_bytes("imagery")
+        count = len(self.selection)
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Delete from {count} tile{'s' if count != 1 else ''}")
+        layout = QVBoxLayout(dialog)
+        heading = QLabel("What do you want to delete?")
+        layout.addWidget(heading)
+        mesh_check = QCheckBox(f"&Scenery ({format_bytes(mesh)})")
+        mesh_check.setEnabled(mesh > 0)
+        mesh_check.setChecked(mesh > 0)
+        layout.addWidget(mesh_check)
+        layout.addWidget(self._note(
+            "Downloaded again the next time you fly there if downloading while "
+            "flying is on. Downloaded tiles stop being kept."))
+        imagery_check = QCheckBox(f"&Imagery ({format_bytes(imagery)})")
+        imagery_check.setEnabled(imagery > 0)
+        imagery_check.setChecked(imagery > 0 and mesh == 0)
+        layout.addWidget(imagery_check)
+        layout.addWidget(self._note("Downloaded again when X-Plane needs it."))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        ok = buttons.addButton("Delete", QDialogButtonBox.ButtonRole.DestructiveRole)
+        ok.clicked.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
 
-    def delete_selected(self, kind: str):
+        def update():
+            size = ((mesh if mesh_check.isChecked() else 0)
+                    + (imagery if imagery_check.isChecked() else 0))
+            ok.setEnabled(size > 0)
+            ok.setText(f"Delete {format_bytes(size)}" if size else "Delete")
+
+        mesh_check.toggled.connect(update)
+        imagery_check.toggled.connect(update)
+        update()
+        self._delete_dialog = dialog  # for tests
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        m, i = mesh_check.isChecked(), imagery_check.isChecked()
+        return "both" if m and i else "mesh" if m else "imagery" if i else None
+
+    @staticmethod
+    def _note(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setProperty("textRole", "secondary")
+        label.setContentsMargins(22, 0, 0, 6)
+        return label
+
+    def delete_selected(self, kind: Optional[str] = None):
+        """Delete what is stored for the selection; asks what (and to
+        confirm) unless ``kind`` is given."""
         if not self._can_change() or not self.selection:
             return
+        if kind is None:
+            kind = self._ask_delete()
+            if kind is None:
+                return
         size = self.selection_bytes(kind)
         cells = sorted(self.selection)
         count = len(cells)
@@ -545,17 +558,6 @@ class CachePanel(QWidget):
             return
         what = {"mesh": "scenery", "imagery": "imagery",
                 "both": "scenery and imagery"}[kind]
-        details = []
-        if kind in ("mesh", "both"):
-            details.append("Scenery is downloaded again the next time you fly "
-                           "there if downloading while flying is on, so it needs "
-                           "internet then. Downloaded tiles stop being kept.")
-        if kind in ("imagery", "both"):
-            details.append("Imagery is downloaded again when X-Plane needs it.")
-        if not self._confirm(f"Delete {what}?",
-                             f"Delete {format_bytes(size)} of {what} from {tiles}?",
-                             " ".join(details), f"Delete {format_bytes(size)}"):
-            return
         ao_dir, cache_dir, _ = self.paths()
         mesh, imagery = kind in ("mesh", "both"), kind in ("imagery", "both")
         task_id = "cache-map-delete"

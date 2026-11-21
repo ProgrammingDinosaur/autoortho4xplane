@@ -128,7 +128,7 @@ the marker because `_create_package` rewrites the marker.
 
 The map on **Flight Plan & Map** has a Scenery & Cache view (`CachePanel`)
 that shows, deletes, downloads and pins what is stored per 1x1 degree tile.
-**Regions** selects every tile of an area of the set: `stream_regions` groups
+The **Select a region…** picker selects every tile of an area of the set: `stream_regions` groups
 the index's DSFs by the `region` of the zip each is in (`TileIndex.regions`,
 labels in `tile_stream.REGION_LABELS`); it is read on the scan thread. The file work is in
 `cache_inventory.py`, which has no Qt dependency:
