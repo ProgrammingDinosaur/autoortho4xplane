@@ -164,8 +164,11 @@ _MAX_ROW_RECORD_SIZE = 128 * 1024 * 1024
 
 
 # Predicate on a chunk JPEG file name: True for files kept for good (the
-# low-zoom base). Set by getortho from the [streaming] config.
+# low-zoom base, imagery of tiles downloaded on the map). Set by getortho.
 protect_jpeg = None
+# Predicate on a DDS path: True for built textures of tiles whose imagery
+# is kept (kept_imagery.dds_protector). LRU eviction skips them.
+protect_dds = None
 
 
 def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
@@ -2522,7 +2525,9 @@ class DynamicDDSCache:
             skipped = []
             while freed < bytes_to_free and self._entries:
                 key, entry = self._entries.popitem(last=False)
-                if key in self._pins:
+                if key in self._pins or (
+                    protect_dds is not None and protect_dds(entry[0])
+                ):
                     skipped.append((key, entry))
                     continue
                 dds_path, ddm_path, size, _ = entry

@@ -148,6 +148,7 @@ def test_locked_blocks_changes(setup, monkeypatch):
     assert panel.delete_button.toolTip() == cmp.LOCKED_TIP
     assert "stop AutoOrtho" in editor.status.text()
     monkeypatch.setattr(panel, "_confirm", lambda *a, **k: pytest.fail("asked"))
+    monkeypatch.setattr(panel, "_ask_download", lambda *a, **k: pytest.fail("asked"))
     panel.delete_selected("both")
     panel.keep_selected()
 
@@ -161,7 +162,8 @@ def test_keep_offline_runs_as_an_activity_task(setup, monkeypatch):
     panel.set_selection({(39, 23), (40, 23)})
     monkeypatch.setattr(ci, "mesh_download_estimate", lambda d, cells: (30_000_000, 1, 2))
     asked = []
-    monkeypatch.setattr(panel, "_confirm", lambda *a, **k: asked.append(a) or True)
+    monkeypatch.setattr(panel, "_ask_download",
+                        lambda *a, **k: asked.append(a) or (True, None))
     calls = []
 
     def fake_keep(ao, cells, custom_scenery_dir="", progress=None, cancelled=None):
@@ -174,7 +176,7 @@ def test_keep_offline_runs_as_an_activity_task(setup, monkeypatch):
     panel.keep_selected()
 
     assert "Download about 28.6 MB" in asked[0][1]
-    assert "at ZL16" in asked[0][2] and "at ZL18" in asked[0][2]
+    assert sorted(asked[0][4]) == [16, 17, 18]   # imagery offered per zoom
     assert calls == [[(39, 23), (40, 23)]]
     task = tasks.task("cache-map-keep")
     assert task.state == TaskState.COMPLETED
@@ -246,3 +248,29 @@ def test_regions_menu_without_a_scenery_set(setup, monkeypatch):
     panel._read_regions("ao")
     (action,) = panel.regions_menu.actions()
     assert not action.isEnabled() and "scenery set" in action.text()
+
+
+def test_download_dialog_offers_imagery_per_zoom(setup, monkeypatch):
+    from PySide6.QtWidgets import QComboBox, QDialog
+    _, panel, _, _ = setup
+    picked = {}
+
+    def exec_dialog(dialog):
+        combo = dialog.findChild(QComboBox)
+        picked["items"] = [combo.itemText(i) for i in range(combo.count())]
+        combo.setCurrentIndex(2)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QDialog, "exec", exec_dialog)
+    ok, zoom = panel._ask_download("Download 2 tiles?", "text", "detail", "Download",
+                                   {16: (100, 1_000_000), 17: (400, 4_000_000)})
+    assert ok and zoom == 17 and panel.imagery_zoom == 17
+    assert picked["items"][0] == "Don't download imagery"
+    assert picked["items"][2].startswith("Up to ZL17 (about")
+    monkeypatch.setattr(QDialog, "exec", lambda d: QDialog.DialogCode.Rejected)
+    assert panel._ask_download("t", "x", "y", "Download", {16: (1, 1)}) == (False, None)
+
+
+def test_hover_shows_kept_imagery(setup):
+    usage = ci.CellUsage(chunk_bytes=2048, chunk_files=2, zooms={16}, imagery_kept=17)
+    assert "kept up to ZL17" in cmp.describe_cell((47, -123), usage)

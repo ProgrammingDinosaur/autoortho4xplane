@@ -1108,6 +1108,7 @@ class ConfigUI(QMainWindow):
                 self.cfg.xplane_custom_scenery_path,
             ),
             task_manager=self.task_manager,
+            imagery_options=self._imagery_options,
         )
         self.custom_map_editor.cellsChanged.connect(
             self._on_custom_map_changed
@@ -7925,6 +7926,17 @@ class ConfigUI(QMainWindow):
         self.task_manager.update_task(
             "scenery-stream-seasons", progress=100.0 * done / max(1, total),
             stage=f"{done:,} of {total:,} tiles")
+
+    def _imagery_options(self):
+        """Provider choice for downloading imagery ahead (as getortho)."""
+        override = str(getattr(self.cfg.autoortho, "maptype_override", "") or "")
+        custom_map = None
+        if override == "Custom Map":
+            try:
+                custom_map = get_custom_map_config()
+            except Exception as exc:
+                log.warning(f"Could not read the custom map: {exc}")
+        return {"override": override, "custom_map": custom_map}
 
     def _open_scenery_map(self):
         """Show the map's Scenery & Cache view to download tiles."""

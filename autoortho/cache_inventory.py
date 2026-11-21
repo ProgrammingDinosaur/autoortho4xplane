@@ -77,6 +77,7 @@ class CellUsage:
     mesh_used: float = 0.0      # newest mtime of the mesh files
     imagery_used: float = 0.0   # newest mtime of the imagery files
     pinned: bool = False
+    imagery_kept: int = 0       # highest zoom of imagery kept (0: none)
 
     @property
     def mesh_bytes(self) -> int:
@@ -359,6 +360,8 @@ def scan(ao_scenery_dir: str, cache_dir: str,
     if cache_dir and os.path.isdir(cache_dir):
         _scan_chunks(inv, cache_dir, cancelled)
         _scan_dds(inv, cache_dir, cancelled)
+        for cell, zoom in _kept_imagery().read_kept(cache_dir).items():
+            inv.cell(cell).imagery_kept = zoom
     inv.seconds = time.monotonic() - started
     log.debug("Cache inventory: %d files in %d tiles scanned in %.2fs",
               inv.files, len(inv.cells), inv.seconds)
@@ -446,6 +449,9 @@ def delete_cells(ao_scenery_dir: str, cache_dir: str, cells: Iterable[Cell],
         _delete_mesh(ao_scenery_dir, cells, result)
     if imagery and cache_dir and os.path.isdir(cache_dir):
         _delete_imagery(cache_dir, cells, result)
+        kept = _kept_imagery()
+        if set(kept.read_kept(cache_dir)) & cells:
+            kept.set_kept(cache_dir, cells, None)  # nothing left to keep
     log.info("Cache: deleted %d files (%.1f MB) from %d tiles (mesh=%s, imagery=%s)",
              result.files, result.bytes / 1e6, len(cells), mesh, imagery)
     return result
@@ -512,6 +518,14 @@ def stream_regions(ao_scenery_dir: str) -> List[Tuple[str, str, List[Cell]]]:
                for rid, cells in regions.items() if rid]
         return sorted(out, key=lambda r: r[1])
     return []
+
+
+def _kept_imagery():
+    if __package__:
+        from . import kept_imagery
+    else:
+        import kept_imagery
+    return kept_imagery
 
 
 def _seasons():

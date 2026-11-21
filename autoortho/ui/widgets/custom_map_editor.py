@@ -751,6 +751,7 @@ class CustomMapEditor(QWidget):
         parent=None,
         cache_paths: Optional[Callable[[], tuple[str, str, str]]] = None,
         task_manager=None,
+        imagery_options: Optional[Callable[[], dict]] = None,
     ):
         super().__init__(parent)
         self.config = config
@@ -886,7 +887,8 @@ class CustomMapEditor(QWidget):
             else:
                 from ui.widgets.cache_map_panel import CachePanel
             self.cache_panel = CachePanel(self.canvas, cache_paths,
-                                          task_manager=task_manager)
+                                          task_manager=task_manager,
+                                          imagery_options=imagery_options)
             self.cache_panel.statusChanged.connect(self._on_cache_status)
             self.cache_panel.cacheChanged.connect(self.cacheChanged)
             self.toolbars.addWidget(self.cache_panel)

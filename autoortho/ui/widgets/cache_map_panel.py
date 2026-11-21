@@ -12,6 +12,7 @@ the glue.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime
@@ -22,22 +23,27 @@ from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QLabel,
     QMenu,
     QMessageBox,
     QToolButton,
+    QVBoxLayout,
     QWidget,
 )
 
 if __package__ and __package__.startswith("autoortho."):
     from autoortho import cache_inventory as ci
+    from autoortho import kept_imagery
     from autoortho.ui.readiness import format_bytes
     from autoortho.ui.task_models import TaskType
     from autoortho.ui.widgets.custom_map_editor import (
         CACHE_VIEW, PAN, PINNED_COLOR, SELECT, cell_label, cells_in_box)
 else:
     import cache_inventory as ci
+    import kept_imagery
     from ui.readiness import format_bytes
     from ui.task_models import TaskType
     from ui.widgets.custom_map_editor import (
@@ -107,7 +113,8 @@ def describe_cell(cell, usage: Optional["ci.CellUsage"]) -> str:
             detail.append(f"ZL{lo}" if lo == hi else f"ZL{lo}–{hi}")
         if usage.maptypes:
             detail.append(", ".join(sorted(usage.maptypes)))
-        lines.append(f"Imagery: {format_bytes(usage.imagery_bytes)}")
+        kept = f"  ·  kept up to ZL{usage.imagery_kept}" if usage.imagery_kept else ""
+        lines.append(f"Imagery: {format_bytes(usage.imagery_bytes)}{kept}")
         lines.append("  " + " · ".join(detail))
     if usage.last_used:
         lines.append("Last used: " + datetime.fromtimestamp(usage.last_used)
@@ -124,12 +131,17 @@ class CachePanel(QWidget):
     _finished = Signal(object, object)  # callback, result
     _progress = Signal(int, int, int)   # done, total, bytes
     _regions_read = Signal(object)      # list of regions, or Exception
+    _imagery_progress = Signal(int, int, int)  # chunks done, total, bytes
 
     def __init__(self, canvas, paths: Callable[[], tuple[str, str, str]],
-                 task_manager=None, parent=None):
+                 task_manager=None, parent=None,
+                 imagery_options: Optional[Callable[[], dict]] = None):
         super().__init__(parent)
         self.canvas = canvas
         self._paths = paths
+        # {"override": maptype override, "custom_map": CustomMapConfig or None}
+        self._imagery_options = imagery_options or (lambda: {})
+        self.imagery_zoom: Optional[int] = None   # last choice in the dialog
         self.task_manager = task_manager
         self.inventory: Optional[ci.CacheInventory] = None
         self.selection: set[tuple[int, int]] = set()
@@ -239,6 +251,7 @@ class CachePanel(QWidget):
         self._scanned.connect(self._on_scanned)
         self._finished.connect(self._call_back)
         self._progress.connect(self._on_progress)
+        self._imagery_progress.connect(self._on_imagery_progress)
         canvas.cellsPicked.connect(self._on_picked)
         self.mode_buttons[SELECT].setChecked(True)
         self._update_actions()
@@ -574,9 +587,11 @@ class CachePanel(QWidget):
     def unkeep_selected(self):
         if not self._can_change() or not self.selection:
             return
-        ao_dir, _, _ = self.paths()
+        ao_dir, cache_dir, _ = self.paths()
         try:
             ci.pin_cells(ao_dir, self.selection, pinned=False)
+            if cache_dir:
+                kept_imagery.set_kept(cache_dir, self.selection, None)
         except OSError as exc:
             self._message = f"Could not change kept tiles: {exc}"
         else:
@@ -628,19 +643,61 @@ class CachePanel(QWidget):
             if covered < count:
                 details.append(f"{count - covered} of the {tiles} have no "
                                "scenery (open water or not covered) and are skipped.")
-            details.append("Imagery isn't downloaded. Caching it for these tiles "
-                           "would take about " + ", ".join(
-                               f"{format_bytes(b)} at ZL{z}" for z, (_n, b) in
-                               sorted(imagery.items())) + ".")
-            if self._confirm(f"Download {tiles}?", text,
-                             "\n\n".join(details),
-                             "Download and Keep" if files else "Keep",
-                             destructive=False):
-                self._start_keep(ao_dir, custom, cells, size)
+            ok, zoom = self._ask_download(
+                f"Download {tiles}?", text, "\n\n".join(details),
+                "Download and Keep" if files else "Keep", imagery)
+            if ok:
+                self._start_keep(ao_dir, custom, cells, size, zoom)
 
         self._run(estimate, confirmed)
 
-    def _start_keep(self, ao_dir: str, custom: str, cells: list, size: int):
+    def _ask_download(self, title: str, text: str, detail: str, accept: str,
+                      imagery: dict) -> tuple[bool, Optional[int]]:
+        """The Download confirmation, with a choice of imagery to download
+        too. Returns (accepted, zoom or None)."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+        heading = QLabel(text)
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        info = QLabel(detail)
+        info.setWordWrap(True)
+        info.setProperty("textRole", "secondary")
+        layout.addWidget(info)
+        row = QHBoxLayout()
+        label = QLabel("&Imagery")
+        combo = QComboBox()
+        combo.setAccessibleName("Imagery to download with the tiles")
+        label.setBuddy(combo)
+        combo.addItem("Don't download imagery", None)
+        for zoom, (_count, size) in sorted(imagery.items()):
+            combo.addItem(f"Up to ZL{zoom} (about {format_bytes(size)})", zoom)
+        index = combo.findData(self.imagery_zoom)
+        combo.setCurrentIndex(max(0, index))
+        row.addWidget(label)
+        row.addWidget(combo, 1)
+        layout.addLayout(row)
+        note = QLabel("Downloaded imagery is kept: the cache size limit doesn't "
+                      "remove it. Use the zoom AutoOrtho flies with (Settings, "
+                      "Max zoom); higher zooms are four times larger each.")
+        note.setWordWrap(True)
+        note.setProperty("textRole", "secondary")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        ok = buttons.addButton(accept, QDialogButtonBox.ButtonRole.AcceptRole)
+        ok.setDefault(True)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        self._download_dialog = dialog  # for tests
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False, None
+        self.imagery_zoom = combo.currentData()
+        return True, self.imagery_zoom
+
+    def _start_keep(self, ao_dir: str, custom: str, cells: list, size: int,
+                    imagery_zoom: Optional[int] = None):
         self._cancel = threading.Event()
         cancel = self._cancel
         count = len(cells)
@@ -663,6 +720,15 @@ class CachePanel(QWidget):
             else:
                 self._message = (f"downloaded {count - len(result.missing)} tiles "
                                  f"({format_bytes(result.bytes)})")
+                imagery = getattr(result, "imagery", None)
+                if imagery is not None:
+                    self._message += (f", imagery {format_bytes(imagery.bytes)} in "
+                                      f"{imagery.files:,} chunks")
+                    if imagery.throttled:
+                        self._message += f" (stopped: {imagery.throttled}; try again later)"
+                    if imagery.unsupported:
+                        self._message += (" (" + ", ".join(sorted(imagery.unsupported))
+                                          + " imagery can't be downloaded ahead)")
                 if result.errors:
                     self._message += f", {len(result.errors)} failed (try again later)"
             if self.task_manager is not None:
@@ -681,10 +747,22 @@ class CachePanel(QWidget):
             self.refresh()
             self._update_actions()
 
-        self._run(lambda: ci.keep_offline(
-            ao_dir, cells, custom_scenery_dir=custom,
-            progress=lambda d, t, b: self._progress.emit(d, t, b),
-            cancelled=cancel.is_set), done)
+        _, cache_dir, _ = self.paths()
+        options = dict(self._imagery_options() or {})
+
+        def work():
+            result = ci.keep_offline(
+                ao_dir, cells, custom_scenery_dir=custom,
+                progress=lambda d, t, b: self._progress.emit(d, t, b),
+                cancelled=cancel.is_set)
+            if imagery_zoom and cache_dir and not result.cancelled:
+                result.imagery = download_imagery(
+                    ao_dir, cache_dir, cells, imagery_zoom, options,
+                    progress=lambda d, t, b: self._imagery_progress.emit(d, t, b),
+                    cancelled=cancel.is_set)
+            return result
+
+        self._run(work, done)
 
     def _on_progress(self, done: int, total: int, size: int):
         self.busy = f"Downloading scenery: {done} of {total} tiles…"
@@ -694,5 +772,38 @@ class CachePanel(QWidget):
                 "cache-map-keep", progress=100.0 * done / max(1, total),
                 bytes_completed=size, stage=f"{done} of {total} tiles")
 
+    def _on_imagery_progress(self, done: int, total: int, size: int):
+        self.busy = f"Downloading imagery: {done:,} of {total:,} chunks…"
+        self._emit_status()
+        if self.task_manager is not None:
+            self.task_manager.update_task(
+                "cache-map-keep", progress=100.0 * done / max(1, total),
+                bytes_completed=size, stage=f"Imagery: {done:,} of {total:,} chunks")
+
     def cancel(self):
         self._cancel.set()
+
+
+def download_imagery(ao_dir: str, cache_dir: str, cells: list, zoom: int,
+                     options: dict, progress=None, cancelled=lambda: False):
+    """Download the imagery of downloaded tiles at ``zoom`` and keep it.
+    Returns a kept_imagery.DownloadResult with ``unsupported`` added."""
+    root = None
+    for name, marker in ci.tile_stream.stream_packages(ao_dir).items():
+        if marker.get("kind", "ortho") == "ortho":
+            root = os.path.join(ao_dir, name)
+    result = kept_imagery.DownloadResult()
+    result.unsupported = set()
+    if root is None:
+        return result
+    resolve = kept_imagery.maptype_resolver(options.get("override", ""),
+                                            options.get("custom_map"))
+    plan = kept_imagery.plan(root, cache_dir, cells, zoom, resolve, cancelled)
+    result.unsupported = plan.unsupported
+    if plan.chunks and not cancelled():
+        result = kept_imagery.download(plan.chunks, cache_dir, progress=progress,
+                                       cancelled=cancelled)
+        result.unsupported = plan.unsupported
+    if not result.cancelled and not result.throttled and plan.tiles:
+        kept_imagery.set_kept(cache_dir, plan.tiles, zoom)
+    return result
