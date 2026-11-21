@@ -741,6 +741,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#which-set-should-i-choose" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Which set should I choose?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#setting-it-up" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1069,6 +1080,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../developer/self-updater/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Self-updater
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../developer/settings-refactor-proposal/" class="md-nav__link">
         
   
@@ -1162,6 +1201,17 @@
   
     <nav class="md-nav" aria-label="AutoOrtho scenery">
       <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#which-set-should-i-choose" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Which set should I choose?
+      
+    </span>
+  </a>
+  
+</li>
         
           <li class="md-nav__item">
   <a href="#setting-it-up" class="md-nav__link">
@@ -1387,6 +1437,73 @@ tiles. How big a tile's mesh is depends on the scenery set and the area:</p>
   for detailed ones.</li>
 </ul>
 <p>The scenery comes from releases on GitHub, which have no download limit.</p>
+<h3 id="which-set-should-i-choose">Which set should I choose?</h3>
+<p><strong>Most people flying X-Plane 12:</strong> the <strong>X-Plane 12</strong> set, tiles downloading
+<strong>Automatically as you fly</strong>, and a disk limit of 20 to 50 GB. Download the
+areas you fly most on the map if you want them offline or loading fast the
+first time too.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>X-Plane 12</th>
+<th>X-Plane 11 legacy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Works with</td>
+<td>X-Plane 12</td>
+<td>X-Plane 11 and 12</td>
+</tr>
+<tr>
+<td>Seasons</td>
+<td>Built in</td>
+<td>Added to tiles you download on the map, if you tick it</td>
+</tr>
+<tr>
+<td>Water</td>
+<td>3D water</td>
+<td>X-Plane 11 water</td>
+</tr>
+<tr>
+<td>Mesh</td>
+<td>Fixes such as Iceland's terrain</td>
+<td>As made for X-Plane 11</td>
+</tr>
+<tr>
+<td>Roads, forests, buildings</td>
+<td>None: add simHeaven X-World</td>
+<td>Included (overlays)</td>
+</tr>
+<tr>
+<td>Size per tile</td>
+<td>About 12 MB</td>
+<td>About 3 MB</td>
+</tr>
+</tbody>
+</table>
+<p>The Scenery Library marks the set that suits your X-Plane as
+<strong>Recommended</strong>, from the version in X-Plane's <code>Log.txt</code>.</p>
+<p><strong>Where tiles come from:</strong></p>
+<ul>
+<li><strong>Automatically as you fly</strong> (recommended): each tile downloads the first
+  time X-Plane needs it, usually in a second or two, without slowing down
+  imagery, and stays on disk for next time. Tiles you don't fly over for a
+  while are removed once they fill the disk limit, so you don't need whole
+  regions on disk.</li>
+<li><strong>Only tiles I download on the map:</strong> nothing downloads while you fly,
+  and X-Plane shows its default scenery outside your tiles. Use it to fly
+  offline or to control disk use exactly.</li>
+</ul>
+<p>Either way, tiles you download on the map are kept: they work offline and
+are never removed to make room.</p>
+<p><strong>Should I keep my old regions?</strong> When you upgraded, regions installed with
+earlier versions became kept tiles of the <strong>X-Plane 11 legacy</strong> set. With
+the X-Plane 12 set and tiles downloading as you fly, you don't need them:
+the Scenery Library offers to <strong>Replace</strong> them with the X-Plane 12 version
+(still kept) or <strong>Remove</strong> them to free the space. Keep them only if you
+want those areas on disk no matter what, as X-Plane 11 scenery.</p>
 <h3 id="setting-it-up">Setting it up</h3>
 <p>On a new installation, the setup wizard's <strong>Scenery</strong> step has
 <strong>Use AutoOrtho scenery</strong> ticked: pick the settings below and finish. See
@@ -1396,19 +1513,20 @@ tiles. How big a tile's mesh is depends on the scenery set and the area:</p>
 <li>Stop AutoOrtho if it's running. The settings are locked while AutoOrtho
    or X-Plane is running.</li>
 <li>Open <strong>Scenery Library</strong>. The <strong>AutoOrtho scenery</strong> panel is at the top.</li>
-<li>Pick the <strong>Scenery set</strong>:</li>
-<li><strong>XP12 set (flightwusel v1.4, by jonaseberle):</strong> the default. A base
-     mesh made for X-Plane 12, covering the whole world (all 12 areas of the
-     flightwusel set). It already includes X-Plane 12's seasons. It has no
-     overlays, so use simHeaven X-World for roads, forests and buildings.</li>
-<li><strong>XP11 legacy set (kubilus1/autoortho-scenery):</strong> the meshes the
-     region installer used to install, with overlays.</li>
-<li>Choose whether to <strong>Download tiles while flying</strong>. See
+<li>Pick the <strong>Scenery set</strong> (<a href="#which-set-should-i-choose">Which set should I choose?</a>):</li>
+<li><strong>X-Plane 12:</strong> a base mesh made for X-Plane 12 (flightwusel v1.4 by
+     jonaseberle), covering the whole world (all 12 areas of the flightwusel
+     set). It already includes X-Plane 12's seasons. It has no overlays, so
+     use simHeaven X-World for roads, forests and buildings.</li>
+<li><strong>X-Plane 11 legacy:</strong> the meshes the region installer used to install
+     (kubilus1/autoortho-scenery), with overlays.</li>
+<li>Choose <strong>Where tiles come from</strong>: <strong>Automatically as you fly</strong>, or
+   <strong>Only tiles I download on the map</strong>. See
    <a href="#using-only-downloaded-tiles">Using only downloaded tiles</a>.</li>
 <li>Choose whether to <strong>Include overlays</strong> (roads, forests, buildings). See
    <a href="#overlays-and-simheaven">Overlays and simHeaven</a>. The option is off for
-   the XP12 set, which has none.</li>
-<li>Set the <strong>Disk limit</strong> for tiles downloaded while flying (20 GB by
+   the X-Plane 12 set, which has none.</li>
+<li>Set <strong>Keep up to N GB of tiles downloaded while flying</strong> (20 GB by
    default). Optionally tick <strong>Set terrain reflectivity</strong> and pick a value
    (<a href="#terrain-reflectivity">Terrain reflectivity</a>), and for the XP11 set,
    <strong>Add seasons to downloaded tiles</strong> (<a href="#seasons-for-the-xp11-set">Seasons</a>).</li>
@@ -1461,7 +1579,7 @@ choice per tile). Imagery already in the cache isn't downloaded again.</p>
 <li>Apple Maps imagery can't be downloaded ahead.</li>
 </ul>
 <h3 id="when-you-fly">When you fly</h3>
-<p>With <strong>Download tiles while flying</strong> on:</p>
+<p>With <strong>Automatically as you fly</strong> picked:</p>
 <ul>
 <li>When X-Plane opens a tile you haven't downloaded, AutoOrtho downloads it
   and the tiles around it. The first flight in a new area takes longer to
@@ -1483,11 +1601,12 @@ choice per tile). Imagery already in the cache isn't downloaded again.</p>
 When they grow past the disk limit, AutoOrtho removes the ones you haven't
 used for the longest time, down to 90% of the limit. Tiles used in the last
 two hours, and tiles you downloaded on the map, are never removed. Overlays
-get a quarter of the limit on top of it. The panel shows how many tiles are
-stored and how much space they use.</p>
+get a quarter of the limit on top of it. The panel shows the kept tiles
+and the tiles downloaded while flying apart, with a bar for how much of the
+limit the second ones use.</p>
 <h3 id="using-only-downloaded-tiles">Using only downloaded tiles</h3>
-<p>Untick <strong>Download tiles while flying</strong> to use only the tiles you downloaded
-on the map, as installed regions used to work. X-Plane then shows its
+<p>Pick <strong>Only tiles I download on the map</strong> to use only the tiles you
+downloaded on the map, as installed regions used to work. X-Plane then shows its
 default scenery everywhere else, and nothing is downloaded while you fly.
 If a downloaded tile is missing a water mask, AutoOrtho still fetches it,
 since X-Plane stops with an error on a missing mask.</p>
@@ -1500,16 +1619,19 @@ on <strong>Home</strong> says what moved, and <strong>Activity</strong> shows th
 AutoOrtho waits until it's done.</p>
 <ul>
 <li>If you didn't use AutoOrtho scenery yet, the <strong>XP11 legacy set</strong> is set
-  up for you (your regions are from it), with <strong>Download tiles while
-  flying</strong> off, so everything works as before: your regions' tiles, and
-  X-Plane's default scenery elsewhere. If your regions had the Seasons
+  up for you (your regions are from it), with <strong>Only tiles I download on
+  the map</strong> picked, so everything works as before: your regions' tiles, and
+  X-Plane's default scenery elsewhere. On X-Plane 12, the Scenery Library
+  then recommends switching to the X-Plane 12 set, and a one-time message
+  explains what changed. If your regions had the Seasons
   patch, <strong>Add seasons to downloaded tiles</strong> is turned on too. That needs
   an internet connection once, for the 6 MB tile index; without one, your
   regions keep working and AutoOrtho tries again on the next start.</li>
 <li>If you already used a scenery set, your regions move into it, whichever
   set it is. In the XP12 set, the XP11 tiles keep their own terrain files
-  and water textures, so they look exactly as before; download a tile again
-  on the map to get its XP12 version.</li>
+  and water textures, so they look exactly as before. The Scenery Library
+  says how many there are and offers to <strong>Replace</strong> them with the XP12
+  version or <strong>Remove</strong> them; you can also do it for some tiles on the map.</li>
 <li>Overlays in <code>Custom Scenery/yAutoOrtho_Overlays</code> stay where they are and
   keep working with any scenery set.</li>
 <li>Seasons and terrain reflectivity the regions had are kept.</li>

@@ -606,6 +606,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#updating-autoortho" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Updating AutoOrtho
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#configuring-your-scenery_packsini" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1063,6 +1074,34 @@
   
   
     <li class="md-nav__item">
+      <a href="developer/self-updater/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Self-updater
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="developer/settings-refactor-proposal/" class="md-nav__link">
         
   
@@ -1237,6 +1276,17 @@
         
       </ul>
     </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#updating-autoortho" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Updating AutoOrtho
+      
+    </span>
+  </a>
   
 </li>
       
@@ -1452,6 +1502,43 @@ xattr -d com.apple.quarantine /path/to/AutoOrtho.app</code>
 <li>Configure your scenery_packs.ini file appropriately</li>
 <li>Run X-Plane and choose a location for an ortho set you have downloaded</li>
 </ol>
+<hr />
+<h2 id="updating-autoortho">Updating AutoOrtho</h2>
+<p>AutoOrtho checks GitHub for a new version a moment after it starts. When it
+finds one, a banner appears at the top of the window:</p>
+<ol>
+<li>Click <strong>Update Now</strong>. AutoOrtho downloads the new version in the
+   background and checks it against the release's published checksum. You
+   can keep using AutoOrtho meanwhile. <strong>Release notes</strong> shows what changed.</li>
+<li>When the banner says the new version is ready, click <strong>Restart Now</strong>.
+   AutoOrtho stops streaming if needed, quits, installs the new version and
+   starts it again. Your settings, cache and scenery are not touched.</li>
+</ol>
+<p>If the new version closes right after starting, AutoOrtho puts the previous
+version back and starts that instead. The previous version is also kept so
+you can return to it later: <strong>Settings → General → Software Updates → Go
+Back to <em>version</em></strong>.</p>
+<p>How each download type updates:</p>
+<ul>
+<li><strong>Windows zip, macOS app, Linux tarball:</strong> the install folder is replaced
+  in place. The previous version stays next to it (for example
+  <code>autoortho_release.previous-3.4.0</code>) until the next update.</li>
+<li><strong>Windows installer:</strong> AutoOrtho runs the new installer silently. Windows
+  may ask for administrator rights.</li>
+</ul>
+<p>Settings → General → Software Updates also lets you turn off the startup
+check, get release candidates (test builds of the next version) as well, and
+download new versions automatically so they are ready to install. <strong>Check for
+Updates</strong> in the ⋮ menu checks at any time.</p>
+<p>AutoOrtho opens the release page instead of installing by itself when:</p>
+<ul>
+<li>it runs from source code, or is a development build;</li>
+<li>it cannot write to the folder that holds it (move it to a folder you own);</li>
+<li>on macOS, it runs from the read-only copy macOS makes for apps that still
+  carry the quarantine flag. Move <code>AutoOrtho.app</code> to another folder (for
+  example Applications), open it from there, and try again.</li>
+</ul>
+<p>The updater writes a log to <code>~/.autoortho-data/logs/updater.log</code>.</p>
 <hr />
 <h2 id="configuring-your-scenery_packsini">Configuring your scenery_packs.ini</h2>
 <p>Use this image as a guide on how to order your X-Plane packages within the scenery_packs.ini file.</p>
