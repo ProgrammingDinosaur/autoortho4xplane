@@ -246,6 +246,8 @@ _INTERNAL = {
     "general.kept_values",
     "general.dismissed_pinned",
     "general.dismissed_update_version",
+    "general.dismissed_scenery_hints",
+    "general.scenery_intro_shown",
 }
 
 # Owners other than "fixed" (proposal section 9).
@@ -293,6 +295,9 @@ _USER_SECTIONS = (
 _USER = {
     "autoortho.maptype_override",
     "general.hide",
+    "general.update_check",
+    "general.update_channel",
+    "general.update_auto_download",
 }
 # Picked up by a running mount: read at call time (streaming options, cache
 # write buffer, per-tile image cache for new tiles) or resized through

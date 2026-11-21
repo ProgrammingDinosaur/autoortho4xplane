@@ -71,6 +71,8 @@ charset_datas, charset_binaries, charset_hiddenimports = safe_collect_all('chars
 # Modular Qt UI packages include conditional direct-execution imports that are
 # not always visible to PyInstaller's static analysis.
 ui_hiddenimports = collect_submodules('autoortho.ui')
+# The update helper is imported only when AO_RUN_MODE=apply_update.
+ui_hiddenimports += collect_submodules('autoortho.updater')
 
 # Collect all datas/binaries/hiddenimports for native modules
 native_module_datas = (
@@ -211,6 +213,52 @@ if not os.path.exists(version_file):
 
 if os.path.exists(version_file):
     datas.append((version_file, 'autoortho'))
+
+
+# Build info for the self-updater: which release file this build came from.
+# Linux has one tarball per Ubuntu release (the Makefile builds inside an
+# ubuntu:<codename> container), so record the codename of the build host.
+def _linux_variant():
+    override = os.environ.get('AO_BUILD_VARIANT', '').strip()
+    if override:
+        return override
+    try:
+        with open('/etc/os-release', encoding='utf-8') as handle:
+            fields = dict(
+                line.rstrip('\n').split('=', 1)
+                for line in handle
+                if '=' in line
+            )
+    except OSError:
+        return ''
+    for key in ('UBUNTU_CODENAME', 'VERSION_CODENAME'):
+        value = fields.get(key, '').strip().strip('"')
+        if value:
+            return value
+    return ''
+
+
+def _build_arch():
+    import platform
+    machine = platform.machine().lower()
+    return {'amd64': 'x86_64', 'x64': 'x86_64', 'aarch64': 'arm64'}.get(machine, machine)
+
+
+build_info = {
+    'schema': 1,
+    'version': release_version,
+    'platform': platform_name,
+    'arch': _build_arch(),
+    'linux_variant': _linux_variant() if platform_name == 'linux' else '',
+}
+build_info_dir = os.path.join(SPECPATH, 'build', 'ao-build-info')
+os.makedirs(build_info_dir, exist_ok=True)
+build_info_file = os.path.join(build_info_dir, '.build-info.json')
+with open(build_info_file, 'w', encoding='utf-8') as handle:
+    import json
+    json.dump(build_info, handle, indent=2)
+print(f"Build info: {build_info}")
+datas.append((build_info_file, 'autoortho'))
 
 # Flask templates (required for web UI)
 templates_path = os.path.join(autoortho_path, 'templates')

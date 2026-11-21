@@ -27,6 +27,7 @@ SetCompressorDictSize 32
 !define MULTIUSER_INSTALLMODE_INSTDIR "AutoOrtho"
 !include MultiUser.nsh
 !include FileFunc.nsh
+!include LogicLib.nsh
 
 ; Modern UI installer stuff
 !include "MUI2.nsh"
@@ -69,10 +70,16 @@ RequestExecutionLevel admin
 ; !finalize 'signtool.exe sign /sha1 "THUMBPRINT" /t "http://timestamp.comodoca.com" "%1"'
 
 Var cmdLineInstallDir
+; "1" when started by AutoOrtho's updater with /UPDATE (always with /S).
+; Update mode replaces the installed files in place instead of running the
+; previous version's uninstaller first.
+Var updateMode
 
 Section -SETTINGS
   SetOutPath "$INSTDIR"
-  SetOverwrite ifnewer
+  ; Always replace files: "ifnewer" kept a newer exe when reinstalling an
+  ; older release, mixing two versions in one folder.
+  SetOverwrite on
 SectionEnd
 
 
@@ -83,7 +90,13 @@ Section "!${PRODUCT_NAME}" sec_app
   ; === SAFETY VALIDATION CHECKS ===
   ; Check if installing to a dangerous location
   Call ValidateInstallLocation
-  
+
+  ; An update copies over the existing install. Remove the old runtime folder
+  ; first so no DLLs or extension modules from the previous version remain.
+  ${If} $updateMode == "1"
+    RMDir /r "$INSTDIR\ao_files"
+  ${EndIf}
+
   File ${PRODUCT_ICON}
 
     ; Copy pkgs data
@@ -122,7 +135,9 @@ Section "!${PRODUCT_NAME}" sec_app
   ; Install shortcuts
   ; The output path becomes the working directory for shortcuts
   SetOutPath "%HOMEDRIVE%\%HOMEPATH%"
-    CreateShortCut "$SMPROGRAMS\AutoOrtho.lnk" "$INSTDIR\autoortho_win.exe" "$INSTDIR\ao-icon.ico"
+    ; The PyInstaller build names the program autoortho.exe. The third
+    ; argument is the shortcut's parameters, so the icon goes fourth.
+    CreateShortCut "$SMPROGRAMS\AutoOrtho.lnk" "$INSTDIR\autoortho.exe" "" "$INSTDIR\ao-icon.ico"
   ;  CreateShortCut "$SMPROGRAMS\AutoOrtho.lnk" "$INSTDIR\Python\pythonw.exe" \
   ;    '"$INSTDIR\AutoOrtho.launch.pyw"' "$INSTDIR\ao-icon.ico"
   SetOutPath "$INSTDIR"
@@ -165,25 +180,26 @@ Section "Uninstall"
 
   ; === SAFETY VALIDATION FOR UNINSTALLER ===
   ; Verify this is actually an AutoOrtho installation before deleting everything
+  IfFileExists "$INSTDIR\autoortho.exe" autoortho_confirmed
   IfFileExists "$INSTDIR\autoortho_win.exe" autoortho_confirmed
   IfFileExists "$INSTDIR\ao-icon.ico" autoortho_confirmed
-  
-  ; No AutoOrtho files found - this is dangerous!
-  MessageBox MB_YESNO|MB_ICONEXCLAMATION "WARNING: AutoOrtho files not detected in '$INSTDIR'$\n$\nThis may not be a valid AutoOrtho installation directory.$\nDeleting this directory could remove important files!$\n$\nAre you absolutely sure you want to continue?" IDYES force_uninstall
-  
+
+  ; No AutoOrtho files found - this is dangerous! (Silent: keep the files.)
+  MessageBox MB_YESNO|MB_ICONEXCLAMATION "WARNING: AutoOrtho files not detected in '$INSTDIR'$\n$\nThis may not be a valid AutoOrtho installation directory.$\nDeleting this directory could remove important files!$\n$\nAre you absolutely sure you want to continue?" /SD IDNO IDYES force_uninstall
+
   ; User chose not to continue - just clean registry and exit
   DeleteRegKey SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
   Delete "$SMPROGRAMS\AutoOrtho.lnk"
-  MessageBox MB_OK "Uninstall cancelled for safety. Registry entries have been cleaned."
+  MessageBox MB_OK "Uninstall cancelled for safety. Registry entries have been cleaned." /SD IDOK
   Goto uninstall_end
 
 autoortho_confirmed:
 force_uninstall:
   ; Show what will be deleted
-  MessageBox MB_YESNO|MB_ICONQUESTION "AutoOrtho will be completely removed from:$\n$INSTDIR$\n$\nThis will delete ALL files and folders in this directory.$\n$\nContinue?" IDYES proceed_uninstall
-  
+  MessageBox MB_YESNO|MB_ICONQUESTION "AutoOrtho will be completely removed from:$\n$INSTDIR$\n$\nThis will delete ALL files and folders in this directory.$\n$\nContinue?" /SD IDYES IDYES proceed_uninstall
+
   ; User cancelled
-  MessageBox MB_OK "Uninstall cancelled by user."
+  MessageBox MB_OK "Uninstall cancelled by user." /SD IDOK
   Goto uninstall_end
 
 proceed_uninstall:
@@ -233,20 +249,35 @@ Function .onInit
   IfErrors +2  ; Error means flag not found
     StrCpy $cmdLineInstallDir $1
   ClearErrors
-  
-  ;Exec $INSTDIR\uninstall.exe 
-  ;RMDir /r $INSTDIR
 
-  ;  ${If} ${Silent}
-  ;      ReadRegStr $R0 HKLM "${PROJECT_REG_UNINSTALL_KEY}" "QuietUninstallString"
-  ;  ${Else}
-  ;      ReadRegStr $R0 HKLM "${PROJECT_REG_UNINSTALL_KEY}" "UninstallString"
-  ;  ${EndIf}
-  ;  ExecWait "$R0"
-  
-  ReadRegStr $R0 SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "UninstallString"
-  ;ReadRegStr $R0 HKLM "${PROJECT_REG_UNINSTALL_KEY}" "UninstallString"
-  ExecWait "$R0"
+  ; /UPDATE: started by AutoOrtho's updater to replace this install in place.
+  StrCpy $updateMode "0"
+  ${GetOptions} '$0' "/UPDATE" $1
+  IfErrors +2  ; Error means flag not found
+    StrCpy $updateMode "1"
+  ClearErrors
+
+  ${If} $updateMode != "1"
+    ReadRegStr $R0 SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "UninstallString"
+    ReadRegStr $R1 SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" "InstallLocation"
+    ${If} $R0 != ""
+      ${If} $R1 != ""
+        ; An NSIS uninstaller copies itself to %TEMP% and returns at once,
+        ; so a plain ExecWait let this installer copy files while the old
+        ; uninstaller was still deleting them. _?= runs it in place and
+        ; makes ExecWait wait for it.
+        ExecWait '$R0 _?=$R1'
+        ; Run in place, the uninstaller cannot delete itself. Remove it
+        ; only when the uninstall went ahead (the runtime folder is gone).
+        ${IfNot} ${FileExists} "$R1\ao_files\*.*"
+          Delete "$R1\uninstall.exe"
+          RMDir "$R1"
+        ${EndIf}
+      ${Else}
+        ExecWait '$R0'
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
 
   !insertmacro MULTIUSER_INIT
 
@@ -281,12 +312,12 @@ Function ValidateInstallLocation
   StrCmp $2 "autoortho" safe_location  ; Previous AutoOrtho install
   
   ; Directory not empty and doesn't contain AutoOrtho
-  MessageBox MB_YESNO|MB_ICONEXCLAMATION "Warning: The target directory '$INSTDIR' is not empty.$\n$\nInstalling AutoOrtho here may cause issues during uninstallation.$\n$\nRecommended: Choose an empty directory or dedicated AutoOrtho folder.$\n$\nContinue anyway?" IDYES safe_location
+  MessageBox MB_YESNO|MB_ICONEXCLAMATION "Warning: The target directory '$INSTDIR' is not empty.$\n$\nInstalling AutoOrtho here may cause issues during uninstallation.$\n$\nRecommended: Choose an empty directory or dedicated AutoOrtho folder.$\n$\nContinue anyway?" /SD IDYES IDYES safe_location
   Abort
 
 
 dangerous_xplane_root:
-  MessageBox MB_OK|MB_ICONSTOP "DANGER: You are trying to install to the X-Plane root directory!$\n$\nThis could cause your entire X-Plane installation to be deleted during uninstallation.$\n$\nPlease choose a different directory like:$\n• C:\AutoOrtho$\n• D:\AutoOrtho$\n$\nInstallation aborted for your safety."
+  MessageBox MB_OK|MB_ICONSTOP "DANGER: You are trying to install to the X-Plane root directory!$\n$\nThis could cause your entire X-Plane installation to be deleted during uninstallation.$\n$\nPlease choose a different directory like:$\n• C:\AutoOrtho$\n• D:\AutoOrtho$\n$\nInstallation aborted for your safety." /SD IDOK
   Abort
 
 safe_location:
@@ -327,7 +358,9 @@ check_loop:
   StrCmp $1 ".." next_file
   
   ; Check if it's an AutoOrtho file
+  StrCmp $1 "autoortho.exe" autoortho_file
   StrCmp $1 "autoortho_win.exe" autoortho_file
+  StrCmp $1 "ao_files" autoortho_file
   StrCmp $1 "ao-icon.ico" autoortho_file
   StrCmp $1 "_user_install_marker" autoortho_file
   StrCmp $1 "uninstall.exe" autoortho_file
@@ -339,7 +372,9 @@ check_loop:
 autoortho_file:
 next_file:
   FindNext $0 $1
-  StrCmp $0 "" end_check  ; End of files
+  ; FindNext returns an empty name at the end. (Testing the handle never
+  ; ended the loop, so every existing folder looked "not empty".)
+  StrCmp $1 "" end_check
   Goto check_loop
 
 end_check:

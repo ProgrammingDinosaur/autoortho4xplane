@@ -56,6 +56,7 @@ jobs:
   build:
     needs: prepare-stable
     uses: ./.github/workflows/build_release.yml
+    secrets: inherit
     with:
       version: ${{ needs.prepare-stable.outputs.tag }}
       relname: ${{ needs.prepare-stable.outputs.tag }}

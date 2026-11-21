@@ -14,9 +14,11 @@ On a new installation, AutoOrtho opens a guided setup wizard that:
 2. **X-Plane:** detected, or browse for it.
 3. **Scenery:** the scenery folder and
    [AutoOrtho scenery](scenery.md#autoortho-scenery), ticked by default
-   (or use scenery you already have). Choose the **Scenery set** (the XP12
-   set by default, or the XP11 legacy set), whether to **Download tiles
-   while flying**, the **Disk limit**, and whether to **Include overlays**
+   (or use scenery you already have). Choose the **Scenery set** (the one
+   that suits your X-Plane is marked **Recommended**; see
+   [Which set should I choose?](scenery.md#which-set-should-i-choose)),
+   **Where tiles come from**, how much disk tiles downloaded while flying
+   may use, and whether to **Include overlays**
    (XP11 legacy set only); turn overlays off if you use simHeaven X-World or
    another overlay package. After setup, download the areas you fly on the
    map, or just fly. When you click **Finish**, AutoOrtho downloads the tile

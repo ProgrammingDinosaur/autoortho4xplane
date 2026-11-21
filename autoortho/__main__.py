@@ -7,6 +7,16 @@ import multiprocessing
 if getattr(sys, 'frozen', False):
     multiprocessing.freeze_support()
 
+# The self-updater's helper process (see autoortho/updater/helper.py). It
+# runs before config, logging, Qt and the native libraries are loaded, so it
+# starts fast and holds no locks on the install it replaces.
+if os.environ.get("AO_RUN_MODE") == "apply_update":
+    try:
+        from autoortho.updater.helper import main as _ao_update_main
+    except ImportError:
+        from updater.helper import main as _ao_update_main
+    sys.exit(_ao_update_main())
+
 # This gate precedes imports of mount setup, Qt and native libraries. The
 # collector attaches from another process and can observe Windows fast-fail.
 if sys.platform == "win32" and os.environ.get("AO_RUN_MODE") in ("mount_worker", "macfuse_worker"):

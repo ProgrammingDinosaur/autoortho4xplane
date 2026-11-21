@@ -12,7 +12,6 @@ if __package__ and __package__.startswith("autoortho."):
         MountService,
         SimBriefService,
         StorageService,
-        UpdateService,
     )
     from autoortho.utils.dsf_utils import dsf_utils
 else:
@@ -20,7 +19,6 @@ else:
         MountService,
         SimBriefService,
         StorageService,
-        UpdateService,
     )
     from utils.dsf_utils import dsf_utils
 
@@ -81,12 +79,16 @@ class SceneryUninstallWorker(QThread):
 
 
 class UpdateCheckWorker(QThread):
+    """Ask GitHub for a newer release; emits an UpdateOffer or None."""
+
     result = Signal(object)
     error = Signal(str)
 
-    def __init__(self):
+    def __init__(self, manager, channel, current_version):
         super().__init__()
-        self.service = UpdateService()
+        self.manager = manager
+        self.channel = channel
+        self.current_version = current_version
 
     def cancel(self):
         self.requestInterruption()
@@ -94,14 +96,64 @@ class UpdateCheckWorker(QThread):
     def run(self):
         if self.isInterruptionRequested():
             return
-        result = self.service.check()
-        if self.isInterruptionRequested():
+        try:
+            offer = self.manager.check(
+                self.channel,
+                current_version=self.current_version,
+            )
+        except Exception as exc:
+            log.info("Update check failed: %s", exc)
+            if not self.isInterruptionRequested():
+                self.error.emit("Could not check for updates.")
             return
-        if result.success:
-            info = result.value
-            self.result.emit((info.tag, info.url) if info else None)
+        if not self.isInterruptionRequested():
+            self.result.emit(offer)
+
+
+class UpdatePrepareWorker(QThread):
+    """Download, verify and unpack an update (or get a rollback ready)."""
+
+    progress = Signal(object, object)  # bytes done, bytes total
+    stage = Signal(str)
+    prepared = Signal(object)  # PreparedUpdate
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, manager, offer=None, rollback=False):
+        super().__init__()
+        self.manager = manager
+        self.offer = offer
+        self.rollback = rollback
+
+    def cancel(self):
+        self.requestInterruption()
+
+    def run(self):
+        if __package__ and __package__.startswith("autoortho."):
+            from autoortho.updater.download import DownloadCancelled
         else:
-            self.error.emit(result.error.message)
+            from updater.download import DownloadCancelled
+        try:
+            if self.rollback:
+                prepared = self.manager.prepare_rollback()
+            else:
+                prepared = self.manager.prepare(
+                    self.offer,
+                    progress=lambda done, total: self.progress.emit(done, total),
+                    cancelled=self.isInterruptionRequested,
+                    stage_progress=self.stage.emit,
+                )
+        except DownloadCancelled:
+            self.cancelled.emit()
+            return
+        except Exception as exc:
+            log.error("Preparing the update failed:\n%s", traceback.format_exc())
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+            return
+        if self.isInterruptionRequested():
+            self.cancelled.emit()
+            return
+        self.prepared.emit(prepared)
 
 
 class AddSeasonsWorker(QThread):

@@ -402,16 +402,14 @@ def test_stream_panel_states(qt_app):
         getattr(panel, name).connect(lambda *a, n=name: events.append((n,) + a))
 
     # XP12 is the default; it has no overlays, so that option is off.
-    assert panel.source_combo.currentData() == "xp12"
-    assert all(panel.source_combo.model().item(i).isEnabled()
-               for i in range(panel.source_combo.count()))
+    assert panel.source_choice.current() == "xp12"
+    assert all(b.isEnabled() for b in panel.source_choice.buttons.values())
+    assert not panel.source_choice.chips["xp12"].isHidden()  # Recommended
     assert not panel.overlays_check.isEnabled()
     assert panel.overlays_help.text() == NO_OVERLAY_HELP
 
     # Off: settings can be picked before turning streaming on, without requests.
-    xp11 = panel.source_combo.findData("xp11")
-    panel.source_combo.setCurrentIndex(xp11)
-    panel.source_combo.activated.emit(xp11)  # what a user's pick sends
+    panel.source_choice.buttons["xp11"].click()
     assert panel.overlays_check.isEnabled()
     assert panel.overlays_help.text() == OVERLAY_HELP
     panel.overlays_check.click()
@@ -461,7 +459,7 @@ def test_stream_panel_states(qt_app):
     assert panel.status_label.text() == "Downloading the overlay index…"
     panel.restore()
     panel.set_runtime_locked(True)
-    assert not panel.enable_check.isEnabled() and not panel.source_combo.isEnabled()
+    assert not panel.enable_check.isEnabled() and not panel.source_choice.isEnabled()
     assert "locked while AutoOrtho" in panel.status_label.text()
     panel.set_runtime_locked(False)
     assert events[-1] == ("refresh_requested",)
@@ -536,17 +534,117 @@ def test_stream_panel_fetch_toggle_and_map_button(qt_app):
     panel.fetch_missing_change_requested.connect(lambda v: events.append(("fetch", v)))
     panel.open_map_requested.connect(lambda: events.append(("map",)))
     assert not panel.map_button.isEnabled()
-    panel.fetch_check.click()  # off: picked before turning on, no request
+    choice = panel.fetch_choice
+    choice.map_radio.click()  # off: picked before turning on, no request
     assert events == [] and panel.fetch_missing is False
     panel.set_state({"enabled": True, "source": "xp12", "fetch_missing": True,
                      "ortho": (0, 0), "overlay": (0, 0)})
-    assert panel.fetch_check.isChecked() and panel.map_button.isEnabled()
-    panel.fetch_check.click()
+    assert choice.auto_radio.isChecked() and panel.map_button.isEnabled()
+    choice.map_radio.click()
     assert events == [("fetch", False)]
     panel.map_button.click()
     assert events[-1] == ("map",)
     panel.set_runtime_locked(True)
-    assert not panel.fetch_check.isEnabled()
+    assert not choice.isEnabled()
+
+
+def test_xplane_version_and_recommended_set(tmp_path):
+    assert ts.xplane_major_version(str(tmp_path)) is None  # never ran
+    (tmp_path / "Log.txt").write_bytes(
+        b"Log.txt for X-Plane 12.4.4-r2-e8642cec (build 124419 Intel 64-bit)\n")
+    assert ts.xplane_major_version(str(tmp_path)) == 12
+    (tmp_path / "Log.txt").write_bytes(b"Log.txt for X-Plane 11.55r2 (build 115520)\n")
+    assert ts.xplane_major_version(str(tmp_path)) == 11
+    assert ts.xplane_major_version("") is None
+    assert ts.recommended_source(None) == "xp12"
+    assert ts.recommended_source(12) == "xp12"
+    assert ts.recommended_source(11) == "xp11"  # it can't show the XP12 set
+
+
+def test_summary_counts_kept_tiles_of_another_set(tmp_path):
+    root = tmp_path / "z_ao_stream_xp12"
+    root.mkdir()
+    ts.write_marker(str(root), {"source": "xp12", "kind": "ortho"})
+    a, b, gone = (47, -123), (48, -123), (49, -123)
+    for cell, size in ((a, 100), (b, 50)):
+        path = root / ts.dsf_rel(*cell)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * size)
+    ts.write_tile_sources(str(root), {a: "xp11", b: "xp11", gone: "xp11"})
+    assert ts.other_set_usage(str(root)) == {"xp11": (2, 150)}
+    assert ts.stream_summary(str(tmp_path))["other_sets"] == {"xp11": (2, 150)}
+
+
+def test_stream_panel_recommends_the_set_for_this_xplane(qt_app):
+    from ui.widgets.stream_panel import StreamPanel
+    panel = StreamPanel()
+    events = []
+    panel.source_change_requested.connect(lambda s: events.append(("source", s)))
+    panel.hint_dismissed.connect(lambda k: events.append(("dismissed", k)))
+    # Off, with X-Plane 11: the XP11 set is offered and marked, XP12 says why not.
+    panel.set_state({"enabled": False, "xplane_major": 11})
+    choice = panel.source_choice
+    assert choice.current() == "xp11" and not choice.chips["xp11"].isHidden()
+    assert choice.chips["xp12"].isHidden()
+    assert "Needs X-Plane 12" in choice.notes["xp12"].text()
+    assert panel.hint.isHidden()  # nothing to point out while off
+
+    # On the XP11 set with X-Plane 12 (an upgrade that moved regions in).
+    base = {"enabled": True, "source": "xp11", "fetch_missing": False,
+            "ortho": (0, 0), "overlay": (0, 0), "xplane_major": 12}
+    panel.set_state(base)
+    assert not panel.hint.isHidden()
+    assert "For X-Plane 12, the X-Plane 12 set is recommended" in panel.hint.title_label.text()
+    assert "earlier versions" in panel.hint.body_label.text()
+    panel.hint.buttons["switch"].click()
+    assert events == [("source", "xp12")]
+    panel.restore()  # the user cancelled the switch dialog
+    assert choice.current() == "xp11"
+
+    # Keep: the hint goes and the main window is told to remember it.
+    panel.hint.buttons["dismiss"].click()
+    assert panel.hint.isHidden() and events[-1] == ("dismissed", "set:xp11")
+    panel.set_state(dict(base))
+    assert panel.hint.isHidden()  # stays dismissed
+
+    # Unknown X-Plane: the hint asks instead of telling.
+    panel.set_dismissed_hints(set())
+    panel.set_state(dict(base, xplane_major=None))
+    assert panel.hint.title_label.text().startswith("Flying X-Plane 12?")
+
+    # Locked while running: the hint's buttons are too.
+    panel.set_runtime_locked(True)
+    assert not panel.hint.buttons["switch"].isEnabled()
+
+
+def test_stream_panel_points_out_kept_tiles_of_another_set(qt_app):
+    from ui.widgets.stream_panel import StreamPanel
+    panel = StreamPanel()
+    events = []
+    panel.other_set_tiles_requested.connect(events.append)
+    base = {"enabled": True, "source": "xp12", "fetch_missing": True,
+            "ortho": (0, 0), "overlay": (0, 0), "xplane_major": 12}
+    panel.set_state(base)
+    assert panel.hint.isHidden()  # the recommended set, nothing kept from another
+    panel.set_state(dict(base, other_sets={"xp11": (1200, 3_600_000_000)}))
+    assert not panel.hint.isHidden()
+    title = panel.hint.title_label.text()
+    assert title.startswith("1,200 kept tiles") and "X-Plane 11 legacy" in title
+    assert "download as you fly" in panel.hint.body_label.text()
+    assert list(panel.hint.buttons) == ["replace", "remove", "dismiss"]
+    assert panel.hint.buttons["replace"].text() == "Replace with X-Plane 12…"
+    panel.hint.buttons["replace"].click()
+    panel.hint.buttons["remove"].click()
+    assert events == ["replace", "remove"]
+    panel.set_state(dict(base, fetch_missing=False,
+                         other_sets={"xp11": (1, 3_000_000)}))
+    assert panel.hint.title_label.text().startswith("1 kept tile (")
+    assert "default scenery" in panel.hint.body_label.text()
+    # Dismissed for this many tiles only: more tiles bring it back.
+    panel.hint.buttons["dismiss"].click()
+    assert panel.hint.isHidden()
+    panel.set_state(dict(base, other_sets={"xp11": (2, 6_000_000)}))
+    assert not panel.hint.isHidden()
 
 
 # ---------------------------------------------------------------------------
@@ -683,3 +781,38 @@ def test_switch_dialog_offers_keep_or_replace_with_a_size(qt_app, monkeypatch, t
     finally:
         ui.close()
         ui.deleteLater()
+
+
+def test_summary_splits_kept_tiles_from_the_rest(tmp_path):
+    root = tmp_path / "z_ao_stream_xp12"
+    root.mkdir()
+    ts.write_marker(str(root), {"source": "xp12", "kind": "ortho"})
+    kept, flown = (47, -123), (48, -123)
+    for cell, size in ((kept, 100), (flown, 40)):
+        path = root / ts.dsf_rel(*cell)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x" * size)
+    ts.write_pins(str(root), {kept})
+    summary = ts.stream_summary(str(tmp_path))
+    assert summary["ortho"] == (140, 2)
+    assert summary["kept"] == (100, 1)
+
+
+def test_stream_panel_shows_kept_tiles_apart_from_the_limit(qt_app):
+    from ui.widgets.stream_panel import CHOOSE_URL, StreamPanel
+    panel = StreamPanel()
+    assert CHOOSE_URL in panel.choose_link.text()
+    assert CHOOSE_URL.endswith("#which-set-should-i-choose")
+    base = {"enabled": True, "source": "xp12", "disk_limit_gb": 10,
+            "ortho": (6_000_000_000, 500), "overlay": (0, 0)}
+    panel.set_state(dict(base, kept=(1_000_000_000, 100)))
+    assert panel.kept_label.text().startswith("Kept: 100 tiles")
+    assert "never removed" in panel.kept_label.text()
+    assert panel.usage_label.text().startswith("Downloaded while flying: 400 tiles")
+    assert "of 10 GB" in panel.usage_label.text()
+    assert panel.usage_bar.value() == 500  # 5 of 10 GB: kept tiles don't count
+    assert panel.overlay_usage_label.isHidden()
+    panel.set_state(dict(base, overlays=True, overlay=(500_000_000, 20)))
+    assert panel.kept_label.isHidden()  # nothing kept
+    assert panel.overlay_usage_label.text().startswith("Overlays:")
+    assert "of 2 GB" in panel.overlay_usage_label.text()
