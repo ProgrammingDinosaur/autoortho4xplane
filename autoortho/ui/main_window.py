@@ -62,7 +62,8 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.widgets.scenery_patches import SceneryPatchesWidget
     from autoortho.ui.shell import ApplicationShell
     from autoortho.ui.pages.scenery_page import SceneryLibraryPage
-    from autoortho import region_adopt, stream_seasons, tile_stream
+    from autoortho import cache_inventory, region_adopt, stream_seasons, tile_stream
+    from autoortho.ui.widgets.stream_panel import CHOOSE_URL, set_title
     from autoortho.ui.pages.settings_page import SettingsPage
     from autoortho.ui.pages.expert_settings_page import ExpertSettingsPage
     from autoortho.ui.widgets.target_cost_panel import TargetCostPanel
@@ -150,9 +151,11 @@ else:
     from ui.widgets.scenery_patches import SceneryPatchesWidget
     from ui.shell import ApplicationShell
     from ui.pages.scenery_page import SceneryLibraryPage
+    import cache_inventory
     import region_adopt
     import stream_seasons
     import tile_stream
+    from ui.widgets.stream_panel import CHOOSE_URL, set_title
     from ui.pages.settings_page import SettingsPage
     from ui.pages.expert_settings_page import ExpertSettingsPage
     from ui.widgets.target_cost_panel import TargetCostPanel
@@ -1127,6 +1130,9 @@ class ConfigUI(QMainWindow):
         stream_panel.seasons_change_requested.connect(self._on_stream_seasons)
         stream_panel.open_map_requested.connect(self._open_scenery_map)
         stream_panel.refresh_requested.connect(self._refresh_stream_panel)
+        stream_panel.other_set_tiles_requested.connect(self._on_other_set_tiles)
+        stream_panel.hint_dismissed.connect(self._on_scenery_hint_dismissed)
+        stream_panel.set_dismissed_hints(self._dismissed_scenery_hints())
         self._stream_workers = []
         QTimer.singleShot(0, self._refresh_stream_panel)
         self._migration_running = False
@@ -3579,7 +3585,7 @@ class ConfigUI(QMainWindow):
         selected_streaming = getattr(wizard, "selected_streaming", None)
         streaming = selected_streaming() if callable(selected_streaming) else None
         if streaming:
-            self.scenery_library_page.stream_panel.fetch_check.setChecked(
+            self.scenery_library_page.stream_panel.fetch_choice.set_fetch_missing(
                 bool(streaming.get("fetch_missing", True))
             )
             self._on_stream_enable(
@@ -7637,6 +7643,7 @@ class ConfigUI(QMainWindow):
 
     def _refresh_stream_panel(self):
         scenery_dir = self.cfg.ao_scenery_path
+        xplane_dir = str(getattr(self.cfg.paths, "xplane_path", "") or "")
 
         def show(result):
             panel = self.scenery_library_page.stream_panel
@@ -7645,8 +7652,180 @@ class ConfigUI(QMainWindow):
                 panel.restore()
                 return
             panel.set_state(result)
+            self._maybe_explain_scenery()
 
-        self._run_stream_job(lambda: tile_stream.stream_summary(scenery_dir), show)
+        def summary():
+            # Which X-Plane runs decides the set the panel recommends.
+            return dict(tile_stream.stream_summary(scenery_dir),
+                        xplane_major=tile_stream.xplane_major_version(xplane_dir))
+
+        self._run_stream_job(summary, show)
+
+    def _maybe_explain_scenery(self):
+        """Once, for someone who used AutoOrtho before tile-by-tile scenery
+        (regions moved in, or the XP11 set): what changed. The Scenery
+        Library's hint card then says what to do. Never blocks: the dialog
+        isn't modal."""
+        shown = str(getattr(self.cfg.general, "scenery_intro_shown", False))
+        if shown.strip().lower() in ("1", "true", "yes", "on"):
+            return
+        if getattr(self, "_scenery_intro_box", None) is not None:
+            return
+        if (not getattr(self.cfg.general, "setup_complete", False)
+                or getattr(self, "_migration_running", False)
+                or region_adopt.needs_migration(self.cfg.ao_scenery_path)):
+            return  # the first run, or regions still to move: ask again later
+        panel = self.scenery_library_page.stream_panel
+        if not panel.enabled:
+            return
+        hint = panel.current_hint()
+        self.cfg.general.scenery_intro_shown = True
+        self._persist_configuration()
+        if hint is None:
+            return  # set up the recommended way already: nothing to explain
+        kept = panel.state.get("kept", (0, 0))[1]
+        points = []
+        if kept:
+            points.append(
+                f"Regions you installed before are now kept tiles ({kept:,}): "
+                "they work offline, show on the map, and are never removed "
+                "to make room.")
+        points.append(
+            "There are two scenery sets. X-Plane 12 is recommended for "
+            "X-Plane 12: seasons built in, 3D water and mesh fixes. X-Plane 11 "
+            "legacy is the set the old regions came from.")
+        points.append(
+            "Tiles can download automatically as you fly, usually in a second "
+            "or two each, and stay on disk up to a limit you choose. You don't "
+            "need whole regions on disk.")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("AutoOrtho Scenery Has Changed")
+        box.setText("Scenery now comes tile by tile instead of by region.")
+        box.setInformativeText(
+            "\n\n".join(f"• {p}" for p in points)
+            + "\n\nThe Scenery Library shows what's worth changing for your setup.")
+        library = box.addButton("Open Scenery Library", QMessageBox.ButtonRole.AcceptRole)
+        guide = box.addButton("Read the Guide", QMessageBox.ButtonRole.HelpRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.setDefaultButton(library)
+        box.setWindowModality(Qt.WindowModality.NonModal)
+
+        def clicked(button):
+            if button is library:
+                self.navigate_to("scenery-library")
+            elif button is guide:
+                webbrowser.open(CHOOSE_URL)
+            self._scenery_intro_box = None
+
+        box.buttonClicked.connect(clicked)
+        self._scenery_intro_box = box
+        box.show()
+
+    def _dismissed_scenery_hints(self):
+        raw = str(getattr(self.cfg.general, "dismissed_scenery_hints", "") or "")
+        return {key for key in raw.split(",") if key}
+
+    def _on_scenery_hint_dismissed(self, key):
+        keys = self._dismissed_scenery_hints() | {key}
+        self.cfg.general.dismissed_scenery_hints = ",".join(sorted(keys))
+        self._persist_configuration()
+
+    def _other_set_cells(self):
+        """(package folder, {cell: set}) of the kept tiles of another set
+        than the one in use."""
+        scenery_dir = self.cfg.ao_scenery_path
+        for name, marker in tile_stream.stream_packages(scenery_dir).items():
+            if marker.get("kind", "ortho") != "ortho":
+                continue
+            root = os.path.join(scenery_dir, name)
+            own = marker.get("source")
+            cells = {cell: source for cell, source in
+                     tile_stream.read_tile_sources(root).items() if source != own}
+            return root, cells
+        return "", {}
+
+    def _on_other_set_tiles(self, action):
+        """Replace (download the set in use's version) or remove the kept
+        tiles of another set, from the Scenery Library's hint."""
+        panel = self.scenery_library_page.stream_panel
+        state = panel.state
+        current = state.get("source")
+        others = {k: v for k, v in (state.get("other_sets") or {}).items()
+                  if k != current and v and v[0]}
+        tiles = sum(v[0] for v in others.values())
+        size = sum(v[1] for v in others.values())
+        if not tiles:
+            return
+        label = set_title(current)
+        old = " and ".join(set_title(k) for k in sorted(others))
+        count = f"{tiles:,} tile{'s' if tiles != 1 else ''}"
+        box = QMessageBox(self)
+        if action == "replace":
+            box.setIcon(QMessageBox.Icon.Question)
+            tile_mb = tile_stream.SOURCES.get(current, {}).get("tile_mb")
+            estimate = (f" (about {format_bytes(tiles * tile_mb * 1e6)})"
+                        if tile_mb else "")
+            box.setWindowTitle(f"Replace with {label}")
+            box.setText(f"Replace {count} with the {label} version?")
+            box.setInformativeText(
+                f"Their {old} files ({format_bytes(size)}) are deleted and the "
+                f"{label} version of each downloads{estimate} in the background. "
+                f"They stay kept for offline flying. Tiles the {label} set "
+                "doesn't have stay as they are.")
+            ok = box.addButton(f"Replace with {label}", QMessageBox.ButtonRole.AcceptRole)
+        else:
+            box.setIcon(QMessageBox.Icon.Warning)
+            then = (f"The {label} version downloads there as you fly."
+                    if state.get("fetch_missing", True) else
+                    "X-Plane shows its default scenery there unless you download "
+                    "the tiles on the map again.")
+            box.setWindowTitle("Remove Kept Tiles")
+            box.setText(f"Remove {count} of the {old} set?")
+            box.setInformativeText(
+                f"Their files ({format_bytes(size)}) are deleted. {then}")
+            ok = box.addButton("Remove Tiles", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(ok)
+        box.exec()
+        if box.clickedButton() is not ok:
+            return
+        scenery_dir = self.cfg.ao_scenery_path
+
+        def work():
+            root, cells = self._other_set_cells()
+            if action == "remove":
+                cache_inventory.delete_cells(scenery_dir, "", cells, mesh=True,
+                                             imagery=False)
+                return []
+            # Only tiles the set in use has: the others would be lost.
+            marker = tile_stream.read_marker(root) or {}
+            path = marker.get("index", tile_stream.INDEX_NAME)
+            if not os.path.isabs(path):
+                path = os.path.join(root, path)
+            have = tile_stream.TileIndex.load(path).cells()
+            replace = sorted(c for c in cells if c in have)
+            cache_inventory.switch_to_current_set(scenery_dir, replace)
+            return replace
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.display_error(f"Could not change the kept tiles:\n{result}")
+                panel.restore()
+                self._refresh_stream_panel()
+                return
+            if result:
+                self._download_kept(result)
+            elif action == "remove":
+                self.update_status_bar(f"Removed {count} of the {old} set.")
+            self._after_stream_change()
+            editor = getattr(self, "custom_map_editor", None)
+            if editor is not None and editor.cache_panel is not None:
+                editor.cache_panel.refresh()
+
+        panel.set_busy(True, "Replacing kept tiles…" if action == "replace"
+                       else "Removing kept tiles…")
+        self._run_stream_job(work, done)
 
     def _after_stream_change(self):
         """New or removed streaming folders become mounts on the next start."""
@@ -7786,8 +7965,9 @@ class ConfigUI(QMainWindow):
             if result.regions:
                 kept = (f" {len(result.kept)} couldn't move and stay installed."
                         if result.kept else "")
-                fetch = (" Downloading tiles while flying is off, as before; "
-                         "turn it on in the Scenery Library to fly anywhere."
+                fetch = (" Only tiles you download on the map are used, as "
+                         "before; pick Automatically as you fly in the Scenery "
+                         "Library to fly anywhere."
                          if result.created else "")
                 self.set_notice(Notice(
                     "region_migration", "info",

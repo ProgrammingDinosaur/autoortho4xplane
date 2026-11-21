@@ -62,6 +62,14 @@ INDEX_BASE_URL = (
 SOURCES = OrderedDict([
     ("xp12", {
         "label": "XP12 set (flightwusel v1.4, by jonaseberle)",
+        # What the Scenery Library's choice shows: a name, what the set
+        # gives you, and who made it.
+        "title": "X-Plane 12",
+        "summary": ("Seasons built in, 3D water and mesh fixes (Iceland, for "
+                    "example). About 12 MB per tile. No roads, forests or "
+                    "buildings: add simHeaven X-World for those."),
+        "credit": "flightwusel v1.4 mesh by jonaseberle",
+        "xplane": 12,           # the oldest X-Plane that can show it
         "available": True,
         "tile_mb": 12,          # average base mesh per tile, for estimates
         "short": "XP12",
@@ -70,6 +78,12 @@ SOURCES = OrderedDict([
     }),
     ("xp11", {
         "label": "XP11 legacy set (kubilus1/autoortho-scenery)",
+        "title": "X-Plane 11 legacy",
+        "summary": ("The original AutoOrtho scenery, made for X-Plane 11, with "
+                    "roads, forests and buildings. About 3 MB per tile. Seasons "
+                    "can be added to tiles you download on the map."),
+        "credit": "kubilus1/autoortho-scenery",
+        "xplane": 11,
         "available": True,
         "tile_mb": 3,
         "short": "XP11",
@@ -87,6 +101,34 @@ REGION_LABELS = {
     "eur-e": "Europe East", "eur-w": "Europe West", "greenland": "Greenland",
     "na-n": "North America North", "na-s": "North America South",
 }
+
+
+_LOG_VERSION_RE = re.compile(rb"X-Plane (\d+)\.")
+
+
+def xplane_major_version(xplane_dir: str) -> Optional[int]:
+    """The X-Plane version (11, 12, ...) installed in ``xplane_dir``, from the
+    first line of its Log.txt; None if X-Plane hasn't run there yet."""
+    if not xplane_dir:
+        return None
+    try:
+        with open(os.path.join(xplane_dir, "Log.txt"), "rb") as fh:
+            first = fh.readline(256)
+    except OSError:
+        return None
+    m = _LOG_VERSION_RE.search(first)
+    return int(m.group(1)) if m else None
+
+
+def recommended_source(xplane_major: Optional[int] = None) -> Optional[str]:
+    """The set to recommend: the first available one that ``xplane_major``
+    can show (any, when the version isn't known)."""
+    for key, spec in SOURCES.items():
+        if not spec.get("available"):
+            continue
+        if xplane_major is None or spec.get("xplane", 0) <= xplane_major:
+            return key
+    return None
 
 
 def region_label(region: str) -> str:
@@ -2171,21 +2213,42 @@ def stream_summary(ao_scenery_dir: str) -> dict:
     summary = {"enabled": False, "source": None, "overlays": False,
                "disk_limit_gb": None, "roughness": None, "fetch_missing": True,
                "seasons": False,
-               "ortho": (0, 0), "overlay": (0, 0)}
+               "ortho": (0, 0), "overlay": (0, 0), "kept": (0, 0),
+               "other_sets": {}}
     for name, marker in packages.items():
         kind = marker.get("kind", "ortho")
         if kind not in ("ortho", "overlay"):
             continue
-        summary[kind] = _package_usage(os.path.join(ao_scenery_dir, name))
+        root = os.path.join(ao_scenery_dir, name)
         if kind == "overlay":
+            summary[kind] = _package_usage(root)
             summary["overlays"] = True
         else:
+            # Kept tiles never count toward the disk limit; the rest does.
+            summary["ortho"], summary["kept"] = _package_usage_split(root)
             summary.update(enabled=True, source=marker.get("source"),
                            disk_limit_gb=marker.get("disk_limit_gb"),
                            roughness=marker.get("roughness"),
                            fetch_missing=bool(marker.get("fetch_missing", True)),
-                           seasons=bool(marker.get("seasons")))
+                           seasons=bool(marker.get("seasons")),
+                           other_sets=other_set_usage(
+                               os.path.join(ao_scenery_dir, name)))
     return summary
+
+
+def other_set_usage(root: str) -> Dict[str, Tuple[int, int]]:
+    """Stored tiles of an ortho package that came from another scenery set
+    (regions moved in, kept tiles carried over a switch), per set: {source:
+    (tiles, DSF bytes)}."""
+    out: Dict[str, Tuple[int, int]] = {}
+    for cell, source in read_tile_sources(root).items():
+        try:
+            size = os.path.getsize(os.path.join(root, *dsf_rel(*cell).split("/")))
+        except OSError:
+            continue  # recorded but not stored
+        tiles, total = out.get(source, (0, 0))
+        out[source] = (tiles + 1, total + size)
+    return out
 
 
 def stream_usage(ao_scenery_dir: str) -> Tuple[int, int]:
@@ -2215,6 +2278,34 @@ def _package_usage(root: str) -> Tuple[int, int]:
         except OSError:
             continue
     return total, count
+
+
+def _package_usage_split(root: str) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """((bytes, DSF count) of every stored tile, (bytes, DSF count) of the
+    kept ones) in one streaming package. A file counts as kept when its
+    tile is, as eviction counts it."""
+    pins = read_pins(root)
+    total = count = kept = kept_count = 0
+    dirs = []
+    try:
+        dirs = [e.path for e in os.scandir(os.path.join(root, DSF_DIR)) if e.is_dir()]
+    except OSError:
+        pass
+    for d in dirs + [os.path.join(root, "textures")]:
+        try:
+            for f in os.scandir(d):
+                if not (f.is_file() and f.name.endswith((".dsf", ".png"))):
+                    continue
+                size = f.stat().st_size
+                dsf = f.name.endswith(".dsf")
+                total += size
+                count += dsf
+                if pins and stored_file_cell(f.name) in pins:
+                    kept += size
+                    kept_count += dsf
+        except OSError:
+            continue
+    return (total, count), (kept, kept_count)
 
 
 def ensure_pack_order(custom_scenery_dir: str, ortho_name: str,

@@ -274,8 +274,21 @@ scenery when this version first starts, without downloading anything again,
 and show on the map as downloaded tiles. See
 [Regions installed with earlier versions](scenery.md#regions-installed-with-earlier-versions).
 
+### Which scenery set should I use, and should I keep my old regions?
+On X-Plane 12, use the **X-Plane 12** set with tiles downloading
+**Automatically as you fly**: it has seasons built in, 3D water and mesh
+fixes, and tiles download in a second or two the first time you fly over
+them. Your old regions became kept tiles of the X-Plane 11 legacy set; the
+Scenery Library offers to replace them with the X-Plane 12 version or remove
+them. See [Which set should I choose?](scenery.md#which-set-should-i-choose).
+
+### Are tiles downloaded while flying deleted when I quit?
+No. They stay on disk for next time, up to the disk limit you set in the
+Scenery Library; above it, the ones you haven't flown over for longest are
+removed. Tiles you download on the map are never removed.
+
 ### Can I fly only the tiles I downloaded, with nothing downloading while I fly?
-Yes. Untick **Download tiles while flying** in the AutoOrtho scenery panel.
+Yes. Pick **Only tiles I download on the map** in the AutoOrtho scenery panel.
 X-Plane then shows its default scenery outside the tiles you downloaded. See
 [Using only downloaded tiles](scenery.md#using-only-downloaded-tiles).
 
@@ -311,7 +324,7 @@ pick a value. It applies to all tiles from the next start. See
 Those tiles weren't downloaded, or couldn't be when X-Plane asked for them,
 so X-Plane got them from its Global Scenery instead. Check that:
 
-- **Download tiles while flying** is on, or that you downloaded that area
+- **Automatically as you fly** is picked, or that you downloaded that area
   on the map.
 - AutoOrtho was running before X-Plane started, and the scenery was set up
   before AutoOrtho started. Changes take effect on the next start.

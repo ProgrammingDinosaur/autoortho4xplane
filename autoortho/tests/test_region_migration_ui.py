@@ -60,3 +60,106 @@ def test_installed_regions_move_on_start_and_say_so(qt_app, monkeypatch, tmp_pat
     finally:
         ui.close()
         ui.deleteLater()
+
+
+def test_scenery_library_replaces_or_removes_tiles_of_another_set(
+        qt_app, monkeypatch, tmp_path):
+    """Regions moved into the XP12 set stay XP11 tiles; the Scenery Library's
+    hint replaces them (only where the XP12 set has the tile) or removes them."""
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(ConfigUI, "refresh_scenery_list",
+                        lambda self: self.scenery_layout.addStretch())
+    monkeypatch.setattr(ConfigUI, "start_update_check",
+                        lambda self, manual=False: None)
+    accept = (QMessageBox.ButtonRole.AcceptRole, QMessageBox.ButtonRole.DestructiveRole)
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)
+    monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: next(
+        b for b in self.buttons() if self.buttonRole(b) in accept))
+    downloads = []
+    monkeypatch.setattr(ConfigUI, "_download_kept",
+                        lambda self, cells: downloads.append(list(cells)))
+    cfg = AOConfig(str(tmp_path / ".autoortho"))
+    cfg.paths.scenery_path = str(tmp_path / "Custom Scenery")
+    cfg.paths.cache_dir = str(tmp_path / "cache")
+    cfg.paths.download_dir = str(tmp_path / "downloads")
+    cfg.paths.xplane_path = str(tmp_path / "X-Plane")
+    os.makedirs(cfg.paths.xplane_path)
+    with open(os.path.join(cfg.paths.xplane_path, "Log.txt"), "wb") as fh:
+        fh.write(b"Log.txt for X-Plane 12.4.4-r2 (build 124419)\n")
+    cfg.general.setup_complete = True
+    cfg.cache.auto_clean_cache = False
+    cfg.save()
+    cfg.get_config()
+    ao_dir = os.path.join(cfg.paths.scenery_path, "z_autoortho", "scenery")
+    os.makedirs(ao_dir, exist_ok=True)
+    pkg = make_streaming(ao_dir, source="xp12", tiles=TILES[:2])
+    make_region(ao_dir, "eur", TILES)
+
+    ui = ConfigUI(cfg)
+    panel = ui.scenery_library_page.stream_panel
+    try:
+        assert wait_until(lambda: not ra.needs_migration(ao_dir))
+        assert wait_until(lambda: not panel.hint.isHidden())
+        assert panel.state["xplane_major"] == 12
+        assert panel.hint.title_label.text().startswith("3 kept tiles")
+
+        ui._on_other_set_tiles("replace")
+        assert wait_until(lambda: downloads)
+        assert downloads == [sorted(TILES[:2])]
+        assert ts.read_tile_sources(pkg) == {TILES[2]: "xp11"}  # XP12 lacks it
+        assert ts.read_pins(pkg) == set(TILES)
+        assert wait_until(lambda: panel.hint.title_label.text().startswith("1 kept tile"))
+
+        ui._on_other_set_tiles("remove")
+        assert wait_until(lambda: panel.hint.isHidden())
+        assert ts.read_tile_sources(pkg) == {}
+        assert ts.read_pins(pkg) == set(TILES[:2])
+
+        # Upgraders get the one-time explanation, without it blocking.
+        box = ui._scenery_intro_box
+        assert box is not None and box.isVisible() and not box.isModal()
+        assert "tile by tile" in box.text()
+        assert cfg.general.scenery_intro_shown is True
+        library = next(b for b in box.buttons() if b.text() == "Open Scenery Library")
+        library.click()
+        assert ui._scenery_intro_box is None
+        ui._refresh_stream_panel()
+        QApplication.processEvents()
+        assert ui._scenery_intro_box is None  # once only
+
+        # A dismissed hint is remembered in the config.
+        ui._on_scenery_hint_dismissed("other:xp12:7")
+        assert "other:xp12:7" in cfg.general.dismissed_scenery_hints
+    finally:
+        ui.close()
+        ui.deleteLater()
+
+
+def test_no_scenery_explanation_when_set_up_the_recommended_way(
+        qt_app, monkeypatch, tmp_path):
+    monkeypatch.setattr(ConfigUI, "refresh_scenery_list",
+                        lambda self: self.scenery_layout.addStretch())
+    monkeypatch.setattr(ConfigUI, "start_update_check",
+                        lambda self, manual=False: None)
+    cfg = AOConfig(str(tmp_path / ".autoortho"))
+    cfg.paths.scenery_path = str(tmp_path / "Custom Scenery")
+    cfg.paths.cache_dir = str(tmp_path / "cache")
+    cfg.paths.download_dir = str(tmp_path / "downloads")
+    cfg.paths.xplane_path = str(tmp_path / "X-Plane")
+    cfg.general.setup_complete = True
+    cfg.cache.auto_clean_cache = False
+    cfg.save()
+    cfg.get_config()
+    ao_dir = os.path.join(cfg.paths.scenery_path, "z_autoortho", "scenery")
+    os.makedirs(ao_dir, exist_ok=True)
+    make_streaming(ao_dir, source="xp12")
+
+    ui = ConfigUI(cfg)
+    try:
+        assert wait_until(lambda: ui.scenery_library_page.stream_panel.enabled)
+        assert wait_until(lambda: cfg.general.scenery_intro_shown is True)
+        assert getattr(ui, "_scenery_intro_box", None) is None
+        assert ui.scenery_library_page.stream_panel.hint.isHidden()
+    finally:
+        ui.close()
+        ui.deleteLater()

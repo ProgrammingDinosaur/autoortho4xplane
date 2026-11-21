@@ -15,9 +15,15 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.dynamic_zoom_editor import PRESETS
     from autoortho.ui.widgets.connection_test_panel import ConnectionTestPanel
     from autoortho.ui.widgets.stream_panel import (
+        CHOOSE_URL,
+        LIMIT_HELP,
+        LIMIT_SENTENCE,
         LOCKED_HELP,
+        MAP_HELP,
         NO_OVERLAY_HELP,
         OVERLAY_HELP,
+        SetChoice,
+        TileSourceChoice,
     )
     from autoortho.ui.widgets.limits_editor import LimitsEditor
     from autoortho.ui.widgets.target_cost_panel import TargetCostPanel
@@ -40,9 +46,15 @@ else:
     from ui.dynamic_zoom_editor import PRESETS
     from ui.widgets.connection_test_panel import ConnectionTestPanel
     from ui.widgets.stream_panel import (
+        CHOOSE_URL,
+        LIMIT_HELP,
+        LIMIT_SENTENCE,
         LOCKED_HELP,
+        MAP_HELP,
         NO_OVERLAY_HELP,
         OVERLAY_HELP,
+        SetChoice,
+        TileSourceChoice,
     )
     from ui.widgets.limits_editor import LimitsEditor
     from ui.widgets.target_cost_panel import TargetCostPanel
@@ -594,57 +606,49 @@ class SceneryPage(_BasePage):
             "installing whole regions."
         )
         layout.addWidget(self.stream_check)
+
+        set_row = QHBoxLayout()
+        set_label = QLabel("Scenery set")
+        set_label.setProperty("textRole", "sectionTitle")
+        choose_link = QLabel(f'<a href="{CHOOSE_URL}">Which set should I choose?</a>')
+        choose_link.setTextFormat(Qt.TextFormat.RichText)
+        choose_link.setOpenExternalLinks(True)
+        set_row.addWidget(set_label)
+        set_row.addStretch()
+        set_row.addWidget(choose_link)
+        layout.addLayout(set_row)
+        self.stream_source_choice = SetChoice()
+        self.stream_source_choice.setAccessibleName("Scenery set")
+        layout.addWidget(self.stream_source_choice)
+        self._source_chosen = False  # the user picked a set themselves
+
+        fetch_label = QLabel("Where tiles come from")
+        fetch_label.setProperty("textRole", "sectionTitle")
+        layout.addWidget(fetch_label)
+        self.stream_fetch_choice = TileSourceChoice()
+        self.stream_fetch_choice.setAccessibleName("Where tiles come from")
+        layout.addWidget(self.stream_fetch_choice)
         layout.addWidget(_secondary(
-            "After setup, download the tiles or whole regions you fly on the "
-            "map (Flight Plan & Map, Scenery & Cache), or just fly: tiles "
-            "download the first time X-Plane needs them."
+            f"{MAP_HELP} After setup, open the map (Flight Plan & Map, Scenery "
+            "& Cache) to download tiles or whole regions."
         ))
-        self.stream_fetch_check = QCheckBox("&Download tiles while flying")
-        self.stream_fetch_check.setChecked(True)
-        self.stream_fetch_check.setToolTip(
-            "Off: only tiles you download on the map are used; elsewhere "
-            "X-Plane shows its default scenery."
-        )
-        layout.addWidget(self.stream_fetch_check)
 
         row = QHBoxLayout()
-        source_label = QLabel("Scenery s&et")
-        self.stream_source_combo = QComboBox()
-        source_label.setBuddy(self.stream_source_combo)
-        model = self.stream_source_combo.model()
-        first_available = -1
-        for key, spec in tile_stream.SOURCES.items():
-            available = bool(spec.get("available"))
-            label = spec["label"] if available else f"{spec['label']} — Soon"
-            self.stream_source_combo.addItem(label, key)
-            index = self.stream_source_combo.count() - 1
-            if available and first_available < 0:
-                first_available = index
-            if not available:
-                item = model.item(index)
-                item.setEnabled(False)
-                item.setToolTip(
-                    "Coming soon: these packages are being repackaged for streaming."
-                )
-        if first_available >= 0:
-            self.stream_source_combo.setCurrentIndex(first_available)
-        limit_label = QLabel("Disk li&mit")
+        limit_label = QLabel("Keep up to")
         self.stream_limit_spin = QSpinBox()
         self.stream_limit_spin.setRange(5, 1000)
         self.stream_limit_spin.setSuffix(" GB")
         self.stream_limit_spin.setValue(20)
-        self.stream_limit_spin.setToolTip(
-            "Tiles downloaded while flying that you haven't used for a while "
-            "are removed above this size. Tiles you download on the map don't "
-            "count. Overlays get a quarter of it on top."
-        )
+        self.stream_limit_spin.setToolTip(LIMIT_HELP)
+        self.stream_limit_spin.setAccessibleName(
+            "Disk limit for tiles downloaded while flying")
         limit_label.setBuddy(self.stream_limit_spin)
-        row.addWidget(source_label)
-        row.addWidget(self.stream_source_combo, 1)
-        row.addSpacing(12)
         row.addWidget(limit_label)
         row.addWidget(self.stream_limit_spin)
+        row.addWidget(QLabel("of tiles downloaded while flying"))
+        row.addStretch()
         layout.addLayout(row)
+        layout.addWidget(_secondary(LIMIT_SENTENCE))
 
         self.stream_overlays_check = QCheckBox(
             "Include &overlays (roads, forests, buildings)"
@@ -657,13 +661,29 @@ class SceneryPage(_BasePage):
         layout.addWidget(self.stream_status_label)
 
         self.stream_check.toggled.connect(self._stream_changed)
-        self.stream_source_combo.currentIndexChanged.connect(self._stream_changed)
+        self.stream_source_choice.picked.connect(self._source_picked)
         self.stream_overlays_check.toggled.connect(self._stream_changed)
         return box
 
+    def selected_source(self) -> str | None:
+        return self.stream_source_choice.current()
+
     def _source_has_overlays(self) -> bool:
-        spec = tile_stream.SOURCES.get(self.stream_source_combo.currentData(), {})
+        spec = tile_stream.SOURCES.get(self.selected_source() or "", {})
         return bool(spec.get("overlay_index"))
+
+    def set_xplane_major(self, major: int | None) -> None:
+        """Recommend the set that suits the X-Plane found, and pick it until
+        the user picks one."""
+        self.stream_source_choice.set_xplane_major(major)
+        if not self._source_chosen and self._existing_stream is None:
+            self.stream_source_choice.set_current(
+                self.stream_source_choice.recommended)
+        self._stream_changed()
+
+    def _source_picked(self, _source: str) -> None:
+        self._source_chosen = True
+        self._stream_changed()
 
     def show_existing_stream(self, marker: dict | None) -> None:
         """Show that the scenery folder already streams (``marker``), or not."""
@@ -673,15 +693,12 @@ class SceneryPage(_BasePage):
             QSignalBlocker(widget)
             for widget in (
                 self.stream_check,
-                self.stream_source_combo,
                 self.stream_overlays_check,
             )
         ]
         if marker is not None:
             self.stream_check.setChecked(True)
-            index = self.stream_source_combo.findData(marker.get("source"))
-            if index >= 0:
-                self.stream_source_combo.setCurrentIndex(index)
+            self.stream_source_choice.set_current(marker.get("source"))
             self.stream_overlays_check.setChecked(bool(marker.get("overlays")))
             limit = int(round(float(marker.get("disk_limit_gb") or 20)))
             self.stream_limit_spin.setValue(
@@ -698,8 +715,8 @@ class SceneryPage(_BasePage):
         editable = not wizard.streaming_locked and not existing
         has_overlays = self._source_has_overlays()
         self.stream_check.setEnabled(editable)
-        for widget in (self.stream_source_combo, self.stream_limit_spin,
-                       self.stream_fetch_check):
+        for widget in (self.stream_source_choice, self.stream_limit_spin,
+                       self.stream_fetch_choice):
             widget.setEnabled(editable and self.stream_check.isChecked())
         self.stream_overlays_check.setEnabled(
             editable and self.stream_check.isChecked() and has_overlays
@@ -1051,6 +1068,7 @@ class SetupWizard(QWizard):
         # Streaming settings can't change while AutoOrtho or X-Plane runs.
         self.streaming_locked = bool(streaming_locked)
         self._stream_checked_path: str | None = None
+        self._xplane_checked_path: str | None = None
         self.target = dict(target or {
             "mode": "fixed", "max_zoom": 16, "airport_zoom": 18, "steps": [],
         })
@@ -1143,8 +1161,8 @@ class SetupWizard(QWizard):
             return False
         if page._existing_stream is not None or not page.stream_check.isChecked():
             return False
-        source = page.stream_source_combo.currentData()
-        return bool(tile_stream.SOURCES.get(source, {}).get("available"))
+        source = page.selected_source()
+        return bool(tile_stream.SOURCES.get(source or "", {}).get("available"))
 
     def selected_streaming(self) -> dict | None:
         """Streaming to turn on when setup finishes: ``source``, ``overlays``
@@ -1154,13 +1172,13 @@ class SetupWizard(QWizard):
             return None
         page = self.scenery_page
         return {
-            "source": str(page.stream_source_combo.currentData()),
+            "source": str(page.selected_source()),
             "overlays": (
                 page.stream_overlays_check.isChecked()
                 and page._source_has_overlays()
             ),
             "disk_limit_gb": int(page.stream_limit_spin.value()),
-            "fetch_missing": page.stream_fetch_check.isChecked(),
+            "fetch_missing": page.stream_fetch_choice.fetch_missing(),
         }
 
     def set_value(self, key: str, value: str) -> None:
@@ -1313,6 +1331,13 @@ class SetupWizard(QWizard):
         if scenery_path != self._stream_checked_path:
             self._stream_checked_path = scenery_path
             self.scenery_page.show_existing_stream(existing_stream(scenery_path))
+        xplane_path = self._values.get("xplane_path", "")
+        if xplane_path != self._xplane_checked_path:
+            self._xplane_checked_path = xplane_path
+            # Calls back into this method once; the path matches by then.
+            self.scenery_page.set_xplane_major(
+                tile_stream.xplane_major_version(xplane_path))
+            return
         self._readiness = build_readiness(
             self._values,
             self._choices,

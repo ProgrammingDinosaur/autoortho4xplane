@@ -547,6 +547,17 @@ QRadioButton::indicator:checked {{
 QCheckBox::indicator:checked {{
     image: url("{_asset_path("checkmark.svg")}");
 }}
+QRadioButton::indicator {{
+    border-radius: 8px;
+}}
+QRadioButton::indicator:checked {{
+    /* A ring, so a radio never reads as a ticked checkbox. Same outer
+       size: 7 + 2 * 5 = 15 + 2 * 1. */
+    width: 7px;
+    height: 7px;
+    border: 5px solid {colors.primary};
+    background-color: {colors.surface};
+}}
 QCheckBox::indicator:indeterminate {{
     background-color: {colors.focus};
     border-color: {colors.focus};
@@ -607,6 +618,15 @@ QProgressBar {{
 QProgressBar::chunk {{
     background-color: {colors.primary};
     border-radius: {radius.sm}px;
+}}
+QProgressBar[thin="true"] {{
+    /* A meter without text, such as disk use against a limit. */
+    min-height: 6px;
+    max-height: 6px;
+    border-radius: 3px;
+}}
+QProgressBar[thin="true"]::chunk {{
+    border-radius: 3px;
 }}
 QScrollBar:vertical {{
     background: {colors.window};

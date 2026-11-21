@@ -156,6 +156,10 @@ kept_values =
 # offering to hand these back; a newly pinned one is offered again).
 dismissed_pinned =
 dismissed_update_version =
+# Scenery Library hints you chose to dismiss (Keep Them / Keep this set)
+dismissed_scenery_hints =
+# The one-time explanation of tile-by-tile scenery was shown (upgrades)
+scenery_intro_shown = False
 # Check GitHub for a newer AutoOrtho when the app starts
 update_check = True
 # Which releases to offer: stable, or rc to also get release candidates
