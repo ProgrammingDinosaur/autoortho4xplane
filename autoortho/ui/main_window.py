@@ -7054,6 +7054,16 @@ class ConfigUI(QMainWindow):
 
     def on_restore_default_dsfs_finished(self, region_id, success):
         """Handle restore default DSFs completion"""
+        # Drop the finished job first: a job left here counts as active work
+        # and blocks Start Streaming and Quit for the rest of the session.
+        worker = self.restore_default_dsfs_workers.pop(region_id, None)
+        if worker is not None:
+            try:
+                # finished/error are emitted from run(), so this returns at once.
+                worker.wait()
+                worker.deleteLater()
+            except Exception:
+                pass
         button = self.findChild(QPushButton, f"scenery-options-{region_id}")
         if button:
             button.setEnabled(True)
@@ -9025,7 +9035,23 @@ class ConfigUI(QMainWindow):
                 )
         return issues
 
+    @staticmethod
+    def _thread_running(worker):
+        try:
+            return worker is not None and worker.isRunning()
+        except RuntimeError:
+            # The Qt object behind a stale entry was already deleted.
+            return False
+
     def _has_active_ui_jobs(self):
+        """True while a scenery or cache job thread is actually running.
+
+        Counts running threads, not map entries: an entry a finished
+        handler forgot to remove must not block Start Streaming and Quit
+        until restart. Seasons jobs queue behind a running seasons worker
+        and start from its finished handler, so a running thread covers
+        the queue too.
+        """
         worker_maps = (
             self.download_workers,
             self.uninstall_workers,
@@ -9034,14 +9060,11 @@ class ConfigUI(QMainWindow):
             getattr(self, "add_roughness_workers", {}),
             getattr(self, "restore_roughness_workers", {}),
         )
-        return (
-            any(bool(workers) for workers in worker_maps)
-            or self.add_seasons_current is not None
-            or (
-                self.cache_thread is not None
-                and self.cache_thread.isRunning()
-            )
-        )
+        return any(
+            self._thread_running(worker)
+            for workers in worker_maps
+            for worker in list(workers.values())
+        ) or self._thread_running(self.cache_thread)
 
     def _set_runtime_state(self, state, message=None):
         self.runtime_state = RuntimeState(state)

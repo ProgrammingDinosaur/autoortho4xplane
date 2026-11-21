@@ -406,13 +406,19 @@ def test_validation_navigates_visible_shell_even_when_legacy_tab_is_stale(
 def test_header_start_action_stays_disabled_during_background_jobs(
     config_ui,
 ):
-    config_ui.download_workers["na"] = object()
-    config_ui._set_runtime_state(RuntimeState.STOPPED)
-    assert not config_ui.run_button.isEnabled()
+    class RunningWorker:
+        def isRunning(self):
+            return True
 
-    config_ui._update_shell_status()
-    assert not config_ui.run_button.isEnabled()
-    config_ui.download_workers.clear()
+    config_ui.download_workers["na"] = RunningWorker()
+    try:
+        config_ui._set_runtime_state(RuntimeState.STOPPED)
+        assert not config_ui.run_button.isEnabled()
+
+        config_ui._update_shell_status()
+        assert not config_ui.run_button.isEnabled()
+    finally:
+        config_ui.download_workers.clear()
 
 
 def test_update_result_uses_nonmodal_header_banner(
