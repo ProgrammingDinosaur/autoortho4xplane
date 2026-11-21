@@ -246,6 +246,8 @@ _INTERNAL = {
     "general.kept_values",
     "general.dismissed_pinned",
     "general.dismissed_update_version",
+    "general.dismissed_scenery_hints",
+    "general.scenery_intro_shown",
 }
 
 # Owners other than "fixed" (proposal section 9).

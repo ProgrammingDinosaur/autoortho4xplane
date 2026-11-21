@@ -128,13 +128,13 @@ def test_streaming_without_regions_enables_finish(qt_app, tmp_path, monkeypatch)
     assert wizard.selected_streaming() is None
     assert wizard.readiness.can_finish is False
     # The settings wait until AutoOrtho scenery is ticked.
-    assert page.stream_source_combo.isEnabled() is False
-    assert page.stream_fetch_check.isEnabled() is False
+    assert page.stream_source_choice.isEnabled() is False
+    assert page.stream_fetch_choice.isEnabled() is False
 
     page.stream_check.setChecked(True)
     qt_app.processEvents()
 
-    assert page.stream_source_combo.isEnabled() is True
+    assert page.stream_source_choice.isEnabled() is True
     assert wizard.selected_region_ids == ()
     assert wizard.readiness.can_finish is True
     assert wizard.review_page.isComplete() is True
@@ -143,7 +143,7 @@ def test_streaming_without_regions_enables_finish(qt_app, tmp_path, monkeypatch)
         "source": "xp12", "overlays": False, "disk_limit_gb": 20,
         "fetch_missing": True,
     }
-    page.stream_fetch_check.setChecked(False)
+    page.stream_fetch_choice.map_radio.click()
     assert wizard.selected_streaming()["fetch_missing"] is False
     assert "finish without selecting a region" in page.note_label.text()
     assert wizard.readiness.by_id("setup-scenery").message.startswith(
@@ -162,26 +162,44 @@ def test_streaming_without_regions_enables_finish(qt_app, tmp_path, monkeypatch)
 def test_streaming_offers_only_available_sets(qt_app, tmp_path, monkeypatch):
     wizard = _build_wizard(tmp_path, monkeypatch)
     page = wizard.scenery_page
-    combo = page.stream_source_combo
-    model = combo.model()
+    choice = page.stream_source_choice
 
-    assert combo.count() == len(tile_stream.SOURCES)
-    for index in range(combo.count()):
-        spec = tile_stream.SOURCES[combo.itemData(index)]
-        assert model.item(index).isEnabled() is bool(spec.get("available"))
-        if not spec.get("available"):
-            assert combo.itemText(index).endswith("Soon")
-    assert tile_stream.SOURCES[combo.currentData()]["available"] is True
+    assert list(choice.buttons) == list(tile_stream.SOURCES)
+    for key, button in choice.buttons.items():
+        assert button.isEnabled() is bool(tile_stream.SOURCES[key].get("available"))
+    assert tile_stream.SOURCES[choice.current()]["available"] is True
     # XP12 is the default and has no overlays; the XP11 set's overlays
     # question carries the simHeaven hint.
-    assert combo.currentData() == "xp12"
+    assert choice.current() == "xp12"
     assert page.stream_overlays_help.text() == NO_OVERLAY_HELP
     page.stream_check.setChecked(True)
-    combo.setCurrentIndex(combo.findData("xp11"))
+    choice.buttons["xp11"].click()
     qt_app.processEvents()
     assert page.stream_overlays_check.isEnabled()
     assert page.stream_overlays_help.text() == OVERLAY_HELP
     assert "simHeaven" in OVERLAY_HELP
+
+    wizard.close()
+    wizard.deleteLater()
+
+
+def test_streaming_recommends_the_set_for_the_xplane_found(qt_app, tmp_path, monkeypatch):
+    xplane = tmp_path / "X-Plane 11"
+    (xplane / "Custom Scenery").mkdir(parents=True)
+    (xplane / "Log.txt").write_bytes(b"Log.txt for X-Plane 11.55r2 (build 115520)\n")
+    wizard = _build_wizard(tmp_path, monkeypatch)
+    page = wizard.scenery_page
+    choice = page.stream_source_choice
+    assert choice.current() == "xp12"
+    wizard.set_value("xplane_path", str(xplane))
+    qt_app.processEvents()
+    assert choice.current() == "xp11"
+    assert not choice.chips["xp11"].isHidden()
+    assert "Needs X-Plane 12" in choice.notes["xp12"].text()
+    # A pick of the user's own stays.
+    choice.buttons["xp12"].click()
+    wizard.set_value("xplane_path", str(tmp_path / "other"))
+    assert choice.current() == "xp12"
 
     wizard.close()
     wizard.deleteLater()
