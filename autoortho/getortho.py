@@ -8718,18 +8718,24 @@ class BackgroundDDSBuilder:
                         staging_path,
                         prefetch_sources,
                     )
-                    self._dds_cache.store_from_file(
+                    stored = self._dds_cache.store_from_file(
                         tile_id, tile.max_zoom, staging_path, tile,
                         mm0_manifest=manifests)
-                    
+
                     build_time = (time.monotonic() - build_start) * 1000
                     status = builder.get_status()
+                    if not stored:
+                        # The texture was built, so no other builder is
+                        # tried, but nothing reached the cache: the caller
+                        # sees the build as failed.
+                        self._note_build_not_stored(tile_id, "Streaming")
+                        return True
                     self._builds_completed += 1
                     log.debug(f"BackgroundDDSBuilder: Streaming built {tile_id} in {build_time:.0f}ms "
                               f"(decoded={status['chunks_decoded']}, fallback={status['chunks_fallback']}, "
                               f"missing={status['chunks_missing']})")
                     bump('prebuilt_dds_builds_streaming')
-                    
+
                     return True
             
             log.debug(f"BackgroundDDSBuilder: Streaming finalize failed for {tile_id}")
@@ -8748,6 +8754,17 @@ class BackgroundDDSBuilder:
             tile._active_streaming_builder = None
             tile._live_transition_event = None
             builder.release()
+
+    @staticmethod
+    def _note_build_not_stored(tile_id, builder_name) -> None:
+        """A background build finished but the DDS cache did not take it."""
+        log.debug(
+            "BackgroundDDSBuilder: %s build of %s was not stored in the "
+            "DDS cache",
+            builder_name,
+            tile_id,
+        )
+        bump('prebuilt_dds_store_failed')
 
     def _build_tile_dds(self, tile) -> None:
         """
@@ -8892,9 +8909,14 @@ class BackgroundDDSBuilder:
                                             staging_path,
                                             hybrid_sources,
                                         )
-                                        self._dds_cache.store_from_file(
+                                        if not self._dds_cache.store_from_file(
                                             tile_id, tile.max_zoom, staging_path, tile,
-                                            mm0_manifest=manifests)
+                                            mm0_manifest=manifests,
+                                        ):
+                                            self._note_build_not_stored(
+                                                tile_id, "Direct-to-disk"
+                                            )
+                                            return
                                         build_time = (time.monotonic() - build_start) * 1000
                                         self._builds_completed += 1
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk built {tile_id} "
@@ -9009,9 +9031,14 @@ class BackgroundDDSBuilder:
                                 staging_path,
                                 native_sources,
                             )
-                            self._dds_cache.store_from_file(
+                            if not self._dds_cache.store_from_file(
                                 tile_id, tile.max_zoom, staging_path, tile,
-                                mm0_manifest=manifests)
+                                mm0_manifest=manifests,
+                            ):
+                                self._note_build_not_stored(
+                                    tile_id, "Native direct-to-disk"
+                                )
+                                return
                             build_time = (time.monotonic() - build_start) * 1000
                             self._builds_completed += 1
                             log.debug(f"BackgroundDDSBuilder: Native direct-to-disk built {tile_id} "

@@ -2098,7 +2098,43 @@ class DynamicDDSCache:
         """
         if not self._enabled:
             return False
+        stored = False
+        try:
+            stored = self._store_from_file(
+                tile_id, max_zoom, source_path, tile,
+                mm0_missing_indices, mm0_fallback_indices, mm0_manifest)
+            return stored
+        finally:
+            if not stored and self._is_staging_path(source_path, max_zoom, tile):
+                # The staging file is this cache's own temp file: a build
+                # that was not stored must not leave it behind.
+                try:
+                    os.remove(source_path)
+                except OSError:
+                    pass
 
+    def _is_staging_path(self, source_path: str, max_zoom: int, tile) -> bool:
+        """``source_path`` is the file ``get_staging_path()`` hands out."""
+        try:
+            dds_path, _ = self._paths_for(
+                tile.row, tile.col, tile.maptype,
+                tile.tilename_zoom, max_zoom)
+        except Exception:
+            return False
+        return self._same_path(source_path, dds_path + f".tmp.{os.getpid()}")
+
+    @staticmethod
+    def _same_path(first: str, second: str) -> bool:
+        return (
+            os.path.normcase(os.path.abspath(first))
+            == os.path.normcase(os.path.abspath(second))
+        )
+
+    def _store_from_file(self, tile_id: str, max_zoom: int,
+                         source_path: str, tile,
+                         mm0_missing_indices: Optional[List[int]] = None,
+                         mm0_fallback_indices: Optional[List[int]] = None,
+                         mm0_manifest=None) -> bool:
         try:
             source_size = os.path.getsize(source_path)
         except OSError:
@@ -2136,6 +2172,11 @@ class DynamicDDSCache:
 
             # Atomic placement: create at a temp name, then os.replace().
             tmp_dds = dds_path + f".tmp.{os.getpid()}"
+            # get_staging_path() hands out this same temp name, so a build
+            # staged there is already in place. Removing it to make room for
+            # a link, as for a source elsewhere, deleted the build itself and
+            # every uncompressed store failed with "file not found".
+            staged_in_place = self._same_path(source_path, tmp_dds)
 
             if self._compression == "zstd" and _HAS_ZSTD:
                 # Read source, compress, write compressed version
@@ -2151,22 +2192,23 @@ class DynamicDDSCache:
                 disk_size = len(disk_bytes)
             else:
                 disk_compression = "none"
-                # Try hard-link first -- zero-copy, instant, works when source
-                # and destination are on the same filesystem.
-                linked = False
-                try:
+                if not staged_in_place:
+                    # Try hard-link first -- zero-copy, instant, works when
+                    # source and destination are on the same filesystem.
+                    linked = False
                     try:
-                        os.remove(tmp_dds)
+                        try:
+                            os.remove(tmp_dds)
+                        except OSError:
+                            pass
+                        os.link(source_path, tmp_dds)
+                        linked = True
                     except OSError:
                         pass
-                    os.link(source_path, tmp_dds)
-                    linked = True
-                except OSError:
-                    pass
 
-                if not linked:
-                    import shutil
-                    shutil.copy2(source_path, tmp_dds)
+                    if not linked:
+                        import shutil
+                        shutil.copy2(source_path, tmp_dds)
                 disk_size = source_size
 
                 # Windows requires a writable handle for fsync/_commit.

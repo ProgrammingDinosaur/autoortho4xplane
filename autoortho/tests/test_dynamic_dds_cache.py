@@ -1632,6 +1632,73 @@ class TestGetStagingPath:
         parent = os.path.dirname(path)
         assert os.path.isdir(parent)
 
+    @pytest.mark.parametrize("compression", ["none", "zstd"])
+    def test_build_staged_in_place_is_stored(
+        self, dds_cache, mock_tile, sample_dds_bytes, monkeypatch, compression,
+    ):
+        """A build written to the staging path reaches the cache.
+
+        The staging path is the store's own temp name. Stored uncompressed
+        (direct reads on, the default), the store removed that temp file to
+        make room for a link to the source, which was the same file: every
+        background build failed with "file not found".
+        """
+        from autoortho.aopipeline import dynamic_dds_cache as module
+
+        if compression == "zstd" and not module._HAS_ZSTD:
+            pytest.skip("zstandard unavailable")
+        monkeypatch.setattr(dds_cache, "_max_size", 32 * 1024 * 1024)
+        monkeypatch.setattr(dds_cache, "_compression", compression)
+        staging = dds_cache.get_staging_path(
+            mock_tile.id, mock_tile.max_zoom, mock_tile)
+        with open(staging, "wb") as staged:
+            staged.write(sample_dds_bytes)
+
+        assert dds_cache.store_from_file(
+            mock_tile.id, mock_tile.max_zoom, staging, mock_tile
+        ) is True
+
+        assert not os.path.exists(staging)
+        assert dds_cache.contains(mock_tile.id, mock_tile.max_zoom, mock_tile)
+        assert dds_cache.load(
+            mock_tile.id, mock_tile.max_zoom, mock_tile
+        ) == sample_dds_bytes
+
+    def test_rejected_staged_build_leaves_no_temp_file(
+        self, dds_cache, mock_tile, sample_dds_bytes, monkeypatch,
+    ):
+        """A staged build the cache does not take is not left on disk."""
+        monkeypatch.setattr(dds_cache, "_compression", "none")
+        staging = dds_cache.get_staging_path(
+            mock_tile.id, mock_tile.max_zoom, mock_tile)
+        with open(staging, "wb") as staged:
+            staged.write(sample_dds_bytes)
+
+        # No row manifest: the store is refused.
+        assert dds_cache.store_from_file(
+            mock_tile.id, mock_tile.max_zoom, staging, mock_tile,
+            mm0_manifest={},
+        ) is False
+
+        assert not os.path.exists(staging)
+        assert not dds_cache.contains(
+            mock_tile.id, mock_tile.max_zoom, mock_tile)
+
+    def test_rejected_source_elsewhere_is_kept(
+        self, dds_cache, mock_tile, sample_dds_bytes, cache_dir,
+    ):
+        """Only the cache's own staging file is removed on a failed store."""
+        source_path = os.path.join(cache_dir, "ephemeral_tile.dds")
+        with open(source_path, "wb") as source:
+            source.write(sample_dds_bytes)
+
+        assert dds_cache.store_from_file(
+            mock_tile.id, mock_tile.max_zoom, source_path, mock_tile,
+            mm0_manifest={},
+        ) is False
+
+        assert os.path.exists(source_path)
+
 
 # ============================================================================
 # Zstd Compression Tests
