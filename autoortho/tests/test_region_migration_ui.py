@@ -163,3 +163,54 @@ def test_no_scenery_explanation_when_set_up_the_recommended_way(
     finally:
         ui.close()
         ui.deleteLater()
+
+
+def test_a_burst_of_task_updates_refreshes_the_library_once(
+        qt_app, monkeypatch, tmp_path):
+    """Moving a region reports progress many times a second; rebuilding the
+    Scenery Library for each report froze the window (3.4.1 start-up move)."""
+    from ui.task_models import TaskType
+    monkeypatch.setattr(ConfigUI, "refresh_scenery_list",
+                        lambda self: self.scenery_layout.addStretch())
+    monkeypatch.setattr(ConfigUI, "start_update_check",
+                        lambda self, manual=False: None)
+    cfg = AOConfig(str(tmp_path / ".autoortho"))
+    cfg.paths.scenery_path = str(tmp_path / "Custom Scenery")
+    cfg.paths.cache_dir = str(tmp_path / "cache")
+    cfg.paths.download_dir = str(tmp_path / "downloads")
+    cfg.paths.xplane_path = str(tmp_path / "X-Plane")
+    cfg.general.setup_complete = True
+    cfg.cache.auto_clean_cache = False
+    cfg.save()
+    cfg.get_config()
+    ao_dir = os.path.join(cfg.paths.scenery_path, "z_autoortho", "scenery")
+    os.makedirs(ao_dir, exist_ok=True)
+    make_streaming(ao_dir, source="xp12")
+
+    ui = ConfigUI(cfg)
+    try:
+        assert wait_until(lambda: ui.scenery_library_page.stream_panel.enabled)
+        page = ui.scenery_library_page
+        real_set_regions = page.set_regions
+        calls = []
+
+        def set_regions(*args, **kwargs):
+            calls.append(1)
+            return real_set_regions(*args, **kwargs)
+
+        monkeypatch.setattr(page, "set_regions", set_regions)
+        manager = ui.task_manager
+        manager.create_task("burst", TaskType.SCENERY_INSTALL, "Burst")
+        for i in range(1000):
+            manager.update_task("burst", progress=i / 10.0,
+                                stage=f"Moving eur: {i} of 1000 files")
+        assert calls == []  # coalesced, not one rebuild per update
+        assert wait_until(lambda: len(calls) >= 1)
+        deadline = time.time() + 0.6
+        while time.time() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        assert len(calls) == 1
+    finally:
+        ui.close()
+        ui.deleteLater()

@@ -846,10 +846,10 @@ class Release(object):
             h.write(json.dumps(info_dict, indent=4, default=vars))
 
     def parse(self):
-        log.info(f"Begin parsing info_dict for {self.name}")
-
         if self.parsed:
-            return
+            return  # UI refreshes call this often; only real parses log
+
+        log.info(f"Begin parsing info_dict for {self.name}")
 
         info = {}
         packages = []

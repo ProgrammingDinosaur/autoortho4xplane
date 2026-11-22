@@ -53,6 +53,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -68,6 +69,7 @@ REGION_PREFIX = "z_ao_"
 SEASON_BACKUPS = "dsf_backups"
 REGION_SET = "xp11"          # what the region installer installed
 MIN_KNOWN = 0.5              # share of a region's DSFs the index must have
+PROGRESS_INTERVAL = 0.25     # seconds between progress reports while moving
 
 
 @dataclass
@@ -397,6 +399,7 @@ def _adopt_checked(ao_scenery_dir: str, check: RegionCheck, pkg_root: str,
     dsfs = _dsfs(root)
     total = len(linked) + len(dsfs)
     files = size = 0
+    last_report = None
     for i, rel in enumerate(linked + dsfs, 1):
         if cancelled():
             return None
@@ -407,8 +410,14 @@ def _adopt_checked(ao_scenery_dir: str, check: RegionCheck, pkg_root: str,
         if added and not rel.startswith("terrain/"):
             files += 1
             size += n
-        if progress and (i % 50 == 0 or i == total):
-            progress(check.region_id, i, total)
+        if progress:
+            # By time, not file count: links take microseconds, and each
+            # report crosses to the UI thread.
+            now = time.monotonic()
+            if (i == total or last_report is None
+                    or now - last_report >= PROGRESS_INTERVAL):
+                last_report = now
+                progress(check.region_id, i, total)
     if own_terrain and check.tiles:
         # Its tiles are another set's than the package's: say so (the map
         # shows it, and deleting one removes its own terrain files too).

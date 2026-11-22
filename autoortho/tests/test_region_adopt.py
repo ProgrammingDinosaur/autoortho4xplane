@@ -95,6 +95,41 @@ def test_region_moves_into_the_package_and_is_pinned(ao_dir):
     assert ra.installed_regions(ao_dir) == []
 
 
+class _Clock:
+    def __init__(self, step):
+        self.now, self.step = 100.0, step
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
+def _progress_steps(ao_dir, monkeypatch, clock_step):
+    """Moves a region of 3 DSFs and 20 masks with a clock that advances
+    ``clock_step`` seconds per reading; returns the progress reports."""
+    make_streaming(ao_dir)
+    masks = [f"textures/{100000 + i}_148176_ZL18.png" for i in range(20)]
+    make_region(ao_dir, "eur", TILES, masks=masks)
+    monkeypatch.setattr(ra.time, "monotonic", _Clock(clock_step))
+    steps = []
+    result = ra.adopt_regions(ao_dir, progress=lambda *a: steps.append(a))
+    assert result.regions == ["eur"] and not result.errors
+    return steps
+
+
+def test_fast_moves_report_progress_by_time_not_per_file(ao_dir, monkeypatch):
+    """Links take microseconds: reporting every few files flooded the UI
+    thread with updates and froze the window during the start-up move."""
+    steps = _progress_steps(ao_dir, monkeypatch, clock_step=0.0)
+    assert steps == [("eur", 1, 23), ("eur", 23, 23)]
+
+
+def test_slow_moves_report_each_interval(ao_dir, monkeypatch):
+    steps = _progress_steps(ao_dir, monkeypatch,
+                            clock_step=ra.PROGRESS_INTERVAL)
+    assert [done for _, done, _ in steps] == list(range(1, 24))
+
+
 def test_patched_overlapping_and_unindexed_tiles_move_as_they_are(ao_dir):
     """Seasons-patched DSFs keep their seasons; tiles the index lacks still
     move (the mount lists stored DSFs), as long as most are known."""

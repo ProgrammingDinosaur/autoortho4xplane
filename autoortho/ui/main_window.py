@@ -218,6 +218,9 @@ from PySide6.QtGui import (
 
 log = logging.getLogger(__name__)
 
+# Task updates within this window share one Scenery Library / Home refresh.
+TASK_VIEWS_REFRESH_MS = 250
+
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
     CUR_PATH = os.path.join(sys._MEIPASS, 'autoortho')
 else:
@@ -1429,14 +1432,21 @@ class ConfigUI(QMainWindow):
             title="Diagnostics",
         )
 
+        # A long task can report progress hundreds of times a second (moving
+        # a region's files); rebuilding the Scenery Library for each update
+        # starves the UI thread. One refresh per burst instead.
+        self._task_views_timer = QTimer(self)
+        self._task_views_timer.setSingleShot(True)
+        self._task_views_timer.setInterval(TASK_VIEWS_REFRESH_MS)
+        self._task_views_timer.timeout.connect(self._refresh_phase3_task_views)
         self.task_manager.task_added.connect(
-            lambda task: self._refresh_phase3_task_views()
+            lambda task: self._schedule_task_views_refresh()
         )
         self.task_manager.task_updated.connect(
-            lambda task: self._refresh_phase3_task_views()
+            lambda task: self._schedule_task_views_refresh()
         )
         self.task_manager.task_removed.connect(
-            lambda task_id: self._refresh_phase3_task_views()
+            lambda task_id: self._schedule_task_views_refresh()
         )
         self.task_manager.active_count_changed.connect(
             lambda count: self._update_shell_status()
@@ -2795,7 +2805,17 @@ class ConfigUI(QMainWindow):
             self._refresh_phase3_task_views()
             self._refresh_region_checks()
 
+    def _schedule_task_views_refresh(self):
+        """Refresh the task views soon. Unlike restarting the timer, the
+        first update of a burst sets the time, so steady progress still
+        shows about four times a second."""
+        if not self._task_views_timer.isActive():
+            self._task_views_timer.start()
+
     def _refresh_phase3_task_views(self):
+        timer = getattr(self, "_task_views_timer", None)
+        if timer is not None:
+            timer.stop()  # a direct refresh covers any pending one
         if not self.phase3_active:
             return
         self.scenery_library_page.set_regions(
