@@ -33,6 +33,11 @@ except ImportError:
     from utils.constants import system_type
 
 try:
+    from autoortho import read_trace
+except ImportError:
+    import read_trace
+
+try:
     from autoortho import wait_bands
 except ImportError:
     import wait_bands
@@ -809,6 +814,8 @@ class AutoOrtho(Operations):
 
     # Streaming defaults, so instances built without __init__ (tests) work.
     _stream = None
+    # Texture reads recorded for the replay benchmark (AO_READ_TRACE).
+    _read_trace = None
     _virtual_files = {}
     _virtual_lock = threading.Lock()
     _stream_fallback = set()
@@ -827,6 +834,7 @@ class AutoOrtho(Operations):
         )
         self.root = os.path.abspath(root)
         self.cache_dir = cache_dir
+        self._read_trace = read_trace.from_environment(position=_trace_position)
 
         getortho.clear_shutdown_request()
         # Shared workers pass one TileCacher to every mount they serve.
@@ -1664,6 +1672,8 @@ class AutoOrtho(Operations):
                 getortho.register_discovered_maptype(maptype)
 
             tile_id = f"{row}_{col}_{maptype}_{zoom}"
+            if self._read_trace is not None:
+                self._read_trace.event("open", path)
             getortho.note_texture_requested(row, col, zoom)
             # A finished texture is served from its cache file, with no
             # tile in memory (see disk_texture.py).
@@ -1749,9 +1759,21 @@ class AutoOrtho(Operations):
         os.chown(full_path,uid,gid) #chown to context uid & gid
         return fd
 
+    def read(self, path, length, offset, fh):
+        trace = self._read_trace
+        if trace is None or not self.dds_re.match(path):
+            return self._read(path, length, offset, fh)
+        started = time.monotonic()
+        data = self._read(path, length, offset, fh)
+        trace.event(
+            "read", path, offset=int(offset), length=int(length),
+            ms=round((time.monotonic() - started) * 1000.0, 2),
+        )
+        return data
+
     #@profile
     #@lru_cache
-    def read(self, path, length, offset, fh):
+    def _read(self, path, length, offset, fh):
         if TRACE_READS:
             log.debug(f"READ: {path} {offset} {length} {fh}")
         m = self.dds_re.match(path)
@@ -1980,6 +2002,8 @@ class AutoOrtho(Operations):
         
         dds_match = self.dds_re.match(path)
         if dds_match:
+            if self._read_trace is not None:
+                self._read_trace.event("release", path)
             row, col, maptype, zoom = dds_match.groups()
             row = int(row)
             col = int(col)
@@ -2027,6 +2051,21 @@ def do_fuse_exit(fuse_ptr=None):
     if not fuse_ptr:
         fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
     _libfuse.fuse_exit(fuse_ptr)
+
+
+def _trace_position():
+    """The aircraft position for the read trace (None without one)."""
+    camera = getortho.current_camera()
+    if camera is None:
+        return None
+    lat, lon, agl_m, hdg, speed = camera
+    return {
+        "lat": round(float(lat), 6),
+        "lon": round(float(lon), 6),
+        "agl_m": round(float(agl_m), 1),
+        "hdg": round(float(hdg or 0.0), 1),
+        "gs": round(float(speed or 0.0), 1),
+    }
 
 
 def run(ao, mountpoint, name="", nothreads=False):
