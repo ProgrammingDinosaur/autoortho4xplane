@@ -1002,3 +1002,53 @@ def test_builder_exception_clears_pending_ownership():
     assert candidate.build_pending is False
     assert key not in coordinator._candidates
     assert cacher.closes == 1
+
+
+# Performance plan, item 7: a pass keeps its lease while its row builds run.
+
+
+def _deferred_pass_with_rows(rows_in_flight):
+    coordinator, cacher, _ = make_coordinator(
+        count=8,
+        statuses=(
+            PrefetchSubmitStatus.ACCEPTED,
+            PrefetchSubmitStatus.NO_CAPACITY,
+        ),
+    )
+    key = publish(coordinator)
+    candidate = coordinator._candidates[key]
+    result = coordinator._admit(candidate)
+    assert result.reason == PrefetchBatchReason.NO_CAPACITY
+    candidate.active_chunks.clear()
+    tile = candidate.lease.tile
+    tile.exact_rows_in_flight = lambda: rows_in_flight[0]
+    return coordinator, cacher, candidate, result
+
+
+def test_deferred_pass_keeps_lease_while_rows_build_then_drops_it():
+    rows = [2]
+    coordinator, cacher, candidate, result = _deferred_pass_with_rows(rows)
+    coordinator._defer_candidate(candidate, result.reason)
+    assert candidate.lease is not None
+    assert cacher.closes == 0
+
+    rows[0] = 0  # the rows were saved
+    coordinator._defer_candidate(candidate, result.reason)
+    assert candidate.lease is None
+    assert cacher.closes == 1
+    assert candidate.rows_hold_started_at == 0.0
+
+
+def test_row_stuck_in_flight_loses_the_lease_at_the_deadline(monkeypatch):
+    import prefetch
+
+    rows = [1]
+    coordinator, cacher, candidate, result = _deferred_pass_with_rows(rows)
+    now = [1000.0]
+    monkeypatch.setattr(prefetch.time, "monotonic", lambda: now[0])
+    coordinator._defer_candidate(candidate, result.reason)
+    assert candidate.lease is not None
+    now[0] += prefetch._ROW_BUILD_HOLD_SECONDS + 0.1
+    coordinator._defer_candidate(candidate, result.reason)
+    assert candidate.lease is None
+    assert cacher.closes == 1

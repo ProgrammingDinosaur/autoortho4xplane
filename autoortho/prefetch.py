@@ -27,6 +27,19 @@ log = logging.getLogger(__name__)
 # item 2): every chunk event used to publish nine of them, two summed over
 # every candidate.
 _REPORT_INTERVAL_SECONDS = 0.25
+# A deferred pass keeps its lease at most this long for the exact row builds
+# it queued (performance plan, item 7).
+_ROW_BUILD_HOLD_SECONDS = 10.0
+
+
+def _rows_in_flight(tile: Any) -> int:
+    probe = getattr(tile, "exact_rows_in_flight", None)
+    if probe is None:
+        return 0
+    try:
+        return int(probe() or 0)
+    except Exception:
+        return 0
 
 
 class PrefetchSource(str, Enum):
@@ -341,6 +354,9 @@ class PrefetchCandidate:
     durable_rows_seen: int = 0
     unsaved_coverage_dropped: bool = False
     fruitless_passes: int = 0
+    # When a deferred pass began keeping its lease for row builds still in
+    # flight (_defer_candidate); 0.0 while it holds none.
+    rows_hold_started_at: float = 0.0
 
     @property
     def terminal(self) -> bool:
@@ -2625,6 +2641,25 @@ class PrefetchCoordinator:
                 and not candidate.build_pending
                 and not target_complete
             )
+            # Dropping the lease closes the tile, which kills the row builds
+            # this pass just queued. Keep it while they run, up to a deadline,
+            # so a row stuck in a state cannot hold the chunk budget for good.
+            if should_drop and tile is not None:
+                rows_in_flight = _rows_in_flight(tile)
+                now = time.monotonic()
+                if rows_in_flight > 0:
+                    if candidate.rows_hold_started_at <= 0.0:
+                        candidate.rows_hold_started_at = now
+                    if (
+                        now - candidate.rows_hold_started_at
+                        < _ROW_BUILD_HOLD_SECONDS
+                    ):
+                        should_drop = False
+                        self._metric("prefetch_lease_held_for_rows")
+                    else:
+                        self._metric("prefetch_lease_row_hold_expired")
+            if should_drop or tile is None:
+                candidate.rows_hold_started_at = 0.0
         self._metric(f"prefetch_admission_{reason.value}")
         if should_drop:
             self._drop_lease(candidate)
@@ -2733,6 +2768,7 @@ class PrefetchCoordinator:
     ) -> Optional[PrefetchLease]:
         with self._lock:
             lease, candidate.lease = candidate.lease, None
+            candidate.rows_hold_started_at = 0.0
             if lease is None:
                 return None
             tile_id = getattr(lease.tile, "id", "")

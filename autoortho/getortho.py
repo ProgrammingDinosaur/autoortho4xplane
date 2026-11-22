@@ -11794,9 +11794,30 @@ class Tile(object):
             self._exact_row_states[row_index] = "unbuilt"
         _exact_row_capacity.release()
 
+    def exact_rows_in_flight(self):
+        """Rows queued for an exact build, building, or built and not saved.
+
+        A prefetch pass keeps its lease while this is above zero, so closing
+        the tile does not throw away the row builds it just queued.
+        """
+        with self._exact_row_lock:
+            return sum(
+                1
+                for state in self._exact_row_states.values()
+                if state in ("build_queued", "building")
+            )
+
     def _run_exact_prefetch_row(self, row_index):
         try:
             if self._closed or is_shutdown_requested():
+                # Leave no row behind in "build_queued": it would count as in
+                # flight for good and keep a prefetch lease alive.
+                with self._exact_row_lock:
+                    if self._exact_row_states.get(row_index) in (
+                        "build_queued",
+                        "building",
+                    ):
+                        self._exact_row_states[row_index] = "unbuilt"
                 return
             with self._exact_row_lock:
                 self._exact_row_states[row_index] = "building"
