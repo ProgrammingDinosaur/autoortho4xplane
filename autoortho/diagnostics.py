@@ -49,6 +49,24 @@ _MAX_OBSERVED_MEMORY_SAMPLES = 7_200
 # process) and a thread count lists every process on the system, so sampling them
 # every second cost about 16% of a flight's CPU.
 _DETAIL_SAMPLE_SECONDS = 10.0
+# Processes whose timeline rarely explains a stutter (the parent, the brokers,
+# the stats manager) are sampled at most this often. The mount worker keeps the
+# configured interval: its 1 s timeline is the one that explains stutters.
+_HELPER_SAMPLE_SECONDS = 5.0
+# Field order of a memory sample tuple, as written to the samples file.
+_SAMPLE_FIELDS = (
+    "timestamp",
+    "elapsed_s",
+    "rss_bytes",
+    "uss_bytes",
+    "vms_bytes",
+    "physical_footprint_bytes",
+    "cpu_percent",
+    "threads",
+    "read_bytes",
+    "write_bytes",
+)
+_JSON_SEPARATORS = (",", ":")
 
 _active_profiler: Optional["PerformanceProfiler"] = None
 
@@ -407,6 +425,66 @@ def _sanitize_json(value: Any) -> Any:
     return repr(value)
 
 
+def _sample_dict(sample) -> dict:
+    return dict(zip(_SAMPLE_FIELDS, sample))
+
+
+def _samples_path_for(process_path: Path) -> Path:
+    """``process-<pid>-<role>.json`` -> ``process-<pid>-<role>.samples.jsonl``."""
+    return process_path.with_name(process_path.stem + ".samples.jsonl")
+
+
+def _append_samples_file(path: Path, samples: list[tuple]) -> None:
+    if not samples:
+        return
+    lines = "".join(
+        json.dumps(list(sample), separators=_JSON_SEPARATORS) + "\n"
+        for sample in samples
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(lines)
+
+
+def _read_samples_file(path: Path, limit: int = _MAX_SELF_MEMORY_SAMPLES) -> list[dict]:
+    """Read an append-only samples file, compacted to ``limit`` entries."""
+    samples: list[tuple] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    values = json.loads(line)
+                except ValueError:
+                    # A line cut short by a crash mid-append.
+                    continue
+                if not isinstance(values, list) or len(values) != len(_SAMPLE_FIELDS):
+                    continue
+                _append_bounded_sample(samples, tuple(values), limit)
+    except OSError:
+        return []
+    return [_sample_dict(sample) for sample in samples]
+
+
+def load_process_profile(path: Path) -> dict:
+    """Read one process profile, in either layout.
+
+    A checkpoint written while the process runs keeps its memory samples in an
+    append-only ``.samples.jsonl`` file beside it (``samples_file``); a complete
+    profile, and those of older versions, hold them inline. Both come back in
+    the inline layout.
+    """
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as handle:
+        profile = json.load(handle)
+    samples_file = profile.pop("samples_file", None)
+    if samples_file:
+        samples_path = path.with_name(Path(str(samples_file)).name)
+        profile["memory_samples"] = _read_samples_file(samples_path)
+    return profile
+
+
 def _append_bounded_sample(samples: list[tuple], sample: tuple, limit: int) -> None:
     samples.append(sample)
     if len(samples) <= limit:
@@ -575,6 +653,9 @@ class PerformanceProfiler:
         self.session_id = str(session_id)
         self.role = str(role)
         self.sample_interval = sample_interval
+        # What child processes are told to use: the configured interval, even
+        # when this process samples itself less often (a helper process).
+        self.child_sample_interval = sample_interval
         self.slow_operation_ms = slow_operation_ms
         self.max_slow_operations = max_slow_operations
         self.trace_python_allocations = trace_python_allocations
@@ -588,6 +669,10 @@ class PerformanceProfiler:
         self._gauges: dict[str, GaugeAggregate] = {}
         self._slow_operations: list[tuple[float, int, dict]] = []
         self._memory_samples: list[tuple] = []
+        # Samples taken since the last checkpoint, appended to the samples file
+        # then: checkpoints never rewrite the timeline.
+        self._unsaved_samples: list[tuple] = []
+        self._host: Optional[dict] = None
         self._observed_processes: dict[int, dict] = {}
         self._sequence = 0
         self._lock = threading.RLock()
@@ -698,7 +783,7 @@ class PerformanceProfiler:
             _PROFILE_ENV_ENABLED: "1",
             _PROFILE_ENV_SESSION_DIR: str(self.session_dir),
             _PROFILE_ENV_SESSION_ID: self.session_id,
-            _PROFILE_ENV_INTERVAL: str(self.sample_interval),
+            _PROFILE_ENV_INTERVAL: str(self.child_sample_interval),
             _PROFILE_ENV_SLOW_MS: str(self.slow_operation_ms),
             _PROFILE_ENV_MAX_EVENTS: str(self.max_slow_operations),
             _PROFILE_ENV_ALLOCATIONS: "1" if self.trace_python_allocations else "0",
@@ -745,6 +830,12 @@ class PerformanceProfiler:
         process_path = self._process_path()
         with self._profile_write_lock:
             _atomic_json_write(process_path, profile)
+            # The complete profile holds every sample inline.
+            self._unsaved_samples.clear()
+            try:
+                _samples_path_for(process_path).unlink(missing_ok=True)
+            except OSError:
+                pass
         self._write_observed_process_profiles()
 
         report_path = None
@@ -782,11 +873,22 @@ class PerformanceProfiler:
             with self._profile_write_lock:
                 if self._stopped or self._stop_event.is_set():
                     return
+                process_path = self._process_path()
+                with self._lock:
+                    unsaved, self._unsaved_samples = self._unsaved_samples, []
+                try:
+                    _append_samples_file(_samples_path_for(process_path), unsaved)
+                except OSError:
+                    # Keep them for the next checkpoint rather than lose them.
+                    with self._lock:
+                        self._unsaved_samples[:0] = unsaved
+                    raise
                 profile = self._build_process_profile(
                     [],
                     profile_status="checkpoint",
+                    inline_samples=False,
                 )
-                _atomic_json_write(self._process_path(), profile)
+                _atomic_json_write(process_path, profile)
                 self._write_observed_process_profiles()
         except Exception as exc:
             log.debug("Performance checkpoint failed: %s", exc)
@@ -845,8 +947,21 @@ class PerformanceProfiler:
                     sample,
                     _MAX_SELF_MEMORY_SAMPLES,
                 )
+                self._unsaved_samples.append(sample)
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             return
+
+    def _host_info(self) -> dict:
+        if self._host is None:
+            self._host = {
+                "hostname": socket.gethostname(),
+                "platform": platform.platform(),
+                "python": platform.python_version(),
+                "cpu_count": psutil.cpu_count(logical=True),
+                "physical_cpu_count": psutil.cpu_count(logical=False),
+                "total_memory_bytes": int(psutil.virtual_memory().total),
+            }
+        return dict(self._host)
 
     def _sample_observed_process(self, entry: dict) -> None:
         process = entry["process"]
@@ -923,6 +1038,7 @@ class PerformanceProfiler:
         allocation_stats: list[dict],
         *,
         profile_status: str,
+        inline_samples: bool = True,
     ) -> dict:
         with self._lock:
             stages = {
@@ -941,10 +1057,10 @@ class PerformanceProfiler:
                     reverse=True,
                 )
             ]
-            memory_samples = list(self._memory_samples)
+            memory_samples = list(self._memory_samples) if inline_samples else []
 
         ended_wall = time.time()
-        return {
+        profile = {
             "schema_version": 1,
             "session_id": self.session_id,
             "role": self.role,
@@ -955,14 +1071,7 @@ class PerformanceProfiler:
             "started_wall_time": self.started_wall,
             "ended_wall_time": ended_wall,
             "duration_seconds": round(ended_wall - self.started_wall, 3),
-            "host": {
-                "hostname": socket.gethostname(),
-                "platform": platform.platform(),
-                "python": platform.python_version(),
-                "cpu_count": psutil.cpu_count(logical=True),
-                "physical_cpu_count": psutil.cpu_count(logical=False),
-                "total_memory_bytes": int(psutil.virtual_memory().total),
-            },
+            "host": self._host_info(),
             "settings": {
                 "sample_interval_seconds": self.sample_interval,
                 "slow_operation_ms": self.slow_operation_ms,
@@ -974,23 +1083,12 @@ class PerformanceProfiler:
             "stages": stages,
             "gauges": gauges,
             "slow_operations": slow_operations,
-            "memory_samples": [
-                {
-                    "timestamp": sample[0],
-                    "elapsed_s": sample[1],
-                    "rss_bytes": sample[2],
-                    "uss_bytes": sample[3],
-                    "vms_bytes": sample[4],
-                    "physical_footprint_bytes": sample[5],
-                    "cpu_percent": sample[6],
-                    "threads": sample[7],
-                    "read_bytes": sample[8],
-                    "write_bytes": sample[9],
-                }
-                for sample in memory_samples
-            ],
+            "memory_samples": [_sample_dict(sample) for sample in memory_samples],
             "python_allocations": allocation_stats,
         }
+        if not inline_samples:
+            profile["samples_file"] = _samples_path_for(self._process_path()).name
+        return profile
 
     def _write_observed_process_profiles(self) -> None:
         with self._lock:
@@ -1032,14 +1130,7 @@ class PerformanceProfiler:
                 "duration_seconds": round(
                     max(0.0, ended_wall - entry["started_wall_time"]), 3
                 ),
-                "host": {
-                    "hostname": socket.gethostname(),
-                    "platform": platform.platform(),
-                    "python": platform.python_version(),
-                    "cpu_count": psutil.cpu_count(logical=True),
-                    "physical_cpu_count": psutil.cpu_count(logical=False),
-                    "total_memory_bytes": int(psutil.virtual_memory().total),
-                },
+                "host": self._host_info(),
                 "settings": {
                     "sample_interval_seconds": self.sample_interval,
                     "observed_by_parent": True,
@@ -1051,21 +1142,7 @@ class PerformanceProfiler:
                 "stages": {},
                 "gauges": {},
                 "slow_operations": [],
-                "memory_samples": [
-                    {
-                        "timestamp": sample[0],
-                        "elapsed_s": sample[1],
-                        "rss_bytes": sample[2],
-                        "uss_bytes": sample[3],
-                        "vms_bytes": sample[4],
-                        "physical_footprint_bytes": sample[5],
-                        "cpu_percent": sample[6],
-                        "threads": sample[7],
-                        "read_bytes": sample[8],
-                        "write_bytes": sample[9],
-                    }
-                    for sample in samples
-                ],
+                "memory_samples": [_sample_dict(sample) for sample in samples],
                 "python_allocations": [],
             }
             _atomic_json_write(observed_path, profile)
@@ -1169,16 +1246,17 @@ def start_parent_profiler(cfg: Any) -> Optional[PerformanceProfiler]:
     )
 
     metadata = {"config": _config_snapshot(cfg)}
+    configured_interval = _safe_number(
+        getattr(diagnostics_cfg, "sample_interval_seconds", 1.0),
+        1.0,
+        0.1,
+        60.0,
+    )
     profiler = PerformanceProfiler(
         session_dir=session_dir,
         session_id=session_id,
         role="parent",
-        sample_interval=_safe_number(
-            getattr(diagnostics_cfg, "sample_interval_seconds", 1.0),
-            1.0,
-            0.1,
-            60.0,
-        ),
+        sample_interval=max(configured_interval, _HELPER_SAMPLE_SECONDS),
         slow_operation_ms=_safe_number(
             getattr(diagnostics_cfg, "slow_operation_ms", 250.0),
             250.0,
@@ -1202,10 +1280,20 @@ def start_parent_profiler(cfg: Any) -> Optional[PerformanceProfiler]:
         ),
         metadata=metadata,
     )
+    # Mount workers sample at the interval the user configured.
+    profiler.child_sample_interval = configured_interval
     return _activate_profiler(profiler)
 
 
-def start_worker_profiler_from_env(role: str) -> Optional[PerformanceProfiler]:
+def start_worker_profiler_from_env(
+    role: str,
+    helper: bool = False,
+) -> Optional[PerformanceProfiler]:
+    """Start this process's profiler from the parent's environment.
+
+    ``helper`` processes (the brokers) sample at most every
+    ``_HELPER_SAMPLE_SECONDS``; a mount worker keeps the configured interval.
+    """
     if not _as_bool(os.getenv(_PROFILE_ENV_ENABLED), False):
         return None
     session_dir = os.getenv(_PROFILE_ENV_SESSION_DIR)
@@ -1213,12 +1301,16 @@ def start_worker_profiler_from_env(role: str) -> Optional[PerformanceProfiler]:
     if not session_dir or not session_id:
         log.warning("Profiling was enabled without a session directory or ID")
         return None
+    sample_interval = _safe_number(
+        os.getenv(_PROFILE_ENV_INTERVAL), 1.0, 0.1, 60.0
+    )
     profiler = PerformanceProfiler(
         session_dir=Path(session_dir),
         session_id=session_id,
         role=f"mount-worker:{role}",
-        sample_interval=_safe_number(
-            os.getenv(_PROFILE_ENV_INTERVAL), 1.0, 0.1, 60.0
+        sample_interval=(
+            max(sample_interval, _HELPER_SAMPLE_SECONDS) if helper
+            else sample_interval
         ),
         slow_operation_ms=_safe_number(
             os.getenv(_PROFILE_ENV_SLOW_MS), 250.0, 1.0, 300_000.0
@@ -1310,7 +1402,7 @@ def _atomic_json_write(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
+        json.dump(payload, handle, separators=_JSON_SEPARATORS, sort_keys=True)
     os.replace(temporary, path)
 
 
@@ -1327,8 +1419,7 @@ def finalize_session_report(
     }
     for path in sorted(Path(session_dir).glob("process-*.json")):
         try:
-            with path.open("r", encoding="utf-8") as handle:
-                profile = json.load(handle)
+            profile = load_process_profile(path)
             if profile.get("session_id") == session_id:
                 pid = int(profile.get("pid", 0) or 0)
                 process_key = (pid, str(profile.get("role", "")))

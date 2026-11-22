@@ -619,7 +619,7 @@ class StatsStore:
 
 
 class StatsBatcher:
-    def __init__(self, flush_interval=0.05, max_items=200):
+    def __init__(self, flush_interval=1.0, max_items=200):
         self._buf = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()

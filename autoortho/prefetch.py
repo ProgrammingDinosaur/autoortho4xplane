@@ -23,6 +23,11 @@ from typing import Any, Callable, Hashable, Iterable, Optional
 
 log = logging.getLogger(__name__)
 
+# The coordinator's gauges are published at most this often (performance plan,
+# item 2): every chunk event used to publish nine of them, two summed over
+# every candidate.
+_REPORT_INTERVAL_SECONDS = 0.25
+
 
 class PrefetchSource(str, Enum):
     DSF = "dsf"
@@ -936,6 +941,10 @@ class PrefetchCoordinator:
         self._materialized_chunks = 0
         self._resident_jpeg_bytes = 0
         self._peak_candidates = 0
+        # Gauge publication is throttled (_report_locked).
+        self._report_dirty = False
+        self._report_flush_scheduled = False
+        self._last_report_at = 0.0
         add_pressure_listener = getattr(
             self.chunk_getter, "add_pressure_listener", None
         )
@@ -1440,7 +1449,7 @@ class PrefetchCoordinator:
             self._live_owned.clear()
             self._live_tile_keys.clear()
             self._rediscovery.clear()
-            self._report_locked()
+            self._report_locked(force=True)
         remove_pressure_listener = getattr(
             self.chunk_getter, "remove_pressure_listener", None
         )
@@ -1452,6 +1461,7 @@ class PrefetchCoordinator:
         while not self._stop.is_set():
             self._wake.wait(self._next_wake_delay())
             self._wake.clear()
+            self._flush_report_if_due()
             self._resume_pressure_waiters()
             while not self._stop.is_set():
                 candidate = None
@@ -1519,6 +1529,9 @@ class PrefetchCoordinator:
                     self._pressure.clear_since
                     + self._pressure.minimum_pause
                 )
+            report_due = self._report_due_at()
+            if report_due is not None:
+                deadlines.append(report_due)
         if not deadlines:
             return None
         return max(0.0, min(deadlines) - time.monotonic())
@@ -2692,6 +2705,8 @@ class PrefetchCoordinator:
             self._notify(self.on_complete, candidate.key)
         if should_release:
             self._release_candidate(candidate)
+        # A final state is worth publishing at once, throttle or not.
+        self._report(force=True)
 
     def _release_candidate(self, candidate: PrefetchCandidate) -> None:
         lease = self._drop_lease(candidate)
@@ -2832,11 +2847,45 @@ class PrefetchCoordinator:
         except Exception:
             pass
 
-    def _report(self) -> None:
+    def _report(self, force: bool = False) -> None:
         with self._lock:
-            self._report_locked()
+            self._report_locked(force=force)
 
-    def _report_locked(self) -> None:
+    def _report_locked(self, force: bool = False) -> None:
+        """Mark the gauges stale and publish them at most four times a second.
+
+        Chunk events arrive by the thousand; two of the gauges sum over every
+        candidate. A throttled report is published by the coordinator thread
+        when its interval has passed (``_flush_report_if_due``). ``force``
+        publishes now: a candidate reaching a final state, or shutdown.
+        """
+        self._report_dirty = True
+        now = time.monotonic()
+        if force or now - self._last_report_at >= _REPORT_INTERVAL_SECONDS:
+            self._publish_report_locked(now)
+            return
+        if not self._report_flush_scheduled:
+            self._report_flush_scheduled = True
+            self._wake.set()
+
+    def _flush_report_if_due(self) -> None:
+        with self._lock:
+            if not self._report_dirty:
+                self._report_flush_scheduled = False
+                return
+            now = time.monotonic()
+            if now - self._last_report_at >= _REPORT_INTERVAL_SECONDS:
+                self._publish_report_locked(now)
+
+    def _report_due_at(self) -> Optional[float]:
+        if not self._report_dirty:
+            return None
+        return self._last_report_at + _REPORT_INTERVAL_SECONDS
+
+    def _publish_report_locked(self, now: float) -> None:
+        self._report_dirty = False
+        self._report_flush_scheduled = False
+        self._last_report_at = now
         total_candidates = len(self._candidates) + len(self._retired)
         self._gauge("prefetch_candidates_current", total_candidates)
         self._gauge("prefetch_candidates_peak", self._peak_candidates)

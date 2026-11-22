@@ -2158,7 +2158,10 @@ def _ensure_stats_batcher():
         try:
             # Create when a remote store is bound (either via env or parent bind)
             if getattr(STATS, "_remote", None) is not None or os.getenv("AO_STATS_ADDR"):
-                stats_batcher = StatsBatcher(flush_interval=0.05, max_items=200)
+                # One flush a second (performance plan, item 2): the readers of these
+                # counters (governor every 2 s, STATS log every 10 s, the Home
+                # page) need nothing fresher, and a full buffer still flushes.
+                stats_batcher = StatsBatcher(flush_interval=1.0, max_items=200)
                 atexit.register(stats_batcher.stop)
         except Exception:
             stats_batcher = None

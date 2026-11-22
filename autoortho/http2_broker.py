@@ -3403,7 +3403,9 @@ def _process_entrypoint(token: str, handshake_queue, config: Dict[str, Any]) -> 
             except ImportError:
                 from diagnostics import start_worker_profiler_from_env
             profiler_started = (
-                start_worker_profiler_from_env("http2-broker") is not None
+                start_worker_profiler_from_env(
+                    "http2-broker", helper=True
+                ) is not None
             )
         except Exception as exc:
             log.warning("Could not start broker performance diagnostics: %s", exc)
