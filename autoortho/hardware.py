@@ -5,13 +5,21 @@ and for the guards that compare a zoom target with the graphics card. Every
 probe is best effort: an unknown value is None, never a guess, and callers
 treat None as "do not warn".
 
-Graphics memory comes from:
+Graphics memory: every probe lists the graphics adapters it can see, each
+marked integrated or not, and the largest non-integrated card wins. An
+integrated GPU never counts: what it reports is either a small BIOS carve-out
+(512 MB) or a share of system RAM (16 GB), neither of which is a card's
+memory. A PC with only an integrated GPU therefore reads as unknown.
 
-* Windows: the display adapter class in the registry
-  (``HardwareInformation.qwMemorySize``, which the driver fills in; the largest
-  card wins, so an integrated GPU beside a discrete one is ignored). Same
-  source as OrthoStreamXP's ``GraphicsMemory.CardBytes``.
-* Linux: ``nvidia-smi``, then ``mem_info_vram_total`` in sysfs (AMD, Intel Arc).
+* Windows: DXGI (``DedicatedVideoMemory``, the card's own memory) lists the
+  adapters; the display adapter class in the registry
+  (``HardwareInformation.qwMemorySize``) gives the exact size of the same card,
+  and is the whole answer when DXGI is unavailable.
+* Linux: NVML (``libnvidia-ml``, so no ``nvidia-smi`` on PATH is needed), then
+  ``nvidia-smi``, plus every DRM card in sysfs: ``mem_info_vram_total``
+  (amdgpu) and ``tile*/physical_vram_size_bytes`` (Intel xe, discrete only).
+  Intel Arc on the older i915 driver and NVIDIA on nouveau publish no memory
+  size and read as unknown.
 * macOS on Apple silicon: unified memory; the GPU may use about two thirds of
   RAM (three quarters above 36 GB). Intel Macs ask ``system_profiler``.
 """
@@ -27,7 +35,7 @@ import re
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -64,10 +72,32 @@ class HardwareInfo:
         if self.vram:
             name = f" ({self.gpu_name})" if self.gpu_name else ""
             kind = "shared " if self.unified_memory else ""
-            parts.append(f"{self.vram / GB:.0f} GB {kind}graphics memory{name}")
+            parts.append(f"{size_text(self.vram)} {kind}graphics memory{name}")
         else:
             parts.append("graphics memory unknown")
         return ", ".join(parts)
+
+
+def size_text(value: int) -> str:
+    """Bytes as whole GB, or MB below 1 GB (512 MB must not read as "0 GB")."""
+    if value < GB:
+        return f"{value / MB:.0f} MB"
+    return f"{value / GB:.0f} GB"
+
+
+@dataclass(frozen=True)
+class GpuCandidate:
+    """One graphics adapter a probe found."""
+
+    vram: int                       # bytes the probe reported
+    name: str = ""
+    source: str = ""
+    integrated: bool = False
+
+    def describe(self) -> str:
+        kind = "integrated" if self.integrated else "card"
+        name = self.name or "unnamed"
+        return f"{name} {size_text(self.vram)} {kind} via {self.source}"
 
 
 # ---------------------------------------------------------------- CPU / RAM
@@ -114,6 +144,47 @@ def ram_available() -> Optional[int]:
 
 # ------------------------------------------------------------------- VRAM
 
+NVIDIA, AMD, INTEL = 0x10DE, 0x1002, 0x8086
+_VENDOR_NAMES = {NVIDIA: "NVIDIA GPU", AMD: "AMD GPU", INTEL: "Intel GPU"}
+
+# An AMD or Intel adapter reporting less than this is an integrated GPU's BIOS
+# carve-out (usually 512 MB), not a card: X-Plane 12 runs on no card this small.
+INTEGRATED_MAX = 2 * GB
+
+# Intel's discrete cards carry an A- or B-series model ("Arc(TM) A770",
+# "Arc(TM) A370M", "Arc(TM) Pro B60"); the integrated ones do not
+# ("Arc(TM) Graphics", "Arc(TM) 140V GPU", "UHD Graphics 770", "Iris(R) Xe").
+_INTEL_DISCRETE = re.compile(r"\bArc\b.*?\b(?:Pro\s+)?[AB]\d{2,3}[A-Z]?\b", re.I)
+# AMD's integrated GPUs: "AMD Radeon(TM) Graphics", "Radeon(TM) 780M Graphics",
+# "AMD Radeon(TM) Vega 8 Graphics", "AMD Radeon 610M". Cards name a series.
+_AMD_INTEGRATED = re.compile(
+    r"(?:Graphics\s*$|\bRadeon(?:\(TM\))?\s+\d{3}M\b)", re.I
+)
+_AMD_CARD_WORDS = re.compile(r"\b(?:RX|Pro|FirePro|R9)\b", re.I)
+
+
+def looks_integrated(vendor: int, name: str, vram: int) -> bool:
+    """Whether an adapter is an integrated GPU (judged by vendor, name, size)."""
+    name = (name or "").strip()
+    lowered = name.lower()
+    if vendor == NVIDIA or "nvidia" in lowered:
+        return False
+    if vendor == INTEL or lowered.startswith("intel"):
+        if name:
+            return not _INTEL_DISCRETE.search(name)
+        return vram < INTEGRATED_MAX
+    if vendor == AMD or "radeon" in lowered:
+        if (name and _AMD_INTEGRATED.search(name)
+                and not _AMD_CARD_WORDS.search(name)):
+            return True
+    return vram < INTEGRATED_MAX
+
+
+def pick_card(candidates) -> Optional[GpuCandidate]:
+    """The largest adapter that is not integrated, or None."""
+    cards = [c for c in candidates if c.vram > 0 and not c.integrated]
+    return max(cards, key=lambda c: c.vram) if cards else None
+
 
 def _registry_number(value) -> int:
     if isinstance(value, int):
@@ -126,26 +197,143 @@ def _registry_number(value) -> int:
     return 0
 
 
-def _windows_vram():
+# Windows ---------------------------------------------------------------------
+
+_DXGI_ADAPTER_FLAG_SOFTWARE = 0x2
+_IDXGIFACTORY1_ENUMADAPTERS1 = 12      # vtable slots
+_IDXGIADAPTER1_GETDESC1 = 10
+_IUNKNOWN_RELEASE = 2
+
+
+def _dxgi_adapters():
+    """Every hardware adapter DXGI lists, with its dedicated video memory.
+
+    ``DedicatedVideoMemory`` is the card's own memory; an integrated GPU
+    reports only its BIOS carve-out there. Creating the factory loads no
+    driver, so this is cheap and safe in the UI process.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [
+            ("Data1", wintypes.DWORD),
+            ("Data2", wintypes.WORD),
+            ("Data3", wintypes.WORD),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class DXGI_ADAPTER_DESC1(ctypes.Structure):
+        _fields_ = [
+            ("Description", ctypes.c_wchar * 128),
+            ("VendorId", wintypes.UINT),
+            ("DeviceId", wintypes.UINT),
+            ("SubSysId", wintypes.UINT),
+            ("Revision", wintypes.UINT),
+            ("DedicatedVideoMemory", ctypes.c_size_t),
+            ("DedicatedSystemMemory", ctypes.c_size_t),
+            ("SharedSystemMemory", ctypes.c_size_t),
+            ("AdapterLuid", LUID),
+            ("Flags", wintypes.UINT),
+        ]
+
+    def method(obj, slot, *argtypes):
+        vtable = ctypes.cast(
+            obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        ).contents
+        prototype = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)
+        return prototype(vtable[slot])
+
+    try:
+        create = ctypes.WinDLL("dxgi").CreateDXGIFactory1
+    except (OSError, AttributeError):
+        return []
+    create.restype = ctypes.c_long
+    create.argtypes = [ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)]
+    iid_factory1 = GUID(  # {770aae78-f26f-4dba-a829-253c83d1b387}
+        0x770AAE78, 0xF26F, 0x4DBA,
+        (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87),
+    )
+    factory = ctypes.c_void_p()
+    if create(ctypes.byref(iid_factory1), ctypes.byref(factory)) != 0 or not factory:
+        return []
+    found = []
+    seen = set()
+    try:
+        enum_adapters = method(
+            factory, _IDXGIFACTORY1_ENUMADAPTERS1,
+            wintypes.UINT, ctypes.POINTER(ctypes.c_void_p),
+        )
+        for index in range(16):
+            adapter = ctypes.c_void_p()
+            if enum_adapters(factory, index, ctypes.byref(adapter)) != 0 or not adapter:
+                break  # DXGI_ERROR_NOT_FOUND: no more adapters
+            desc = DXGI_ADAPTER_DESC1()
+            try:
+                ok = method(
+                    adapter, _IDXGIADAPTER1_GETDESC1,
+                    ctypes.POINTER(DXGI_ADAPTER_DESC1),
+                )(adapter, ctypes.byref(desc)) == 0
+            finally:
+                method(adapter, _IUNKNOWN_RELEASE)(adapter)
+            if not ok or desc.Flags & _DXGI_ADAPTER_FLAG_SOFTWARE:
+                continue  # Microsoft Basic Render Driver
+            # A virtual display adapter that renders on a card is listed with
+            # that card's description under a LUID of its own, so duplicates
+            # are expected; the largest card wins either way.
+            luid = (desc.AdapterLuid.LowPart, desc.AdapterLuid.HighPart)
+            if luid in seen:
+                continue
+            seen.add(luid)
+            vram = int(desc.DedicatedVideoMemory)
+            name = desc.Description.strip()
+            found.append(GpuCandidate(
+                vram, name, "dxgi", looks_integrated(desc.VendorId, name, vram)
+            ))
+    finally:
+        method(factory, _IUNKNOWN_RELEASE)(factory)
+    return found
+
+
+_VENDOR_ID_RE = re.compile(r"ven_([0-9a-f]{4})", re.I)
+
+
+def _registry_adapters():
+    """Display adapters in the registry (the fallback when DXGI fails).
+
+    The driver fills in ``HardwareInformation.qwMemorySize``; for an
+    integrated GPU that is a share of system RAM, so integrated adapters are
+    told apart by vendor and name instead.
+    """
     try:
         import winreg
     except ImportError:
-        return None, ""
-    best, best_name = 0, ""
+        return []
+    found = []
     try:
         cards = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _DISPLAY_CLASS)
     except OSError:
-        return None, ""
+        return []
+
+    def text(key, value_name):
+        try:
+            return str(winreg.QueryValueEx(key, value_name)[0])
+        except OSError:
+            return ""
+
     with cards:
         index = 0
         while True:
             try:
-                name = winreg.EnumKey(cards, index)
+                key_name = winreg.EnumKey(cards, index)
             except OSError:
                 break
             index += 1
             try:
-                card = winreg.OpenKey(cards, name)
+                card = winreg.OpenKey(cards, key_name)
             except OSError:
                 continue  # "Properties" and similar keys Windows keeps to itself
             with card:
@@ -162,13 +350,37 @@ def _windows_vram():
                         continue
                     if size:
                         break
-                if size > best:
-                    best = size
-                    try:
-                        best_name = str(winreg.QueryValueEx(card, "DriverDesc")[0])
-                    except OSError:
-                        best_name = ""
-    return (best or None), best_name
+                if not size:
+                    continue
+                name = text(card, "DriverDesc").strip()
+                match = _VENDOR_ID_RE.search(text(card, "MatchingDeviceId"))
+                vendor = int(match.group(1), 16) if match else 0
+                found.append(GpuCandidate(
+                    size, name, "registry", looks_integrated(vendor, name, size)
+                ))
+    return found
+
+
+# Linux -----------------------------------------------------------------------
+
+
+def _subprocess_env():
+    """The environment for system tools, without PyInstaller's library path.
+
+    A frozen build points LD_LIBRARY_PATH at its bundled libraries, which can
+    break tools such as ``nvidia-smi``; PyInstaller keeps the original in
+    ``*_ORIG``.
+    """
+    if sys.platform == "win32" or not getattr(sys, "frozen", False):
+        return None
+    env = dict(os.environ)
+    for key in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+        original = env.pop(key + "_ORIG", None)
+        if original is not None:
+            env[key] = original
+        else:
+            env.pop(key, None)
+    return env
 
 
 def _run(command, timeout=4.0):
@@ -179,6 +391,7 @@ def _run(command, timeout=4.0):
             text=True,
             timeout=timeout,
             check=False,
+            env=_subprocess_env(),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
@@ -186,54 +399,182 @@ def _run(command, timeout=4.0):
     return result.stdout if result.returncode == 0 else ""
 
 
-def _nvidia_smi_vram():
+def _nvml_adapters():
+    """NVIDIA cards through NVML, which ships with the driver.
+
+    Unlike ``nvidia-smi`` this needs nothing on PATH (Flatpak, AppImage and
+    distro packages that leave the tool out).
+    """
+    import ctypes
+
+    lib = None
+    for lib_name in ("libnvidia-ml.so.1", "libnvidia-ml.so"):
+        try:
+            lib = ctypes.CDLL(lib_name)
+            break
+        except OSError:
+            continue
+    if lib is None:
+        return []
+
+    class Memory(ctypes.Structure):
+        _fields_ = [
+            ("total", ctypes.c_ulonglong),
+            ("free", ctypes.c_ulonglong),
+            ("used", ctypes.c_ulonglong),
+        ]
+
+    def symbol(*names):
+        for symbol_name in names:
+            function = getattr(lib, symbol_name, None)
+            if function is not None:
+                return function
+        raise AttributeError(names[0])
+
+    try:
+        init = symbol("nvmlInit_v2", "nvmlInit")
+        get_count = symbol("nvmlDeviceGetCount_v2", "nvmlDeviceGetCount")
+        get_handle = symbol(
+            "nvmlDeviceGetHandleByIndex_v2", "nvmlDeviceGetHandleByIndex"
+        )
+        get_memory = symbol("nvmlDeviceGetMemoryInfo")
+        get_name = symbol("nvmlDeviceGetName")
+        shutdown = symbol("nvmlShutdown")
+    except AttributeError:
+        return []
+    if init() != 0:
+        return []
+    found = []
+    try:
+        count = ctypes.c_uint()
+        if get_count(ctypes.byref(count)) != 0:
+            return []
+        for index in range(min(count.value, 16)):
+            handle = ctypes.c_void_p()
+            if get_handle(ctypes.c_uint(index), ctypes.byref(handle)) != 0:
+                continue
+            memory = Memory()
+            if get_memory(handle, ctypes.byref(memory)) != 0:
+                continue
+            buffer = ctypes.create_string_buffer(96)
+            name = ""
+            if get_name(handle, buffer, ctypes.c_uint(len(buffer))) == 0:
+                name = buffer.value.decode("utf-8", "replace").strip()
+            found.append(GpuCandidate(int(memory.total), name, "nvml"))
+    finally:
+        shutdown()
+    return found
+
+
+def _nvidia_smi_adapters():
     out = _run([
         "nvidia-smi",
         "--query-gpu=memory.total,name",
         "--format=csv,noheader,nounits",
     ])
-    best, best_name = 0, ""
+    found = []
     for line in out.splitlines():
         fields = [part.strip() for part in line.split(",", 1)]
         try:
             size = int(float(fields[0])) * MB
         except (ValueError, IndexError):
             continue
-        if size > best:
-            best, best_name = size, fields[1] if len(fields) > 1 else ""
-    return (best or None), best_name
+        found.append(GpuCandidate(
+            size, fields[1] if len(fields) > 1 else "", "nvidia-smi"
+        ))
+    return found
 
 
-def _sysfs_vram():
-    best = 0
-    for path in glob.glob("/sys/class/drm/card*/device/mem_info_vram_total"):
-        try:
-            with open(path, encoding="ascii") as handle:
-                best = max(best, int(handle.read().strip()))
-        except (OSError, ValueError):
+_SYSFS_DRM = "/sys/class/drm"
+_CARD_RE = re.compile(r"card\d+")
+
+
+def _read_text(path) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _read_int(path) -> int:
+    try:
+        return int(_read_text(path), 0)  # "0x1002" and "12868124672"
+    except ValueError:
+        return 0
+
+
+def _sysfs_adapters(root=_SYSFS_DRM):
+    """Cards whose kernel driver publishes a memory size in sysfs.
+
+    * amdgpu: ``mem_info_vram_total``. An APU publishes its BIOS carve-out
+      there, which ``looks_integrated`` rejects by size.
+    * Intel xe: ``tile*/physical_vram_size_bytes``, present on discrete
+      cards only.
+    """
+    found = []
+    seen = set()
+    for card in sorted(glob.glob(os.path.join(root, "card*"))):
+        if not _CARD_RE.fullmatch(os.path.basename(card)):
+            continue  # connectors such as card0-HDMI-A-1
+        device = os.path.join(card, "device")
+        real = os.path.realpath(device)
+        if real in seen:
             continue
-    return best or None
+        seen.add(real)
+        vendor = _read_int(os.path.join(device, "vendor"))
+        product = _read_text(os.path.join(device, "product_name"))
+        label = product or _VENDOR_NAMES.get(vendor, "")
+        vram = _read_int(os.path.join(device, "mem_info_vram_total"))
+        if vram:
+            found.append(GpuCandidate(
+                vram, label, "sysfs",
+                looks_integrated(vendor or AMD, product, vram),
+            ))
+            continue
+        vram = sum(
+            _read_int(path) for path in glob.glob(
+                os.path.join(device, "tile*", "physical_vram_size_bytes")
+            )
+        )
+        if vram:
+            found.append(GpuCandidate(vram, label or "Intel GPU", "sysfs"))
+    return found
 
+
+# macOS -----------------------------------------------------------------------
 
 _SIZE_RE = re.compile(r"([\d.]+)\s*(GB|MB)", re.IGNORECASE)
 
 
-def _mac_intel_vram():
+def _mac_adapters():
     out = _run(["system_profiler", "SPDisplaysDataType", "-json"], timeout=6.0)
     try:
         cards = json.loads(out).get("SPDisplaysDataType", [])
     except (ValueError, AttributeError):
-        return None, ""
-    best, best_name = 0, ""
+        return []
+    found = []
     for card in cards:
+        # Integrated GPUs list "spdisplays_vram_shared" instead.
         text = str(card.get("spdisplays_vram") or card.get("_spdisplays_vram") or "")
         match = _SIZE_RE.search(text)
         if not match:
             continue
-        size = float(match.group(1)) * (GB if match.group(2).upper() == "GB" else MB)
-        if size > best:
-            best, best_name = int(size), str(card.get("sppci_model", ""))
-    return (best or None), best_name
+        size = int(float(match.group(1)) * (GB if match.group(2).upper() == "GB" else MB))
+        name = str(card.get("sppci_model", ""))
+        builtin = card.get("sppci_bus") == "spdisplays_builtin"
+        found.append(GpuCandidate(
+            size, name, "system_profiler",
+            builtin or looks_integrated(0, name, size),
+        ))
+    return found
+
+
+def _is_apple_silicon() -> bool:
+    if platform.machine() == "arm64":
+        return True
+    # An Intel build running under Rosetta still sits on Apple silicon.
+    return _run(["sysctl", "-n", "hw.optional.arm64"]).strip() == "1"
 
 
 def apple_unified_vram(ram_bytes: int) -> int:
@@ -242,21 +583,69 @@ def apple_unified_vram(ram_bytes: int) -> int:
     return int(ram_bytes * share)
 
 
+# All -------------------------------------------------------------------------
+
+
+def _safely(probe):
+    try:
+        return list(probe())
+    except Exception as exc:  # one broken probe must not hide the others
+        log.debug("Graphics probe %s failed: %s", probe.__name__, exc)
+        return []
+
+
+def with_registry_sizes(dxgi, registry):
+    """DXGI's adapters, sized by the registry entry for the same card.
+
+    DXGI leaves out what Windows reserves (a 32 GB card reads 31.4 GB); the
+    registry has the size on the box. DXGI still decides which adapters exist
+    and which are integrated: the registry also keeps disabled and removed
+    adapters, and gives an integrated GPU a share of system RAM.
+    """
+    exact = {}
+    for card in registry:
+        if card.name and not card.integrated:
+            exact[card.name] = max(exact.get(card.name, 0), card.vram)
+    sized = []
+    for card in dxgi:
+        size = exact.get(card.name, 0)
+        if not card.integrated and card.vram <= size <= card.vram * 1.25:
+            card = replace(card, vram=size)
+        sized.append(card)
+    return sized
+
+
+def probe_adapters():
+    """Every graphics adapter this OS's probes can see."""
+    if sys.platform == "win32":
+        registry = _safely(_registry_adapters)
+        dxgi = _safely(_dxgi_adapters)
+        return with_registry_sizes(dxgi, registry) if dxgi else registry
+    if sys.platform == "darwin":
+        return _safely(_mac_adapters)
+    nvidia = _safely(_nvml_adapters) or _safely(_nvidia_smi_adapters)
+    return nvidia + _safely(_sysfs_adapters)
+
+
 def _detect_vram(ram_bytes):
     """(bytes or None, gpu name, source, unified)."""
-    if sys.platform == "win32":
-        size, name = _windows_vram()
-        return size, name, "registry" if size else "", False
-    if sys.platform == "darwin":
-        if platform.machine() == "arm64":
-            return apple_unified_vram(ram_bytes), "Apple silicon", "unified", True
-        size, name = _mac_intel_vram()
-        return size, name, "system_profiler" if size else "", False
-    size, name = _nvidia_smi_vram()
-    if size:
-        return size, name, "nvidia-smi", False
-    size = _sysfs_vram()
-    return size, "", "sysfs" if size else "", False
+    if sys.platform == "darwin" and _is_apple_silicon():
+        return apple_unified_vram(ram_bytes), "Apple silicon", "unified", True
+    candidates = probe_adapters()
+    counts = {}
+    for candidate in candidates:
+        text = candidate.describe()
+        counts[text] = counts.get(text, 0) + 1
+    log.info(
+        "Graphics adapters: %s",
+        "; ".join(
+            text if n == 1 else f"{text} (x{n})" for text, n in counts.items()
+        ) or "none found",
+    )
+    card = pick_card(candidates)
+    if card is None:
+        return None, "", "", False
+    return card.vram, card.name, card.source, False
 
 
 # ---------------------------------------------------------------- caching
