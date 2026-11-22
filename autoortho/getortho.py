@@ -19278,6 +19278,27 @@ class TileCacher(object):
 
         return True
 
+    def prefetch_target_cached(self, row, col, map_type, zoom, target_zoom):
+        """The DDS cache holds this tile's finished texture at ``target_zoom``.
+
+        Asked by the prefetch coordinator before it opens a tile: a texture
+        that is complete and exact in the cache needs no chunk read and no
+        build.
+        """
+        if dynamic_dds_cache is None:
+            return False
+        from types import SimpleNamespace
+
+        map_type = self._resolve_maptype(row, col, map_type, zoom)
+        probe = SimpleNamespace(
+            row=row, col=col, maptype=map_type, tilename_zoom=zoom
+        )
+        return bool(
+            dynamic_dds_cache.contains(
+                self._to_tile_id(row, col, map_type, zoom), target_zoom, probe
+            )
+        )
+
     def _close_prefetch_tile(self, row, col, map_type, zoom):
         """Release a background lease and evict it unless live code owns it."""
         tile_id = self._to_tile_id(row, col, map_type, zoom)

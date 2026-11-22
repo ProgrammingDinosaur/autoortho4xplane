@@ -330,6 +330,12 @@ class PrefetchCandidate:
     lease: Optional["PrefetchLease"] = None
     admitting: bool = False
     build_pending: bool = False
+    # A tile larger than the coordinator's chunk budget is finished over
+    # several passes, each keeping only the rows saved to the DDS cache.
+    # These track whether a pass saved anything (see _ensure_lease).
+    durable_rows_seen: int = 0
+    unsaved_coverage_dropped: bool = False
+    fruitless_passes: int = 0
 
     @property
     def terminal(self) -> bool:
@@ -1618,6 +1624,41 @@ class PrefetchCoordinator:
                 and not candidate.terminal
             )
 
+    def _target_already_cached(self, key: PrefetchKey) -> bool:
+        """The DDS cache holds the finished texture this key asks for."""
+        check = getattr(self.tile_cacher, "prefetch_target_cached", None)
+        if check is None:
+            return False
+        try:
+            return bool(
+                check(
+                    key.tile_row,
+                    key.tile_col,
+                    key.resolved_maptype,
+                    key.terrain_zoom,
+                    key.target_zoom,
+                )
+            )
+        except Exception:
+            log.debug(
+                "Could not check the DDS cache for %s", key, exc_info=True
+            )
+            return False
+
+    @staticmethod
+    def _fruitless_delay(passes: int) -> float:
+        """Seconds to hold back a candidate whose passes save no rows.
+
+        Each such pass reads every chunk again from disk and rebuilds its
+        rows for nothing. One is forgiven (the rows may still be on their
+        way to the cache when the next pass starts); from the second on the
+        candidate waits 15 s, 60 s, 4 min, then 10 min between passes, so a
+        transient cause (cache writes paused, its queue full) still recovers.
+        """
+        if passes < 2:
+            return 0.0
+        return min(600.0, 15.0 * 4.0 ** min(passes - 2, 4))
+
     @staticmethod
     def _retry_delay(attempts: int, terminal: bool = False) -> float:
         schedule = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0)
@@ -1855,6 +1896,10 @@ class PrefetchCoordinator:
 
         lease = self._ensure_lease(candidate)
         if lease is None:
+            if candidate.state == CandidateState.COMPLETE:
+                return PrefetchBatchResult(
+                    0, 0, 0, True, cursor, PrefetchBatchReason.TARGET_COMPLETE
+                )
             return PrefetchBatchResult(
                 0, 0, 0, False, cursor, PrefetchBatchReason.NO_CAPACITY
             )
@@ -2108,6 +2153,16 @@ class PrefetchCoordinator:
             if leases >= self.max_tile_leases:
                 return None
         key = candidate.key
+        if self._target_already_cached(key):
+            # The finished texture is in the DDS cache: there is nothing to
+            # fetch or build. Without this check a texture too large for one
+            # pass (8192 px: 1024 chunks against a budget of 512) never
+            # reached the builder's own "already cached" check, and the
+            # cache refused every row built for it, so the candidate read
+            # and rebuilt the same chunks every few seconds for good.
+            self._metric("prefetch_candidates_already_cached")
+            self._finish_candidate(candidate, CandidateState.COMPLETE)
+            return None
         tile = self.tile_cacher._open_tile(
             key.tile_row,
             key.tile_col,
@@ -2155,6 +2210,18 @@ class PrefetchCoordinator:
                 getattr(tile, "_persisted_exact_rows", ()) or ()
             )
             candidate.persisted_exact_rows.update(persisted_rows)
+            durable_rows = len(candidate.persisted_exact_rows)
+            if candidate.unsaved_coverage_dropped:
+                # The pass before this one covered chunks that were dropped
+                # with its lease. It was worth it only if rows reached the
+                # DDS cache since.
+                candidate.unsaved_coverage_dropped = False
+                if durable_rows > candidate.durable_rows_seen:
+                    candidate.fruitless_passes = 0
+                else:
+                    candidate.fruitless_passes += 1
+                    self._metric("prefetch_passes_without_saved_rows")
+            candidate.durable_rows_seen = durable_rows
             grid = tile._get_chunk_grid(tile.max_zoom)
             for row_index in persisted_rows:
                 row_start = row_index * grid.width
@@ -2520,8 +2587,9 @@ class PrefetchCoordinator:
                 candidate.next_attempt_at = 0.0
             else:
                 candidate.retry_count += 1
-                base = min(
-                    5.0, 0.05 * (2 ** min(candidate.retry_count, 7))
+                base = max(
+                    min(5.0, 0.05 * (2 ** min(candidate.retry_count, 7))),
+                    self._fruitless_delay(candidate.fruitless_passes),
                 )
                 candidate.next_attempt_at = (
                     time.monotonic() + base * random.uniform(0.8, 1.2)
@@ -2683,7 +2751,10 @@ class PrefetchCoordinator:
                     for row in candidate.persisted_exact_rows
                     for column in range(width)
                 }
+                covered = len(candidate.exact_coverage)
                 candidate.exact_coverage.intersection_update(durable)
+                if len(candidate.exact_coverage) < covered:
+                    candidate.unsaved_coverage_dropped = True
                 candidate.cursor = PrefetchCursor(
                     candidate.cursor.ordering_revision,
                     0,

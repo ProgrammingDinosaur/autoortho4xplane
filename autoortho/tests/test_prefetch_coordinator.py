@@ -746,6 +746,152 @@ def test_persisted_exact_row_skips_network_admission():
     assert key not in coordinator._candidates
 
 
+def test_target_already_in_dds_cache_completes_without_opening_tile():
+    coordinator, cacher, getter = make_coordinator(count=8, burst=4)
+    asked = []
+
+    def prefetch_target_cached(row, col, maptype, terrain_zoom, target_zoom):
+        asked.append((row, col, maptype, terrain_zoom, target_zoom))
+        return True
+
+    cacher.prefetch_target_cached = prefetch_target_cached
+    key = publish(coordinator)
+
+    result = coordinator._admit(coordinator._candidates[key])
+
+    assert result.reason == PrefetchBatchReason.TARGET_COMPLETE
+    assert result.complete
+    assert asked == [(1, 2, "BI", 17, 17)]
+    assert cacher.opens == 0
+    assert getter.submitted == []
+    assert key not in coordinator._candidates
+    assert not coordinator._retired
+    # Finished: the sources publishing it again do not bring it back.
+    assert publish(coordinator) == key
+    assert key not in coordinator._candidates
+
+
+def test_dds_cache_check_failure_falls_back_to_normal_admission():
+    coordinator, cacher, getter = make_coordinator(count=8, burst=4)
+
+    def prefetch_target_cached(*args):
+        raise OSError("cache unreadable")
+
+    cacher.prefetch_target_cached = prefetch_target_cached
+    key = publish(coordinator)
+
+    result = coordinator._admit(coordinator._candidates[key])
+
+    assert result.reason == PrefetchBatchReason.PROGRESSED
+    assert cacher.opens == 1
+    assert len(getter.submitted) == 4
+
+
+def _disk_cached_tile(cacher, count=8, row_width=2):
+    """A tile whose chunks are all on disk: twice the coordinator's budget."""
+    tile = FakeTile(1, 2, "BI", 17, 17, count=count)
+    tile.chunks[17] = FakeGrid(count, cached=range(count))
+    tile.chunks[17].width = row_width
+    tile.chunks[17].height = count // row_width
+    tile._persisted_exact_rows = set()
+    tile.restore_partial_dds_cache = lambda: bool(tile._persisted_exact_rows)
+    cacher.tiles[(1, 2, "BI", 17)] = tile
+    return tile
+
+
+def _run_pass(coordinator, candidate):
+    """One pass: scan until the chunk budget is spent, then lose the lease."""
+    scanned = 0
+    while True:
+        result = coordinator._admit(candidate)
+        scanned += result.scanned
+        if result.reason != PrefetchBatchReason.PROGRESSED:
+            break
+    if result.reason == PrefetchBatchReason.NO_CAPACITY:
+        coordinator._defer_candidate(candidate, result.reason)
+    return result, scanned
+
+
+def test_passes_that_save_no_rows_back_off_instead_of_looping():
+    """Six 8192 px tiles were reread from disk ~790 times each in a flight.
+
+    Their chunks were all cached, more of them than one pass may hold, and
+    no row the passes built reached the DDS cache, so every pass started
+    again from nothing a few seconds later, for good.
+    """
+    coordinator, cacher, _ = make_coordinator(count=8, burst=4)
+    coordinator.set_builder(False)
+    _disk_cached_tile(cacher)
+    key = publish(coordinator)
+    candidate = coordinator._candidates[key]
+
+    waits = []
+    for _ in range(5):
+        result, scanned = _run_pass(coordinator, candidate)
+        assert result.reason == PrefetchBatchReason.NO_CAPACITY
+        assert scanned == 4
+        assert candidate.lease is None
+        assert not candidate.exact_coverage
+        waits.append(candidate.next_attempt_at - time.monotonic())
+
+    # The first two passes retry as before (a pass's rows may still be on
+    # their way to the cache); after that the candidate is held back.
+    assert max(waits[:2]) < 6.5
+    assert waits[2] >= 15.0 * 0.8 - 1.0
+    assert waits[3] >= 60.0 * 0.8 - 1.0
+    assert waits[4] >= 240.0 * 0.8 - 1.0
+    assert candidate.fruitless_passes == 4
+    assert not candidate.terminal
+
+
+def test_fruitless_backoff_is_capped():
+    delays = [PrefetchCoordinator._fruitless_delay(n) for n in range(12)]
+    assert delays[:6] == [0.0, 0.0, 15.0, 60.0, 240.0, 600.0]
+    assert max(delays) == 600.0
+
+
+def test_passes_that_save_rows_keep_their_pace_and_finish():
+    coordinator, cacher, _ = make_coordinator(count=8, burst=4)
+    coordinator.set_builder(False)
+    tile = _disk_cached_tile(cacher)
+    key = publish(coordinator)
+    candidate = coordinator._candidates[key]
+
+    # The first pass covers two rows of two chunks; they are saved before
+    # the next one starts, which then only has the other two rows to do.
+    result, scanned = _run_pass(coordinator, candidate)
+    assert result.reason == PrefetchBatchReason.NO_CAPACITY
+    assert scanned == 4
+    assert tile.chunks[17].ranges == [(0, 4)]
+    tile._persisted_exact_rows.update({0, 1})
+    assert candidate.next_attempt_at - time.monotonic() < 6.5
+
+    result, _ = _run_pass(coordinator, candidate)
+
+    assert candidate.fruitless_passes == 0
+    assert tile.chunks[17].ranges == [(0, 4), (4, 8)]
+    assert result.reason == PrefetchBatchReason.TARGET_COMPLETE
+    assert key not in coordinator._candidates
+
+
+def test_saved_rows_reset_the_fruitless_count():
+    coordinator, cacher, _ = make_coordinator(count=8, burst=4)
+    coordinator.set_builder(False)
+    tile = _disk_cached_tile(cacher)
+    key = publish(coordinator)
+    candidate = coordinator._candidates[key]
+
+    for _ in range(3):
+        _run_pass(coordinator, candidate)
+    assert candidate.fruitless_passes == 2
+
+    tile._persisted_exact_rows.add(0)
+    _run_pass(coordinator, candidate)
+
+    assert candidate.fruitless_passes == 0
+    assert candidate.next_attempt_at - time.monotonic() < 6.5
+
+
 def test_generation_change_cannot_revive_candidate_during_admission():
     coordinator, cacher, getter = make_coordinator(count=2, burst=2)
     key = publish(coordinator, generation=1)
