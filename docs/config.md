@@ -531,6 +531,12 @@ partial_cache_promote_startup_max_tiles = 0
   multiple requests over each connection.
 - `download_dispatch_workers` applies completed responses; it does not limit
   network concurrency.
+- `provider_broker_processes` is the most download broker processes that run
+  (0: one per 4 CPU threads, 1 to 4). With `provider_broker_autoscale = True`
+  (the default) one broker starts; another starts when the running ones hold
+  more than 64 requests or answer late for two seconds (a flight loading), and
+  extra ones stop after five calm minutes. One broker handles a flight in
+  cruise. `False` starts them all at once.
 - Adaptive concurrency raises a provider's limit after sustained successes and
   reduces it after overload responses or timeouts. Windowed v2 additionally
   requires utilized, backlogged windows before latency-based adjustments.

@@ -438,8 +438,11 @@ provider_max_connections = 160
 download_dispatch_workers = 4
 # Download broker processes. One broker is one Python event loop and tops out
 # near one CPU core (about 200 tiles a second); requests are spread over them
-# by URL. 0 picks one per 4 CPU threads, 1 to 4.
+# by URL. 0 picks one per 4 CPU threads, 1 to 4. With provider_broker_autoscale
+# this is the most that run: one starts, more start while requests pile up (a
+# flight loading) and stop again after five calm minutes.
 provider_broker_processes = 0
+provider_broker_autoscale = True
 # HTTP client of the download brokers: auto (curl when installed, else httpx),
 # curl (libcurl through curl_cffi: HTTP/2 in C, several times the requests per
 # CPU core) or httpx.
@@ -1394,6 +1397,11 @@ PROVIDER_SETTINGS = {
     },
     # Adaptive per-origin concurrency (enforced by the broker server).
     "provider_adaptive_concurrency": {
+        "type": bool,
+        "default": True,
+        "legacy": None,
+    },
+    "provider_broker_autoscale": {
         "type": bool,
         "default": True,
         "legacy": None,

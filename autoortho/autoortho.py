@@ -17,6 +17,8 @@ import pickle
 import struct
 
 
+import multiprocessing.managers
+import multiprocessing.process
 from multiprocessing.managers import BaseManager
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
@@ -91,6 +93,7 @@ try:
     from autoortho.http2_broker import (
         HTTP2Broker,
         BrokerGroup as HTTP2BrokerGroup,
+        BrokerAutoscaler as HTTP2BrokerAutoscaler,
         BrokerError as HTTP2BrokerError,
         BrokerStartupError as HTTP2BrokerStartupError,
     )
@@ -99,12 +102,14 @@ except ImportError:
         from http2_broker import (
             HTTP2Broker,
             BrokerGroup as HTTP2BrokerGroup,
+            BrokerAutoscaler as HTTP2BrokerAutoscaler,
             BrokerError as HTTP2BrokerError,
             BrokerStartupError as HTTP2BrokerStartupError,
         )
     except ImportError:
         HTTP2Broker = None
         HTTP2BrokerGroup = None
+        HTTP2BrokerAutoscaler = None
         HTTP2BrokerError = Exception
         HTTP2BrokerStartupError = Exception
 
@@ -183,11 +188,63 @@ class LogServer(socketserver.ThreadingTCPServer):
 _SERVER_STATS_STORE = None
 
 def _get_or_create_stats_store():
-    """Factory used by the StatsManager server process to expose a singleton store."""
+    """Factory used by the stats server to expose a singleton store."""
     global _SERVER_STATS_STORE
     if _SERVER_STATS_STORE is None:
         _SERVER_STATS_STORE = aostats.StatsStore()
     return _SERVER_STATS_STORE
+
+
+class _ThreadedStatsServer(multiprocessing.managers.Server):
+    """The stats manager's server, run on threads of the parent.
+
+    Performance plan, item 5: the counters used to live in a manager process
+    of their own (about 94 MB and 15 CPU seconds a flight) only to hold one
+    dictionary. Workers and brokers keep their client code and the socket
+    protocol; only the server moved. ``serve_forever`` cannot be used on a
+    thread (it resets ``sys.stdout`` and calls ``sys.exit`` when it stops, and
+    its accept loop spins once the socket closes), so this accepts on a loop
+    of its own that ``stop`` ends.
+    """
+
+    def start_threads(self):
+        self.stop_event = threading.Event()
+        current = multiprocessing.process.current_process()
+        if getattr(current, "_manager_server", None) is None:
+            current._manager_server = self
+        self._accept_thread = threading.Thread(
+            target=self._accept_loop, name="StatsServer", daemon=True
+        )
+        self._accept_thread.start()
+
+    def _accept_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                connection = self.listener.accept()
+            except OSError:
+                if self.stop_event.is_set():
+                    return
+                time.sleep(0.05)
+                continue
+            threading.Thread(
+                target=self.handle_request,
+                args=(connection,),
+                name="StatsServerClient",
+                daemon=True,
+            ).start()
+
+    def stop(self, timeout: float = 2.0):
+        self.stop_event.set()
+        try:
+            self.listener.close()
+        except Exception:
+            pass
+        thread = getattr(self, "_accept_thread", None)
+        if thread is not None:
+            thread.join(timeout)
+        current = multiprocessing.process.current_process()
+        if getattr(current, "_manager_server", None) is self:
+            current._manager_server = None
 
 
 # Share one mount setup implementation with subprocess workers.
@@ -392,17 +449,22 @@ class AOMount:
             exposed=['inc', 'inc_many', 'set', 'get', 'delete', 'keys', 'snapshot']
         )
 
-        mgr = StatsManager(address=('127.0.0.1', 0), authkey=authkey)
-        mgr.start()
+        # A fresh store per session, as the manager process used to give.
+        global _SERVER_STATS_STORE
+        _SERVER_STATS_STORE = None
+        store = _get_or_create_stats_store()
+        server = _ThreadedStatsServer(
+            StatsManager._registry, ('127.0.0.1', 0), authkey, 'pickle'
+        )
+        server.start_threads()
 
-        # Obtain a proxy to the server-owned store and bind helpers to it so
-        # that all stats updates/readouts go through the shared store.
-        store_proxy = mgr.get_store()
-        aostats.bind_local_store(store_proxy)
-        self._shared_store = store_proxy
-        host, port = mgr.address
-        log.info(f"StatsManager listening on {host}:{port}")
-        self.stats_manager = mgr
+        # The parent uses the store directly: no socket round trip for its
+        # own counters. Workers and brokers reach it through the server.
+        aostats.bind_local_store(store)
+        self._shared_store = store
+        host, port = server.address
+        log.info(f"Stats server listening on {host}:{port} (in the parent)")
+        self.stats_manager = server
         self.stats_host = host
         self.stats_port = port
         self.stats_auth = authkey
@@ -414,7 +476,11 @@ class AOMount:
         mgr = getattr(self, "stats_manager", None)
         if mgr:
             try:
-                mgr.shutdown()
+                stop = getattr(mgr, "stop", None)
+                if stop is not None:
+                    stop(join_timeout)
+                else:
+                    mgr.shutdown()
             except Exception as e:
                 log.error(f"Error stopping stats manager: {e}")
         self.stats_manager = None
@@ -779,6 +845,15 @@ class AOMount:
         self.start_download_broker()
         self.start_reporter()
 
+    def _register_broker_process(self, broker, index):
+        """Profile a broker the autoscaler started."""
+        profiler = getattr(self, "_performance_profiler", None)
+        pid = getattr(broker, "pid", None)
+        if profiler is not None and pid:
+            profiler.register_process(
+                pid, "http2-broker" if index == 0 else f"http2-broker-{index + 1}"
+            )
+
     def _broker_process_count(self):
         """Download broker processes: the setting, or one per 4 CPU threads (1-4)."""
         try:
@@ -883,7 +958,38 @@ class AOMount:
                 )
             processes = self._broker_process_count()
             broker = None
-            if processes > 1 and HTTP2BrokerGroup is not None:
+            autoscale = bool(aoconfig.resolve_provider_setting(
+                "provider_broker_autoscale", self.cfg
+            ))
+            if (
+                processes > 1 and autoscale and HTTP2BrokerGroup is not None
+                and HTTP2BrokerAutoscaler is not None
+            ):
+                # Performance plan, item 5: one broker in cruise, up to
+                # ``processes`` while a flight loads.
+                single = _split_broker_kwargs(broker_kwargs, 1)[0]
+                group = HTTP2BrokerGroup(
+                    [HTTP2Broker(**single)],
+                    factory=lambda: HTTP2Broker(**_split_broker_kwargs(broker_kwargs, 1)[0]),
+                    max_brokers=processes,
+                    publish=lambda table: aostats.set_stat("broker_routing", table),
+                    on_started=self._register_broker_process,
+                )
+                try:
+                    group.start()
+                    if broker_kwargs.get("max_bytes_per_second"):
+                        # Remembered, so each scaling step shares it out again.
+                        group.configure(
+                            max_bytes_per_second=broker_kwargs["max_bytes_per_second"]
+                        )
+                    group._publish_routing()
+                    broker = group
+                    broker_mode = f"1 to {processes} processes"
+                    self._broker_autoscaler = HTTP2BrokerAutoscaler(group)
+                    self._broker_autoscaler.start()
+                except HTTP2BrokerStartupError as group_exc:
+                    log.warning("Could not start the broker group: %s", group_exc)
+            elif processes > 1 and HTTP2BrokerGroup is not None:
                 group = HTTP2BrokerGroup(
                     [HTTP2Broker(**part) for part in _split_broker_kwargs(broker_kwargs, processes)]
                 )
@@ -1363,6 +1469,11 @@ class AOMount:
         self._download_broker_env = {}
         os.environ.pop("AO_HTTP2_BROKER_ADDR", None)
         os.environ.pop("AO_HTTP2_BROKER_TOKEN", None)
+        os.environ.pop("AO_HTTP2_BROKER_DYNAMIC", None)
+        autoscaler = getattr(self, "_broker_autoscaler", None)
+        self._broker_autoscaler = None
+        if autoscaler is not None:
+            autoscaler.stop()
         if broker is not None:
             try:
                 broker.stop()
@@ -1907,7 +2018,18 @@ def main():
         if USE_QT:
             app = QApplication(sys.argv)
             apply_theme(app)
-            
+            # Qt's shared pool is sized by logical CPUs (32 here); nothing in
+            # the window needs more than a few threads (performance plan,
+            # item 5: the parent held 92 threads during a flight).
+            try:
+                from PySide6.QtCore import QThreadPool
+
+                QThreadPool.globalInstance().setMaxThreadCount(
+                    max(2, min(4, os.cpu_count() or 2))
+                )
+            except Exception as exc:
+                log.debug("Could not cap Qt's thread pool: %s", exc)
+
             # Set application icon - required for macOS dock icon visibility
             if system_type == 'darwin':
                 # Use native macOS icon format

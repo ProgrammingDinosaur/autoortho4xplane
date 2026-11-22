@@ -120,15 +120,49 @@ except ImportError:
         def record_stage(_stage, _duration_ms, **_kwargs):
             return None
 
-try:
-    import httpx
-except ImportError:  # pragma: no cover - exercised via BrokerUnavailableError
-    httpx = None
+class _LazyModule:
+    """A module imported on first use.
 
-try:
-    import h2  # noqa: F401 - validates the httpx HTTP/2 extra
-except ImportError:  # pragma: no cover - production dependency validation
-    h2 = None
+    Performance plan, item 5: ``httpx`` (with ``click`` and ``pygments``,
+    which its command line pulls in) added about 23 MB to every broker
+    process, though brokers use curl whenever it is installed. ``loaded``
+    says whether it was imported without importing it.
+    """
+
+    def __init__(self, name):
+        self._name = name
+        self._module = None
+        self._failed = False
+        self._lock = threading.Lock()
+
+    def _load(self):
+        if self._module is None and not self._failed:
+            with self._lock:
+                if self._module is None and not self._failed:
+                    try:
+                        self._module = __import__(self._name)
+                    except ImportError:
+                        self._failed = True
+        return self._module
+
+    @property
+    def loaded(self) -> bool:
+        return self._module is not None
+
+    @property
+    def available(self) -> bool:
+        return self._load() is not None
+
+    def __getattr__(self, attribute):
+        module = self._load()
+        if module is None:
+            raise AttributeError(f"{self._name} is not installed")
+        return getattr(module, attribute)
+
+
+httpx = _LazyModule("httpx")
+# The httpx HTTP/2 extra, checked only when a broker uses httpx.
+h2 = _LazyModule("h2")
 
 try:
     import zmq
@@ -387,15 +421,21 @@ def _safe_url_for_log(url: str) -> str:
         return "<invalid-url>"
 
 
+def _module_available(module) -> bool:
+    if module is None:
+        return False
+    return bool(getattr(module, "available", True))
+
+
 def _require_dependencies(*, require_http2: bool = False) -> None:
     missing = []
-    if httpx is None:
+    if (require_http2 or httpx is None) and not _module_available(httpx):
         missing.append("httpx")
     if zmq is None:
         missing.append("pyzmq")
     if msgpack is None:
         missing.append("msgpack")
-    if require_http2 and h2 is None:
+    if require_http2 and not _module_available(h2):
         missing.append("h2")
     if missing:
         raise BrokerUnavailableError(
@@ -1243,7 +1283,8 @@ def _classify_origin_outcome(
             return "throttle" if isinstance(error, BrokerTimeoutError) else "neutral"
         if isinstance(error, BrokerTransportError):
             return "throttle"
-        if httpx is not None:
+        if getattr(httpx, "loaded", httpx is not None):
+            # Without httpx imported, the error cannot be one of its own.
             if isinstance(error, httpx.TimeoutException):
                 return "throttle"
             if isinstance(error, httpx.LocalProtocolError):
@@ -2291,18 +2332,23 @@ class _BrokerCore:
                 "httpcore internals changed; abandoned HTTP/2 streams will "
                 "not be reset"
             )
-        limits = httpx.Limits(max_connections=max_connections, max_keepalive_connections=max_connections)
-        client_kwargs: Dict[str, Any] = {
-            "http2": transport is None,
-            # Match requests.get(), which historically followed imagery
-            # provider redirects. Several providers redirect HTTP tile URLs to
-            # HTTPS and must not be reported as failed with a 301/302 response.
-            "follow_redirects": True,
-            "limits": limits,
-        }
-        if transport is not None:
-            client_kwargs["transport"] = transport
-        self._client = httpx.AsyncClient(**client_kwargs) if self.http_client == "httpx" else None
+        self._client = None
+        if self.http_client == "httpx":
+            limits = httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_connections,
+            )
+            client_kwargs: Dict[str, Any] = {
+                "http2": transport is None,
+                # Match requests.get(), which historically followed imagery
+                # provider redirects. Several providers redirect HTTP tile URLs
+                # to HTTPS and must not be reported as failed with a 301/302.
+                "follow_redirects": True,
+                "limits": limits,
+            }
+            if transport is not None:
+                client_kwargs["transport"] = transport
+            self._client = httpx.AsyncClient(**client_kwargs)
         self._curl = (
             _CurlTransport(max_concurrency, max_response_bytes)
             if self.http_client == "curl" else None
@@ -2786,12 +2832,14 @@ class _BrokerCore:
         self._active_requests += 1
         profile_gauge("broker.active_requests", self._active_requests)
         try:
-            timeout = httpx.Timeout(
-                connect=entry.timeout.connect,
-                read=entry.timeout.read,
-                write=entry.timeout.write,
-                pool=entry.timeout.pool,
-            )
+            timeout = None
+            if self._curl is None:
+                timeout = httpx.Timeout(
+                    connect=entry.timeout.connect,
+                    read=entry.timeout.read,
+                    write=entry.timeout.write,
+                    pool=entry.timeout.pool,
+                )
             # httpx timeouts are inactivity limits for individual socket phases.
             # A server that continuously trickles bytes can otherwise keep a
             # coalesced request alive indefinitely as new waiters join it.
@@ -3410,7 +3458,11 @@ def _process_entrypoint(token: str, handshake_queue, config: Dict[str, Any]) -> 
         except Exception as exc:
             log.warning("Could not start broker performance diagnostics: %s", exc)
     try:
-        _require_dependencies(require_http2=True)
+        # httpx and its HTTP/2 extra only when this broker uses them.
+        _require_dependencies(
+            require_http2=resolve_http_client(config.get("http_client", "auto"), None)
+            == "httpx"
+        )
     except BrokerUnavailableError as exc:
         handshake_queue.put(("error", str(exc)))
         return
@@ -3924,7 +3976,8 @@ class HTTP2Broker:
         live_queue_timeout: Optional[float] = None,
     ) -> "HTTP2Broker":
         """Attach a client-only handle to an existing broker process."""
-        _require_dependencies(require_http2=True)
+        # A client speaks to the broker over ZeroMQ only: no httpx needed.
+        _require_dependencies(require_http2=False)
         if not address.startswith("tcp://127.0.0.1:"):
             raise BrokerProtocolError(
                 "broker clients may only connect to a loopback TCP endpoint"
@@ -4273,12 +4326,117 @@ ADDRESS_SEPARATOR = ","
 
 
 class BrokerGroup:
-    """Several broker processes behind the parent's single broker handle."""
+    """Several broker processes behind the parent's single broker handle.
 
-    def __init__(self, brokers):
+    With a ``factory``, the group can grow to ``max_brokers`` and shrink back
+    (performance plan, item 5): one broker serves a flight in cruise (about
+    24 requests a second; one is good for about 200), more start while a
+    flight loads. Workers learn the current set from the routing table the
+    group publishes (``publish``, the stats store in AutoOrtho); a broker
+    being retired is first marked draining, so workers send it nothing new,
+    and is stopped once it holds no request.
+    """
+
+    def __init__(self, brokers, *, factory=None, max_brokers=None, publish=None,
+                 on_started=None):
         self._brokers = list(brokers)
         if not self._brokers:
             raise ValueError("a broker group needs at least one broker")
+        self._factory = factory
+        self.max_brokers = max(len(self._brokers), int(max_brokers or len(self._brokers)))
+        self._publish = publish
+        self._on_started = on_started
+        self._draining: List[Any] = []
+        self._generation = 0
+        self._scale_lock = threading.Lock()
+        self._last_config: Dict[str, Any] = {}
+
+    @property
+    def scalable(self) -> bool:
+        return self._factory is not None and self.max_brokers > 1
+
+    def routing_table(self) -> Dict[str, Any]:
+        """What workers route by: every live broker, and those draining."""
+        envs = [broker.client_environment() for broker in self._brokers]
+        draining = {
+            broker.client_environment()["AO_HTTP2_BROKER_ADDR"]
+            for broker in self._draining
+        }
+        return {
+            "generation": self._generation,
+            "addresses": [env["AO_HTTP2_BROKER_ADDR"] for env in envs],
+            "tokens": [env["AO_HTTP2_BROKER_TOKEN"] for env in envs],
+            "draining": sorted(draining),
+        }
+
+    def _publish_routing(self) -> None:
+        self._generation += 1
+        if self._publish is None:
+            return
+        try:
+            self._publish(self.routing_table())
+        except Exception:
+            log.debug("Could not publish the broker routing table", exc_info=True)
+
+    def add_broker(self) -> bool:
+        """Start one more broker (up to ``max_brokers``). True if started."""
+        if self._factory is None:
+            return False
+        with self._scale_lock:
+            if len(self._brokers) >= self.max_brokers:
+                return False
+            broker = self._factory()
+            broker.start()
+            self._brokers.append(broker)
+            self._reapply_config()
+            self._publish_routing()
+        if self._on_started is not None:
+            try:
+                self._on_started(broker, len(self._brokers) - 1)
+            except Exception:
+                log.debug("Broker start hook failed", exc_info=True)
+        log.info("Started download broker %d of at most %d", len(self._brokers), self.max_brokers)
+        return True
+
+    def retire_broker(self, *, drain_timeout: float = 90.0, poll: float = 0.5) -> bool:
+        """Drain the newest broker and stop it. Never the first. True if retired."""
+        with self._scale_lock:
+            if len(self._brokers) <= 1:
+                return False
+            broker = self._brokers[-1]
+            self._draining.append(broker)
+            self._publish_routing()
+        # Workers stop routing to it within their poll interval; requests it
+        # already holds finish (or reach the broker's queue timeout).
+        deadline = time.monotonic() + max(0.0, drain_timeout)
+        while time.monotonic() < deadline:
+            try:
+                stats = broker.server_stats(timeout=2.0) or {}
+            except Exception:
+                break
+            if not int(stats.get("entries", 0) or 0):
+                break
+            time.sleep(poll)
+        with self._scale_lock:
+            if broker in self._draining:
+                self._draining.remove(broker)
+            if broker in self._brokers:
+                self._brokers.remove(broker)
+            self._reapply_config()
+            self._publish_routing()
+        try:
+            broker.stop()
+        except Exception:
+            log.debug("Failed stopping a retired broker", exc_info=True)
+        log.info("Retired a download broker; %d running", len(self._brokers))
+        return True
+
+    def _reapply_config(self) -> None:
+        if self._last_config:
+            try:
+                self.configure(**self._last_config)
+            except Exception:
+                log.debug("Broker reconfigure after scaling failed", exc_info=True)
 
     @property
     def brokers(self):
@@ -4307,7 +4465,7 @@ class BrokerGroup:
 
     def client_environment(self) -> Dict[str, str]:
         envs = [broker.client_environment() for broker in self._brokers]
-        return {
+        env = {
             "AO_HTTP2_BROKER_ADDR": ADDRESS_SEPARATOR.join(
                 env["AO_HTTP2_BROKER_ADDR"] for env in envs
             ),
@@ -4315,6 +4473,10 @@ class BrokerGroup:
                 env["AO_HTTP2_BROKER_TOKEN"] for env in envs
             ),
         }
+        if self.scalable:
+            # Workers follow the published routing table (BrokerGroup docs).
+            env["AO_HTTP2_BROKER_DYNAMIC"] = "1"
+        return env
 
     @property
     def pid(self) -> Optional[int]:
@@ -4337,6 +4499,10 @@ class BrokerGroup:
         budget bounds the total.
         """
         parts = len(self._brokers)
+        if origin_max_concurrency is not None:
+            self._last_config["origin_max_concurrency"] = origin_max_concurrency
+        if max_bytes_per_second is not None:
+            self._last_config["max_bytes_per_second"] = max_bytes_per_second
         kwargs: Dict[str, Any] = {}
         if origin_max_concurrency is not None:
             kwargs["origin_max_concurrency"] = int(origin_max_concurrency)
@@ -4378,6 +4544,112 @@ class BrokerGroup:
         self.stop()
 
 
+class BrokerAutoscaler:
+    """Starts brokers under load and retires them when it is gone.
+
+    Every ``interval`` seconds each broker is asked for its counters. A
+    broker is under pressure when it holds more than ``entries_threshold``
+    requests (in flight and queued) or its answer takes longer than
+    ``late_seconds`` (its event loop runs late). Pressure for
+    ``pressure_seconds`` starts another broker; ``calm_seconds`` without it
+    retires the newest extra one.
+    """
+
+    def __init__(
+        self,
+        group: BrokerGroup,
+        *,
+        interval: float = 1.0,
+        entries_threshold: int = 64,
+        late_seconds: float = 0.25,
+        pressure_seconds: float = 2.0,
+        calm_seconds: float = 300.0,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.group = group
+        self.interval = float(interval)
+        self.entries_threshold = int(entries_threshold)
+        self.late_seconds = float(late_seconds)
+        self.pressure_seconds = float(pressure_seconds)
+        self.calm_seconds = float(calm_seconds)
+        self._clock = clock
+        self._pressure_since: Optional[float] = None
+        self._last_pressure = clock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._retiring = False
+
+    def pressured(self) -> bool:
+        for broker in self.group.brokers:
+            started = time.perf_counter()
+            try:
+                stats = broker.server_stats(timeout=2.0) or {}
+            except Exception:
+                continue
+            late = time.perf_counter() - started > self.late_seconds
+            if late or int(stats.get("entries", 0) or 0) > self.entries_threshold:
+                return True
+        return False
+
+    def tick(self, pressured: Optional[bool] = None) -> Optional[str]:
+        """One decision. Returns "add", "retire" or None."""
+        now = self._clock()
+        if pressured is None:
+            pressured = self.pressured()
+        if pressured:
+            self._last_pressure = now
+            if self._pressure_since is None:
+                self._pressure_since = now
+            if now - self._pressure_since >= self.pressure_seconds:
+                self._pressure_since = None
+                if self.group.add_broker():
+                    return "add"
+            return None
+        self._pressure_since = None
+        if (
+            len(self.group.brokers) > 1
+            and now - self._last_pressure >= self.calm_seconds
+            and not self._retiring
+        ):
+            self._last_pressure = now
+            return "retire"
+        return None
+
+    def _retire(self):
+        self._retiring = True
+        try:
+            self.group.retire_broker()
+        finally:
+            self._retiring = False
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                decision = self.tick()
+            except Exception:
+                log.debug("Broker autoscaler tick failed", exc_info=True)
+                continue
+            if decision == "retire":
+                # Draining waits for the broker to empty: not on this loop.
+                threading.Thread(
+                    target=self._retire, name="BrokerRetire", daemon=True
+                ).start()
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="BrokerAutoscaler", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+
 class MultiBrokerClient:
     """A worker's client for a :class:`BrokerGroup`: one connection per broker.
 
@@ -4386,12 +4658,21 @@ class MultiBrokerClient:
     broker refuses work that the total would admit.
     """
 
-    def __init__(self, clients):
+    def __init__(self, clients, *, addresses=None, connector=None):
         self._clients = list(clients)
         if not self._clients:
             raise ValueError("a multi-broker client needs at least one client")
         self._owners: Dict[str, Any] = {}
         self._owners_lock = threading.Lock()
+        # Routing follows the parent's table when the broker group scales:
+        # address -> client, and the clients new requests go to.
+        self._by_address: Dict[str, Any] = dict(zip(addresses or (), self._clients))
+        self._active = list(self._clients)
+        self._connector = connector
+        self._routing_generation = None
+        self._routing_lock = threading.Lock()
+        self._watch_stop = threading.Event()
+        self._watch_thread: Optional[threading.Thread] = None
 
     @classmethod
     def connect(cls, addresses, tokens, **kwargs) -> "MultiBrokerClient":
@@ -4408,15 +4689,81 @@ class MultiBrokerClient:
                 except Exception:
                     pass
             raise
-        return cls(clients)
+        return cls(
+            clients,
+            addresses=list(addresses),
+            connector=lambda address, token: HTTP2Broker.connect(address, token, **kwargs),
+        )
 
     @property
     def clients(self):
         return tuple(self._clients)
 
     def _client_for(self, url: str):
-        index = zlib.crc32(url.encode("utf-8", "surrogatepass")) % len(self._clients)
-        return self._clients[index]
+        active = self._active or self._clients
+        index = zlib.crc32(url.encode("utf-8", "surrogatepass")) % len(active)
+        return active[index]
+
+    def apply_routing(self, table: Optional[Dict[str, Any]]) -> bool:
+        """Follow the broker group's routing table. True when it changed.
+
+        New brokers get a connection; draining ones get no new requests
+        (those they hold finish); brokers no longer listed are disconnected.
+        """
+        if not table or self._connector is None:
+            return False
+        generation = table.get("generation")
+        if generation is not None and generation == self._routing_generation:
+            return False
+        addresses = list(table.get("addresses") or ())
+        tokens = list(table.get("tokens") or ())
+        draining = set(table.get("draining") or ())
+        if not addresses or len(addresses) != len(tokens):
+            return False
+        removed = []
+        with self._routing_lock:
+            for address, token in zip(addresses, tokens):
+                if address in self._by_address:
+                    continue
+                try:
+                    client = self._connector(address, token)
+                except Exception as exc:
+                    log.warning("Could not connect to broker %s: %s", address, exc)
+                    continue
+                self._by_address[address] = client
+                self._clients.append(client)
+            listed = set(addresses)
+            for address in list(self._by_address):
+                if address not in listed:
+                    removed.append(self._by_address.pop(address))
+            self._clients = [c for c in self._clients if c not in removed]
+            self._active = [
+                self._by_address[address]
+                for address in addresses
+                if address in self._by_address and address not in draining
+            ]
+            self._routing_generation = generation
+        for client in removed:
+            try:
+                client.stop()
+            except Exception:
+                log.debug("Failed stopping a retired broker client", exc_info=True)
+        return True
+
+    def watch_routing(self, reader: Callable[[], Any], interval: float = 1.0) -> None:
+        """Poll ``reader()`` for the routing table every ``interval`` seconds."""
+        if self._watch_thread is not None and self._watch_thread.is_alive():
+            return
+
+        def loop():
+            while not self._watch_stop.wait(interval):
+                try:
+                    self.apply_routing(reader())
+                except Exception:
+                    log.debug("Broker routing update failed", exc_info=True)
+
+        self._watch_thread = threading.Thread(target=loop, name="BrokerRouting", daemon=True)
+        self._watch_thread.start()
 
     def _remember(self, future, client):
         with self._owners_lock:
@@ -4486,6 +4833,7 @@ class MultiBrokerClient:
         return all(client.configure(**kwargs) for client in self._clients)
 
     def stop(self, timeout: float = 5.0) -> None:
+        self._watch_stop.set()
         for client in self._clients:
             try:
                 client.stop(timeout=timeout)

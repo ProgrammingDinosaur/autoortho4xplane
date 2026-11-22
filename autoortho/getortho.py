@@ -1235,11 +1235,18 @@ def _get_http2_client():
                 live_queue_timeout=_live_queue_timeout_seconds(),
             )
             addresses = [a for a in address.split(",") if a]
-            if len(addresses) > 1 and MultiBrokerClient is not None:
-                # Several broker processes (provider_broker_processes).
+            dynamic = os.environ.get("AO_HTTP2_BROKER_DYNAMIC") == "1"
+            if (len(addresses) > 1 or dynamic) and MultiBrokerClient is not None:
+                # Several broker processes (provider_broker_processes), or
+                # a group that starts and retires brokers with the load: the
+                # client follows the routing table the parent publishes.
                 _http2_client = MultiBrokerClient.connect(
                     addresses, token.split(","), **client_kwargs
                 )
+                if dynamic:
+                    _http2_client.watch_routing(
+                        lambda: STATS.get("broker_routing")
+                    )
             else:
                 _http2_client = HTTP2Broker.connect(
                     address, token, **client_kwargs

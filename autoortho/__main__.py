@@ -53,12 +53,24 @@ import atexit, signal, threading
 import platform
 from pathlib import Path
 
+# A multiprocessing child (a download broker, started with "spawn") imports
+# this module again as "__mp_main__". The app's config, its Qt imports and
+# its shutdown hooks are none of the child's business: importing them cost
+# each broker about 70 MB (performance plan, item 5).
+_MP_CHILD = __name__ == "__mp_main__"
+
+
+def _load_config():
+    try:
+        from autoortho.aoconfig import CFG as config
+    except ImportError:
+        from aoconfig import CFG as config
+    return config
+
+
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
-    try:
-        from autoortho.aoconfig import CFG
-    except ImportError:
-        from aoconfig import CFG
+    CFG = None if _MP_CHILD else _load_config()
 except Exception as _cfg_err:
     # Config loading failed (e.g., permission error creating dirs on fresh install).
     # Log to stderr since logging isn't set up yet, then show a dialog on macOS.
@@ -248,14 +260,16 @@ def _global_shutdown(signum=None, frame=None):
     os._exit(0)
 
 
-# Register the hooks as early as possible
-atexit.register(_global_shutdown)
-for _sig in (signal.SIGINT, signal.SIGTERM):
-    try:
-        signal.signal(_sig, _global_shutdown)
-    except Exception:
-        # Signals may not be available on some platforms (e.g., Windows < py3.8)
-        pass
+# Register the hooks as early as possible (not in a multiprocessing child:
+# a broker that exits must not run the app's shutdown).
+if not _MP_CHILD:
+    atexit.register(_global_shutdown)
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(_sig, _global_shutdown)
+        except Exception:
+            # Signals may not be available on some platforms (e.g., Windows < py3.8)
+            pass
 
 
 def setuplogs():
@@ -347,10 +361,11 @@ except Exception:
     pass
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
-try:
-    from autoortho import autoortho
-except ImportError:
-    import autoortho
+if not _MP_CHILD:
+    try:
+        from autoortho import autoortho
+    except ImportError:
+        import autoortho
 
 if __name__ == "__main__":
     try:

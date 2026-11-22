@@ -3255,6 +3255,41 @@ class ConfigUI(QMainWindow):
         super().showEvent(event)
         if not self._setup_wizard_checked:
             QTimer.singleShot(0, self._maybe_show_setup_wizard)
+        self._apply_window_quiet()
+
+    # Hidden or minimized, nothing on screen needs a refresh every second;
+    # the tray summary still updates (performance plan, item 5: the parent
+    # used 4 % of a core while doing nothing the flight needs).
+    _QUIET_REFRESH_MS = 5000
+    _QUIET_TIMERS = (("shell_status_timer", 1000), ("_tuning_timer", 1000))
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._apply_window_quiet()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._apply_window_quiet()
+
+    def _apply_window_quiet(self):
+        quiet = (not self.isVisible()) or self.isMinimized()
+        if quiet == getattr(self, "_window_quiet", False):
+            return
+        self._window_quiet = quiet
+        for name, normal_ms in self._QUIET_TIMERS:
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.setInterval(self._QUIET_REFRESH_MS if quiet else normal_ms)
+        if not quiet:
+            # Shown again: bring the pages up to date at once.
+            for refresh in ("_refresh_tuning", "_update_shell_status"):
+                method = getattr(self, refresh, None)
+                if method is not None:
+                    try:
+                        method()
+                    except Exception as exc:
+                        log.debug("Refresh after showing failed: %s", exc)
 
     def _readiness_values(self):
         values = self._current_configuration_input().__dict__.copy()
