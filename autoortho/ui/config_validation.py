@@ -228,12 +228,19 @@ def validate_configuration(
         except OSError:
             has_dsf = False
         if not has_dsf:
-            issues.append(
-                ValidationIssue(
-                    "scenery",
-                    ValidationSeverity.WARNING,
-                    f"Scenery folder appears incomplete: {root}",
+            if root.name.startswith("z_ao_") and (root / "Earth nav data").is_dir():
+                # What an interrupted region move leaves behind (region_adopt
+                # finishes it on the next start); it has nothing to load.
+                message = (
+                    f"{root.name} has no tiles left: it is left over from "
+                    "moving an installed region into AutoOrtho scenery. "
+                    "AutoOrtho removes it on its next start, or you can "
+                    f"delete it: {root}"
                 )
+            else:
+                message = f"Scenery folder appears incomplete: {root}"
+            issues.append(
+                ValidationIssue("scenery", ValidationSeverity.WARNING, message)
             )
 
     return issues

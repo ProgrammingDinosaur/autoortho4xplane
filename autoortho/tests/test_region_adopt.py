@@ -95,6 +95,41 @@ def test_region_moves_into_the_package_and_is_pinned(ao_dir):
     assert ra.installed_regions(ao_dir) == []
 
 
+class _Clock:
+    def __init__(self, step):
+        self.now, self.step = 100.0, step
+
+    def __call__(self):
+        self.now += self.step
+        return self.now
+
+
+def _progress_steps(ao_dir, monkeypatch, clock_step):
+    """Moves a region of 3 DSFs and 20 masks with a clock that advances
+    ``clock_step`` seconds per reading; returns the progress reports."""
+    make_streaming(ao_dir)
+    masks = [f"textures/{100000 + i}_148176_ZL18.png" for i in range(20)]
+    make_region(ao_dir, "eur", TILES, masks=masks)
+    monkeypatch.setattr(ra.time, "monotonic", _Clock(clock_step))
+    steps = []
+    result = ra.adopt_regions(ao_dir, progress=lambda *a: steps.append(a))
+    assert result.regions == ["eur"] and not result.errors
+    return steps
+
+
+def test_fast_moves_report_progress_by_time_not_per_file(ao_dir, monkeypatch):
+    """Links take microseconds: reporting every few files flooded the UI
+    thread with updates and froze the window during the start-up move."""
+    steps = _progress_steps(ao_dir, monkeypatch, clock_step=0.0)
+    assert steps == [("eur", 1, 23), ("eur", 23, 23)]
+
+
+def test_slow_moves_report_each_interval(ao_dir, monkeypatch):
+    steps = _progress_steps(ao_dir, monkeypatch,
+                            clock_step=ra.PROGRESS_INTERVAL)
+    assert [done for _, done, _ in steps] == list(range(1, 24))
+
+
 def test_patched_overlapping_and_unindexed_tiles_move_as_they_are(ao_dir):
     """Seasons-patched DSFs keep their seasons; tiles the index lacks still
     move (the mount lists stored DSFs), as long as most are known."""
@@ -199,6 +234,61 @@ def test_cancel_midway_keeps_the_region_and_pins(ao_dir):
     # A second run finishes the job.
     again = ra.adopt_regions(ao_dir)
     assert again.regions == ["eur"] and not os.path.exists(region)
+
+
+def test_region_left_without_dsfs_is_removed(ao_dir):
+    """An earlier move took every DSF but didn't remove the folder (the app
+    quit, or the delete failed): the next run removes the leftover instead
+    of keeping an empty region installed for ever."""
+    pkg = make_streaming(ao_dir)
+    region, info = make_region(ao_dir, "asi", [])
+    os.makedirs(os.path.join(region, ts.DSF_DIR, "+30+100"))
+    assert ra.installed_regions(ao_dir) == ["z_ao_asi"]
+    check = ra.check_regions(ao_dir)[0]
+    assert check.movable and check.leftover
+    result = ra.adopt_regions(ao_dir)
+    assert result.cleaned == ["asi"] and result.regions == [] and not result.kept
+    assert not os.path.exists(region) and not os.path.exists(info)
+    assert os.path.exists(os.path.join(pkg, *MASK.split("/")))
+    assert ts.read_pins(pkg) == set()
+    assert ra.installed_regions(ao_dir) == []
+    assert "removed 1 emptied" in str(result)
+
+
+def test_leftover_region_goes_even_when_turned_off(ao_dir, tmp_path):
+    make_streaming(ao_dir)
+    region, _ = make_region(ao_dir, "eur", [])
+    os.makedirs(os.path.join(region, ts.DSF_DIR))
+    custom = tmp_path / "Custom Scenery"
+    custom.mkdir()
+    (custom / "scenery_packs.ini").write_text(
+        "I\n1000 Version\nSCENERY\n\n"
+        "SCENERY_PACK_DISABLED Custom Scenery/z_ao_eur/\n")
+    result = ra.adopt_regions(ao_dir, custom_scenery_dir=str(custom))
+    assert result.cleaned == ["eur"] and not os.path.exists(region)
+
+
+def test_move_counts_when_the_folder_cant_be_removed(ao_dir, monkeypatch):
+    """The tiles are in the package; a failed delete leaves a DSF-less
+    folder, which the next run removes."""
+    pkg = make_streaming(ao_dir)
+    region, info = make_region(ao_dir, "eur", TILES)
+    real_remove = ra._remove_region
+
+    def fail(_root):
+        raise OSError("Directory not empty")
+
+    monkeypatch.setattr(ra, "_remove_region", fail)
+    result = ra.adopt_regions(ao_dir)
+    assert result.regions == ["eur"] and not result.errors
+    assert os.path.isdir(region) and os.path.exists(info)
+    for cell in TILES:
+        assert os.path.exists(os.path.join(pkg, *ts.dsf_rel(*cell).split("/")))
+    monkeypatch.setattr(ra, "_remove_region", real_remove)
+    again = ra.adopt_regions(ao_dir)
+    assert again.cleaned == ["eur"] and not again.kept
+    assert not os.path.exists(region) and not os.path.exists(info)
+    assert ts.read_pins(pkg) == set(TILES)
 
 
 def test_patched_reflectivity_carries_over(ao_dir):

@@ -14,6 +14,11 @@ try:
 except ImportError:
     from aoconfig import CFG
 
+try:
+    from autoortho.utils.win_mountpoint import remove_stale_mount_point
+except ImportError:
+    from utils.win_mountpoint import remove_stale_mount_point
+
 log = logging.getLogger(__name__)
 
 reg = None
@@ -228,6 +233,10 @@ def force_unmount(path):
     Best-effort force unmount on Windows for both WinFsp and Dokan.
     No exception if not installed.
     """
+    # The filesystem may already be gone with only its mount point left
+    # (Dokan without admin rights). dokanctl /u would need admin for that too.
+    if remove_stale_mount_point(path):
+        return
     try:        # Dokan: dokanctl.exe /u <mount> (drive letter or mount dir)
         if shutil.which("dokanctl.exe"):
             subprocess.run(["dokanctl.exe", "/u", path],

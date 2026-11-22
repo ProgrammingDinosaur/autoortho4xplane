@@ -102,6 +102,27 @@ def test_incomplete_scenery_is_warning(tmp_path):
     )
 
 
+def test_leftover_region_folder_warning_says_what_it_is(tmp_path):
+    xplane = tmp_path / "X-Plane"
+    (xplane / "Custom Scenery").mkdir(parents=True)
+    root = tmp_path / "scenery" / "z_autoortho" / "scenery" / "z_ao_asi"
+    (root / "Earth nav data" / "+30+100").mkdir(parents=True)
+
+    issues = validate_configuration(
+        _values(tmp_path, xplane),
+        scenery_mounts=[{"root": str(root), "mount": "/unused"}],
+    )
+
+    warnings = [
+        issue.message for issue in issues
+        if issue.field == "scenery"
+        and issue.severity == ValidationSeverity.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "z_ao_asi has no tiles left" in warnings[0]
+    assert "appears incomplete" not in warnings[0]
+
+
 def test_stale_mounts_do_not_satisfy_current_scenery_path(tmp_path):
     xplane = tmp_path / "X-Plane"
     (xplane / "Custom Scenery").mkdir(parents=True)
