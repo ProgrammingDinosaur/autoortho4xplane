@@ -46,12 +46,14 @@ try:
         cleanup_stale_mount_folders,
         safe_ismount,
     )
+    from autoortho.utils.win_mountpoint import remove_stale_mount_point
 except ImportError:
     from utils.mount_utils import (
         cleanup_mountpoint,
         cleanup_stale_mount_folders,
         safe_ismount,
     )
+    from utils.win_mountpoint import remove_stale_mount_point
 
 try:
     from autoortho import tile_stream
@@ -1606,6 +1608,11 @@ class AOMount:
             return False
         self.stop_download_broker()
 
+        if system_type == "windows":
+            # A worker may have released its volume only after unmount() gave up.
+            for mountpoint in mountpoints:
+                remove_stale_mount_point(mountpoint)
+
         remaining_mounts = [
             mountpoint for mountpoint in mountpoints
             if safe_ismount(mountpoint)
@@ -1713,6 +1720,9 @@ class AOMount:
             deadline = time.time() + wait_timeout
             while time.time() < deadline:
                 if not safe_ismount(mountpoint):
+                    break
+                # Dokan without admin rights leaves the mount point behind.
+                if system_type == "windows" and remove_stale_mount_point(mountpoint):
                     break
                 time.sleep(0.5)
 
