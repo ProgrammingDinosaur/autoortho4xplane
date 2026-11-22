@@ -144,6 +144,8 @@ class SceneryCard(QFrame):
             f"Seasons: {item.seasons_status} · Terrain reflectivity: {roughness}"))
         self.check_label = _secondary(
             "" if check is None else
+            "Its tiles were already moved; moving removes the leftover folder."
+            if check.movable and check.leftover else
             "Can move into AutoOrtho scenery." if check.movable else check.reason)
         self.check_label.setVisible(check is not None)
         layout.addWidget(self.check_label)

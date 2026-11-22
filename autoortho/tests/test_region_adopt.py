@@ -201,6 +201,61 @@ def test_cancel_midway_keeps_the_region_and_pins(ao_dir):
     assert again.regions == ["eur"] and not os.path.exists(region)
 
 
+def test_region_left_without_dsfs_is_removed(ao_dir):
+    """An earlier move took every DSF but didn't remove the folder (the app
+    quit, or the delete failed): the next run removes the leftover instead
+    of keeping an empty region installed for ever."""
+    pkg = make_streaming(ao_dir)
+    region, info = make_region(ao_dir, "asi", [])
+    os.makedirs(os.path.join(region, ts.DSF_DIR, "+30+100"))
+    assert ra.installed_regions(ao_dir) == ["z_ao_asi"]
+    check = ra.check_regions(ao_dir)[0]
+    assert check.movable and check.leftover
+    result = ra.adopt_regions(ao_dir)
+    assert result.cleaned == ["asi"] and result.regions == [] and not result.kept
+    assert not os.path.exists(region) and not os.path.exists(info)
+    assert os.path.exists(os.path.join(pkg, *MASK.split("/")))
+    assert ts.read_pins(pkg) == set()
+    assert ra.installed_regions(ao_dir) == []
+    assert "removed 1 emptied" in str(result)
+
+
+def test_leftover_region_goes_even_when_turned_off(ao_dir, tmp_path):
+    make_streaming(ao_dir)
+    region, _ = make_region(ao_dir, "eur", [])
+    os.makedirs(os.path.join(region, ts.DSF_DIR))
+    custom = tmp_path / "Custom Scenery"
+    custom.mkdir()
+    (custom / "scenery_packs.ini").write_text(
+        "I\n1000 Version\nSCENERY\n\n"
+        "SCENERY_PACK_DISABLED Custom Scenery/z_ao_eur/\n")
+    result = ra.adopt_regions(ao_dir, custom_scenery_dir=str(custom))
+    assert result.cleaned == ["eur"] and not os.path.exists(region)
+
+
+def test_move_counts_when_the_folder_cant_be_removed(ao_dir, monkeypatch):
+    """The tiles are in the package; a failed delete leaves a DSF-less
+    folder, which the next run removes."""
+    pkg = make_streaming(ao_dir)
+    region, info = make_region(ao_dir, "eur", TILES)
+    real_remove = ra._remove_region
+
+    def fail(_root):
+        raise OSError("Directory not empty")
+
+    monkeypatch.setattr(ra, "_remove_region", fail)
+    result = ra.adopt_regions(ao_dir)
+    assert result.regions == ["eur"] and not result.errors
+    assert os.path.isdir(region) and os.path.exists(info)
+    for cell in TILES:
+        assert os.path.exists(os.path.join(pkg, *ts.dsf_rel(*cell).split("/")))
+    monkeypatch.setattr(ra, "_remove_region", real_remove)
+    again = ra.adopt_regions(ao_dir)
+    assert again.cleaned == ["eur"] and not again.kept
+    assert not os.path.exists(region) and not os.path.exists(info)
+    assert ts.read_pins(pkg) == set(TILES)
+
+
 def test_patched_reflectivity_carries_over(ao_dir):
     pkg = make_streaming(ao_dir)
     make_region(ao_dir, "eur", TILES, info={

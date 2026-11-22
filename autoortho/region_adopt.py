@@ -86,6 +86,12 @@ class RegionCheck:
     def movable(self) -> bool:
         return not self.reason
 
+    @property
+    def leftover(self) -> bool:
+        """No DSFs left: an earlier move took them but didn't remove the
+        folder. Moving it only removes what is left."""
+        return self.dsfs == 0
+
 
 MIGRATION_SET = "xp11"   # the set a migrated install starts with
 
@@ -93,6 +99,7 @@ MIGRATION_SET = "xp11"   # the set a migrated install starts with
 @dataclass
 class AdoptResult:
     regions: List[str] = field(default_factory=list)   # moved region ids
+    cleaned: List[str] = field(default_factory=list)   # leftover folders removed
     kept: Dict[str, str] = field(default_factory=dict)  # region id -> reason
     tiles: int = 0
     files: int = 0
@@ -107,6 +114,8 @@ class AdoptResult:
         parts = []
         if self.regions:
             parts.append(f"moved {len(self.regions)} region(s), {self.tiles} tiles")
+        if self.cleaned:
+            parts.append(f"removed {len(self.cleaned)} emptied region folder(s)")
         if self.overlays:
             parts.append(f"{self.overlays} overlay tiles")
         if self.kept:
@@ -233,8 +242,11 @@ def check_region(ao_scenery_dir: str, name: str, index: "tile_stream.TileIndex",
     for rel in _masks(root):
         check.size += _size(os.path.join(root, *rel.split("/")))
     if not dsfs:
-        check.reason = "It has no DSFs."
-    elif disabled and name in disabled:
+        # A leftover: nothing for X-Plane to load, and the move that took its
+        # DSFs had put its terrain and textures in the package first. Moving
+        # it finishes that job and removes what is left.
+        return check
+    if disabled and name in disabled:
         check.reason = ("It's turned off in X-Plane's scenery list. Turn it on "
                         "to move it, or remove it.")
     elif check.known < MIN_KNOWN * check.dsfs:
@@ -359,6 +371,9 @@ def adopt_regions(ao_scenery_dir: str, region_names: Optional[List[str]] = None,
         if moved is None:
             result.cancelled = True
             break
+        if check.leftover:
+            result.cleaned.append(check.region_id)
+            continue
         result.regions.append(check.region_id)
         result.tiles += len(check.tiles)
         result.files += moved[0]
@@ -394,7 +409,7 @@ def _adopt_checked(ao_scenery_dir: str, check: RegionCheck, pkg_root: str,
             size += n
         if progress and (i % 50 == 0 or i == total):
             progress(check.region_id, i, total)
-    if own_terrain:
+    if own_terrain and check.tiles:
         # Its tiles are another set's than the package's: say so (the map
         # shows it, and deleting one removes its own terrain files too).
         sources = tile_stream.read_tile_sources(pkg_root)
@@ -406,6 +421,27 @@ def _adopt_checked(ao_scenery_dir: str, check: RegionCheck, pkg_root: str,
     if not own_terrain and roughness is not None and marker.get("roughness") is None:
         tile_stream.set_stream_roughness(ao_scenery_dir, roughness)
         marker["roughness"] = roughness
+    try:
+        _remove_region(root)
+    except OSError as exc:
+        # Its tiles are in the package already, so the move counts; what is
+        # left has no DSFs and the next start removes it.
+        log.warning("Adopt: moved %s but couldn't remove its folder yet: %s",
+                    check.name, exc)
+        return files, size
+    if os.path.exists(info_path):
+        os.remove(info_path)
+    if check.leftover:
+        log.info("Adopt: removed %s (no DSFs left; an earlier move took them)",
+                 check.name)
+    else:
+        log.info("Adopt: moved %s into %s (%d tiles, %d files, %.1f GB)",
+                 check.name, os.path.basename(pkg_root), len(check.tiles),
+                 files, size / 1e9)
+    return files, size
+
+
+def _remove_region(root: str) -> None:
     if _is_link(root):
         # A junction or symlink to another drive: remove the link only;
         # what is left at its target (terrain files) is the user's.
@@ -415,11 +451,6 @@ def _adopt_checked(ao_scenery_dir: str, check: RegionCheck, pkg_root: str,
             os.rmdir(root)
     else:
         shutil.rmtree(root)
-    if os.path.exists(info_path):
-        os.remove(info_path)
-    log.info("Adopt: moved %s into %s (%d tiles, %d files, %.1f GB)", check.name,
-             os.path.basename(pkg_root), len(check.tiles), files, size / 1e9)
-    return files, size
 
 
 def _region_roughness(info: dict) -> Optional[float]:
