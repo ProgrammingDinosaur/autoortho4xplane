@@ -10157,6 +10157,47 @@ class _ChunkReadyEvent(threading.Event):
             callback(self)
 
 
+# Backstop for chunks whose ready event cannot call back (a plain Event in a
+# test double, or a ready event replaced after the wait began): re-check this
+# often instead of a hundred times a second.
+_SETTLED_WAIT_BACKSTOP_SECONDS = 0.25
+
+
+def wait_for_chunks_settled(chunks, deadline):
+    """Wait until every chunk in ``chunks`` is ready, or ``deadline`` passes.
+
+    A chunk counts once its ``ready`` event is set, whether it holds data or
+    not: a provider with no imagery for it, a permanent failure or a
+    cancellation all settle it. Waiting wakes on the chunks' ready callbacks
+    instead of polling. Returns True when every chunk settled in time.
+    """
+    pending = [c for c in chunks if c is not None and not c.ready.is_set()]
+    if not pending:
+        return True
+    woke = threading.Event()
+
+    def on_ready(_event=None):
+        woke.set()
+
+    callbacks_ok = True
+    for chunk in pending:
+        add_callback = getattr(chunk.ready, "add_callback", None)
+        if add_callback is None:
+            callbacks_ok = False
+            continue
+        add_callback(on_ready)
+    backstop = None if callbacks_ok else _SETTLED_WAIT_BACKSTOP_SECONDS
+    while True:
+        pending = [c for c in pending if not c.ready.is_set()]
+        if not pending:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        woke.wait(remaining if backstop is None else min(remaining, backstop))
+        woke.clear()
+
+
 class ChunkGrid:
     """Sparse canonical chunk grid with stable logical indices."""
 
@@ -16846,17 +16887,20 @@ class Tile(object):
                         self.get_maxwait(),
                     )
                     if wait_time > 0:
-                        wait_deadline = time.monotonic() + wait_time
-                        
-                        while time.monotonic() < wait_deadline:
-                            # Count ready chunks (including newly completed ones)
-                            current_ready = sum(1 for i in range(total_chunks) 
-                                               if jpeg_datas[i] is not None or 
-                                               (chunks[i].ready.is_set() and chunks[i].data))
-                            if current_ready >= total_chunks * min_ratio:
-                                break
-                            time.sleep(0.01)
-                        
+                        # Leave as soon as every outstanding chunk has settled,
+                        # with data or without: a chunk the provider has no
+                        # imagery for, or whose download failed for good, will
+                        # not change by waiting. The threshold check below
+                        # then sends the build to the fallback path.
+                        all_settled = wait_for_chunks_settled(
+                            [chunks[i] for i in missing_chunks_indices],
+                            time.monotonic() + wait_time,
+                        )
+                        if all_settled and any(
+                            not chunks[i].data for i in missing_chunks_indices
+                        ):
+                            bump('read_wait_ended_all_settled')
+
                         # Collect newly downloaded chunks
                         for i in missing_chunks_indices:
                             chunk = chunks[i]
