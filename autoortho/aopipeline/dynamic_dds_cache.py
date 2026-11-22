@@ -48,6 +48,11 @@ except ImportError:
     from diagnostics import profiled_stage
 
 try:
+    from autoortho import chunk_store
+except ImportError:
+    import chunk_store
+
+try:
     import zstandard
     _HAS_ZSTD = True
 except ImportError:
@@ -185,6 +190,8 @@ def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
     """
     deleted = 0
     bytes_freed = 0
+    store = chunk_store.store_for(cache_dir)
+    legacy_files = store is None or store.legacy_pending()
     for zoom in range(max_zoom, min_zoom - 1, -1):
         zoom_diff = tilename_zoom - zoom
         if zoom_diff >= 0:
@@ -199,6 +206,22 @@ def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
             scaled_width = width << shift
             scaled_height = height << shift
 
+        if store is not None:
+            keys = [
+                (c, r)
+                for r in range(scaled_row, scaled_row + scaled_height)
+                for c in range(scaled_col, scaled_col + scaled_width)
+                if protect_jpeg is None
+                or not protect_jpeg(f"{c}_{r}_{zoom}_{maptype}.jpg")
+            ]
+            if keys:
+                count, freed = store.delete_many(
+                    maptype, zoom, keys, return_bytes=True
+                )
+                deleted += count
+                bytes_freed += freed
+            if not legacy_files:
+                continue
         for r in range(scaled_row, scaled_row + scaled_height):
             for c in range(scaled_col, scaled_col + scaled_width):
                 jpeg_name = f"{c}_{r}_{zoom}_{maptype}.jpg"
@@ -3281,7 +3304,7 @@ class DynamicDDSCache:
         jpeg_path = os.path.join(
             cache_dir,
             f"{col}_{row}_{max_zoom}_{tile.maptype}.jpg")
-        return os.path.exists(jpeg_path)
+        return chunk_store.chunk_path_exists(jpeg_path)
 
     def _try_heal_from_disk_cache(self, tile_id: str, max_zoom: int, tile) -> List[int]:
         """Check if healable chunk JPEGs exist on disk and dispatch healing.
@@ -3390,12 +3413,11 @@ class DynamicDDSCache:
             jpeg_path = os.path.join(
                 tile.cache_dir,
                 f"{col}_{row}_{max_zoom}_{tile.maptype}.jpg")
-            try:
-                with open(jpeg_path, "rb") as f:
-                    chunk_jpegs[idx] = f.read()
-            except (FileNotFoundError, OSError):
+            data = chunk_store.read_chunk_path(jpeg_path)
+            if not data:
                 log.debug(f"Healing: JPEG missing for chunk {idx} of {tile_id}")
                 return
+            chunk_jpegs[idx] = data
 
         self.patch_missing_chunks(tile_id, max_zoom, tile, chunk_jpegs)
 

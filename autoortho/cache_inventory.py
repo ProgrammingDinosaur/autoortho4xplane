@@ -29,8 +29,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 if __package__:
-    from . import tile_stream
+    from . import chunk_store, tile_stream
 else:  # running from inside the autoortho folder
+    import chunk_store
     import tile_stream
 
 log = logging.getLogger(__name__)
@@ -296,9 +297,35 @@ def _scan_packages(inv: CacheInventory, ao_scenery_dir: str) -> None:
             usage.mesh_used = max(usage.mesh_used, st.st_mtime)
 
 
+def _count_chunk(inv: CacheInventory, cell: Cell, zoom: int, maptype: str,
+                 size: int, used: float) -> None:
+    usage = inv.cell(cell)
+    usage.chunk_bytes += size
+    usage.chunk_files += 1
+    usage.zooms.add(zoom)
+    usage.maptypes.add(maptype)
+    if used > usage.imagery_used:
+        usage.imagery_used = used
+    totals = inv.chunk_zooms.setdefault(zoom, [0, 0])
+    totals[0] += 1
+    totals[1] += size
+    inv.files += 1
+
+
 def _scan_chunks(inv: CacheInventory, cache_dir: str,
                  cancelled: Callable[[], bool]) -> None:
     mapper = _CellMapper()
+    store = chunk_store.store_for(cache_dir)
+    if store is not None:
+        # The packed store: one row per chunk, no file to stat.
+        for i, (col, row, zoom, maptype, status, size, fetched) in enumerate(
+            store.iter_chunks()
+        ):
+            if i % 5000 == 0 and cancelled():
+                return
+            if status & 3 != chunk_store.STATUS_DATA:
+                continue
+            _count_chunk(inv, mapper(col, row, zoom), zoom, maptype, size, fetched)
     match = CHUNK_RE.match
     for i, f in enumerate(_scandir(cache_dir)):
         if i % 5000 == 0 and cancelled():
@@ -311,17 +338,8 @@ def _scan_chunks(inv: CacheInventory, cache_dir: str,
         except OSError:
             continue
         col, row, zoom = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        usage = inv.cell(mapper(col, row, zoom))
-        usage.chunk_bytes += st.st_size
-        usage.chunk_files += 1
-        usage.zooms.add(zoom)
-        usage.maptypes.add(m.group(4))
-        if st.st_mtime > usage.imagery_used:
-            usage.imagery_used = st.st_mtime
-        totals = inv.chunk_zooms.setdefault(zoom, [0, 0])
-        totals[0] += 1
-        totals[1] += st.st_size
-        inv.files += 1
+        _count_chunk(inv, mapper(col, row, zoom), zoom, m.group(4),
+                     st.st_size, st.st_mtime)
 
 
 def _scan_dds(inv: CacheInventory, cache_dir: str,
@@ -436,6 +454,16 @@ def _delete_mesh(ao_scenery_dir: str, cells: Set[Cell], result: ChangeResult) ->
 
 def _delete_imagery(cache_dir: str, cells: Set[Cell], result: ChangeResult) -> None:
     mapper = _CellMapper()
+    store = chunk_store.store_for(cache_dir)
+    if store is not None:
+        groups: Dict[Tuple[str, int], List[Tuple[int, int]]] = {}
+        for col, row, zoom, maptype, _status, _size, _fetched in store.iter_chunks():
+            if mapper(col, row, zoom) in cells:
+                groups.setdefault((maptype, zoom), []).append((col, row))
+        for (maptype, zoom), keys in groups.items():
+            count, freed = store.delete_many(maptype, zoom, keys, return_bytes=True)
+            result.files += count
+            result.bytes += freed
     for f in _scandir(cache_dir):
         m = CHUNK_RE.match(f.name)
         if m and mapper(int(m.group(1)), int(m.group(2)), int(m.group(3))) in cells:

@@ -37,6 +37,11 @@ import time
 from collections import OrderedDict
 from typing import Optional, Dict, Any, Callable, TYPE_CHECKING
 
+try:
+    from autoortho import chunk_store
+except ImportError:
+    import chunk_store
+
 if TYPE_CHECKING:
     from autoortho.aoimage.AoImage import AoImage
 
@@ -397,6 +402,9 @@ class FallbackResolver:
         cache_path = os.path.join(
             self.cache_dir, f"{col}_{row}_{zoom}_{self.maptype}.jpg"
         )
+        if chunk_store.enabled():
+            # The store refreshes the row's use time itself.
+            return chunk_store.read_chunk_path(cache_path)
         for attempt in range(1, 4):
             try:
                 with open(cache_path, 'rb') as f:

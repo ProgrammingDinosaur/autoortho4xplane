@@ -651,6 +651,30 @@ AutoOrtho uses disk-only caching (no dedicated RAM cache) because:
 
 **Recommendation:** Leave at 0 so the shared disk budget controls retention.
 
+### Packed chunk store (`chunk_store`)
+- **Type:** Boolean
+- **Default:** True
+- **Config file:** `[cache]` `chunk_store = True`
+
+Downloaded imagery chunks (256 px JPEGs) are kept in a few SQLite files under
+`cache_dir/chunks/`, one per 10 degree square, instead of one file per chunk.
+Measured on 100,000 real chunks on Windows, writing them cost 14 times less CPU
+(29 times counting Microsoft Defender, which scans every new file), and reading
+a texture's chunks was about four times faster. The files also take less disk
+space than a million small files do.
+
+A cache folder of the old layout keeps working: a chunk the store does not have
+is read from its old file and moved over, and the remaining files are moved in
+the background while no flight is mounted (Home shows the progress). Going back
+to an older AutoOrtho finds an empty chunk cache; the built-texture cache
+(`dds_cache`) is untouched. The long-term cache (`long_term_cache_dir`) stays one
+file per chunk, because SQLite should not be used on network shares.
+
+The store also remembers where the imagery provider has nothing (open sea), for
+30 days, so those chunks are not requested again in the next session.
+
+Set to `False` to keep one file per chunk.
+
 ### Apple Maps Caveat
 
 When using Apple Maps (`APPLE`) as your imagery source, downloads **always use the Python HTTP client** instead of the native libcurl client. This is because Apple Maps requires:

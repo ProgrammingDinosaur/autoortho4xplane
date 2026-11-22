@@ -3,9 +3,10 @@
 One ZL12 chunk covers a whole ZL16 tile, so once it is on disk the tile's
 base mipmap, and every placeholder stretched from it, is real imagery and
 never needs the network again. These chunks are small (10-25 KB) and few,
-so they are exempt from JPEG eviction. They stay in the normal cache folder
-and naming (``{col}_{row}_{zoom}_{maptype}.jpg``), because the native
-pipeline reads chunks from there by name.
+so they are exempt from JPEG eviction. With the packed chunk store they are
+rows marked kept (``chunk_store.FLAG_KEEP``), which eviction skips; with one
+file per chunk they keep the normal naming (``{col}_{row}_{zoom}_{maptype}.jpg``)
+and the disk budget skips them by name (:func:`protector`).
 """
 
 import re

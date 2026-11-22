@@ -10,8 +10,9 @@ import re
 import shutil
 from typing import Callable, Optional, Tuple
 
-# Folders AutoOrtho creates directly under the cache directory.
-CACHE_SUBDIRS = ("dds_cache", "terrain_index")
+# Folders AutoOrtho creates directly under the cache directory ("chunks" is
+# the packed chunk store, autoortho/chunk_store.py).
+CACHE_SUBDIRS = ("dds_cache", "terrain_index", "chunks")
 
 # Interrupted atomic writes: ".{name}.{uuid}.tmp" (chunk downloads) and
 # "{name}.tmp.{pid}" (DDS cache writes).
@@ -75,6 +76,17 @@ def delete_all_cache_contents(
     failures = 0
     if not os.path.isdir(cache_dir):
         return 0, 0
+
+    # This process's open chunk stores hold their files open (Windows cannot
+    # delete them then); a store opened again later starts empty.
+    try:
+        try:
+            from autoortho import chunk_store
+        except ImportError:
+            import chunk_store
+        chunk_store.close_all()
+    except Exception:
+        pass
 
     for entry in os.scandir(cache_dir):
         try:

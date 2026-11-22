@@ -285,7 +285,36 @@ class DiskBudgetManager:
             pass
         return total
 
+    def _chunk_store(self):
+        try:
+            try:
+                from autoortho import chunk_store
+            except ImportError:
+                import chunk_store
+        except ImportError:
+            return None
+        return chunk_store.store_for(self._cache_dir)
+
+    def _protect_chunk(self, col: int, row: int, zoom: int, maptype: str) -> bool:
+        if self.protect_jpeg is None:
+            return False
+        return bool(self.protect_jpeg(f"{col}_{row}_{zoom}_{maptype}.jpg"))
+
     def _scan_jpegs_size(self) -> int:
+        """Size of the imagery chunks the JPEG budget counts.
+
+        With the packed chunk store, its exact total of rows not kept (an
+        O(1) read), plus files of the old layout while they remain.
+        """
+        store = self._chunk_store()
+        if store is not None:
+            total = store.evictable_bytes()
+            if store.legacy_pending():
+                total += self._scan_jpeg_files_size()
+            return total
+        return self._scan_jpeg_files_size()
+
+    def _scan_jpeg_files_size(self) -> int:
         """Estimate total size of JPEG files in the cache."""
         total = 0
         try:
@@ -305,6 +334,21 @@ class DiskBudgetManager:
         return total
 
     def _evict_oldest_jpegs(self, bytes_to_free: int) -> int:
+        store = self._chunk_store()
+        if store is None:
+            return self._evict_oldest_jpeg_files(bytes_to_free)
+        freed = 0
+        if store.legacy_pending():
+            # Old files first: they are the oldest imagery there is.
+            freed += self._evict_oldest_jpeg_files(bytes_to_free)
+        if freed < bytes_to_free:
+            freed += store.evict_oldest(
+                bytes_to_free - freed,
+                protect=self._protect_chunk if self.protect_jpeg is not None else None,
+            )
+        return freed
+
+    def _evict_oldest_jpeg_files(self, bytes_to_free: int) -> int:
         candidates = []
         try:
             for dirpath, _dirnames, filenames in os.walk(self._cache_dir):

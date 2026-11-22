@@ -82,6 +82,12 @@ except ImportError:
     from diagnostics import start_parent_profiler, stop_active_profiler
 
 try:
+    from autoortho import chunk_migration, chunk_store
+except ImportError:
+    import chunk_migration
+    import chunk_store
+
+try:
     from autoortho.http2_broker import (
         HTTP2Broker,
         BrokerGroup as HTTP2BrokerGroup,
@@ -338,6 +344,11 @@ class AOMount:
         self.start_reporter()
 
         self.start_log_server()
+
+        # Chunk files of the old layout move into the packed store while no
+        # flight is mounted (performance plan, item 3).
+        self._chunk_converter = None
+        self._start_chunk_converter()
 
     def start_log_server(self):
         """Start once in the parent. Returns (host, port) bound on 127.0.0.1."""
@@ -1461,10 +1472,66 @@ class AOMount:
             self.unmount_sceneries()
         return handle
 
+    def _chunk_keep_predicate(self, cache_dir):
+        try:
+            try:
+                from autoortho import kept_imagery, low_zoom_base, streaming_options
+            except ImportError:
+                import kept_imagery
+                import low_zoom_base
+                import streaming_options
+            return kept_imagery.protector(
+                cache_dir,
+                low_zoom_base.protector(
+                    streaming_options.flag("low_zoom_base"),
+                    streaming_options.number("low_zoom_base_max_zoom"),
+                ),
+            )
+        except Exception as exc:
+            log.debug("Chunk keep predicate unavailable: %s", exc)
+            return None
+
+    def _start_chunk_converter(self):
+        """Move old-layout chunk files into the store in the background."""
+        try:
+            if not chunk_store.configure_from_config(self.cfg):
+                return
+            cache_dir = str(getattr(getattr(self.cfg, "paths", None), "cache_dir", "") or "")
+            if not cache_dir or not os.path.isdir(cache_dir):
+                return
+            if self._chunk_converter is None:
+                self._chunk_converter = chunk_migration.LegacyChunkConverter(
+                    cache_dir, keep=self._chunk_keep_predicate(cache_dir),
+                    pause_seconds=0.01,
+                )
+            if self._chunk_converter.start():
+                log.info("Converting the chunk cache to the packed store in the background")
+        except Exception as exc:
+            log.warning("Could not start the chunk cache conversion: %s", exc)
+
+    def _stop_chunk_converter(self):
+        """Pause the conversion while a flight runs; it resumes after unmount."""
+        converter = getattr(self, "_chunk_converter", None)
+        if converter is not None and converter.running:
+            converter.stop()
+            log.info("Chunk cache conversion paused for the flight")
+        try:
+            chunk_store.close_all()
+        except Exception:
+            pass
+
+    def chunk_conversion_text(self):
+        """A line for Home while old-layout chunk files are being moved."""
+        converter = getattr(self, "_chunk_converter", None)
+        if converter is None or not converter.running:
+            return ""
+        return converter.progress.text()
+
     def mount_sceneries(self, blocking=True):
         if self.mount_workers or self._active_mountpoints:
             log.error("Cannot start streaming until previous mounts have stopped")
             return False
+        self._stop_chunk_converter()
         self._ensure_parent_services()
 
         # Clean up any stale mount folders left behind from a crash
@@ -1639,6 +1706,7 @@ class AOMount:
 
         self._active_mountpoints = []
         log.info("Unmount complete")
+        self._start_chunk_converter()
         return True
 
     def restart_mount_worker(self, handle):

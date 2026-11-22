@@ -235,6 +235,10 @@ def _write_jpeg_mosaic(
         from autoortho.aoimage import AoImage as Image
     except ImportError:
         from aoimage import AoImage as Image
+    try:
+        from autoortho import chunk_store
+    except ImportError:
+        import chunk_store
 
     zoom_diff = tile_zoom - source_zoom
     if zoom_diff >= 0:
@@ -261,10 +265,11 @@ def _write_jpeg_mosaic(
                     f"{origin_col + x}_{origin_row + y}_"
                     f"{source_zoom}_{maptype}.jpg"
                 )
-                if not jpeg_path.is_file():
+                jpeg = chunk_store.read_chunk_path(str(jpeg_path))
+                if not jpeg:
                     continue
                 try:
-                    source = Image.load_from_memory(jpeg_path.read_bytes())
+                    source = Image.load_from_memory(jpeg)
                     if source is None:
                         continue
                     try:

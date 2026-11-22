@@ -252,8 +252,13 @@ def build(
     show_last_flight: bool = False,
     mode_label: str = "",
     now: Optional[float] = None,
+    maintenance: str = "",
 ) -> HomeSnapshot:
-    """``runtime`` is the app's state: stopped, starting, running or error."""
+    """``runtime`` is the app's state: stopped, starting, running or error.
+
+    ``maintenance`` is a line about background cache work (the chunk store
+    conversion), shown in the status strip while stopped.
+    """
     snap = governor or {}
     home = snap.get("home") or {}
     connection = "X-Plane connected" if xplane_connected else "X-Plane not connected"
@@ -264,6 +269,8 @@ def build(
         out.state = AFTER_FLIGHT if (show_last_flight and last_flight) else STOPPED
         out.pill = "Stopped" if runtime == "stopped" else "Error"
         out.strip_detail = f"{pack_text} configured"
+        if maintenance:
+            out.strip_detail += f" · {maintenance}"
         out.last_flight = last_flight
         out.summary = f"AutoOrtho · {out.pill}"
         return out

@@ -2185,6 +2185,10 @@ class ConfigUI(QMainWindow):
                 (governor_snapshot or {}).get("mode", ""), ""
             ),
             now=time.monotonic(),
+            maintenance=(
+                self.chunk_conversion_text()
+                if hasattr(self, "chunk_conversion_text") else ""
+            ),
         )
         self.home_snapshot_ready.emit(snapshot)
         self._update_tray_summary(snapshot)
@@ -11827,6 +11831,7 @@ class ConfigUI(QMainWindow):
                         jpeg_count += 1
                     except OSError:
                         pass
+            jpeg_count += self._clear_chunk_store(cache_dir)
             emit_progress(f"Phase 1: Deleted {jpeg_count} JPEG files.")
 
             # --- Phase 2: DDS cache (LRU, only if still over target) ---
@@ -11882,6 +11887,32 @@ class ConfigUI(QMainWindow):
             emit_progress(f"Cache cleanup error: {str(e)}")
             return False, str(e), False
 
+    def _clear_chunk_store(self, cache_dir):
+        """Empty the packed chunk store (cache cleanup). Returns rows removed.
+
+        Runs after the chunk files were deleted, so no old-layout file is
+        left to convert either.
+        """
+        stop = getattr(self, "_stop_chunk_converter", None)
+        if stop is not None:
+            stop()
+        try:
+            from autoortho import chunk_store
+        except ImportError:
+            import chunk_store
+        try:
+            store = chunk_store.store_for(cache_dir)
+            if store is None:
+                return 0
+            count = sum(1 for _ in store.iter_chunks())
+            store.clear()
+            store.set_legacy_pending(False)
+            chunk_store.close_all()
+            return count
+        except Exception as exc:
+            log.warning("Could not clear the chunk store: %s", exc)
+            return 0
+
     def clean_jpegs_only(
         self,
         cache_dir,
@@ -11903,7 +11934,8 @@ class ConfigUI(QMainWindow):
                 if entry.is_file() and entry.name.lower().endswith(('.jpg', '.jpeg')):
                     os.remove(entry.path)
                     jpeg_count += 1
-            
+            jpeg_count += self._clear_chunk_store(cache_dir)
+
             if jpeg_count > 0:
                 emit_progress(f"Deleted {jpeg_count} JPEG files.")
             else:

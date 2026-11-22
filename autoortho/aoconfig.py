@@ -594,6 +594,10 @@ file_cache_size = 30
 cache_mem_limit = 4
 # Auto clean cache on AutoOrtho exit
 auto_clean_cache = False
+# Keep downloaded imagery chunks packed in a few SQLite files (cache_dir/chunks)
+# instead of one file per chunk. Far less CPU, antivirus work and disk space.
+# A cache of the old layout is converted in the background while no flight runs.
+chunk_store = True
 
 [diagnostics]
 # Record per-stage tile latency and per-process memory/CPU usage for each mounted

@@ -158,6 +158,11 @@ except ImportError:
     import kept_imagery
 
 try:
+    from autoortho import chunk_store
+except ImportError:
+    import chunk_store
+
+try:
     from autoortho import hardware
     from autoortho import limits as limits_module
     from autoortho.live_settings import LiveSettings, ResizableGate
@@ -355,6 +360,22 @@ def _get_native_cache():
 
 @profiled_stage("cache.jpeg_batch_read")
 def _batch_read_cache_files(paths: list) -> dict:
+    """Read many chunks by their cache paths.
+
+    With the packed chunk store (``[cache] chunk_store``), a texture's chunks
+    are one range scan per band; files of the old layout that remain are read
+    through and moved into the store. Otherwise, one file per chunk.
+    """
+    if not paths:
+        return {}
+    if chunk_store.enabled():
+        return chunk_store.read_chunk_paths(
+            paths, legacy_reader=_batch_read_chunk_files
+        )
+    return _batch_read_chunk_files(paths)
+
+
+def _batch_read_chunk_files(paths: list) -> dict:
     """
     Read multiple cache files in parallel.
     
@@ -4691,6 +4712,29 @@ def _cache_write_limit_bytes() -> int:
     return max(16 * 1048576, value)
 
 
+def _configure_chunk_store() -> None:
+    """Turn the packed chunk store on or off from ``[cache] chunk_store``.
+
+    Imported legacy chunks of the low-zoom base and of kept tiles stay out
+    of eviction, as their files were.
+    """
+    enabled = _get_bool_config(getattr(CFG, "cache", None), "chunk_store", True)
+    chunk_store.configure(enabled, max_pending_bytes=_cache_write_limit_bytes())
+    if enabled:
+        try:
+            chunk_store.set_legacy_keep(
+                kept_imagery.protector(
+                    str(CFG.paths.cache_dir),
+                    low_zoom_base.protector(
+                        streaming_options.flag("low_zoom_base"),
+                        streaming_options.number("low_zoom_base_max_zoom"),
+                    ),
+                )
+            )
+        except Exception as exc:
+            log.debug(f"Chunk store keep predicate unavailable: {exc}")
+
+
 def _lt_cache_write_limit_bytes() -> int:
     try:
         value = int(
@@ -4776,6 +4820,9 @@ def _submit_bounded_cache_write(
         lambda _future: _release_pending_bytes(kind, byte_count)
     )
     return True
+
+
+_configure_chunk_store()
 
 _lt_cache_write_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=2,
@@ -5009,6 +5056,11 @@ def shutdown_cache_writer():
     except Exception as e:
         log.debug(f"shutdown_cache_writer: local executor shutdown failed: {e}")
     try:
+        # Commits what the chunk store still holds, then closes its files.
+        chunk_store.close_all()
+    except Exception as e:
+        log.debug(f"shutdown_cache_writer: chunk store close failed: {e}")
+    try:
         _lt_cache_write_executor.shutdown(wait=False)
     except Exception as e:
         log.debug(f"shutdown_cache_writer: LT executor shutdown failed: {e}")
@@ -5036,6 +5088,10 @@ def flush_cache_writer(timeout=30.0):
     try:
         # Shutdown with wait=True ensures ALL pending tasks complete
         _cache_write_executor.shutdown(wait=True)
+    except Exception:
+        pass
+    try:
+        chunk_store.flush_all(timeout)
     except Exception:
         pass
     finally:
@@ -8851,6 +8907,26 @@ class BackgroundDDSBuilder:
                         chunk.data if chunk.data else None
                         for chunk in chunks_for_hybrid
                     )
+                    if chunk_store.enabled() and any(
+                        data is None for data in hybrid_jpeg_snapshot
+                    ):
+                        # The native file mode below would read chunk files
+                        # the store replaced: take what is not in memory from
+                        # the store here, one range scan per band.
+                        stored = _batch_read_cache_files([
+                            chunk.cache_path
+                            for chunk, data in zip(
+                                chunks_for_hybrid, hybrid_jpeg_snapshot
+                            )
+                            if data is None
+                        ])
+                        hybrid_jpeg_snapshot = tuple(
+                            data if data is not None
+                            else stored.get(chunk.cache_path)
+                            for chunk, data in zip(
+                                chunks_for_hybrid, hybrid_jpeg_snapshot
+                            )
+                        )
                     hybrid_sources = bytearray(
                         int(
                             MipmapSource.TARGET_PROVIDER
@@ -8981,7 +9057,14 @@ class BackgroundDDSBuilder:
                         except Exception as e:
                             log.debug(f"BackgroundDDSBuilder: Hybrid build failed for {tile_id}: "
                                       f"{e}, trying native file I/O")
-                
+
+                if chunk_store.enabled():
+                    # The native modes below read chunk files by name; with
+                    # the packed store there are none to read (the hybrid
+                    # build above took its chunks from the store).
+                    bump('prebuilt_dds_native_file_skipped')
+                    return
+
                 # ───────────────────────────────────────────────────────────────────
                 # NATIVE MODE: C handles file I/O + decode + compress
                 # Best for Windows, also serves as fallback for hybrid
@@ -10247,6 +10330,25 @@ class ChunkGrid:
         if not chunks:
             return
         bump("cache_paths_probed", len(chunks))
+        if chunk_store.enabled():
+            cached_data = _batch_read_cache_files(
+                [chunk.cache_path for chunk in chunks]
+            ) or {}
+            misses = [c for c in chunks if not cached_data.get(c.cache_path)]
+            # One range scan tells which misses the provider has nothing for.
+            nothing_there = chunk_store.no_imagery_paths(
+                [c.cache_path for c in misses]
+            ) if misses else set()
+            for chunk in chunks:
+                data = cached_data.get(chunk.cache_path)
+                if data:
+                    chunk.set_cached_data(data)
+                elif chunk.cache_path in nothing_there:
+                    chunk._settle_no_imagery()
+                else:
+                    # Only the long-term cache is left to look in.
+                    chunk._get_long_term_cache()
+            return
         cached_data = _batch_read_cache_files(
             [chunk.cache_path for chunk in chunks]
         )
@@ -10457,6 +10559,8 @@ class Chunk(object):
         return f"Chunk({self.col},{self.row},{self.maptype},{self.zoom},{self.priority})"
 
     def _read_local_cache(self):
+        if chunk_store.enabled():
+            return chunk_store.read_chunk_path(self.cache_path)
         cache_file = Path(self.cache_path)
         data = None
         max_attempts = 5
@@ -10493,15 +10597,34 @@ class Chunk(object):
         return data
 
     def get_cache(self):
-        data = _chunk_cache_index.probe(
-            self.cache_path,
-            self._read_local_cache,
-        )
-        if data:
-            bump('chunk_hit')
-            self.data = data
-            return True
+        """Fill ``data`` from the local cache, else the long-term cache.
 
+        With the chunk store, a chunk the provider is remembered to have no
+        imagery for settles at once (permanent ``no_imagery`` failure)
+        instead of being downloaded again.
+        """
+        if chunk_store.enabled():
+            data, nothing_there = chunk_store.lookup_chunk_path(self.cache_path)
+            if data:
+                bump('chunk_hit')
+                self.data = data
+                return True
+            if nothing_there:
+                self._settle_no_imagery()
+                return False
+        else:
+            data = _chunk_cache_index.probe(
+                self.cache_path,
+                self._read_local_cache,
+            )
+            if data:
+                bump('chunk_hit')
+                self.data = data
+                return True
+        return self._get_long_term_cache()
+
+    def _get_long_term_cache(self):
+        """The local cache missed: try the long-term cache."""
         bump('chunk_miss')
         self.data = None
         if self.lt_cache_path and _lt_available(self.lt_cache_dir):
@@ -10523,6 +10646,23 @@ class Chunk(object):
                 return True
         return False
 
+    def _settle_no_imagery(self):
+        """Settle as the provider answered before: no imagery here.
+
+        The lower-zoom fallbacks fill it, as when the answer arrives in
+        this session; nothing is downloaded.
+        """
+        if self.ready.is_set():
+            return
+        self.permanent_failure = True
+        self.failure_reason = "no_imagery"
+        self.data = b''
+        self.download_started.set()
+        self.ready.set()
+        bump('chunk_no_imagery_remembered')
+        self.mark_settled()
+        self._notify_ready()
+
     def _save_to_dir(self, target_dir, data=None):
         data = self.data if data is None else data
         if not data:
@@ -10534,6 +10674,17 @@ class Chunk(object):
                 return
         else:
             target_path = os.path.join(target_dir, f"{self.chunk_id}.jpg")
+            store = chunk_store.store_for(target_dir)
+            if store is not None:
+                keep = self._is_base_chunk()
+                if store.put(
+                    self.col, self.row, self.zoom, self.maptype, data, keep=keep
+                ):
+                    if disk_budget_manager is not None and not keep:
+                        disk_budget_manager.account_jpeg(len(data))
+                else:
+                    bump("local_cache_write_backpressure")
+                return
 
         if not _atomic_write(target_path, data):
             if target_dir == self.lt_cache_dir:
@@ -10566,17 +10717,32 @@ class Chunk(object):
         if not data:
             return
 
-        # Skip if the parent cache dir was nuked (e.g. diagnose temp cleanup).
-        if not os.path.exists(self.cache_dir):
-            log.debug(f"Cache directory gone for {self}, skipping save")
-            return
+        store = chunk_store.store_for(self.cache_dir)
+        if store is not None:
+            # Queued for the store's next batch and readable from its pending
+            # map at once: no temp file, no rename, no probe index entry.
+            if not disk_brake.writes_allowed():
+                bump("local_cache_write_disk_brake")
+                return
+            keep = self._is_base_chunk()
+            if not store.put(
+                self.col, self.row, self.zoom, self.maptype, data, keep=keep
+            ):
+                bump("local_cache_write_backpressure")
+                return
+            if disk_budget_manager is not None and not keep:
+                disk_budget_manager.account_jpeg(len(data))
+        else:
+            # Skip if the parent cache dir was nuked (e.g. diagnose temp cleanup).
+            if not os.path.exists(self.cache_dir):
+                log.debug(f"Cache directory gone for {self}, skipping save")
+                return
+            _chunk_cache_index.mark_write_pending(self.cache_path)
+            if not _atomic_write(self.cache_path, data):
+                return
 
-        _chunk_cache_index.mark_write_pending(self.cache_path)
-        if not _atomic_write(self.cache_path, data):
-            return
-
-        if disk_budget_manager is not None and not self._is_base_chunk():
-            disk_budget_manager.account_jpeg(len(data))
+            if disk_budget_manager is not None and not self._is_base_chunk():
+                disk_budget_manager.account_jpeg(len(data))
         if self.lt_cache_dir:
             if not _submit_bounded_cache_write(
                 _lt_cache_write_executor,
@@ -10759,6 +10925,10 @@ class Chunk(object):
             self.permanent_failure = True
             self.failure_reason = "no_imagery"
             self.data = b''
+            # Remembered by the chunk store, so the next session does not
+            # ask for the open sea again (performance plan, item 3).
+            if chunk_store.mark_no_imagery_path(self.cache_path):
+                bump('chunk_no_imagery_stored')
             self.ready.set()
             self._notify_ready()
             return _AttemptOutcome(resolved=True)
@@ -10782,7 +10952,11 @@ class Chunk(object):
         # released, so completed tiles can safely drop Chunk.data immediately.
         cache_data = self.data
         if cache_data:
-            if not _submit_bounded_cache_write(
+            if chunk_store.enabled():
+                # Queuing for the store's batch writer is cheap: no hop
+                # through the cache-writer pool.
+                self.save_cache(data=cache_data)
+            elif not _submit_bounded_cache_write(
                 _cache_write_executor,
                 _async_cache_write,
                 self,
@@ -16489,6 +16663,8 @@ class Tile(object):
         path = os.path.join(
             self.cache_dir, f"{col}_{row}_{self.max_zoom}_{self.maptype}.jpg"
         )
+        if chunk_store.enabled():
+            return chunk_store.read_chunk_path(path)
         try:
             with open(path, "rb") as f:
                 return f.read()
@@ -16509,14 +16685,22 @@ class Tile(object):
         exact where the max_zoom JPEG is cached, missing elsewhere."""
         col, row, width, height, zoom, _diff = self._get_quick_zoom()
         sources = bytearray(width * height)
-        for index in range(width * height):
-            path = os.path.join(
+        paths = [
+            os.path.join(
                 self.cache_dir,
                 f"{col + index % width}_{row + index // width}_{zoom}_{self.maptype}.jpg",
             )
+            for index in range(width * height)
+        ]
+        present = (
+            chunk_store.chunk_paths_present(paths)
+            if chunk_store.enabled()
+            else {path for path in paths if os.path.isfile(path)}
+        )
+        for index, path in enumerate(paths):
             sources[index] = int(
                 MipmapSource.TARGET_PROVIDER
-                if os.path.isfile(path)
+                if path in present
                 else MipmapSource.MISSING_COLOR
             )
         return sources
@@ -16535,10 +16719,13 @@ class Tile(object):
             chunk = grid.peek(grid.col + col, grid.row + row)
             if chunk is None:
                 continue
-            try:
-                os.remove(chunk.cache_path)
-            except OSError:
-                pass
+            if chunk_store.enabled():
+                chunk_store.remove_chunk_path(chunk.cache_path)
+            else:
+                try:
+                    os.remove(chunk.cache_path)
+                except OSError:
+                    pass
             _chunk_cache_index.mark_missing(chunk.cache_path)
             if chunk.lt_cache_path and _lt_available(chunk.lt_cache_dir):
                 # Fire and forget: a hung long-term share must not stall the

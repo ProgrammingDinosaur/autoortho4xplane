@@ -36,8 +36,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 if __package__:
-    from . import provider_urls, tile_stream
+    from . import chunk_store, provider_urls, tile_stream
 else:  # running from inside the autoortho folder
+    import chunk_store
     import provider_urls
     import tile_stream
 
@@ -98,6 +99,34 @@ def set_kept(cache_dir: str, cells: Iterable[Cell], zoom: Optional[int]) -> None
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"tiles": {_key(c): z for c, z in sorted(kept.items())}}, fh)
         os.replace(tmp, path)
+    if zoom is None:
+        _release_kept_rows(cache_dir, set(cells))
+
+
+def _release_kept_rows(cache_dir: str, cells: Set[Cell]) -> None:
+    """Let eviction drop the stored imagery of tiles no longer kept.
+
+    The low-zoom base keeps its own rows (it is kept for good either way).
+    """
+    store = chunk_store.store_for(cache_dir)
+    if store is None or not cells:
+        return
+    try:
+        if __package__:
+            from . import streaming_options
+        else:
+            import streaming_options
+        base_zoom = (
+            int(streaming_options.number("low_zoom_base_max_zoom"))
+            if streaming_options.flag("low_zoom_base") else -1
+        )
+    except Exception:
+        base_zoom = 12
+    released = store.clear_keep_where(
+        lambda col, row, zoom, _maptype: zoom > base_zoom
+        and chunk_cell(col, row, zoom) in cells
+    )
+    log.info("Imagery: %d chunks of %d tiles no longer kept", released, len(cells))
 
 
 def chunk_cell(col: int, row: int, zoom: int) -> Cell:
@@ -236,10 +265,7 @@ def plan(pkg_root: str, cache_dir: str, cells: Iterable[Cell], zoom: int,
     resolve = resolve or maptype_resolver()
     out = Plan()
     seen: Set[Chunk] = set()
-    try:
-        present = set(os.listdir(cache_dir))
-    except OSError:
-        present = set()
+    present = chunk_store.present_chunk_names(cache_dir)
     for cell in cells:
         if cancelled():
             break
@@ -309,11 +335,15 @@ def fetch_chunk(session, chunk: Chunk, cache_dir: str, attempts: int = 3,
             if resp.status_code in (403, 429):
                 raise Throttled(f"{maptype} answered {resp.status_code}")
             if resp.status_code == 404:
+                chunk_store.mark_no_imagery_path(
+                    os.path.join(cache_dir, f"{col}_{row}_{zoom}_{maptype}.jpg"))
                 return "no_imagery", 0
             if resp.status_code != 200:
                 time.sleep(min(2.0, 0.5 * (attempt + 1)))
                 continue
             if _no_imagery(resp.headers):
+                chunk_store.mark_no_imagery_path(
+                    os.path.join(cache_dir, f"{col}_{row}_{zoom}_{maptype}.jpg"))
                 return "no_imagery", 0
             data = resp.content
         finally:
@@ -323,6 +353,12 @@ def fetch_chunk(session, chunk: Chunk, cache_dir: str, attempts: int = 3,
         if not _is_jpeg(data):
             continue
         path = os.path.join(cache_dir, f"{col}_{row}_{zoom}_{maptype}.jpg")
+        store = chunk_store.store_for(cache_dir)
+        if store is not None:
+            # Kept imagery is outside the budget: eviction skips it.
+            while not store.put(col, row, zoom, maptype, data, keep=True):
+                store.flush(timeout=5.0)
+            return "ok", len(data)
         tmp = os.path.join(cache_dir, f".{col}_{row}_{zoom}_{maptype}.jpg.{uuid.uuid4().hex}.tmp")
         with open(tmp, "wb") as fh:
             fh.write(data)
@@ -394,6 +430,9 @@ def download(chunks: List[Chunk], cache_dir: str, workers: int = 8,
             done += 1
             if progress and (done % step == 0 or done == total):
                 progress(done, total, result.bytes)
+    store = chunk_store.store_for(cache_dir)
+    if store is not None:
+        store.flush(timeout=120.0)
     log.info("Imagery: downloaded %d chunks (%.1f MB), %d without imagery, %d failed%s",
              result.files, result.bytes / 1e6, result.no_imagery, result.failed,
              f", stopped: {result.throttled}" if result.throttled else "")
