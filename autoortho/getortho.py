@@ -7637,15 +7637,18 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
                 return None
         max_zoom = tile_cacher._get_target_zoom_level(zoom, row=row, col=col)
         width, height = _tile_dimensions(zoom, max_zoom)
+        wanted = _partial_direct_level(row, col, zoom, max_zoom)
         entry = cache.open_direct(
             row, col, maptype, zoom, max_zoom,
             _expected_dds_size(width, height),
+            min_level=wanted,
         )
         if entry is None:
             return None
         if entry["width"] != width or entry["height"] != height:
             cache.unpin(entry["key"])
             return None
+        partial = bool(entry.get("finest_level"))
 
         dxt_format = CFG.pydds.format
         block_bytes = colour_table.block_bytes(dxt_format)
@@ -7663,13 +7666,18 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
         def note_wanted(mip, _level_width):
             note_texture_wanted(tile_id, row, col, zoom, width, mip)
 
+        def metric(name, *args, **kwargs):
+            if name == "dds_direct_partial_fallbacks":
+                _partial_direct_stats.note_fallback()
+            bump(name, *args, **kwargs)
+
         texture = disk_texture.DiskTexture(
             entry,
             unpin=cache.unpin,
             invalidate=cache.invalidate,
             recolour=recolour,
             note_wanted=note_wanted,
-            metric=bump,
+            metric=metric,
         )
     except disk_texture.DiskTextureFailed as exc:
         log.debug(f"Direct read unavailable for {row}_{col}_{zoom}: {exc}")
@@ -7678,7 +7686,68 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
         log.debug(f"Direct read open failed for {row}_{col}_{zoom}: {exc}")
         return None
     bump("dds_direct_opens")
+    if partial:
+        bump("dds_direct_partial_opens")
+        _partial_direct_stats.note_open()
     return texture
+
+
+class _PartialDirectStats:
+    """Partial direct opens against their fallbacks to a live tile.
+
+    A fallback costs what an open costs without direct reads, so it is never
+    wrong, only wasted. When more than one partial open in ten falls back
+    (the paging model guesses too coarse for this flight), partial entries
+    must hold one level finer than the guess (performance plan, item 4).
+    """
+
+    WINDOW = 200
+    MIN_SAMPLES = 50
+    WIDEN_ABOVE = 0.10
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.opens = 0
+        self.fallbacks = 0
+
+    def note_open(self):
+        with self._lock:
+            self.opens += 1
+            if self.opens > self.WINDOW:
+                # Keep the recent behaviour: halve both counts.
+                self.opens //= 2
+                self.fallbacks //= 2
+
+    def note_fallback(self):
+        with self._lock:
+            self.fallbacks += 1
+
+    def margin(self) -> int:
+        with self._lock:
+            if self.opens < self.MIN_SAMPLES:
+                return 0
+            return 1 if self.fallbacks / self.opens > self.WIDEN_ABOVE else 0
+
+
+_partial_direct_stats = _PartialDirectStats()
+
+
+def _partial_direct_level(row, col, zoom, max_zoom):
+    """The coarsest level a partial entry may start at, or None (full only).
+
+    The level the paging model says X-Plane wants of this texture now, one
+    finer while partial opens fall back too often.
+    """
+    if not streaming_options.flag("partial_direct_reads"):
+        return None
+    try:
+        mip = paging_target_mip(row, col, zoom, max_zoom)
+    except Exception:
+        return None
+    if mip is None:
+        return None
+    level = int(mip) - _partial_direct_stats.margin()
+    return level if level >= 1 else None
 
 
 def _start_terrain_load_ahead():

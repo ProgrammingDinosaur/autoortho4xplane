@@ -1433,16 +1433,44 @@ class DynamicDDSCache:
             return value.strip().lower() in ("true", "1", "yes", "on")
         return bool(value)
 
+    @staticmethod
+    def _finest_populated_run(meta: dict, mm_count: int) -> Optional[int]:
+        """The finest level from which every level to the last is populated.
+
+        None when the entry does not say (a v2 entry) or holds no level.
+        """
+        populated = meta.get("populated_mipmaps")
+        if populated is None or mm_count <= 0:
+            return None
+        levels = set(int(level) for level in populated)
+        finest = None
+        for level in range(mm_count - 1, -1, -1):
+            if level not in levels:
+                break
+            finest = level
+        return finest
+
     def open_direct(self, row: int, col: int, maptype: str,
                     tilename_zoom: int, max_zoom: int,
-                    expected_size: int) -> Optional[dict]:
+                    expected_size: int,
+                    min_level: Optional[int] = None) -> Optional[dict]:
         """The cache entry of a texture that can be served as a plain file.
 
         Returns ``None`` unless the entry is at ``max_zoom``, not stale,
-        uncompressed, complete and exact in mipmap 0, populated at every
-        level and exactly ``expected_size`` bytes. A compressed entry that is
-        otherwise servable is rewritten uncompressed in the background, so a
-        later open can be direct.
+        uncompressed, exactly ``expected_size`` bytes, and either
+
+        * complete and exact in mipmap 0 and populated at every level
+          (``finest_level`` 0), or
+        * when ``min_level`` is given (the level the paging model says
+          X-Plane wants now), populated from some level ``k <= min_level``
+          to the last (``finest_level`` k). A far texture is read at 512 px:
+          its mipmap 0 is never downloaded, but the coarse levels
+          ``store_incremental`` wrote into the sparse file are enough
+          (performance plan, item 4). A read finer than ``finest_level``
+          falls back to a live tile.
+
+        A compressed entry that is otherwise servable is rewritten
+        uncompressed in the background, so a later open can be direct.
 
         The returned entry is pinned (skipped by eviction) until
         :meth:`unpin` is called with its ``key``.
@@ -1460,12 +1488,23 @@ class DynamicDDSCache:
             shim = _SizeShim(max_zoom, expected_size)
             if self._is_stale(meta, shim, dds_path):
                 return None
-            if not self._mm0_cache_complete(meta):
-                return None
             mm_count = int(meta.get("mm", 0) or 0)
             populated = meta.get("populated_mipmaps")
-            if populated is not None and not set(range(mm_count)) <= set(populated):
-                return None
+            full = self._mm0_cache_complete(meta) and (
+                populated is None or set(range(mm_count)) <= set(populated)
+            )
+            finest_level = 0
+            if not full:
+                if min_level is None or min_level <= 0 or meta.get("needs_healing"):
+                    return None
+                finest = self._finest_populated_run(meta, mm_count)
+                if finest is None or finest > int(min_level):
+                    return None
+                # Mipmap 0 without its exact row manifest is never served
+                # from the file: level 1 is the finest a partial entry gives.
+                finest_level = max(1, finest)
+                if finest_level > int(min_level):
+                    return None
             if meta.get("disk_compression", "none") != "none":
                 self._schedule_promote(tile_id, max_zoom, dds_path, ddm_path,
                                        expected_size)
@@ -1474,7 +1513,10 @@ class DynamicDDSCache:
             stat = os.stat(dds_path)
             if stat.st_size != expected_size:
                 return None
-            manifests = manifests_from_dict(meta["mm0_manifest"], tile_id=tile_id)
+            manifests = (
+                manifests_from_dict(meta["mm0_manifest"], tile_id=tile_id)
+                if full else {}
+            )
         except (OSError, KeyError, TypeError, ValueError):
             return None
         except Exception as exc:
@@ -1504,6 +1546,7 @@ class DynamicDDSCache:
             "height": int(meta.get("h", 0) or 0),
             "fmt": meta.get("fmt"),
             "manifests": manifests,
+            "finest_level": finest_level,
         }
 
     def unpin(self, key: str) -> None:

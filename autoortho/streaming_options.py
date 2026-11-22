@@ -28,6 +28,7 @@ DEFAULTS = {
     "prefetch_during_live_reads": True,
     "read_time_colours": True,
     "real_from_index": True,
+    "partial_direct_reads": True,
 }
 
 

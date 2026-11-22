@@ -538,6 +538,10 @@ read_time_colours = True
 # Track one number per tile: the finest mipmap with real imagery. Only real
 # imagery is persisted, and a level implies every coarser one.
 real_from_index = True
+# Serve a far texture straight from its cache file when the file holds the
+# level X-Plane wants now and every coarser one, though its full resolution was
+# never downloaded. A read of a finer level switches that open to a live tile.
+partial_direct_reads = True
 
 [pydds]
 # ISPC or STB for dds file compression

@@ -1769,7 +1769,12 @@ class AutoOrtho(Operations):
                 try:
                     return direct.texture.read(offset, length)
                 except disk_texture.DiskTextureFailed as exc:
-                    log.warning(f"Direct read of {path} failed, serving it live: {exc}")
+                    if isinstance(exc, disk_texture.DiskTextureLevelMissing):
+                        # A partial entry: X-Plane came closer than the
+                        # paging model expected. Expected, not a fault.
+                        log.debug(f"Direct read of {path} wants a finer level, serving it live: {exc}")
+                    else:
+                        log.warning(f"Direct read of {path} failed, serving it live: {exc}")
                     try:
                         self._switch_direct_to_live(direct, row, col, maptype, zoom)
                     except Exception as switch_exc:

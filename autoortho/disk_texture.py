@@ -36,6 +36,13 @@ class DiskTextureFailed(Exception):
     """The cache file cannot serve this read; serve it live instead."""
 
 
+class DiskTextureLevelMissing(DiskTextureFailed):
+    """A partial entry does not hold the level this read wants.
+
+    Not a fault of the file: it is not marked bad, and the entry stays.
+    """
+
+
 def mip_layout(width: int, height: int, fmt) -> Tuple[MipLevel, ...]:
     """The byte range of every level, as ``pydds.DDS`` lays them out."""
     block = 16 if str(fmt).upper() in ("BC3", "DXT5") else 8
@@ -168,6 +175,12 @@ class DiskTexture:
         self._row_start, self._row_bytes, self._rows = mm0_row_layout(
             self.width, self.height, self.fmt
         )
+        # Levels finer than this are not in the file (a partial entry).
+        self.finest_level = int(entry.get("finest_level", 0) or 0)
+        if not 0 <= self.finest_level < len(self._levels):
+            unpin(self.key)
+            raise DiskTextureFailed(f"{self.tile_id}: bad finest level {self.finest_level}")
+        self._standin_block: Optional[bytes] = None
         self._cursor = read_pattern.ReadCursor()
         self._closed = False
         try:
@@ -184,10 +197,16 @@ class DiskTexture:
             return b""
         length = min(length, self.size - offset)
         end = offset + length
-        self._note_read(offset, length)
+        first_needed = self._note_read(offset, length)
         try:
-            self._verify_rows(offset, end)
-            data = self._file.read_exact(length, offset)
+            if self.finest_level:
+                data = self._read_partial(offset, end, first_needed)
+            else:
+                self._verify_rows(offset, end)
+                data = self._file.read_exact(length, offset)
+        except DiskTextureLevelMissing:
+            self._metric("dds_direct_partial_fallbacks")
+            raise
         except DiskTextureFailed:
             self._file.bad = True
             raise
@@ -198,6 +217,60 @@ class DiskTexture:
         if self._recolour is not None:
             data = self._recolour(data, offset)
         return data
+
+    def _read_partial(self, offset: int, end: int, first_needed: int) -> bytes:
+        """A read of an entry that holds levels ``finest_level`` and coarser.
+
+        Bytes of finer levels that the read only touches incidentally (the
+        header chunk's piece of mipmap 0, the tail of the level in front of
+        the wanted one) are answered with stand-in bytes, as the live path
+        answers them from the base level. A read that needs a finer level
+        raises :class:`DiskTextureLevelMissing`.
+        """
+        boundary = self._levels[self.finest_level].startpos
+        needed_start = (
+            self._levels[first_needed].startpos
+            if first_needed < len(self._levels)
+            else end
+        )
+        needed_start = max(offset, needed_start)
+        if needed_start < min(end, boundary):
+            raise DiskTextureLevelMissing(
+                f"{self.tile_id}: level {first_needed} wanted, "
+                f"file holds {self.finest_level} and coarser"
+            )
+        parts = []
+        if offset < DDS_HEADER_BYTES:
+            # The real header, from the file.
+            parts.append(self._file.read_exact(min(end, DDS_HEADER_BYTES) - offset, offset))
+        standin_start = max(offset, DDS_HEADER_BYTES)
+        standin_end = min(end, boundary)
+        if standin_start < standin_end:
+            parts.append(self._standin(standin_start, standin_end))
+        file_start = max(offset, boundary)
+        if file_start < end:
+            parts.append(self._file.read_exact(end - file_start, file_start))
+        return parts[0] if len(parts) == 1 else b"".join(parts)
+
+    def _standin(self, start: int, end: int) -> bytes:
+        """Stand-in bytes for ``[start, end)`` of the levels not in the file.
+
+        One compressed block repeated: the texture's coarsest stored block,
+        so the stand-in has its average colour. Built once per texture.
+        """
+        block_size = 16 if str(self.fmt).upper() in ("BC3", "DXT5") else 8
+        if self._standin_block is None:
+            coarsest = self._levels[-1]
+            block = self._file.read_exact(min(block_size, coarsest.length), coarsest.startpos)
+            if len(block) < block_size:
+                block = block.ljust(block_size, b"\x00")
+            self._standin_block = block
+        # Blocks are aligned to the start of each level, and every level
+        # starts on a block boundary: align to the data start (byte 128).
+        phase = (start - DDS_HEADER_BYTES) % block_size
+        count = (end - start + phase) // block_size + 2
+        tiled = self._standin_block * count
+        return tiled[phase:phase + (end - start)]
 
     def close(self):
         if self._closed:
@@ -214,17 +287,20 @@ class DiskTexture:
                 log.debug(f"Could not invalidate {self.tile_id}: {exc}")
 
     # ------------------------------------------------------------------
-    def _note_read(self, offset, length):
-        if self._note_wanted is None:
-            return
+    def _note_read(self, offset, length) -> int:
+        """Classify the read, feed the paging model; return ``first_needed``."""
         try:
-            _header, wanted, _first = read_pattern.classify(
+            _header, wanted, first_needed = read_pattern.classify(
                 self._levels, self._cursor, offset, length
             )
-            if wanted is not None:
+        except Exception:
+            return 0
+        if wanted is not None and self._note_wanted is not None:
+            try:
                 self._note_wanted(wanted, max(1, self.width >> int(wanted)))
-        except Exception:  # statistics only
-            pass
+            except Exception:  # statistics only
+                pass
+        return int(first_needed)
 
     def _verify_rows(self, offset, end):
         mm0_end = self._row_start + self._row_bytes * self._rows

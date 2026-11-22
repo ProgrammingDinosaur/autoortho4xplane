@@ -675,6 +675,21 @@ The store also remembers where the imagery provider has nothing (open sea), for
 
 Set to `False` to keep one file per chunk.
 
+### Partial direct reads (`partial_direct_reads`)
+- **Type:** Boolean
+- **Default:** True
+- **Config file:** `[streaming]` `partial_direct_reads = True`
+
+A texture whose finished DDS is in the cache is served straight from the file,
+without building it in memory (`[pydds] serve_from_disk`). Most textures X-Plane
+loads are far away and read at 512 px or less, so their full resolution is never
+downloaded; their coarse levels are in the cache all the same. With this on, such
+a texture is also served from its file when the file holds the level X-Plane
+wants now (from the aircraft's distance) and every coarser one. If X-Plane comes
+closer and reads a finer level, that open switches to a live tile, which costs
+what it would have cost without direct reads. When more than one partial open in
+ten switches, AutoOrtho asks partial files for one level finer.
+
 ### Apple Maps Caveat
 
 When using Apple Maps (`APPLE`) as your imagery source, downloads **always use the Python HTTP client** instead of the native libcurl client. This is because Apple Maps requires:
