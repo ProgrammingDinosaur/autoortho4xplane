@@ -4,6 +4,8 @@ import logging
 import shutil
 from pathlib import Path
 
+from .win_mountpoint import remove_stale_mount_point
+
 log = logging.getLogger(__name__)
 
 
@@ -49,6 +51,8 @@ _IGNORE_FILES = {".DS_Store", ".metadata_never_index"}
 _AO_PLACEHOLDER_ITEMS = {"Earth nav data", "terrain", "textures", ".AO_PLACEHOLDER"}
 
 def cleanup_mountpoint(mountpoint):
+    # Without admin rights Dokan leaves its mount point behind after unmount.
+    remove_stale_mount_point(mountpoint)
     # Checking lexists/rmdir first can deadlock against a stopped FUSE server.
     if safe_ismount(mountpoint):
         log.debug("Skipping cleanup: still mounted: %s", mountpoint)

@@ -318,6 +318,8 @@ hiddenimports = [
     'autoortho.aopipeline.fallback_resolver',
     # Cache path utilities
     'autoortho.utils.cache_paths',
+    # Removes mount points Dokan leaves behind without admin rights
+    'autoortho.utils.win_mountpoint',
     # 7-Zip wrapper (replaces py7zr)
     'autoortho.utils.sevenzip',
     # Async/networking stack

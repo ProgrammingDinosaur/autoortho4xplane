@@ -92,7 +92,9 @@ class LimitsEditor(QWidget):
         }
         tops = {
             "ram_gb": (hw.ram_total / GB) if hw and hw.ram_total else 1024,
-            "vram_gb": (hw.vram / GB) if hw and hw.vram else 256,
+            # Not capped at the detected card: detection can miss the real
+            # card, and the limit is how a user tells AutoOrtho its size.
+            "vram_gb": 256,
             "bandwidth_mbps": 100000,
             "cpu_cores": hw.physical_cores if hw and hw.physical_cores else 512,
         }

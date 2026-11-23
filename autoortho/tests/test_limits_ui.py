@@ -75,6 +75,16 @@ def test_limits_editor_auto_and_custom(qt_app):
     assert set(editor.values().values()) == {"auto"}
 
 
+def test_graphics_memory_limit_is_not_capped_at_the_detected_card(qt_app):
+    # Detection found only an integrated GPU's 512 MB: the user must still be
+    # able to type the real card's 12 GB.
+    editor = LimitsEditor()
+    editor.set_hardware(HardwareInfo(12, 6, 32 * GB, 512 * 1024 ** 2))
+    editor.auto_checks["vram_gb"].setChecked(False)
+    editor.spins["vram_gb"].setValue(12)
+    assert editor.values()["vram_gb"] == "12"
+
+
 def test_connection_panel_runs_off_the_ui_thread(qt_app):
     calls = []
 
