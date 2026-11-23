@@ -89,6 +89,14 @@ except ImportError:
 _DDS_FAULTS = debug_faults.DdsFaults.from_env()
 
 
+def _bump_stat(name, value=1):
+    """Count ``name`` in STATS; never fails a read."""
+    try:
+        getortho.bump(name, value)
+    except Exception:
+        pass
+
+
 def _get_fuse_pid_for_log():
     """Return the calling process ID for diagnostics, or None if unavailable."""
     try:
@@ -1252,23 +1260,72 @@ class AutoOrtho(Operations):
         self._size_cache[key] = dds_size
         return dds_size
     
-    def _fallback_dds(self, row, col, maptype, zoom, offset, length):
-        """Placeholder bytes for a texture read that can't be served.
+    def _fallback_dds(self, row, col, maptype, zoom, offset, length,
+                      reason="error", tile=None):
+        """Bytes for a texture read that can't be served in time.
 
-        A valid header for the size X-Plane was given (see dds_fallback.py):
-        an invalid one makes X-Plane keep the terrain white until the scenery
-        reloads, instead of showing missing_color.
+        X-Plane keeps whatever it reads first until it loads the texture
+        again, so this serves the best that needs no download or build: the
+        tile's own bytes when the tile is in memory (its real header, what is
+        built, unbuilt levels upscaled from coarser built ones), otherwise a
+        placeholder with a valid header for the size X-Plane was given and
+        solid missing_color (see dds_fallback.py). An invalid header would
+        make X-Plane keep the terrain white.
+
+        Counted as ``fuse_fallback_<reason>``; ``fuse_fallback_imagery``
+        counts the ones served from the tile.
         """
+        _bump_stat(f"fuse_fallback_{reason}")
         fmt = CFG.pydds.format
         if _DDS_FAULTS.zero_header:
             header = b"\0" * dds_fallback.DDS_HEADER_SIZE
-        else:
-            try:
-                size = self._get_dds_size_cached(row, col, maptype, zoom)
-            except Exception:
-                size = None
-            header = dds_fallback.header_for_size(size, fmt)
+            return dds_fallback.fallback_bytes(offset, length, header, fmt)
+        try:
+            size = self._get_dds_size_cached(row, col, maptype, zoom)
+        except Exception:
+            size = None
+        if tile is None and reason != "shutdown":
+            tile = self._tile_in_memory(row, col, maptype, zoom)
+        data = self._tile_standin(tile, size, offset, length)
+        if data is not None:
+            _bump_stat("fuse_fallback_imagery")
+            return data
+        header = dds_fallback.header_for_size(size, fmt)
         return dds_fallback.fallback_bytes(offset, length, header, fmt)
+
+    def _tile_in_memory(self, row, col, maptype, zoom):
+        """The tile already in memory for this texture, or None. No lock:
+        a dict lookup, safe from any read thread."""
+        tc = getattr(self, "tc", None)
+        tiles = getattr(tc, "tiles", None)
+        to_id = getattr(tc, "_to_tile_id", None)
+        if tiles is None or to_id is None:
+            return None
+        try:
+            return tiles.get(to_id(row, col, maptype, zoom))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _tile_standin(tile, size, offset, length):
+        """The tile's servable bytes without downloading or building, or None
+        when it has none or they would not match the size X-Plane was told."""
+        standin = getattr(tile, "standin_bytes", None)
+        dds = getattr(tile, "dds", None)
+        if standin is None or dds is None:
+            return None
+        if size and getattr(dds, "total_size", None) != size:
+            return None
+        try:
+            data = standin(offset, length)
+        except Exception as exc:
+            log.debug(f"Stand-in bytes for {getattr(tile, 'id', tile)} failed: {exc}")
+            return None
+        if not isinstance(data, (bytes, bytearray)) or len(data) != length:
+            return None
+        if offset == 0 and length >= 4 and bytes(data[:4]) != b"DDS ":
+            return None
+        return bytes(data)
 
     def _set_dds_size_cached(self, row, col, maptype, zoom, size):
         """Set actual DDS size in cache with LRU eviction."""
@@ -1702,9 +1759,9 @@ class AutoOrtho(Operations):
             maptype = self._resolve_dds_maptype(maptype)
             if getortho.is_shutdown_requested():
                 log.info(f"Shutdown in progress, returning fallback data for {path}")
-                return self._fallback_dds(row, col, maptype, zoom, offset, length)
+                return self._fallback_dds(row, col, maptype, zoom, offset, length, "shutdown")
             if _DDS_FAULTS.active and _DDS_FAULTS.should_fail(row, col, zoom):
-                return self._fallback_dds(row, col, maptype, zoom, offset, length)
+                return self._fallback_dds(row, col, maptype, zoom, offset, length, "injected")
             direct = self._direct.get(fh) if fh else None
             if direct is not None and not direct.live:
                 try:
@@ -1720,7 +1777,7 @@ class AutoOrtho(Operations):
                         self._switch_direct_to_live(direct, row, col, maptype, zoom)
                     except Exception as switch_exc:
                         log.error(f"Could not serve {path} live: {switch_exc}")
-                        return self._fallback_dds(row, col, maptype, zoom, offset, length)
+                        return self._fallback_dds(row, col, maptype, zoom, offset, length, "direct_failed")
             key = self._tile_key(row, col, maptype, zoom)
             tile_id = f"{row}_{col}_{maptype}_{zoom}"
             request_started = time.monotonic()
@@ -1787,7 +1844,7 @@ class AutoOrtho(Operations):
                     log.error(f"  DIAGNOSTIC: Failed to gather tile state: {diag_err}")
                 # ═══════════════════════════════════════════════════════════════
 
-                return self._fallback_dds(row, col, maptype, zoom, offset, length)
+                return self._fallback_dds(row, col, maptype, zoom, offset, length, "lock_timeout")
 
             record_stage(
                 "fuse.tile_lock_wait",
@@ -1798,6 +1855,7 @@ class AutoOrtho(Operations):
             admitted = False
             weight = 0
             lock_held = True
+            t = None
             try:
                 with profile_span(
                     "tile.cache_lookup",
@@ -1823,7 +1881,7 @@ class AutoOrtho(Operations):
                             key,
                             build_timeout,
                         )
-                        return self._fallback_dds(row, col, maptype, zoom, offset, length)
+                        return self._fallback_dds(row, col, maptype, zoom, offset, length, "admission_timeout", tile=t)
                 # Tile/build coordinators provide the fine-grained safety below.
                 # Release the FUSE lookup lock before cache, network, decode, or
                 # compression work so disjoint row reads can proceed together.
@@ -1833,17 +1891,17 @@ class AutoOrtho(Operations):
                 if data is None:
                     read_outcome = "fallback"
                     log.error(f"Tile read returned None for {key} - returning fallback data")
-                    return self._fallback_dds(row, col, maptype, zoom, offset, length)
+                    return self._fallback_dds(row, col, maptype, zoom, offset, length, "read_none", tile=t)
                 return data
             except FuseOSError:
                 read_outcome = "fallback"
                 log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
-                return self._fallback_dds(row, col, maptype, zoom, offset, length)
+                return self._fallback_dds(row, col, maptype, zoom, offset, length, "fuse_error", tile=t)
             except Exception as e:
                 read_outcome = "fallback"
                 log.error(f"Tile read/build failed for {key} - returning fallback data to prevent CTD")
                 log.exception("cause:", exc_info=e)
-                return self._fallback_dds(row, col, maptype, zoom, offset, length)
+                return self._fallback_dds(row, col, maptype, zoom, offset, length, "exception", tile=t)
             finally:
                 if admitted:
                     getortho.release_live_tile_slot(weight=weight)

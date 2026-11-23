@@ -142,6 +142,8 @@ def _load_fuse(monkeypatch, tile):
     stub.begin_shutdown = lambda *a, **k: None
     stub.acquire_live_tile_slot = lambda timeout, weight=0: True
     stub.release_live_tile_slot = lambda weight=0: None
+    BUMPS.clear()
+    stub.bump = lambda name, value=1: BUMPS.append(name)
     monkeypatch.setitem(sys.modules, "getortho", stub)
     monkeypatch.setitem(sys.modules, "autoortho.getortho", stub)
 
@@ -190,6 +192,7 @@ class _Tile:
 
 
 PATH = "/textures/24832_12416_BI16.dds"
+BUMPS = []
 
 
 def _fuse(monkeypatch, tmp_path, behaviour, size=SIZE_8K_BC1):
@@ -302,3 +305,108 @@ def test_env_options():
         "AO_DEBUG_FAIL_DDS_HEADER": "zero",
     })
     assert faults.every and faults.seconds == 45 and faults.zero_header
+
+
+# ---------------------------------------------------------------- reasons and tile imagery
+
+
+class _MemoryTile:
+    """A tile in memory whose own bytes a fallback can serve."""
+
+    def __init__(self, size, data=b"DDS " + b"t" * 124, fail=False):
+        self.dds = types.SimpleNamespace(total_size=size)
+        self.data = data
+        self.fail = fail
+        self.calls = []
+
+    def standin_bytes(self, offset, length):
+        self.calls.append((offset, length))
+        if self.fail:
+            raise RuntimeError("busy")
+        return (self.data * (1 + (offset + length) // len(self.data)))[offset:offset + length]
+
+
+def _with_memory_tile(ao, tile):
+    ao.tc.tiles = {"24832_12416_BI_16": tile}
+    ao.tc._to_tile_id = lambda row, col, maptype, zoom: f"{row}_{col}_{maptype}_{zoom}"
+
+
+@pytest.mark.parametrize("behaviour,reason", [
+    ("none", "read_none"),
+    ("fuse_error", "fuse_error"),
+    (RuntimeError("boom"), "exception"),
+])
+def test_fallbacks_are_counted_by_reason(monkeypatch, tmp_path, behaviour, reason):
+    _module, ao = _fuse(monkeypatch, tmp_path, behaviour)
+    ao.read(PATH, 128, 0, 0)
+    assert f"fuse_fallback_{reason}" in BUMPS
+
+
+def test_lock_timeout_and_shutdown_are_counted(monkeypatch, tmp_path):
+    module, ao = _fuse(monkeypatch, tmp_path, "ok")
+    ao._calculate_build_timeout = lambda: 0.0
+    lock = ao._tile_locks[ao._tile_key(24832, 12416, "BI", 16)]
+    lock.acquire()
+    try:
+        ao.read(PATH, 128, 0, 0)
+    finally:
+        lock.release()
+    module.getortho.is_shutdown_requested = lambda: True
+    ao.read(PATH, 128, 0, 0)
+    assert "fuse_fallback_lock_timeout" in BUMPS
+    assert "fuse_fallback_shutdown" in BUMPS
+
+
+def test_failed_read_serves_the_tiles_own_bytes(monkeypatch, tmp_path):
+    _module, ao = _fuse(monkeypatch, tmp_path, RuntimeError("boom"))
+    tile = _MemoryTile(SIZE_8K_BC1)
+    ao.tc._get_tile = lambda *args: tile_with_failing_read(tile)
+    data = ao.read(PATH, 256, 0, 0)
+    assert data == tile.standin_bytes(0, 256)
+    assert "fuse_fallback_imagery" in BUMPS
+
+
+def tile_with_failing_read(tile):
+    def fail(offset, length):
+        raise RuntimeError("boom")
+    tile.needs_live_slot = lambda offset, length: False
+    tile.read_dds_bytes = fail
+    return tile
+
+
+def test_lock_timeout_finds_the_tile_in_memory(monkeypatch, tmp_path):
+    _module, ao = _fuse(monkeypatch, tmp_path, "ok")
+    tile = _MemoryTile(SIZE_8K_BC1)
+    _with_memory_tile(ao, tile)
+    ao._calculate_build_timeout = lambda: 0.0
+    lock = ao._tile_locks[ao._tile_key(24832, 12416, "BI", 16)]
+    lock.acquire()
+    try:
+        data = ao.read(PATH, 128, 0, 0)
+    finally:
+        lock.release()
+    assert tile.calls and data == tile.standin_bytes(0, 128)
+
+
+@pytest.mark.parametrize("tile", [
+    _MemoryTile(SIZE_4K_BC1),                    # not the size X-Plane was told
+    _MemoryTile(SIZE_8K_BC1, fail=True),         # stand-in raised
+    _MemoryTile(SIZE_8K_BC1, data=b"XXXX" * 32),  # no DDS header
+])
+def test_unusable_tile_bytes_fall_back_to_the_placeholder(monkeypatch, tmp_path, tile):
+    _module, ao = _fuse(monkeypatch, tmp_path, "none")
+    _with_memory_tile(ao, tile)
+    data = ao.read(PATH, 256, 0, 0)
+    header = parse_header(data)
+    assert header["magic"] == b"DDS " and header["width"] == 8192
+    assert data[H:] == dds_fallback.missing_block("BC1", tuple(dds_fallback.configured_missing_color())) * ((256 - H) // 8)
+    assert "fuse_fallback_imagery" not in BUMPS
+
+
+def test_shutdown_does_not_touch_tiles(monkeypatch, tmp_path):
+    module, ao = _fuse(monkeypatch, tmp_path, "ok")
+    tile = _MemoryTile(SIZE_8K_BC1)
+    _with_memory_tile(ao, tile)
+    module.getortho.is_shutdown_requested = lambda: True
+    assert ao.read(PATH, 128, 0, 0)[:4] == b"DDS "
+    assert tile.calls == []

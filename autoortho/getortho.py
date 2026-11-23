@@ -148,6 +148,11 @@ except ImportError:
     from ram_brake import DiskBrake, RamBrake
 
 try:
+    from autoortho.eviction_guard import EvictionStallGuard
+except ImportError:
+    from eviction_guard import EvictionStallGuard
+
+try:
     from autoortho import provider_urls
 except ImportError:
     import provider_urls
@@ -1680,6 +1685,11 @@ def _live_build_memory_bytes(cache_mem_gb=None):
     except (TypeError, ValueError):
         derived = 1024 ** 3
     return max(256 * 1048576, min(2 * 1024 ** 3, derived))
+
+
+# Longest a read fallback waits for a tile's lock before serving the flat
+# placeholder instead of the tile's own bytes (Tile.standin_bytes).
+STANDIN_LOCK_WAIT_S = 0.25
 
 
 def live_build_weight(width, height, mip):
@@ -14826,6 +14836,30 @@ class Tile(object):
             table,
         )
 
+    def standin_bytes(self, offset, length):
+        """Bytes ``offset .. offset + length`` as they can be served right
+        now, with no download, build or wait: the real header, built data as
+        it is, unbuilt ranges upscaled from the nearest coarser built level,
+        missing color where none covers them.
+
+        For a read that cannot be served in time (the FUSE fallback). X-Plane
+        keeps what it reads first, so this beats a flat placeholder whenever
+        any level is built. A display substitute: never cache it.
+        """
+        dds = self.dds
+        if dds is None or not dds.mipmap_list:
+            return None
+        # A fallback must not wait behind a build holding the tile lock.
+        if not self._lock.acquire(timeout=STANDIN_LOCK_WAIT_S):
+            bump("standin_lock_busy")
+            return None
+        try:
+            green_sources = frozenset(self._green_mipmaps)
+        finally:
+            self._lock.release()
+        data = dds.read_served(offset, length, green_sources)
+        return self._recolour(data, offset)
+
     def _band_budget(self, mip, tile_budget):
         """The budget of one read by its band (see wait_bands.py).
 
@@ -18625,6 +18659,8 @@ class TileCacher(object):
         # Bounded ring of recently-evicted tile ids for thrash detection.
         # Maps idx -> eviction monotonic time; capped at 500 entries (OrderedDict FIFO).
         self._recently_evicted: dict = OrderedDict()
+        # Pauses memory eviction that frees nothing (eviction_guard.py).
+        self._evict_stall = EvictionStallGuard(metric=bump)
         
         self.cache_dir = CFG.paths.cache_dir
         log.info(f"Cache dir: {self.cache_dir}")
@@ -19413,14 +19449,20 @@ class TileCacher(object):
                     evicted = self._evict_batch(tiles_to_evict)
                     total_evicted += evicted
 
-            # Evict while above proportional target using adaptive batch sizing
-            while self.tiles and cur_mem > my_target:
+            # Evict while above proportional target using adaptive batch sizing,
+            # unless recent passes freed nothing (eviction_guard.py).
+            memory_pass = bool(self.tiles) and cur_mem > my_target
+            if memory_pass and not self._evict_stall.allow(cur_mem):
+                memory_pass = False
+            memory_evicted = 0
+            while memory_pass and self.tiles and cur_mem > my_target:
                 over_bytes = max(0, cur_mem - my_target)
                 ratio = min(1.0, over_bytes / max(1, effective_limit))
                 adaptive = max(20, int(len(self.tiles) * min(0.10, ratio)))
                 # _evict_batch handles its own locking internally
                 evicted = self._evict_batch(adaptive)
                 total_evicted += evicted
+                memory_evicted += evicted
                 if evicted == 0:
                     break
 
@@ -19478,6 +19520,13 @@ class TileCacher(object):
                     f"RSS after release={rss_after_release // (1024**2)}MB, "
                     f"freed={max(0, rss_before_eviction - rss_after_release) // (1024**2)}MB"
                 )
+                if memory_evicted > 0:
+                    self._evict_stall.note_pass(
+                        max(0, rss_before_eviction - rss_after_release),
+                        rss_after_release,
+                        target_bytes=my_target,
+                        tiles=len(self.tiles),
+                    )
 
             if MEMTRACE:
                 snapshot = tracemalloc.take_snapshot()
