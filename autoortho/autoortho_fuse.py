@@ -74,115 +74,14 @@ try:
 except ImportError:
     from diagnostics import profile_span, record_stage
 
-def _rgb_to_rgb565(r: int, g: int, b: int) -> int:
-    """Convert RGB888 to RGB565 format used by BC1/DXT1 compression."""
-    # RGB565: 5 bits red (high), 6 bits green (mid), 5 bits blue (low)
-    r5 = (r >> 3) & 0x1F
-    g6 = (g >> 2) & 0x3F
-    b5 = (b >> 3) & 0x1F
-    return (r5 << 11) | (g6 << 5) | b5
+try:
+    from autoortho import dds_fallback, debug_faults
+except ImportError:
+    import dds_fallback
+    import debug_faults
 
-def _get_fallback_bc1_block() -> bytes:
-    """
-    Generate an 8-byte BC1/DXT1 block using the configured missing_color.
-    
-    BC1 block format:
-    - 2 bytes: color0 (RGB565, little-endian)
-    - 2 bytes: color1 (RGB565, little-endian)
-    - 4 bytes: 4x4 pixel indices (2 bits each)
-    
-    For a solid color, we set color0 = color1 and all indices to 0.
-    """
-    try:
-        # Get missing_color from config [R, G, B]
-        missing = CFG.autoortho.missing_color
-        if isinstance(missing, (list, tuple)) and len(missing) >= 3:
-            r, g, b = int(missing[0]), int(missing[1]), int(missing[2])
-        else:
-            # Fallback to default gray if config is malformed
-            r, g, b = 66, 77, 55
-    except Exception:
-        # Fallback to default if config not available
-        r, g, b = 66, 77, 55
-    
-    # Convert to RGB565
-    rgb565 = _rgb_to_rgb565(r, g, b)
-    
-    # Pack as little-endian 2-byte value (appears twice for color0 and color1)
-    color_bytes = rgb565.to_bytes(2, 'little')
-    
-    # BC1 block: color0, color1, 4 bytes of indices (all 0 for solid color)
-    return color_bytes + color_bytes + b'\x00\x00\x00\x00'
-
-# Cache the BC1 block to avoid recomputing on every call
-_cached_bc1_block = None
-
-# DDS header size is always 128 bytes
-_DDS_HEADER_SIZE = 128
-
-def _generate_fallback_dds_bytes(offset: int, length: int) -> bytes:
-    """
-    Generate fallback DDS bytes for when tile generation fails.
-    
-    This returns valid DDS-compatible data that X-Plane can safely render,
-    preventing EXCEPTION_IN_PAGE_ERROR crashes on Windows.
-    
-    The fallback uses the configured missing_color from [autoortho] section,
-    converted to BC1/DXT1 compressed format. This ensures the placeholder
-    texture visually matches the missing tile color the user has configured.
-    
-    The function properly handles the offset parameter to return the correct
-    portion of the fallback DDS data:
-    - Bytes 0-127: DDS header region (returns zeros for valid structure)
-    - Bytes 128+: Mipmap data region (returns BC1 blocks in missing_color)
-    """
-    global _cached_bc1_block
-    
-    # Generate and cache the BC1 block on first use
-    if _cached_bc1_block is None:
-        _cached_bc1_block = _get_fallback_bc1_block()
-    
-    block = _cached_bc1_block
-    block_size = 8  # BC1 blocks are 8 bytes each
-    
-    result = bytearray()
-    current_offset = offset
-    remaining = length
-    
-    # Handle header region (bytes 0-127)
-    # Return zeros for header bytes - this is safe because X-Plane will see
-    # an invalid/empty DDS header and handle it gracefully
-    if current_offset < _DDS_HEADER_SIZE:
-        header_bytes_needed = min(remaining, _DDS_HEADER_SIZE - current_offset)
-        result.extend(b'\x00' * header_bytes_needed)
-        current_offset += header_bytes_needed
-        remaining -= header_bytes_needed
-    
-    # Handle mipmap data region (bytes 128+)
-    if remaining > 0:
-        # Calculate position within mipmap data (offset from byte 128)
-        mipmap_offset = current_offset - _DDS_HEADER_SIZE
-        
-        # Calculate where we are within the 8-byte BC1 block pattern
-        block_phase = mipmap_offset % block_size
-        
-        # If we're not aligned to block boundary, add partial block first
-        if block_phase > 0:
-            partial_len = min(remaining, block_size - block_phase)
-            result.extend(block[block_phase:block_phase + partial_len])
-            remaining -= partial_len
-        
-        # Add complete blocks
-        if remaining >= block_size:
-            full_blocks = remaining // block_size
-            result.extend(block * full_blocks)
-            remaining -= full_blocks * block_size
-        
-        # Add any remaining partial block
-        if remaining > 0:
-            result.extend(block[:remaining])
-    
-    return bytes(result)
+# AO_DEBUG_FAIL_DDS: make chosen texture reads fail on purpose (debug_faults.py).
+_DDS_FAULTS = debug_faults.DdsFaults.from_env()
 
 
 def _get_fuse_pid_for_log():
@@ -1345,6 +1244,24 @@ class AutoOrtho(Operations):
         self._size_cache[key] = dds_size
         return dds_size
     
+    def _fallback_dds(self, row, col, maptype, zoom, offset, length):
+        """Placeholder bytes for a texture read that can't be served.
+
+        A valid header for the size X-Plane was given (see dds_fallback.py):
+        an invalid one makes X-Plane keep the terrain white until the scenery
+        reloads, instead of showing missing_color.
+        """
+        fmt = CFG.pydds.format
+        if _DDS_FAULTS.zero_header:
+            header = b"\0" * dds_fallback.DDS_HEADER_SIZE
+        else:
+            try:
+                size = self._get_dds_size_cached(row, col, maptype, zoom)
+            except Exception:
+                size = None
+            header = dds_fallback.header_for_size(size, fmt)
+        return dds_fallback.fallback_bytes(offset, length, header, fmt)
+
     def _set_dds_size_cached(self, row, col, maptype, zoom, size):
         """Set actual DDS size in cache with LRU eviction."""
         key = (row, col, maptype, zoom)
@@ -1763,7 +1680,9 @@ class AutoOrtho(Operations):
             maptype = self._resolve_dds_maptype(maptype)
             if getortho.is_shutdown_requested():
                 log.info(f"Shutdown in progress, returning fallback data for {path}")
-                return _generate_fallback_dds_bytes(offset, length)
+                return self._fallback_dds(row, col, maptype, zoom, offset, length)
+            if _DDS_FAULTS.active and _DDS_FAULTS.should_fail(row, col, zoom):
+                return self._fallback_dds(row, col, maptype, zoom, offset, length)
             direct = self._direct.get(fh) if fh else None
             if direct is not None and not direct.live:
                 try:
@@ -1774,7 +1693,7 @@ class AutoOrtho(Operations):
                         self._switch_direct_to_live(direct, row, col, maptype, zoom)
                     except Exception as switch_exc:
                         log.error(f"Could not serve {path} live: {switch_exc}")
-                        return _generate_fallback_dds_bytes(offset, length)
+                        return self._fallback_dds(row, col, maptype, zoom, offset, length)
             key = self._tile_key(row, col, maptype, zoom)
             tile_id = f"{row}_{col}_{maptype}_{zoom}"
             request_started = time.monotonic()
@@ -1841,7 +1760,7 @@ class AutoOrtho(Operations):
                     log.error(f"  DIAGNOSTIC: Failed to gather tile state: {diag_err}")
                 # ═══════════════════════════════════════════════════════════════
 
-                return _generate_fallback_dds_bytes(offset, length)
+                return self._fallback_dds(row, col, maptype, zoom, offset, length)
 
             record_stage(
                 "fuse.tile_lock_wait",
@@ -1877,7 +1796,7 @@ class AutoOrtho(Operations):
                             key,
                             build_timeout,
                         )
-                        return _generate_fallback_dds_bytes(offset, length)
+                        return self._fallback_dds(row, col, maptype, zoom, offset, length)
                 # Tile/build coordinators provide the fine-grained safety below.
                 # Release the FUSE lookup lock before cache, network, decode, or
                 # compression work so disjoint row reads can proceed together.
@@ -1887,17 +1806,17 @@ class AutoOrtho(Operations):
                 if data is None:
                     read_outcome = "fallback"
                     log.error(f"Tile read returned None for {key} - returning fallback data")
-                    return _generate_fallback_dds_bytes(offset, length)
+                    return self._fallback_dds(row, col, maptype, zoom, offset, length)
                 return data
             except FuseOSError:
                 read_outcome = "fallback"
                 log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
-                return _generate_fallback_dds_bytes(offset, length)
+                return self._fallback_dds(row, col, maptype, zoom, offset, length)
             except Exception as e:
                 read_outcome = "fallback"
                 log.error(f"Tile read/build failed for {key} - returning fallback data to prevent CTD")
                 log.exception("cause:", exc_info=e)
-                return _generate_fallback_dds_bytes(offset, length)
+                return self._fallback_dds(row, col, maptype, zoom, offset, length)
             finally:
                 if admitted:
                     getortho.release_live_tile_slot(weight=weight)
