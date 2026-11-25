@@ -771,6 +771,13 @@ class AutoOrtho(Operations):
     _stream = None
     # Texture reads recorded for the replay benchmark (AO_READ_TRACE).
     _read_trace = None
+    # Real texture sizes recorded at open (not getattr's estimates).
+    _opened_sizes = None
+    _OPENED_SIZES_MAX = 8192
+    # Native reads (aopipeline/AoFast.py) for this mount, once installed.
+    _native = None
+    _native_mount = -1
+    _native_candidate = None
     _virtual_files = {}
     _virtual_lock = threading.Lock()
     _stream_fallback = set()
@@ -832,6 +839,7 @@ class AutoOrtho(Operations):
         self._lock = threading.RLock()
         self._tile_locks = _KeyLocks()
         self._size_cache = OrderedDict()  # LRU cache for DDS sizes
+        self._opened_sizes = OrderedDict()  # real sizes from opens (see _dds_size_for_read)
         self._size_cache_max = 5000  # Max entries before LRU eviction
         self._negative_getattr_cache = OrderedDict()  # LRU cache for avoiding getattr probes for files that don't exist
         self._negative_getattr_cache_max = 16384  # Max entries before LRU eviction
@@ -1308,6 +1316,22 @@ class AutoOrtho(Operations):
         self._size_cache[key] = dds_size
         return dds_size
     
+    def _dds_size_for_read(self, row, col, maptype, zoom):
+        """The real size of this texture as its last open found it, or None.
+
+        Only sizes an open recorded (a live tile's or the cache file's) are
+        used, never the estimate getattr computes from the configured zoom:
+        with dynamic or airport zoom that estimate can be smaller than the
+        texture, and cutting a read there would hand X-Plane short data.
+        Unknown: nothing is cut here (the tile and the cache file cut at
+        their own size).
+        """
+        sizes = getattr(self, "_opened_sizes", None)
+        if not sizes:
+            return None
+        size = sizes.get((row, col, maptype, zoom))
+        return size if size and size > 0 else None
+
     def _fallback_dds(self, row, col, maptype, zoom, offset, length,
                       reason="error", tile=None):
         """Bytes for a texture read that can't be served in time.
@@ -1378,6 +1402,14 @@ class AutoOrtho(Operations):
     def _set_dds_size_cached(self, row, col, maptype, zoom, size):
         """Set actual DDS size in cache with LRU eviction."""
         key = (row, col, maptype, zoom)
+        # Real sizes only, for cutting reads at the end (_dds_size_for_read).
+        opened = getattr(self, "_opened_sizes", None)
+        if opened is None:
+            opened = self._opened_sizes = OrderedDict()
+        opened[key] = size
+        opened.move_to_end(key)
+        while len(opened) > self._OPENED_SIZES_MAX:
+            opened.popitem(last=False)
         # Evict oldest entries if at limit
         while len(self._size_cache) >= self._size_cache_max:
             self._size_cache.popitem(last=False)
@@ -1805,6 +1837,18 @@ class AutoOrtho(Operations):
             col = int(col)
             zoom = int(zoom)
             maptype = self._resolve_dds_maptype(maptype)
+            # A read at or past the end gets nothing and one that straddles
+            # it is cut at the end, as a plain file answers. Without this a
+            # live texture answered every read with a full piece, so a
+            # program that reads to end-of-file (an antivirus, an indexer, a
+            # copy) never stopped and kept the worker busy.
+            size = self._dds_size_for_read(row, col, maptype, zoom)
+            if size is not None:
+                if offset >= size or length <= 0:
+                    _bump_stat("fuse_reads_past_end")
+                    return b""
+                if offset + length > size:
+                    length = size - offset
             if getortho.is_shutdown_requested():
                 log.info(f"Shutdown in progress, returning fallback data for {path}")
                 return self._fallback_dds(row, col, maptype, zoom, offset, length, "shutdown")
@@ -1819,6 +1863,8 @@ class AutoOrtho(Operations):
                         # A partial entry: X-Plane came closer than the
                         # paging model expected. Expected, not a fault.
                         log.debug(f"Direct read of {path} wants a finer level, serving it live: {exc}")
+                    elif isinstance(exc, disk_texture.DiskTextureStale):
+                        log.debug(f"Cache entry of {path} changed during the open, serving it live: {exc}")
                     else:
                         log.warning(f"Direct read of {path} failed, serving it live: {exc}")
                     try:

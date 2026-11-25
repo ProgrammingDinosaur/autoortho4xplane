@@ -513,3 +513,32 @@ def test_failed_slot_release_still_frees_the_tile_lock(monkeypatch, tmp_path):
     assert len(ao._tile_locks) == 0
     module.getortho.release_live_tile_slot = lambda weight=0: None
     assert ao.read(PATH, 256, 0, 0) == b"r" * 256  # not stuck behind a held lock
+
+
+def test_reads_at_or_past_the_end_get_nothing(monkeypatch, tmp_path):
+    """A live texture answers like a plain file at its end (hybrid read path
+    plan, N1): a program reading to end-of-file stops."""
+    module, ao = _fuse(monkeypatch, tmp_path, "ok")
+    bumps = []
+    module.getortho.bump = lambda name, n=1: bumps.append(name)
+    assert ao.read(PATH, 65536, SIZE_8K_BC1, 0) == b""
+    assert ao.read(PATH, 65536, SIZE_8K_BC1 + 50_000_000, 0) == b""
+    assert bumps.count("fuse_reads_past_end") == 2
+    # A read that straddles the end is cut at it.
+    assert ao.read(PATH, 65536, SIZE_8K_BC1 - 100, 0) == b"r" * 100
+
+
+def test_fallback_is_cut_at_the_end_too(monkeypatch, tmp_path):
+    _module, ao = _fuse(monkeypatch, tmp_path, "none")
+    assert len(ao.read(PATH, 65536, SIZE_8K_BC1 - 10, 0)) == 10
+
+
+def test_reads_are_cut_only_at_a_size_an_open_recorded(monkeypatch, tmp_path):
+    """getattr's estimate (from the configured zoom) never cuts a read: under
+    dynamic or airport zoom it can be smaller than the real texture."""
+    _module, ao = _fuse(monkeypatch, tmp_path, "ok", size=SIZE_8K_BC1)
+    ao._opened_sizes.clear()
+    ao._size_cache.clear()
+    ao._size_cache[(24832, 12416, "BI", 16)] = SIZE_4K_BC1  # a small estimate
+    offset = SIZE_4K_BC1 + 1000  # inside the real 8192 px texture
+    assert ao.read(PATH, 64, offset, 0) == b"r" * 64

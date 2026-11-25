@@ -760,6 +760,71 @@ class TestDynamicDDSCache:
             assert source.read() == sample_dds_bytes
         assert not os.path.exists(tmp_dds)
 
+    @pytest.mark.parametrize("placement", ["staged", "hardlink", "copy", "zstd"])
+    def test_store_from_file_completes_a_native_mip_chain(
+        self, dds_cache, mock_tile, sample_dds_bytes, cache_dir,
+        monkeypatch, placement,
+    ):
+        """The native builder stops at 4x4 (11 levels at 4096 px, 16 bytes
+        short in BC1). The stored file is finished with the tile's header and
+        the 4x4 block copied into 2x2 and 1x1, as a live tile serves them, so
+        its size is the one an open expects."""
+        import errno
+        import struct
+        from autoortho.aopipeline import dynamic_dds_cache as module
+
+        monkeypatch.setattr(dds_cache, "_max_size", 32 * 1024 * 1024)
+        if placement == "zstd" and not module._HAS_ZSTD:
+            pytest.skip("zstandard unavailable")
+        monkeypatch.setattr(
+            dds_cache, "_compression", "zstd" if placement == "zstd" else "none"
+        )
+        if placement == "copy":
+            def no_hardlinks(*args):
+                raise OSError(errno.EXDEV, "Cross-device link")
+            monkeypatch.setattr(module.os, "link", no_hardlinks)
+
+        mipmaps = mock_tile.dds.mipmap_list
+        smallest = len(mipmaps) - 3  # the 4x4 level
+        native = bytearray(sample_dds_bytes[:mipmaps[smallest].endpos])
+        native[0:4] = b"DDS "
+        struct.pack_into("<I", native, 28, smallest + 1)
+        struct.pack_into("<I", native, 108, 0x401008)
+        block = bytes(native[mipmaps[smallest].startpos:mipmaps[smallest].endpos])
+        expected = (
+            mock_tile.dds.header.getvalue() + bytes(native[128:]) + block * 2
+        )
+        assert len(expected) == mock_tile.dds.total_size
+
+        dds_path, _ = dds_cache._paths_for(
+            mock_tile.row, mock_tile.col, mock_tile.maptype,
+            mock_tile.tilename_zoom, mock_tile.max_zoom,
+        )
+        if placement == "staged":
+            os.makedirs(os.path.dirname(dds_path), exist_ok=True)
+            source_path = dds_path + f".tmp.{os.getpid()}"
+        else:
+            source_path = os.path.join(cache_dir, "native_tile.dds")
+        with open(source_path, "wb") as source:
+            source.write(native)
+
+        assert dds_cache.store_from_file(
+            mock_tile.id, mock_tile.max_zoom, source_path, mock_tile
+        )
+        assert dds_cache.load(mock_tile.id, mock_tile.max_zoom, mock_tile) == expected
+        if placement != "staged":
+            with open(source_path, "rb") as source:
+                assert source.read() == bytes(native)  # the source is untouched
+        if placement != "zstd":
+            assert os.path.getsize(dds_path) == mock_tile.dds.total_size
+
+    def test_store_from_file_keeps_a_whole_file_as_it_is(
+        self, dds_cache, mock_tile, sample_dds_bytes, cache_dir,
+    ):
+        assert dds_cache._complete_mip_chain(mock_tile, sample_dds_bytes) is None
+        truncated = sample_dds_bytes[:-5]  # not a level boundary
+        assert dds_cache._complete_mip_chain(mock_tile, truncated) is None
+
     def test_store_from_file_flush_failure_preserves_sources(
         self, dds_cache, mock_tile, sample_dds_bytes, cache_dir, monkeypatch,
     ):
@@ -2574,8 +2639,10 @@ class TestDirectReads:
             texture.close()
 
     def test_corrupt_row_fails_and_invalidates(self, direct_cache, mock_tile, sample_dds_bytes):
-        from autoortho.disk_texture import DiskTextureFailed
+        from autoortho.disk_texture import DiskTextureFailed, forget_verified
         direct_cache.store(mock_tile.id, mock_tile.max_zoom, sample_dds_bytes, mock_tile)
+        # A later session: this process did not write the file.
+        forget_verified()
         entry = self._open(direct_cache, mock_tile)
         # Same size, same mtime: only the row checksum can tell.
         stat = os.stat(entry["dds_path"])

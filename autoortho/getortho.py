@@ -7656,6 +7656,7 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
         with tile_cacher.tc_lock:
             live = tile_cacher.tiles.get(tile_id)
             if live is not None and live.refs > 0:
+                bump("dds_direct_skip_live_tile")
                 return None
         max_zoom = tile_cacher._get_target_zoom_level(zoom, row=row, col=col)
         width, height = _tile_dimensions(zoom, max_zoom)
@@ -7671,6 +7672,7 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
             cache.unpin(entry["key"])
             return None
         partial = bool(entry.get("finest_level"))
+        no_imagery = bool(entry.get("no_imagery_chunks"))
 
         dxt_format = CFG.pydds.format
         block_bytes = colour_table.block_bytes(dxt_format)
@@ -7708,6 +7710,9 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
         log.debug(f"Direct read open failed for {row}_{col}_{zoom}: {exc}")
         return None
     bump("dds_direct_opens")
+    if no_imagery:
+        # Holes where the provider has no imagery, filled from a lower zoom.
+        bump("dds_direct_no_imagery_opens")
     if partial:
         bump("dds_direct_partial_opens")
         _partial_direct_stats.note_open()
@@ -12515,7 +12520,7 @@ class Tile(object):
             or self.dds is None
             or self._dds_persisted
             or self._dds_persistence_accepted
-            or self._dds_needs_healing
+            or (self._dds_needs_healing and not self._holes_are_no_imagery())
         ):
             return False
         if not all(mm.retrieved for mm in self.dds.mipmap_list):
@@ -12538,6 +12543,39 @@ class Tile(object):
         if self._dds_persistence_accepted:
             self._release_completed_sources()
         return self._dds_persistence_accepted
+
+    def _holes_are_no_imagery(self):
+        """Mipmap 0's only holes are lower-zoom fallbacks for chunks the
+        provider answered "no imagery" for (hybrid read path plan, N4).
+
+        Healing cannot improve such a texture, so it may be persisted. The
+        chunk store's record decides (the chunk objects of this open may
+        never have been fetched: their rows can come from row records); the
+        cache checks it again before it stores. A negative answer is asked
+        again after a few seconds, as records are written in the background.
+        """
+        with self._lock:
+            missing = list(self._dds_missing_indices or ())
+            fallback = tuple(sorted(self._dds_fallback_indices or ()))
+        if missing or not fallback or not chunk_store.enabled():
+            return False
+        now = time.monotonic()
+        known = getattr(self, "_no_imagery_check", None)
+        if known is not None and known[0] == fallback and (known[1] or now - known[2] < 5.0):
+            return known[1]
+        try:
+            paths = []
+            for index in fallback:
+                col, row = self._max_zoom_chunk_coords(index)
+                paths.append(os.path.join(
+                    self.cache_dir, f"{col}_{row}_{self.max_zoom}_{self.maptype}.jpg"
+                ))
+            ok = len(chunk_store.no_imagery_paths(paths)) == len(paths)
+        except Exception as exc:
+            log.debug(f"No-imagery check for {self.id} failed: {exc}")
+            ok = False
+        self._no_imagery_check = (fallback, ok, now)
+        return ok
 
     def _enqueue_dds_persistence(
         self,
@@ -14671,6 +14709,14 @@ class Tile(object):
     def read_dds_bytes(self, offset, length):
         if TRACE_READS:
             log.debug(f"READ DDS BYTES: {offset} {length}")
+
+        # Nothing past the end of the texture, as a plain file answers.
+        total = getattr(self.dds, "total_size", None)
+        if isinstance(total, int) and total > 0:
+            if offset >= total or length <= 0:
+                return b""
+            if offset + length > total:
+                length = total - offset
 
         # Signal that a live tile read is in progress.
         # While any live reads are active, prefetching and background DDS

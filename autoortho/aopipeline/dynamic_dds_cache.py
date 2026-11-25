@@ -16,6 +16,7 @@ Key features:
 """
 
 import json
+import functools
 import hashlib
 import logging
 import os
@@ -25,7 +26,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 try:
     from autoortho.dds_manifest import (
@@ -122,6 +123,24 @@ class _SizeShim:
     def __init__(self, max_zoom, total_size):
         self.max_zoom = max_zoom
         self.dds = self._DDS(total_size)
+
+
+class _DirectInfo(NamedTuple):
+    """The parts of an entry's .ddm a direct open needs (see open_direct)."""
+
+    sig: tuple  # (.ddm size, .ddm mtime_ns, .dds size, .dds mtime_ns)
+    max_zl: object
+    fmt: object
+    comp: object
+    disk_compression: object
+    width: int
+    height: int
+    full: bool  # every level populated, mipmap 0 servable
+    finest_run: Optional[int]
+    needs_healing: bool
+    dds_size: int
+    dds_mtime_ns: int
+    no_imagery_chunks: int  # lower-zoom chunks where the provider has none
 
 
 def mm0_row_layout(width: int, height: int, fmt) -> Tuple[int, int, int]:
@@ -364,6 +383,12 @@ class DynamicDDSCache:
         # Eviction skips them (guarded by self._lock).
         self._pins: Dict[str, int] = {}
         self._promoting: set = set()
+        # What a direct open needs from each entry's .ddm, parsed once and
+        # kept while the .ddm and the .dds keep their size and time
+        # (see _direct_info). Without it every open read and parsed the
+        # sidecar: half a millisecond of Python per open.
+        self._direct_memo: OrderedDict = OrderedDict()
+        self._direct_memo_lock = threading.Lock()
 
         if self._enabled:
             os.makedirs(self._dds_root, exist_ok=True)
@@ -1515,39 +1540,52 @@ class DynamicDDSCache:
             dds_path, ddm_path = self._paths_for(
                 row, col, maptype, tilename_zoom, max_zoom
             )
-            meta = self._read_ddm(ddm_path)
-            if meta is None or meta.get("max_zl") != max_zoom:
+            info = self._direct_info(tile_id, dds_path, ddm_path)
+            # Why an open is not direct, counted per reason (STATS): what a
+            # flight's ready share is made of.
+            if info is None:
+                self._bump("dds_direct_skip_no_entry")
                 return None
-            shim = _SizeShim(max_zoom, expected_size)
-            if self._is_stale(meta, shim, dds_path):
+            if info.max_zl != max_zoom:
+                self._bump("dds_direct_skip_zoom")
                 return None
-            mm_count = int(meta.get("mm", 0) or 0)
-            populated = meta.get("populated_mipmaps")
-            full = self._mm0_cache_complete(meta) and (
-                populated is None or set(range(mm_count)) <= set(populated)
-            )
+            if self._direct_info_stale(info, expected_size):
+                self._bump("dds_direct_skip_stale")
+                return None
+            full = info.full
             finest_level = 0
             if not full:
-                if min_level is None or min_level <= 0 or meta.get("needs_healing"):
+                if info.needs_healing:
+                    self._bump("dds_direct_skip_healing")
                     return None
-                finest = self._finest_populated_run(meta, mm_count)
+                if min_level is None or min_level <= 0:
+                    # Partial entry, and the paging model has no level for
+                    # it (no camera) or wants mipmap 0.
+                    self._bump("dds_direct_skip_partial_no_level")
+                    return None
+                finest = info.finest_run
                 if finest is None or finest > int(min_level):
+                    self._bump("dds_direct_skip_partial_coarse")
                     return None
                 # Mipmap 0 without its exact row manifest is never served
                 # from the file: level 1 is the finest a partial entry gives.
                 finest_level = max(1, finest)
                 if finest_level > int(min_level):
                     return None
-            if meta.get("disk_compression", "none") != "none":
+            if info.disk_compression != "none":
                 self._schedule_promote(tile_id, max_zoom, dds_path, ddm_path,
                                        expected_size)
                 self._bump("dds_direct_compressed_skip")
                 return None
-            stat = os.stat(dds_path)
-            if stat.st_size != expected_size:
+            if info.dds_size != expected_size:
+                self._bump("dds_direct_skip_size")
                 return None
+            # Loaded only if a read needs a row checked: rows found good stay
+            # good for the life of the file (disk_texture._verified).
             manifests = (
-                manifests_from_dict(meta["mm0_manifest"], tile_id=tile_id)
+                functools.partial(
+                    self._direct_manifests, tile_id, ddm_path, info.sig
+                )
                 if full else {}
             )
         except (OSError, KeyError, TypeError, ValueError):
@@ -1574,13 +1612,214 @@ class DynamicDDSCache:
             "max_zoom": max_zoom,
             "dds_path": dds_path,
             "size": expected_size,
-            "mtime_ns": stat.st_mtime_ns,
-            "width": int(meta.get("w", 0) or 0),
-            "height": int(meta.get("h", 0) or 0),
-            "fmt": meta.get("fmt"),
+            "mtime_ns": info.dds_mtime_ns,
+            "width": info.width,
+            "height": info.height,
+            "fmt": info.fmt,
             "manifests": manifests,
             "finest_level": finest_level,
+            "no_imagery_chunks": info.no_imagery_chunks,
         }
+
+    _DIRECT_MEMO_MAX = 8192
+
+    @staticmethod
+    def _remember_rows_checked(dds_path: str, manifests, size: int) -> None:
+        """Tell direct reads that this file's mipmap-0 rows were checked."""
+        try:
+            if __package__ and __package__.startswith("autoortho"):
+                from autoortho import disk_texture
+            else:
+                import disk_texture  # type: ignore[no-redef]
+            disk_texture.remember_verified(dds_path, list(dict(manifests)), size)
+        except Exception as exc:
+            log.debug(f"Could not remember checked rows of {dds_path}: {exc}")
+
+    def _direct_info(self, tile_id: str, dds_path: str,
+                     ddm_path: str) -> Optional["_DirectInfo"]:
+        """What :meth:`open_direct` needs from an entry, or None.
+
+        Parsed from the .ddm once and kept while both files keep their size
+        and modification time: any rewrite (a rebuild, healing, a promotion,
+        another process storing the texture) changes one of them. Two
+        ``stat`` calls instead of reading and parsing the sidecar.
+        """
+        try:
+            ddm_stat = os.stat(ddm_path)
+            dds_stat = os.stat(dds_path)
+        except OSError:
+            self._forget_direct_info(ddm_path)
+            return None
+        sig = (ddm_stat.st_size, ddm_stat.st_mtime_ns,
+               dds_stat.st_size, dds_stat.st_mtime_ns)
+        with self._direct_memo_lock:
+            info = self._direct_memo.get(ddm_path)
+            if info is not None and info.sig == sig:
+                self._direct_memo.move_to_end(ddm_path)
+                return info
+        meta = self._read_ddm(ddm_path)
+        if meta is None:
+            self._forget_direct_info(ddm_path)
+            return None
+        info = self._parse_direct_info(tile_id, meta, sig, dds_stat)
+        with self._direct_memo_lock:
+            self._direct_memo[ddm_path] = info
+            self._direct_memo.move_to_end(ddm_path)
+            while len(self._direct_memo) > self._DIRECT_MEMO_MAX:
+                self._direct_memo.popitem(last=False)
+        return info
+
+    def _forget_direct_info(self, ddm_path: str) -> None:
+        with self._direct_memo_lock:
+            self._direct_memo.pop(ddm_path, None)
+
+    def _parse_direct_info(self, tile_id, meta, sig, dds_stat) -> "_DirectInfo":
+        mm_count = int(meta.get("mm", 0) or 0)
+        populated = meta.get("populated_mipmaps")
+        all_levels = populated is None or set(range(mm_count)) <= set(populated)
+        full = all_levels and self._mm0_cache_complete(meta)
+        no_imagery = 0
+        if all_levels and not full:
+            holes = self._no_imagery_holes(meta)
+            if holes:
+                full = True
+                no_imagery = holes
+                self._bump("dds_direct_no_imagery_entries")
+        return _DirectInfo(
+            sig=sig,
+            max_zl=meta.get("max_zl"),
+            fmt=meta.get("fmt"),
+            comp=meta.get("comp"),
+            disk_compression=meta.get("disk_compression", "none"),
+            width=int(meta.get("w", 0) or 0),
+            height=int(meta.get("h", 0) or 0),
+            full=bool(full),
+            finest_run=self._finest_populated_run(meta, mm_count),
+            needs_healing=bool(meta.get("needs_healing")),
+            dds_size=dds_stat.st_size,
+            dds_mtime_ns=dds_stat.st_mtime_ns,
+            no_imagery_chunks=no_imagery,
+        )
+
+    @staticmethod
+    def _direct_info_stale(info: "_DirectInfo", expected_size: int) -> bool:
+        """:meth:`_is_stale` on a parsed entry, without touching the disk."""
+        try:
+            from autoortho.aoconfig import CFG
+        except ImportError:
+            from aoconfig import CFG  # type: ignore[no-redef]
+        current_fmt = CFG.pydds.format.upper()
+        if current_fmt in ("DXT1",):
+            current_fmt = "BC1"
+        elif current_fmt in ("DXT5",):
+            current_fmt = "BC3"
+        if info.fmt != current_fmt:
+            return True
+        if info.comp != CFG.pydds.compressor.upper():
+            return True
+        if info.disk_compression == "none" and info.dds_size != expected_size:
+            return True
+        return False
+
+    def _direct_manifests(self, tile_id: str, ddm_path: str, sig: tuple) -> dict:
+        """The row manifests of an entry opened for direct reads.
+
+        Raises :class:`disk_texture.DiskTextureStale` when the .ddm was
+        rewritten since the open: its manifests may describe other bytes.
+        """
+        try:
+            from autoortho.disk_texture import DiskTextureStale
+        except ImportError:
+            from disk_texture import DiskTextureStale  # type: ignore[no-redef]
+        try:
+            st = os.stat(ddm_path)
+        except OSError as exc:
+            raise DiskTextureStale(f"{tile_id}: {exc}") from exc
+        if (st.st_size, st.st_mtime_ns) != sig[:2]:
+            raise DiskTextureStale(f"{tile_id}: entry rewritten since open")
+        meta = self._read_ddm(ddm_path)
+        if meta is None:
+            raise DiskTextureStale(f"{tile_id}: entry unreadable")
+        return manifests_from_dict(meta["mm0_manifest"], tile_id=tile_id)
+
+    def _no_imagery_holes(self, meta: dict) -> int:
+        """How many mipmap-0 chunks of an entry are filled from a lower zoom
+        because the provider has no imagery there; 0 when any is not (or
+        none are). See :meth:`_no_imagery_holes_for`."""
+        if meta.get("missing_indices"):
+            return 0
+        fallback = meta.get("fallback_indices") or []
+        if not fallback:
+            return 0
+        try:
+            tile_id = (
+                f"{int(meta['tile_row'])}_{int(meta['tile_col'])}_"
+                f"{meta['map']}_{int(meta['zl'])}"
+            )
+            manifests = manifests_from_dict(meta["mm0_manifest"], tile_id=tile_id)
+            holes = self._no_imagery_holes_for(
+                manifests, int(meta["tile_row"]), int(meta["tile_col"]),
+                int(meta["zl"]), int(meta["max_zl"]), str(meta["map"]),
+                int(meta["w"]), int(meta["h"]),
+            )
+            recorded = set(int(i) for i in fallback)
+        except (KeyError, TypeError, ValueError):
+            return 0
+        if not holes or holes != recorded:
+            return 0
+        return len(holes)
+
+    def _no_imagery_holes_for(self, manifests, tile_row: int, tile_col: int,
+                              zoom: int, max_zoom: int, maptype: str,
+                              width: int, height: int) -> set:
+        """The mipmap-0 chunk indices filled from a lower zoom because the
+        provider has no imagery there, or an empty set when any non-target
+        chunk is not that (or there is none).
+
+        Such a texture is as good as it can get: the live path would build
+        the same fallbacks again at every open. A chunk counts only if the
+        chunk store remembers the provider answering "no imagery" for it; a
+        download that failed or timed out is never recorded so, and leaves
+        the texture live until it is healed. Missing-colour chunks (no
+        fallback either) keep it live too.
+        """
+        manifests = dict(manifests or {})
+        chunks_per_row = max(1, int(width) // 256)
+        rows = max(1, (int(height) + 255) // 256)
+        if set(manifests) != set(range(rows)):
+            return set()
+        target = int(MipmapSource.TARGET_PROVIDER)
+        non_target = set()
+        for row_index, manifest in manifests.items():
+            if len(manifest.sources) != chunks_per_row or manifest.missing_indices:
+                return set()
+            fallback_columns = set(manifest.fallback_indices)
+            base = row_index * chunks_per_row
+            for index, value in enumerate(manifest.sources):
+                if value == target:
+                    continue
+                if index not in fallback_columns:
+                    return set()  # unknown or unrated source
+                non_target.add(base + index)
+        if not non_target:
+            return set()
+        diff = int(zoom) - int(max_zoom)
+        col0 = tile_col >> diff if diff >= 0 else tile_col << (-diff)
+        row0 = tile_row >> diff if diff >= 0 else tile_row << (-diff)
+        paths = [
+            os.path.join(
+                self._cache_dir,
+                f"{col0 + idx % chunks_per_row}_{row0 + idx // chunks_per_row}"
+                f"_{max_zoom}_{maptype}.jpg",
+            )
+            for idx in sorted(non_target)
+        ]
+        try:
+            nothing_there = chunk_store.no_imagery_paths(paths)
+        except Exception as exc:
+            log.debug(f"No-imagery lookup failed: {exc}")
+            return set()
+        return non_target if len(nothing_there) == len(paths) else set()
 
     def unpin(self, key: str) -> None:
         """Release one direct-read pin taken by :meth:`open_direct`."""
@@ -1637,6 +1876,7 @@ class DynamicDDSCache:
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp, dds_path)
+                self._remember_rows_checked(dds_path, manifests, len(raw))
                 meta["disk_compression"] = "none"
                 self._write_ddm(ddm_path, meta)
             self._record_store(key, dds_path, ddm_path, count_store=False)
@@ -1817,6 +2057,25 @@ class DynamicDDSCache:
             if i >= len(chunks) or not getattr(chunks[i], 'permanent_failure', False)
         ]
 
+    def _store_no_imagery_holes(self, tile, max_zoom, mm0_manifest) -> bool:
+        """Whether a mipmap 0 that is not all target imagery may be stored
+        all the same: its only holes are lower-zoom fallbacks for chunks the
+        provider has no imagery for (hybrid read path plan, N4). Built again
+        it would come out the same."""
+        try:
+            dds = tile.dds
+            holes = self._no_imagery_holes_for(
+                mm0_manifest, int(tile.row), int(tile.col),
+                int(tile.tilename_zoom), int(max_zoom), str(tile.maptype),
+                int(dds.width), int(dds.height),
+            )
+        except Exception:
+            return False
+        if holes:
+            self._bump("dds_cache_store_no_imagery")
+            return True
+        return False
+
     @profiled_stage("cache.dds_store", tile_arg=1)
     def store(self, tile_id: str, max_zoom: int, dds_bytes: bytes,
               tile,
@@ -1864,7 +2123,7 @@ class DynamicDDSCache:
         if self.real_only and not all(
             getattr(manifest, "is_exact", False)
             for manifest in dict(mm0_manifest).values()
-        ):
+        ) and not self._store_no_imagery_holes(tile, max_zoom, mm0_manifest):
             # Only real imagery is persisted: mipmap 0 with fallback or
             # missing rows is rebuilt next time instead of cached and healed.
             # Its coarser levels are real and are kept.
@@ -1896,6 +2155,9 @@ class DynamicDDSCache:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_dds, dds_path)
+            if disk_compression == "none":
+                # The bytes were checked against their row manifests above.
+                self._remember_rows_checked(dds_path, mm0_manifest, len(dds_bytes))
 
             # Build and write DDM metadata atomically
             meta = self._build_ddm(tile, max_zoom,
@@ -2229,6 +2491,45 @@ class DynamicDDSCache:
             == os.path.normcase(os.path.abspath(second))
         )
 
+    @staticmethod
+    def _complete_mip_chain(tile, source_bytes) -> Optional[Tuple[bytes, bytes]]:
+        """``(header, tail)`` that finish a native build's file, or None.
+
+        The native builder (aodds.c) stops at the 4x4 level: 11 levels for a
+        4096 px texture, its header saying so. The tile, and X-Plane, count
+        levels to 1x1, and a live tile serves the levels below 4x4 as copies
+        of the 4x4 one (``replace_mipmap_dense`` with the smallest level).
+        Stored as it came, such a file is 16 bytes (BC1) short of the size an
+        open expects and is never served from disk. Finished with the tile's
+        own header and those copies, it holds the bytes the live tile serves.
+        """
+        dds = getattr(tile, "dds", None)
+        mipmaps = getattr(dds, "mipmap_list", None)
+        total = getattr(dds, "total_size", None)
+        header_io = getattr(dds, "header", None)
+        if not mipmaps or not total or header_io is None:
+            return None
+        size = len(source_bytes)
+        if size >= total or size < 128 or bytes(source_bytes[:4]) != b"DDS ":
+            return None
+        try:
+            count = struct.unpack_from("<I", source_bytes, 28)[0]
+            header = bytes(header_io.getvalue())
+        except Exception:
+            return None
+        if not 0 < count < len(mipmaps) or len(header) != 128:
+            return None
+        last = mipmaps[count - 1]
+        if size != last.endpos or last.endpos > len(source_bytes):
+            return None
+        missing = mipmaps[count:]
+        if not missing or any(m.length != last.length for m in missing):
+            return None
+        if missing[-1].endpos != total:
+            return None
+        block = bytes(source_bytes[last.startpos:last.endpos])
+        return header, block * len(missing)
+
     def _store_from_file(self, tile_id: str, max_zoom: int,
                          source_path: str, tile,
                          mm0_missing_indices: Optional[List[int]] = None,
@@ -2259,6 +2560,7 @@ class DynamicDDSCache:
         ):
             log.debug("DDS cache file store rejected a mismatched row manifest")
             return False
+        completed = self._complete_mip_chain(tile, source_bytes)
 
         try:
             dds_path, ddm_path = self._paths_for(
@@ -2277,6 +2579,18 @@ class DynamicDDSCache:
             # every uncompressed store failed with "file not found".
             staged_in_place = self._same_path(source_path, tmp_dds)
 
+            linked = False
+            if completed is not None:
+                header, tail = completed
+                if staged_in_place:
+                    # The cache's own temp file: finish it where it is.
+                    with open(tmp_dds, "r+b") as staged:
+                        staged.write(header)
+                        staged.seek(0, os.SEEK_END)
+                        staged.write(tail)
+                source_bytes = header + source_bytes[len(header):] + tail
+                source_size = len(source_bytes)
+                self._bump("dds_cache_store_mip_chain_completed")
             if self._compression == "zstd" and _HAS_ZSTD:
                 # Read source, compress, write compressed version
                 raw_bytes = source_bytes
@@ -2291,10 +2605,14 @@ class DynamicDDSCache:
                 disk_size = len(disk_bytes)
             else:
                 disk_compression = "none"
-                if not staged_in_place:
+                if completed is not None and not staged_in_place:
+                    # A link would share the source's bytes: write the
+                    # completed file instead.
+                    with open(tmp_dds, "wb") as f:
+                        f.write(source_bytes)
+                elif not staged_in_place:
                     # Try hard-link first -- zero-copy, instant, works when
                     # source and destination are on the same filesystem.
-                    linked = False
                     try:
                         try:
                             os.remove(tmp_dds)
@@ -2316,6 +2634,10 @@ class DynamicDDSCache:
                     os.fsync(committed_dds.fileno())
 
             os.replace(tmp_dds, dds_path)
+            if disk_compression == "none" and (staged_in_place or linked):
+                # The same file whose bytes were checked above (a copy is
+                # checked again at its first read).
+                self._remember_rows_checked(dds_path, mm0_manifest, source_size)
 
             # Write DDM metadata and retire any superseded partial rows.
             dds_format, compressor = self._get_format_and_compressor()

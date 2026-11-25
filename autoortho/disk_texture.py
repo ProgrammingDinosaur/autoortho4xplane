@@ -6,14 +6,17 @@ file cache keeps the hot ones (shared, reclaimed under pressure, not charged
 to AutoOrtho). See docs/developer/resource-usage-plan.md.
 
 Mipmap-0 rows are checked against their SHA-256 row manifest the first time
-each row is read (once per file per process). Any short read, I/O error or
-checksum mismatch raises :class:`DiskTextureFailed`; the caller then serves
-the rest of that open from a live tile.
+each row is read, once per file per process: the rows found good outlive the
+open (``_verified``), keyed by the file's path, size, modification time and
+identity, so a texture X-Plane opens again is not checked again. Any short
+read, I/O error or checksum mismatch raises :class:`DiskTextureFailed`; the
+caller then serves the rest of that open from a live tile.
 """
+import functools
 import logging
 import os
 import threading
-from collections import namedtuple
+from collections import OrderedDict, namedtuple
 from typing import Callable, Dict, Optional, Tuple
 
 try:
@@ -43,6 +46,15 @@ class DiskTextureLevelMissing(DiskTextureFailed):
     """
 
 
+class DiskTextureStale(DiskTextureFailed):
+    """The entry changed on disk since this open (rebuilt, healed).
+
+    Not a fault of the file: the rest of the open is served live and the
+    next open sees the new entry.
+    """
+
+
+@functools.lru_cache(maxsize=64)
 def mip_layout(width: int, height: int, fmt) -> Tuple[MipLevel, ...]:
     """The byte range of every level, as ``pydds.DDS`` lays them out."""
     block = 16 if str(fmt).upper() in ("BC3", "DXT5") else 8
@@ -68,10 +80,12 @@ class _SharedFile:
         self.path = path
         self.size = size
         self.fd = os.open(path, _O_FLAGS)
+        self.ident = None  # the file's identity (inode, file index)
         self.refs = 0
         self.lock = threading.Lock()  # seek+read on platforms without pread
         self.verified_rows = set()
         self.verify_lock = threading.Lock()
+        self.manifests = None  # loaded on the first row check
         self.bad = False
 
     def pread(self, length: int, offset: int) -> bytes:
@@ -107,6 +121,31 @@ class _SharedFile:
 _files: Dict[tuple, _SharedFile] = {}
 _files_lock = threading.Lock()
 
+# Rows found good in files no longer open: file key -> (identity, row bits).
+# The key holds the size and modification time, so a rebuilt or healed file
+# is a new key; the identity guards against a file replaced by another with
+# the same size and time. A few dozen bytes per texture.
+_VERIFIED_MAX = 16384
+_verified: "OrderedDict[tuple, Tuple[object, int]]" = OrderedDict()
+
+
+def _rows_to_bits(rows) -> int:
+    bits = 0
+    for row in rows:
+        bits |= 1 << int(row)
+    return bits
+
+
+def _bits_to_rows(bits: int) -> set:
+    rows = set()
+    row = 0
+    while bits:
+        if bits & 1:
+            rows.add(row)
+        bits >>= 1
+        row += 1
+    return rows
+
 
 def _acquire_file(path: str, size: int, mtime_ns: int) -> _SharedFile:
     key = (os.path.normcase(path), size, mtime_ns)
@@ -119,6 +158,11 @@ def _acquire_file(path: str, size: int, mtime_ns: int) -> _SharedFile:
                 # Replaced between the metadata check and the open.
                 shared.close()
                 raise DiskTextureFailed(f"{path} changed while opening")
+            shared.ident = (st.st_dev, st.st_ino)
+            known = _verified.get(key)
+            if known is not None and known[0] == shared.ident:
+                shared.verified_rows = _bits_to_rows(known[1])
+                _verified.move_to_end(key)
             _files[key] = shared
         shared.refs += 1
         return shared
@@ -132,8 +176,53 @@ def _release_file(shared: _SharedFile) -> bool:
             return False
         if _files.get(shared.key) is shared:
             del _files[shared.key]
+        if shared.bad:
+            _verified.pop(shared.key, None)
+        elif shared.verified_rows and shared.ident is not None:
+            _verified[shared.key] = (shared.ident, _rows_to_bits(shared.verified_rows))
+            _verified.move_to_end(shared.key)
+            while len(_verified) > _VERIFIED_MAX:
+                _verified.popitem(last=False)
     shared.close()
     return True
+
+
+def remember_verified(path: str, rows, size: int) -> bool:
+    """Rows of a cache file this process just wrote, from bytes it had
+    checked against their manifests: no read needs to check them again
+    (hybrid read path plan, S3; the check moves off the read path for every
+    texture built in this session).
+
+    Keyed like the record :func:`_release_file` keeps, by the file as it is
+    now; a file that is not ``size`` bytes is left alone.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if st.st_size != size:
+        return False
+    key = (os.path.normcase(path), st.st_size, st.st_mtime_ns)
+    ident = (st.st_dev, st.st_ino)
+    bits = _rows_to_bits(rows)
+    with _files_lock:
+        known = _verified.get(key)
+        if known is not None and known[0] == ident:
+            bits |= known[1]
+        _verified[key] = (ident, bits)
+        _verified.move_to_end(key)
+        while len(_verified) > _VERIFIED_MAX:
+            _verified.popitem(last=False)
+        shared = _files.get(key)
+        if shared is not None and shared.ident == ident and not shared.bad:
+            shared.verified_rows.update(_bits_to_rows(bits))
+    return True
+
+
+def forget_verified() -> None:
+    """Drop every remembered row check (tests; a cache cleared by hand)."""
+    with _files_lock:
+        _verified.clear()
 
 
 def open_files() -> int:
@@ -162,6 +251,8 @@ class DiskTexture:
         self.width = int(entry["width"])
         self.height = int(entry["height"])
         self.fmt = entry["fmt"]
+        # The row manifests, or a function that loads them: most opens find
+        # every row they read already checked and never need them.
         self._manifests = entry["manifests"]
         self._unpin = unpin
         self._invalidate = invalidate
@@ -181,8 +272,20 @@ class DiskTexture:
             unpin(self.key)
             raise DiskTextureFailed(f"{self.tile_id}: bad finest level {self.finest_level}")
         self._standin_block: Optional[bytes] = None
+        # Set by the mount when native code answers this open's reads
+        # (aofast): it classifies every read itself, and is told which rows
+        # this side checks (see native_spec).
+        self.classified_natively = False
+        self.on_rows_verified: Optional[Callable[[set], None]] = None
+        # The season colour table that applies to this texture now (or
+        # None), and the block size recolour() uses with it.
+        self.colour_table_now: Optional[Callable[[], object]] = None
+        self.colour_block_bytes = 0
         self._cursor = read_pattern.ReadCursor()
         self._closed = False
+        # Reads served, counted once at close: a counter per read cost more
+        # than the read itself.
+        self.reads = 0
         try:
             self._file = _acquire_file(entry["dds_path"], self.size, entry["mtime_ns"])
         except Exception:
@@ -207,13 +310,16 @@ class DiskTexture:
         except DiskTextureLevelMissing:
             self._metric("dds_direct_partial_fallbacks")
             raise
+        except DiskTextureStale:
+            self._metric("dds_direct_stale_fallbacks")
+            raise
         except DiskTextureFailed:
             self._file.bad = True
             raise
         except OSError as exc:
             self._file.bad = True
             raise DiskTextureFailed(f"{self.tile_id}: {exc}") from exc
-        self._metric("dds_direct_reads")
+        self.reads += 1
         if self._recolour is not None:
             data = self._recolour(data, offset)
         return data
@@ -276,6 +382,8 @@ class DiskTexture:
         if self._closed:
             return
         self._closed = True
+        if self.reads:
+            self._metric("dds_direct_reads", self.reads)
         bad = self._file.bad
         closed = _release_file(self._file)
         self._unpin(self.key)
@@ -317,10 +425,26 @@ class DiskTexture:
                     continue
                 start = self._row_start + row * self._row_bytes
                 data = shared.read_exact(self._row_bytes, start)
-                manifest = self._manifests.get(row)
+                manifest = self._row_manifests(shared).get(row)
                 if manifest is None or not manifest.validate_data(data):
                     self._metric("dds_direct_checksum_failures")
                     raise DiskTextureFailed(
                         f"{self.tile_id}: mipmap-0 row {row} does not match its manifest"
                     )
                 shared.verified_rows.add(row)
+                self._metric("dds_direct_rows_checked")
+                if self.on_rows_verified is not None:
+                    try:
+                        self.on_rows_verified({row})
+                    except Exception:  # the native side then asks again
+                        pass
+
+    def _row_manifests(self, shared) -> dict:
+        """The row manifests, loaded once per open file (``verify_lock`` held)."""
+        if shared.manifests is None:
+            manifests = self._manifests
+            if callable(manifests):
+                # Raises DiskTextureStale when the entry changed since open.
+                manifests = manifests()
+            shared.manifests = manifests or {}
+        return shared.manifests
