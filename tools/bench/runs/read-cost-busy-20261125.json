@@ -1,0 +1,371 @@
+{
+ "date": "2026-11-25",
+ "machine": "this PC (32 logical CPUs), WinFsp, files in the system file cache",
+ "textures": "25 cached Vagar textures, Bing ZL16, 4096 px BC1; medians of runs 2-5 (spin: 2-3)",
+ "library": "aopipeline.dll built from this branch (aofast in it), installed in lib/windows",
+ "cases": {
+  "idle": "lone mount worker, nothing else to do",
+  "busy": "the same worker downloads and builds uncached textures (Munich, 4 reader threads) meanwhile",
+  "spin": "two pure-Python threads spin in the worker (worst case for the GIL); levels 1 and 3 only"
+ },
+ "native_share": {
+  "idle": "81725 of 82125 reads",
+  "busy": "81725 of 82125 reads",
+  "rest": "first reads of level-0 rows not yet checked in this process (Python, by design)"
+ },
+ "minimal_c_fs_reference": "read-cost-20261124.json mini-native-*",
+ "runs": {
+  "idle-off-L0-t1": {
+   "body_read_p50_us": 28.4,
+   "body_read_p95_us": 70.95,
+   "texture_ms_mean": 6.726,
+   "read_max_us": 746.7,
+   "vs_minimal_c_p50": 1.99,
+   "vs_minimal_c_p95": 2.35
+  },
+  "idle-on-L0-t1": {
+   "body_read_p50_us": 13.649999999999999,
+   "body_read_p95_us": 31.2,
+   "texture_ms_mean": 3.4265,
+   "read_max_us": 173.6,
+   "vs_minimal_c_p50": 0.95,
+   "vs_minimal_c_p95": 1.03
+  },
+  "idle-off-L0-t8": {
+   "body_read_p50_us": 173.3,
+   "body_read_p95_us": 425.55,
+   "texture_ms_mean": 35.7415,
+   "read_max_us": 1283.1,
+   "vs_minimal_c_p50": 6.74,
+   "vs_minimal_c_p95": 8.98
+  },
+  "idle-on-L0-t8": {
+   "body_read_p50_us": 24.549999999999997,
+   "body_read_p95_us": 46.1,
+   "texture_ms_mean": 6.558999999999999,
+   "read_max_us": 221.7,
+   "vs_minimal_c_p50": 0.96,
+   "vs_minimal_c_p95": 0.97
+  },
+  "idle-off-L0-t16": {
+   "body_read_p50_us": 296.5,
+   "body_read_p95_us": 854.1,
+   "texture_ms_mean": 65.604,
+   "read_max_us": 2277.1,
+   "vs_minimal_c_p50": 6.06,
+   "vs_minimal_c_p95": 9.73
+  },
+  "idle-on-L0-t16": {
+   "body_read_p50_us": 42.7,
+   "body_read_p95_us": 84.15,
+   "texture_ms_mean": 11.1975,
+   "read_max_us": 1061.8,
+   "vs_minimal_c_p50": 0.87,
+   "vs_minimal_c_p95": 0.96
+  },
+  "idle-off-L1-t1": {
+   "body_read_p50_us": 26.0,
+   "body_read_p95_us": 46.0,
+   "texture_ms_mean": 1.9255,
+   "read_max_us": 2401.7,
+   "vs_minimal_c_p50": 1.81,
+   "vs_minimal_c_p95": 1.54
+  },
+  "idle-on-L1-t1": {
+   "body_read_p50_us": 21.2,
+   "body_read_p95_us": 44.4,
+   "texture_ms_mean": 1.786,
+   "read_max_us": 298.0,
+   "vs_minimal_c_p50": 1.47,
+   "vs_minimal_c_p95": 1.48
+  },
+  "idle-off-L1-t8": {
+   "body_read_p50_us": 170.64999999999998,
+   "body_read_p95_us": 409.35,
+   "texture_ms_mean": 10.1655,
+   "read_max_us": 1497.8,
+   "vs_minimal_c_p50": 7.11,
+   "vs_minimal_c_p95": 9.41
+  },
+  "idle-on-L1-t8": {
+   "body_read_p50_us": 25.8,
+   "body_read_p95_us": 47.3,
+   "texture_ms_mean": 2.936,
+   "read_max_us": 120.9,
+   "vs_minimal_c_p50": 1.07,
+   "vs_minimal_c_p95": 1.09
+  },
+  "idle-off-L1-t16": {
+   "body_read_p50_us": 303.75,
+   "body_read_p95_us": 888.5,
+   "texture_ms_mean": 20.0175,
+   "read_max_us": 1801.6,
+   "vs_minimal_c_p50": 6.44,
+   "vs_minimal_c_p95": 10.18
+  },
+  "idle-on-L1-t16": {
+   "body_read_p50_us": 36.15,
+   "body_read_p95_us": 78.2,
+   "texture_ms_mean": 5.002,
+   "read_max_us": 650.9,
+   "vs_minimal_c_p50": 0.77,
+   "vs_minimal_c_p95": 0.9
+  },
+  "idle-off-L3-t1": {
+   "body_read_p50_us": 39.1,
+   "body_read_p95_us": 87.85,
+   "texture_ms_mean": 0.687,
+   "read_max_us": 674.6,
+   "vs_minimal_c_p50": 2.51,
+   "vs_minimal_c_p95": 3.8
+  },
+  "idle-on-L3-t1": {
+   "body_read_p50_us": 15.9,
+   "body_read_p95_us": 32.35,
+   "texture_ms_mean": 0.645,
+   "read_max_us": 69.2,
+   "vs_minimal_c_p50": 1.02,
+   "vs_minimal_c_p95": 1.4
+  },
+  "idle-off-L3-t8": {
+   "body_read_p50_us": 247.8,
+   "body_read_p95_us": 535.9000000000001,
+   "texture_ms_mean": 3.108,
+   "read_max_us": 1152.2,
+   "vs_minimal_c_p50": 9.33,
+   "vs_minimal_c_p95": 12.22
+  },
+  "idle-on-L3-t8": {
+   "body_read_p50_us": 21.35,
+   "body_read_p95_us": 36.55,
+   "texture_ms_mean": 2.083,
+   "read_max_us": 128.0,
+   "vs_minimal_c_p50": 0.8,
+   "vs_minimal_c_p95": 0.83
+  },
+  "idle-off-L3-t16": {
+   "body_read_p50_us": 364.70000000000005,
+   "body_read_p95_us": 753.9,
+   "texture_ms_mean": 5.3870000000000005,
+   "read_max_us": 1284.1,
+   "vs_minimal_c_p50": 11.14,
+   "vs_minimal_c_p95": 5.24
+  },
+  "idle-on-L3-t16": {
+   "body_read_p50_us": 33.349999999999994,
+   "body_read_p95_us": 439.35,
+   "texture_ms_mean": 4.001,
+   "read_max_us": 1188.9,
+   "vs_minimal_c_p50": 1.02,
+   "vs_minimal_c_p95": 3.05
+  },
+  "busy-off-L0-t1": {
+   "body_read_p50_us": 29.700000000000003,
+   "body_read_p95_us": 307.75,
+   "texture_ms_mean": 14.387,
+   "read_max_us": 4532.3,
+   "vs_minimal_c_p50": 2.08,
+   "vs_minimal_c_p95": 10.19
+  },
+  "busy-on-L0-t1": {
+   "body_read_p50_us": 14.149999999999999,
+   "body_read_p95_us": 35.0,
+   "texture_ms_mean": 4.342499999999999,
+   "read_max_us": 136.1,
+   "vs_minimal_c_p50": 0.99,
+   "vs_minimal_c_p95": 1.16
+  },
+  "busy-off-L0-t8": {
+   "body_read_p50_us": 372.7,
+   "body_read_p95_us": 1357.8,
+   "texture_ms_mean": 92.65199999999999,
+   "read_max_us": 12153.6,
+   "vs_minimal_c_p50": 14.5,
+   "vs_minimal_c_p95": 28.65
+  },
+  "busy-on-L0-t8": {
+   "body_read_p50_us": 24.85,
+   "body_read_p95_us": 48.75,
+   "texture_ms_mean": 7.3965,
+   "read_max_us": 1331.3,
+   "vs_minimal_c_p50": 0.97,
+   "vs_minimal_c_p95": 1.03
+  },
+  "busy-off-L0-t16": {
+   "body_read_p50_us": 780.3,
+   "body_read_p95_us": 2208.0,
+   "texture_ms_mean": 168.046,
+   "read_max_us": 11011.8,
+   "vs_minimal_c_p50": 15.94,
+   "vs_minimal_c_p95": 25.16
+  },
+  "busy-on-L0-t16": {
+   "body_read_p50_us": 41.5,
+   "body_read_p95_us": 108.25,
+   "texture_ms_mean": 14.514,
+   "read_max_us": 2282.4,
+   "vs_minimal_c_p50": 0.85,
+   "vs_minimal_c_p95": 1.23
+  },
+  "busy-off-L1-t1": {
+   "body_read_p50_us": 29.65,
+   "body_read_p95_us": 337.85,
+   "texture_ms_mean": 4.743,
+   "read_max_us": 6505.7,
+   "vs_minimal_c_p50": 2.06,
+   "vs_minimal_c_p95": 11.28
+  },
+  "busy-on-L1-t1": {
+   "body_read_p50_us": 13.45,
+   "body_read_p95_us": 31.700000000000003,
+   "texture_ms_mean": 1.767,
+   "read_max_us": 91.3,
+   "vs_minimal_c_p50": 0.93,
+   "vs_minimal_c_p95": 1.06
+  },
+  "busy-off-L1-t8": {
+   "body_read_p50_us": 387.15,
+   "body_read_p95_us": 1302.55,
+   "texture_ms_mean": 25.5885,
+   "read_max_us": 3477.0,
+   "vs_minimal_c_p50": 16.13,
+   "vs_minimal_c_p95": 29.94
+  },
+  "busy-on-L1-t8": {
+   "body_read_p50_us": 23.3,
+   "body_read_p95_us": 45.95,
+   "texture_ms_mean": 3.6665,
+   "read_max_us": 823.8,
+   "vs_minimal_c_p50": 0.97,
+   "vs_minimal_c_p95": 1.06
+  },
+  "busy-off-L1-t16": {
+   "body_read_p50_us": 847.45,
+   "body_read_p95_us": 2109.2,
+   "texture_ms_mean": 47.8955,
+   "read_max_us": 11092.2,
+   "vs_minimal_c_p50": 17.97,
+   "vs_minimal_c_p95": 24.16
+  },
+  "busy-on-L1-t16": {
+   "body_read_p50_us": 37.4,
+   "body_read_p95_us": 121.4,
+   "texture_ms_mean": 7.973000000000001,
+   "read_max_us": 3886.0,
+   "vs_minimal_c_p50": 0.79,
+   "vs_minimal_c_p95": 1.39
+  },
+  "busy-off-L3-t1": {
+   "body_read_p50_us": 54.7,
+   "body_read_p95_us": 291.25,
+   "texture_ms_mean": 1.1179999999999999,
+   "read_max_us": 1132.6,
+   "vs_minimal_c_p50": 3.52,
+   "vs_minimal_c_p95": 12.61
+  },
+  "busy-on-L3-t1": {
+   "body_read_p50_us": 18.05,
+   "body_read_p95_us": 34.05,
+   "texture_ms_mean": 0.9625,
+   "read_max_us": 59.1,
+   "vs_minimal_c_p50": 1.16,
+   "vs_minimal_c_p95": 1.47
+  },
+  "busy-off-L3-t8": {
+   "body_read_p50_us": 520.75,
+   "body_read_p95_us": 1037.65,
+   "texture_ms_mean": 6.5895,
+   "read_max_us": 2819.2,
+   "vs_minimal_c_p50": 19.61,
+   "vs_minimal_c_p95": 23.66
+  },
+  "busy-on-L3-t8": {
+   "body_read_p50_us": 22.35,
+   "body_read_p95_us": 100.25,
+   "texture_ms_mean": 5.125,
+   "read_max_us": 1379.0,
+   "vs_minimal_c_p50": 0.84,
+   "vs_minimal_c_p95": 2.29
+  },
+  "busy-off-L3-t16": {
+   "body_read_p50_us": 1304.25,
+   "body_read_p95_us": 2818.9,
+   "texture_ms_mean": 11.6955,
+   "read_max_us": 8017.4,
+   "vs_minimal_c_p50": 39.82,
+   "vs_minimal_c_p95": 19.6
+  },
+  "busy-on-L3-t16": {
+   "body_read_p50_us": 53.4,
+   "body_read_p95_us": 1003.2,
+   "texture_ms_mean": 7.757,
+   "read_max_us": 24126.3,
+   "vs_minimal_c_p50": 1.63,
+   "vs_minimal_c_p95": 6.97
+  },
+  "spin-off-L1-t1": {
+   "body_read_p50_us": 157855.5,
+   "body_read_p95_us": 411865.05,
+   "texture_ms_mean": 8521.7785,
+   "read_max_us": 930824.1,
+   "vs_minimal_c_p50": 10962.19,
+   "vs_minimal_c_p95": 13751.75
+  },
+  "spin-on-L1-t1": {
+   "body_read_p50_us": 13.7,
+   "body_read_p95_us": 30.200000000000003,
+   "texture_ms_mean": 660.7265,
+   "read_max_us": 217.5,
+   "vs_minimal_c_p50": 0.95,
+   "vs_minimal_c_p95": 1.01
+  },
+  "spin-off-L1-t8": {
+   "body_read_p50_us": 157284.40000000002,
+   "body_read_p95_us": 417733.15,
+   "texture_ms_mean": 8543.121,
+   "read_max_us": 1025638.1,
+   "vs_minimal_c_p50": 6553.52,
+   "vs_minimal_c_p95": 9603.06
+  },
+  "spin-on-L1-t8": {
+   "body_read_p50_us": 13.5,
+   "body_read_p95_us": 29.25,
+   "texture_ms_mean": 1849.1195,
+   "read_max_us": 97.4,
+   "vs_minimal_c_p50": 0.56,
+   "vs_minimal_c_p95": 0.67
+  },
+  "spin-off-L3-t1": {
+   "body_read_p50_us": 142660.35,
+   "body_read_p95_us": 371313.15,
+   "texture_ms_mean": 1238.202,
+   "read_max_us": 694884.4,
+   "vs_minimal_c_p50": 9174.3,
+   "vs_minimal_c_p95": 16074.16
+  },
+  "spin-on-L3-t1": {
+   "body_read_p50_us": 16.35,
+   "body_read_p95_us": 41.5,
+   "texture_ms_mean": 626.267,
+   "read_max_us": 113.9,
+   "vs_minimal_c_p50": 1.05,
+   "vs_minimal_c_p95": 1.8
+  },
+  "spin-off-L3-t8": {
+   "body_read_p50_us": 150498.55,
+   "body_read_p95_us": 371342.85,
+   "texture_ms_mean": 2217.551,
+   "read_max_us": 600994.8,
+   "vs_minimal_c_p50": 5668.5,
+   "vs_minimal_c_p95": 8468.48
+  },
+  "spin-on-L3-t8": {
+   "body_read_p50_us": 17.3,
+   "body_read_p95_us": 47.75,
+   "texture_ms_mean": 1968.346,
+   "read_max_us": 109.4,
+   "vs_minimal_c_p50": 0.65,
+   "vs_minimal_c_p95": 1.09
+  }
+ }
+}

@@ -533,6 +533,18 @@ def test_fallback_is_cut_at_the_end_too(monkeypatch, tmp_path):
     assert len(ao.read(PATH, 65536, SIZE_8K_BC1 - 10, 0)) == 10
 
 
+def test_read_trace_records_tier_thread_and_bytes(monkeypatch, tmp_path):
+    _module, ao = _fuse(monkeypatch, tmp_path, "ok")
+    events = []
+    ao._read_trace = types.SimpleNamespace(
+        event=lambda op, path, **fields: events.append((op, fields))
+    )
+    ao.read(PATH, 64, 0, 0)
+    op, fields = events[-1]
+    assert op == "read" and fields["tier"] == "live"
+    assert fields["got"] == 64 and isinstance(fields["tid"], int)
+
+
 def test_native_reads_through_the_mount(monkeypatch, tmp_path):
     """Tier 1 answers checked rows, tier 2 checks the others and tells tier
     1, release frees the slot (hybrid read path plan, N7)."""

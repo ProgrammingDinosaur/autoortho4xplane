@@ -2061,11 +2061,21 @@ class AutoOrtho(Operations):
         trace = self._read_trace
         if trace is None or not self.dds_re.match(path):
             return self._read(path, length, offset, fh)
+        direct = self._direct.get(fh) if fh else None
+        tier = "live"
+        if direct is not None and not direct.live:
+            tier = "partial" if getattr(direct.texture, "finest_level", 0) else "direct"
         started = time.monotonic()
         data = self._read(path, length, offset, fh)
+        if tier != "live" and direct.live:
+            tier += "_to_live"  # the file could not answer: switched this open
+        # The thread is the file system's, not X-Plane's: reads in flight on
+        # different threads at once show how many X-Plane overlaps (with the
+        # start, t - ms).
         trace.event(
             "read", path, offset=int(offset), length=int(length),
             ms=round((time.monotonic() - started) * 1000.0, 2),
+            tier=tier, tid=threading.get_ident(), got=len(data),
         )
         return data
 

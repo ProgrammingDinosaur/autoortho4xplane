@@ -1,0 +1,135 @@
+{
+ "date": "2026-11-25",
+ "stage": "S3",
+ "machine": "Ryzen 9 9950X3D, Windows 11, Python 3.14.7 (GIL), WinFsp",
+ "note": "lone worker, isolated home, Bing ZL16 around Vagar. far-*: 25 partial entries (levels 4+) read at level 4, partial level pinned to 4 in the probe (a lone worker has no camera). season-*: 25 complete entries with [seasons] enabled, saturation 60. Median of runs 2-5 of 5; off = native_direct_reads off, on = on; bytes identical off/on for season runs.",
+ "units": "microseconds unless named _ms",
+ "targets": {
+  "far-off-L4-t1": {
+   "reads": 50,
+   "read_p50": 104.4,
+   "read_p95": 127.05,
+   "open_p50": 499.45,
+   "texture_ms_mean": 0.73
+  },
+  "far-off-L4-t16": {
+   "reads": 50,
+   "read_p50": 577.3,
+   "read_p95": 989.85,
+   "open_p50": 4223.4,
+   "texture_ms_mean": 5.54
+  },
+  "far-off-L4-t8": {
+   "reads": 50,
+   "read_p50": 315.25,
+   "read_p95": 821.2,
+   "open_p50": 2551.1,
+   "texture_ms_mean": 3.35
+  },
+  "far-on-L4-t1": {
+   "reads": 50,
+   "read_p50": 31.95,
+   "read_p95": 41.55,
+   "open_p50": 565.8,
+   "texture_ms_mean": 0.66
+  },
+  "far-on-L4-t16": {
+   "reads": 50,
+   "read_p50": 100.5,
+   "read_p95": 998.95,
+   "open_p50": 3742.7,
+   "texture_ms_mean": 4.5
+  },
+  "far-on-L4-t8": {
+   "reads": 50,
+   "read_p50": 31.35,
+   "read_p95": 44.15,
+   "open_p50": 2624.55,
+   "texture_ms_mean": 2.84
+  },
+  "season-off-L1-t1": {
+   "reads": 1100,
+   "read_p50": 206.1,
+   "read_p95": 286.2,
+   "open_p50": 501.15,
+   "texture_ms_mean": 10.04
+  },
+  "season-off-L1-t16": {
+   "reads": 1100,
+   "read_p50": 3436.5,
+   "read_p95": 5364.6,
+   "open_p50": 3426.35,
+   "texture_ms_mean": 153.73
+  },
+  "season-off-L1-t8": {
+   "reads": 1100,
+   "read_p50": 1850.6,
+   "read_p95": 2714.85,
+   "open_p50": 1143.85,
+   "texture_ms_mean": 83.05
+  },
+  "season-off-L3-t1": {
+   "reads": 100,
+   "read_p50": 234.55,
+   "read_p95": 301.8,
+   "open_p50": 469.55,
+   "texture_ms_mean": 1.46
+  },
+  "season-off-L3-t16": {
+   "reads": 100,
+   "read_p50": 3825.1,
+   "read_p95": 5992.15,
+   "open_p50": 3265.5,
+   "texture_ms_mean": 18.8
+  },
+  "season-off-L3-t8": {
+   "reads": 100,
+   "read_p50": 2652.75,
+   "read_p95": 4012.6,
+   "open_p50": 1729.35,
+   "texture_ms_mean": 12.88
+  },
+  "season-on-L1-t1": {
+   "reads": 1100,
+   "read_p50": 21.0,
+   "read_p95": 47.75,
+   "open_p50": 580.95,
+   "texture_ms_mean": 1.77
+  },
+  "season-on-L1-t16": {
+   "reads": 1100,
+   "read_p50": 47.55,
+   "read_p95": 87.1,
+   "open_p50": 3335.6,
+   "texture_ms_mean": 5.77
+  },
+  "season-on-L1-t8": {
+   "reads": 1100,
+   "read_p50": 36.35,
+   "read_p95": 61.5,
+   "open_p50": 2090.8,
+   "texture_ms_mean": 3.8
+  },
+  "season-on-L3-t1": {
+   "reads": 100,
+   "read_p50": 34.85,
+   "read_p95": 53.6,
+   "open_p50": 519.1,
+   "texture_ms_mean": 0.7
+  },
+  "season-on-L3-t16": {
+   "reads": 100,
+   "read_p50": 63.0,
+   "read_p95": 640.85,
+   "open_p50": 3908.25,
+   "texture_ms_mean": 4.85
+  },
+  "season-on-L3-t8": {
+   "reads": 100,
+   "read_p50": 34.85,
+   "read_p95": 60.5,
+   "open_p50": 2252.7,
+   "texture_ms_mean": 2.57
+  }
+ }
+}

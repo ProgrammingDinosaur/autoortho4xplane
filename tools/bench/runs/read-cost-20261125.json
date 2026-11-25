@@ -1,0 +1,191 @@
+{
+ "date": "2026-11-25",
+ "machine": "Ryzen 9 9950X3D, Windows 11, Python 3.14.7 (GIL), WinFsp",
+ "textures": 25,
+ "texture_px": 4096,
+ "format": "BC1",
+ "note": "lone mount worker, isolated home, Bing ZL16 around Vagar (2 textures with no-imagery chunks, served direct by N4); median over runs 1-4 of 5; aooff = N1-N4 with native_direct_reads off, aoon = on; standalone aofast build via AO_TEST_AOFAST_LIB",
+ "units": "microseconds unless named _ms",
+ "targets": {
+  "aooff-L0-t1": {
+   "runs": 4,
+   "reads": 4275,
+   "read_p50": 45.0,
+   "read_p95": 85.25,
+   "read_p99": 139.7,
+   "open_p50": 548.1,
+   "texture_ms_mean": 9.43,
+   "same_bytes_as_off": true
+  },
+  "aooff-L0-t16": {
+   "runs": 4,
+   "reads": 4275,
+   "read_p50": 540.55,
+   "read_p95": 1427.35,
+   "read_p99": 1932.95,
+   "open_p50": 4496.1,
+   "texture_ms_mean": 113.32,
+   "same_bytes_as_off": true
+  },
+  "aooff-L0-t8": {
+   "runs": 4,
+   "reads": 4275,
+   "read_p50": 309.9,
+   "read_p95": 692.75,
+   "read_p99": 983.65,
+   "open_p50": 1869.9,
+   "texture_ms_mean": 60.73,
+   "same_bytes_as_off": true
+  },
+  "aooff-L1-t1": {
+   "runs": 4,
+   "reads": 1100,
+   "read_p50": 53.4,
+   "read_p95": 116.45,
+   "read_p99": 175.0,
+   "open_p50": 577.7,
+   "texture_ms_mean": 3.32,
+   "same_bytes_as_off": true
+  },
+  "aooff-L1-t16": {
+   "runs": 4,
+   "reads": 1100,
+   "read_p50": 577.4,
+   "read_p95": 1521.5,
+   "read_p99": 2044.95,
+   "open_p50": 4211.2,
+   "texture_ms_mean": 35.12,
+   "same_bytes_as_off": true
+  },
+  "aooff-L1-t8": {
+   "runs": 4,
+   "reads": 1100,
+   "read_p50": 314.1,
+   "read_p95": 708.0,
+   "read_p99": 998.0,
+   "open_p50": 1860.25,
+   "texture_ms_mean": 17.32,
+   "same_bytes_as_off": true
+  },
+  "aooff-L3-t1": {
+   "runs": 4,
+   "reads": 100,
+   "read_p50": 48.0,
+   "read_p95": 113.3,
+   "read_p99": 161.4,
+   "open_p50": 446.55,
+   "texture_ms_mean": 0.73,
+   "same_bytes_as_off": true
+  },
+  "aooff-L3-t16": {
+   "runs": 4,
+   "reads": 100,
+   "read_p50": 559.7,
+   "read_p95": 1136.05,
+   "read_p99": 1405.0,
+   "open_p50": 5236.15,
+   "texture_ms_mean": 8.01,
+   "same_bytes_as_off": true
+  },
+  "aooff-L3-t8": {
+   "runs": 4,
+   "reads": 100,
+   "read_p50": 338.4,
+   "read_p95": 847.75,
+   "read_p99": 1238.75,
+   "open_p50": 2832.25,
+   "texture_ms_mean": 4.63,
+   "same_bytes_as_off": true
+  },
+  "aoon-L0-t1": {
+   "runs": 4,
+   "reads": 4275,
+   "read_p50": 17.1,
+   "read_p95": 34.0,
+   "read_p99": 58.7,
+   "open_p50": 598.55,
+   "texture_ms_mean": 4.03,
+   "same_bytes_as_off": true
+  },
+  "aoon-L0-t16": {
+   "runs": 4,
+   "reads": 4275,
+   "read_p50": 47.3,
+   "read_p95": 93.65,
+   "read_p99": 151.0,
+   "open_p50": 3781.55,
+   "texture_ms_mean": 13.01,
+   "same_bytes_as_off": true
+  },
+  "aoon-L0-t8": {
+   "runs": 4,
+   "reads": 4275,
+   "read_p50": 32.65,
+   "read_p95": 59.6,
+   "read_p99": 76.75,
+   "open_p50": 2487.0,
+   "texture_ms_mean": 8.44,
+   "same_bytes_as_off": true
+  },
+  "aoon-L1-t1": {
+   "runs": 4,
+   "reads": 1100,
+   "read_p50": 17.35,
+   "read_p95": 36.75,
+   "read_p99": 69.1,
+   "open_p50": 564.45,
+   "texture_ms_mean": 1.5,
+   "same_bytes_as_off": true
+  },
+  "aoon-L1-t16": {
+   "runs": 4,
+   "reads": 1100,
+   "read_p50": 43.45,
+   "read_p95": 90.25,
+   "read_p99": 202.05,
+   "open_p50": 4494.85,
+   "texture_ms_mean": 6.65,
+   "same_bytes_as_off": true
+  },
+  "aoon-L1-t8": {
+   "runs": 4,
+   "reads": 1100,
+   "read_p50": 30.0,
+   "read_p95": 58.6,
+   "read_p99": 77.5,
+   "open_p50": 2226.5,
+   "texture_ms_mean": 3.69,
+   "same_bytes_as_off": true
+  },
+  "aoon-L3-t1": {
+   "runs": 4,
+   "reads": 100,
+   "read_p50": 21.1,
+   "read_p95": 48.8,
+   "read_p99": 64.35,
+   "open_p50": 511.15,
+   "texture_ms_mean": 0.66,
+   "same_bytes_as_off": true
+  },
+  "aoon-L3-t16": {
+   "runs": 4,
+   "reads": 100,
+   "read_p50": 64.65,
+   "read_p95": 761.0,
+   "read_p99": 976.9,
+   "open_p50": 4426.35,
+   "texture_ms_mean": 5.63,
+   "same_bytes_as_off": true
+  },
+  "aoon-L3-t8": {
+   "runs": 4,
+   "reads": 100,
+   "read_p50": 35.65,
+   "read_p95": 69.45,
+   "read_p99": 77.3,
+   "open_p50": 2941.2,
+   "texture_ms_mean": 3.28,
+   "same_bytes_as_off": true
+  }
+ }
+}

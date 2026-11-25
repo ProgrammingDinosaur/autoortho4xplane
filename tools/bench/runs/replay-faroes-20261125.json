@@ -1,0 +1,386 @@
+{
+ "date": "2026-11-25",
+ "scenario": "synthetic (make_scenario.py): Faroes, Vagar eastward, heading 80, 250 kt, 3000 m AGL, 60 s load + 8 min, ZL16 textures within 25 km: 239 opens, 6820 reads",
+ "setup": "whole app from source (parent + one worker + brokers), isolated home, Bing, fake X-Plane feed; cold = fresh cache",
+ "notes": {
+  "round 1 (cold-smooth .. warm-on)": "read trace turned native reads off then; no STATS captured",
+  "round 2 (*2)": "STATS captured; warm cache had 45 complete entries 16 bytes short (native 11-level files)",
+  "round 3 (*3)": "after store_from_file completes native files to 13 levels"
+ },
+ "runs": {
+  "cold-balanced": {
+   "wall_s": 539.55,
+   "reads": {
+    "reads": 6820,
+    "errors": 0,
+    "read_ms_p50": 0.76,
+    "read_ms_p95": 38.87,
+    "read_ms_p99": 60.27,
+    "read_ms_max": 193.58
+   },
+   "cpu_s": 102.14,
+   "counters": {},
+   "worker_trace": {
+    "inflight_read_ms_max": 193.49,
+    "inflight_reads_over_100ms": 2,
+    "opens": 239,
+    "ready_opens": 0,
+    "ready_share": 0.0,
+    "ready_open_ms": null,
+    "ready_open_time_share": null,
+    "native_opens": 0
+   }
+  },
+  "cold-balanced2": {
+   "wall_s": 539.55,
+   "reads": {
+    "reads": 6820,
+    "errors": 0,
+    "read_ms_p50": 0.91,
+    "read_ms_p95": 40.34,
+    "read_ms_p99": 67.32,
+    "read_ms_max": 260.95
+   },
+   "cpu_s": 95.937,
+   "counters": {
+    "native_teams_released": 287,
+    "native_partial_dds_cleared": 2,
+    "native_partial_strict_build": 814,
+    "mm0_served_exact_bytes": 68105320,
+    "mm0_served_lower_zl_bytes": 65065880,
+    "near_reads_real": 6,
+    "near_reads_standin": 54,
+    "prefetch_admission_no_capacity": 782,
+    "chunk_hit": 612,
+    "chunk_miss": 68747,
+    "chunk_no_imagery": 28694,
+    "chunk_no_imagery_remembered": 19169,
+    "bytes_dl": 215375586,
+    "prefetch_lease_held_for_rows": 4,
+    "dds_direct_skip_no_entry": 229,
+    "dds_direct_skip_stale": 6,
+    "dds_direct_skip_live_tile": 2,
+    "reads_wanted_real": 6,
+    "reads_wanted_standin": 231,
+    "wait_policy_balanced_reads": 6559,
+    "wait_policy_balanced_read_ms_total": 62487,
+    "wait_policy_balanced_near_standins": 54
+   },
+   "worker_trace": {
+    "inflight_read_ms_max": 209.05,
+    "inflight_reads_over_100ms": 6,
+    "opens": 239,
+    "ready_opens": 0,
+    "ready_share": 0.0,
+    "ready_open_ms": null,
+    "ready_open_time_share": null,
+    "native_opens": 0
+   }
+  },
+  "cold-balanced3": {
+   "wall_s": 539.55,
+   "reads": {
+    "reads": 6820,
+    "errors": 0,
+    "read_ms_p50": 0.77,
+    "read_ms_p95": 36.14,
+    "read_ms_p99": 56.78,
+    "read_ms_max": 175.94
+   },
+   "cpu_s": 99.423,
+   "counters": {
+    "native_teams_released": 283,
+    "native_partial_dds_cleared": 2,
+    "native_partial_strict_build": 800,
+    "dds_direct_opens": 3,
+    "mm0_served_exact_bytes": 68105320,
+    "mm0_served_lower_zl_bytes": 65065880,
+    "near_reads_real": 6,
+    "near_reads_standin": 54,
+    "prefetch_admission_no_capacity": 765,
+    "chunk_hit": 3369,
+    "chunk_miss": 68032,
+    "chunk_no_imagery": 29481,
+    "chunk_no_imagery_remembered": 20157,
+    "bytes_dl": 213581648,
+    "prefetch_lease_held_for_rows": 4,
+    "dds_direct_skip_no_entry": 231,
+    "dds_direct_skip_live_tile": 4,
+    "reads_wanted_real": 7,
+    "reads_wanted_standin": 228,
+    "wait_policy_balanced_reads": 6537,
+    "wait_policy_balanced_read_ms_total": 57575,
+    "wait_policy_balanced_near_standins": 54
+   },
+   "worker_trace": {
+    "inflight_read_ms_max": 160.96,
+    "inflight_reads_over_100ms": 7,
+    "opens": 239,
+    "ready_opens": 3,
+    "ready_share": 0.0126,
+    "ready_open_ms": {
+     "p50": 0.645,
+     "p95": 0.684,
+     "mean": 0.656,
+     "n": 3
+    },
+    "ready_open_time_share": 0.3517,
+    "native_opens": 0
+   }
+  },
+  "cold-quality": {
+   "wall_s": 539.55,
+   "reads": {
+    "reads": 6820,
+    "errors": 0,
+    "read_ms_p50": 1.2,
+    "read_ms_p95": 31.85,
+    "read_ms_p99": 67.8,
+    "read_ms_max": 145.92
+   },
+   "cpu_s": 102.781,
+   "counters": {},
+   "worker_trace": {
+    "inflight_read_ms_max": 143.5,
+    "inflight_reads_over_100ms": 1,
+    "opens": 239,
+    "ready_opens": 0,
+    "ready_share": 0.0,
+    "ready_open_ms": null,
+    "ready_open_time_share": null,
+    "native_opens": 0
+   }
+  },
+  "cold-quality2": {
+   "wall_s": 539.55,
+   "reads": {
+    "reads": 6820,
+    "errors": 0,
+    "read_ms_p50": 0.69,
+    "read_ms_p95": 38.73,
+    "read_ms_p99": 60.29,
+    "read_ms_max": 200.41
+   },
+   "cpu_s": 95.202,
+   "counters": {
+    "native_teams_released": 283,
+    "native_partial_strict_build": 772,
+    "mm0_served_exact_bytes": 68105320,
+    "mm0_served_missing_bytes": 65065880,
+    "near_reads_real": 6,
+    "near_reads_standin": 54,
+    "prefetch_admission_no_capacity": 842,
+    "chunk_hit": 3129,
+    "chunk_miss": 66766,
+    "chunk_no_imagery": 28677,
+    "chunk_no_imagery_remembered": 19116,
+    "bytes_dl": 207399470,
+    "prefetch_lease_held_for_rows": 2,
+    "dds_direct_skip_no_entry": 232,
+    "dds_direct_skip_stale": 121,
+    "dds_direct_skip_live_tile": 2,
+    "reads_wanted_real": 6,
+    "reads_wanted_standin": 231,
+    "wait_policy_quality_reads": 6559,
+    "wait_policy_quality_read_ms_total": 60175,
+    "wait_policy_quality_near_standins": 54
+   },
+   "worker_trace": {
+    "inflight_read_ms_max": 159.33,
+    "inflight_reads_over_100ms": 3,
+    "opens": 239,
+    "ready_opens": 0,
+    "ready_share": 0.0,
+    "ready_open_ms": null,
+    "ready_open_time_share": null,
+    "native_opens": 0
+   }
+  },
+  "cold-smooth": {
+   "wall_s": 539.55,
+   "reads": {
+    "reads": 6820,
+    "errors": 0,
+    "read_ms_p50": 3.0,
+    "read_ms_p95": 135.39,
+    "read_ms_p99": 247.45,
+    "read_ms_max": 380.46
+   },
+   "cpu_s": 133.938,
+   "counters": {},
+   "worker_trace": {
+    "inflight_read_ms_max": 25.94,
+    "inflight_reads_over_100ms": 0,
+    "opens": 239,
+    "ready_opens": 0,
+    "ready_share": 0.0,
+    "ready_open_ms": null,
+    "ready_open_time_share": null,
+    "native_opens": 0
+   }
+  },
+  "warm-off": {
+   "wall_s": 539.55,
+   "reads": {
+    "reads": 6820,
+    "errors": 0,
+    "read_ms_p50": 0.29,
+    "read_ms_p95": 4.32,
+    "read_ms_p99": 5.29,
+    "read_ms_max": 20.97
+   },
+   "cpu_s": 53.407,
+   "counters": {},
+   "worker_trace": {
+    "inflight_read_ms_max": 20.87,
+    "inflight_reads_over_100ms": 0,
+    "opens": 239,
+    "ready_opens": 16,
+    "ready_share": 0.0669,
+    "ready_open_ms": {
+     "p50": 3.685,
+     "p95": 4.357,
+     "mean": 3.409,
+     "n": 16
+    },
+    "ready_open_time_share": 0.2694,
+    "native_opens": 0
+   }
+  },
+  "warm-on": {
+   "wall_s": 539.55,
+   "reads": {
+    "reads": 6820,
+    "errors": 0,
+    "read_ms_p50": 0.3,
+    "read_ms_p95": 4.3,
+    "read_ms_p99": 5.36,
+    "read_ms_max": 24.24
+   },
+   "cpu_s": 54.641,
+   "counters": {},
+   "worker_trace": {
+    "inflight_read_ms_max": 24.15,
+    "inflight_reads_over_100ms": 0,
+    "opens": 239,
+    "ready_opens": 16,
+    "ready_share": 0.0669,
+    "ready_open_ms": {
+     "p50": 3.42,
+     "p95": 4.202,
+     "mean": 3.286,
+     "n": 16
+    },
+    "ready_open_time_share": 0.2574,
+    "native_opens": 0
+   }
+  },
+  "warm-on2": {
+   "wall_s": 539.55,
+   "reads": {
+    "reads": 6820,
+    "errors": 0,
+    "read_ms_p50": 0.29,
+    "read_ms_p95": 4.23,
+    "read_ms_p99": 5.35,
+    "read_ms_max": 70.17
+   },
+   "cpu_s": 55.126,
+   "counters": {
+    "native_teams_released": 270,
+    "native_partial_dds_cleared": 4,
+    "native_partial_strict_build": 374,
+    "dds_direct_opens": 16,
+    "near_reads_standin": 44,
+    "prefetch_admission_no_capacity": 647,
+    "chunk_hit": 26264,
+    "chunk_miss": 3475,
+    "chunk_no_imagery": 15899,
+    "chunk_no_imagery_remembered": 31077,
+    "bytes_dl": 12655947,
+    "prefetch_lease_held_for_rows": 73,
+    "dds_native_opens": 16,
+    "dds_native_reads": 2480,
+    "dds_native_deferred": 256,
+    "dds_native_deferred_rows": 256,
+    "dds_direct_no_imagery_opens": 13,
+    "dds_direct_skip_no_entry": 1,
+    "dds_direct_skip_stale": 50,
+    "dds_direct_skip_partial_no_level": 61,
+    "dds_direct_skip_partial_coarse": 107,
+    "dds_direct_skip_live_tile": 2,
+    "reads_wanted_standin": 221,
+    "wait_policy_balanced_reads": 3839,
+    "wait_policy_balanced_read_ms_total": 3158,
+    "wait_policy_balanced_near_standins": 44
+   },
+   "worker_trace": {
+    "inflight_read_ms_max": 70.06,
+    "inflight_reads_over_100ms": 0,
+    "opens": 239,
+    "ready_opens": 16,
+    "ready_share": 0.0669,
+    "ready_open_ms": {
+     "p50": 3.993,
+     "p95": 4.712,
+     "mean": 3.873,
+     "n": 16
+    },
+    "ready_open_time_share": null,
+    "native_opens": 16
+   }
+  },
+  "warm-on3": {
+   "wall_s": 539.55,
+   "reads": {
+    "reads": 6820,
+    "errors": 0,
+    "read_ms_p50": 0.11,
+    "read_ms_p95": 3.87,
+    "read_ms_p99": 4.79,
+    "read_ms_max": 32.87
+   },
+   "cpu_s": 39.297,
+   "counters": {
+    "native_teams_released": 173,
+    "native_partial_dds_cleared": 5,
+    "native_partial_strict_build": 115,
+    "dds_direct_opens": 70,
+    "near_reads_standin": 33,
+    "prefetch_admission_no_capacity": 250,
+    "chunk_hit": 12641,
+    "chunk_miss": 4101,
+    "chunk_no_imagery": 15754,
+    "chunk_no_imagery_remembered": 31396,
+    "bytes_dl": 18025982,
+    "prefetch_lease_held_for_rows": 3,
+    "dds_native_opens": 70,
+    "dds_native_reads": 3421,
+    "dds_native_deferred": 315,
+    "dds_native_deferred_rows": 315,
+    "dds_direct_no_imagery_opens": 13,
+    "dds_direct_skip_partial_no_level": 61,
+    "dds_direct_skip_partial_coarse": 106,
+    "reads_wanted_standin": 167,
+    "wait_policy_balanced_reads": 2893,
+    "wait_policy_balanced_read_ms_total": 2235,
+    "wait_policy_balanced_near_standins": 33
+   },
+   "worker_trace": {
+    "inflight_read_ms_max": 32.72,
+    "inflight_reads_over_100ms": 0,
+    "opens": 239,
+    "ready_opens": 70,
+    "ready_share": 0.2929,
+    "ready_open_ms": {
+     "p50": 0.764,
+     "p95": 4.34,
+     "mean": 1.46,
+     "n": 70
+    },
+    "ready_open_time_share": null,
+    "native_opens": 70
+   }
+  }
+ }
+}

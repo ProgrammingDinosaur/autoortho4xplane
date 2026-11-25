@@ -64,6 +64,15 @@ COUNTERS = (
     "prefetch_admission_no_capacity", "chunk_hit", "chunk_miss", "chunk_no_imagery",
     "chunk_no_imagery_remembered", "bytes_dl", "local_cache_write_backpressure",
     "prefetch_lease_held_for_rows", "prefetch_lease_row_hold_expired",
+    # Hybrid read path plan: native reads, why opens are not direct, policies.
+    "dds_native_opens", "dds_native_reads", "dds_native_deferred",
+    "dds_native_deferred_rows", "dds_native_deferred_level", "dds_direct_no_imagery_opens",
+    "dds_direct_skip_no_entry", "dds_direct_skip_zoom", "dds_direct_skip_stale",
+    "dds_direct_skip_healing", "dds_direct_skip_partial_no_level",
+    "dds_direct_skip_partial_coarse", "dds_direct_skip_size", "dds_direct_skip_live_tile",
+    "reads_wanted_real", "reads_wanted_standin",
+    *(f"wait_policy_{p}_{k}" for p in ("quality", "balanced", "smooth")
+      for k in ("reads", "read_ms_total", "near_standins")),
 )
 
 

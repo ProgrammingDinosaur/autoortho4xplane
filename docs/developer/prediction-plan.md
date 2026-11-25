@@ -238,6 +238,31 @@ is a spacing (F1). Lead time changes a level guess that is made once (F2). And
 there is no measure of waste, so evidence only ever pushes one way and the
 levers end at their limits: lead 180 s, chunks per cycle 704, radius 10.
 
+
+**F11. A live build of a coarse level is often not kept either (found
+2026-11-25, hybrid read path replays).** F3 assumes a level becomes a file
+once a read has built it live. On a synthetic cruise (Faroes, 239 textures
+read from level 1), the warm pass found the stored entries starting at
+level 4, the ZL12 imagery the `.ter` load-ahead warms, not at the level 1
+the cold pass had built: 106 of 239 opens were refused as "partial entry
+too coarse" (`dds_direct_skip_partial_coarse`). The likely cause:
+`Tile._try_incremental_dds_store` persists only levels whose whole buffer
+was built and skips prepopulated tiles, while those level-1 reads were
+answered by row-range builds (`native_partial_strict_build`, about 800 per
+pass) that never complete a whole level. To confirm in P0; P3's level
+builder makes it moot for predicted textures, and live row builds that do
+complete a level should be kept too.
+
+**F12. Partial entries are not served while X-Plane loads.** A partial
+entry is served only at the level the paging model names, and on the
+loading screen there is no camera: `open_direct` gets no level and refuses
+every partial entry (61 of 239 opens in the same replay,
+`dds_direct_skip_partial_no_level`). Those textures are built live although
+their coarse levels are on disk. Once the start position is known (item 8,
+open question 2), the level can come from the distance to it; until then,
+serving the entry from its finest level and letting a finer read fall back
+to a live tile costs one extra open in the worst case.
+
 ---
 
 ## How X-Plane asks for textures
@@ -563,11 +588,11 @@ Each stage ships alone. Sizes: S under 200 lines, M under 600, L more.
 | P0 Measure | Trace fields, simulator, scorecard, three reference traces. Re-baseline the current branch. Settle F7 from the trace. Run the simulator on two candidates: the current prefetcher, and the current prefetcher with F1, F2, F4 and F8 patched. Both are scored with predicted levels counted as finished files, because the level builder (P3, which fixes F3) is needed whichever candidate wins. | `read_pattern.py`, `diagnostics.py`, new `tools/bench/predict_sim.py` | M | The baseline ready share and ring fit are recorded. **Gate 0:** if the patched prefetcher reaches the definition of done on the traces, ship the patches and P3, and skip P2 and P4. Otherwise its score is the bar the planner must beat at Gate A. |
 | P1 Inputs | True track, vertical speed, turn rate, scenery-loading flag. Save the ring model per screen. Waste accounting in the ledger. | `datareftrack.py`, `paging_model.py`, `prefetch_ledger.py`, `governor.py` (profiles) | S | Path error on the traces under 5 degrees. |
 | P2 Planner in shadow | Texture table and a pure planner module (no `getortho` import, injected clock, like `prefetch_ledger`). It acts on nothing; it logs what it would have had ready. | new `texture_table.py`, new `level_plan.py`, hooks in `getortho.py` | L | **Gate A:** on the reference traces the shadow plan names at least 95 % of X-Plane's opens (texture and level) a full lead ahead, with waste under 30 %. If not, fix the model before going on. |
-| P3 Level builder | Background jobs that write levels 1 and coarser into cache files. | `getortho.py` (`BackgroundDDSBuilder`), `dynamic_dds_cache.py` | M | A level built in the background is served directly and returns the same bytes as a live build. |
+| P3 Level builder | Background jobs that write levels 1 and coarser into cache files. Keep the levels live row builds complete (F11). | `getortho.py` (`BackgroundDDSBuilder`), `dynamic_dds_cache.py` | M | A level built in the background is served directly and returns the same bytes as a live build. |
 | P4 Planner on | Setting `[streaming] planner = off / shadow / on`. The plan feeds the level builder and the level-0 coordinator. The old producers stop when it is on. | `getortho.py`, `prefetch.py`, `aoconfig.py`, `settings_registry.py` | L | **Gate B:** ready share at least 80 % on a cold reference flight, CPU not above the baseline. The old path stays the default until this passes. |
 | P5 Floor | Load level at `.ter` open and for the next squares; base levels evicted last. | `load_ahead.py`, `disk_budget_manager.py` | S | Load-level reads ready: at least 95 %. |
 | P6 Governor | Signals, miss causes, levers, rules, start values, texts for Home and Tuning, retired settings. | `governor.py`, `tuning_plan.py`, `settings_registry.py`, `home_snapshot.py` | M | Simulator matrix: the levers settle within range in every cell, and no cell ends with a lever at its limit while waste is above 25 %. |
-| P7 Start and route | Start position, airport block, pre-flight preparation, arrival. | `getortho.py`, `flighttrack.py`, UI | M | A start at a known airport waits for no near read after the loading screen. |
+| P7 Start and route | Start position, airport block, pre-flight preparation, arrival. A partial-entry level on the loading screen (F12). | `getortho.py`, `flighttrack.py`, UI | M | A start at a known airport waits for no near read after the loading screen. |
 | P8 Yield and caps | Yield rules; the height-aware detail cap as a governed option. | `level_plan.py`, `governor.py` | S | No frame-time regression on the reference flights. |
 | P9 Platforms | Reference flights on Linux and macOS. | none | S | The definition of done on all three. |
 

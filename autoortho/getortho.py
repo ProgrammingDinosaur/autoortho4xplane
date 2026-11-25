@@ -6048,6 +6048,12 @@ def _publish_graphics_memory():
         fmt = str(getattr(CFG.pydds, "format", "BC1"))
         set_stat(f"graphics_memory_bytes:{pid}", held_textures.bytes(fmt))
         set_stat(f"building_now:{pid}", int(_live_tile_admission.held))
+        queue = terrain_load_ahead
+        if queue is not None:
+            # How many textures X-Plane's .ter opens queued, and the peak:
+            # the size the load-ahead search works over (flight logs).
+            set_stat(f"load_ahead_waiting:{pid}", queue.waiting())
+            set_stat(f"load_ahead_waiting_max:{pid}", queue.max_waiting)
     except Exception as exc:  # statistics only
         log.debug(f"Home gauges failed: {exc}")
 
@@ -19989,7 +19995,7 @@ def shutdown():
         except ImportError:
             from aostats import delete_stat
         for gauge in ("graphics_memory_bytes", "building_now", "prefetch_horizon_m",
-                      "tile_radar"):
+                      "tile_radar", "load_ahead_waiting", "load_ahead_waiting_max"):
             delete_stat(f"{gauge}:{os.getpid()}")
     except Exception:
         pass

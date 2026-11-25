@@ -65,6 +65,61 @@ def test_read_trace_round_trip(tmp_path):
     assert events[1]["length"] == 65536
 
 
+def test_trace_summary_counts_ready_opens_and_overlap():
+    a, b = "/textures/1_2_BI16.dds", "/textures/3_4_BI16.dds"
+    events = [
+        {"t": 0.0, "op": "open", "path": a},
+        {"t": 0.0, "op": "open", "path": b},
+        # Two fast reads in flight together, then a slow live one.
+        {"t": 0.0010, "op": "read", "path": a, "ms": 1.0, "tier": "direct", "tid": 1},
+        {"t": 0.0012, "op": "read", "path": b, "ms": 1.0, "tier": "live", "tid": 2},
+        {"t": 0.5, "op": "read", "path": b, "ms": 400.0, "tier": "live", "tid": 2},
+        {"t": 0.6, "op": "release", "path": a},
+        {"t": 0.6, "op": "release", "path": b},
+    ]
+    summary = read_trace.summarize(events)
+    assert summary["opens"] == 2 and summary["ready_opens"] == 1
+    assert summary["ready_share"] == 0.5
+    assert summary["reads_by_tier"] == {"direct": 1, "live": 2}
+    assert summary["max_overlap"] == 2
+    assert summary["fast_overlap"] == {1: 1, 2: 1}
+    assert summary["ready_open_ms"] is None  # opens not timed in this trace
+
+
+def test_trace_summary_times_the_opens_of_ready_textures():
+    a, b = "/textures/1_2_BI16.dds", "/textures/3_4_BI16.dds"
+    events = [
+        {"t": 0.001, "op": "open", "path": a, "ms": 1.0, "tier": "direct"},
+        {"t": 0.004, "op": "read", "path": a, "ms": 3.0, "tier": "direct"},
+        {"t": 0.002, "op": "open", "path": b, "ms": 2.0, "tier": "live"},
+        {"t": 0.5, "op": "read", "path": b, "ms": 400.0, "tier": "live"},
+    ]
+    summary = read_trace.summarize(sorted(events, key=lambda e: e["t"]))
+    assert summary["ready_open_ms"] == {"p50": 1.0, "p95": 1.0, "mean": 1.0, "n": 1}
+    assert summary["ready_open_time_share"] == 0.25
+    assert summary["native_opens"] == 0
+
+
+def test_trace_summary_counts_native_opens_as_ready():
+    """With native reads on, a native open's reads are not in the trace: it
+    is ready by its own tier, timed in ready_open_ms, and left out of the
+    share (computed over textures read in Python)."""
+    a, b, c = "/textures/1_2_BI16.dds", "/textures/3_4_BI16.dds", "/textures/5_6_BI16.dds"
+    events = [
+        {"t": 0.001, "op": "open", "path": a, "ms": 3.0, "tier": "direct", "native": True},
+        {"t": 0.002, "op": "open", "path": b, "ms": 1.0, "tier": "partial"},
+        {"t": 0.005, "op": "read", "path": b, "ms": 3.0, "tier": "partial"},
+        {"t": 0.006, "op": "open", "path": c, "ms": 2.0, "tier": "live", "native": None},
+        {"t": 0.5, "op": "read", "path": c, "ms": 400.0, "tier": "live"},
+        {"t": 0.6, "op": "release", "path": a},
+    ]
+    summary = read_trace.summarize(events)
+    assert summary["native_opens"] == 1
+    assert summary["ready_opens"] == 2
+    assert summary["ready_open_ms"]["n"] == 2 and summary["ready_open_ms"]["p95"] == 3.0
+    assert summary["ready_open_time_share"] == 0.25
+
+
 def test_trace_from_environment_is_off_by_default(monkeypatch):
     monkeypatch.delenv(read_trace.ENV, raising=False)
     assert read_trace.from_environment() is None
