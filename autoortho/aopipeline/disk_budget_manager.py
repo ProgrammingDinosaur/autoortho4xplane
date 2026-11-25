@@ -19,6 +19,51 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 
+def _iter_file_entries(root: str, skip_dirs_containing: Optional[str] = None):
+    """Yield an ``os.DirEntry`` for every file under ``root``.
+
+    Used in place of ``os.walk`` plus a stat per file: on Windows a
+    ``DirEntry`` already carries the size and time from the directory
+    listing, so reading them costs no further system call.
+
+    Linked directories are not entered, junctions included. ``os.walk``
+    follows a junction, so a scan counted, and an eviction deleted, files
+    outside the cache folder through one. A directory whose path contains
+    ``skip_dirs_containing`` is skipped with everything below it.
+    Directories that cannot be read are skipped.
+    """
+    stack = [root]
+    while stack:
+        dirpath = stack.pop()
+        if skip_dirs_containing is not None and skip_dirs_containing in dirpath:
+            continue
+        try:
+            listing = os.scandir(dirpath)
+        except OSError:
+            continue
+        with listing:
+            while True:
+                try:
+                    entry = next(listing)
+                except StopIteration:
+                    break
+                except OSError:
+                    break
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    is_dir = False
+                if not is_dir:
+                    yield entry
+                    continue
+                try:
+                    linked = entry.is_symlink() or entry.is_junction()
+                except OSError:
+                    linked = True  # cannot tell: stay out of it
+                if not linked:
+                    stack.append(entry.path)
+
+
 class DiskUsageReport:
     """Snapshot of disk usage across all cache categories."""
     __slots__ = ("dds_bytes", "jpeg_bytes",
@@ -274,13 +319,12 @@ class DiskBudgetManager:
             extensions = tuple(extensions)
         total = 0
         try:
-            for dirpath, _dirnames, filenames in os.walk(root):
-                for fname in filenames:
-                    if fname.endswith(extensions):
-                        try:
-                            total += os.path.getsize(os.path.join(dirpath, fname))
-                        except OSError:
-                            pass
+            for entry in _iter_file_entries(root):
+                if entry.name.endswith(extensions):
+                    try:
+                        total += entry.stat().st_size
+                    except OSError:
+                        pass
         except OSError:
             pass
         return total
@@ -318,17 +362,15 @@ class DiskBudgetManager:
         """Estimate total size of JPEG files in the cache."""
         total = 0
         try:
-            for dirpath, _dirnames, filenames in os.walk(self._cache_dir):
-                if "dds_cache" in dirpath:
-                    continue
-                for fname in filenames:
-                    if fname.endswith((".jpg", ".jpeg")):
-                        if self.protect_jpeg is not None and self.protect_jpeg(fname):
-                            continue
-                        try:
-                            total += os.path.getsize(os.path.join(dirpath, fname))
-                        except OSError:
-                            pass
+            for entry in _iter_file_entries(self._cache_dir, "dds_cache"):
+                fname = entry.name
+                if fname.endswith((".jpg", ".jpeg")):
+                    if self.protect_jpeg is not None and self.protect_jpeg(fname):
+                        continue
+                    try:
+                        total += entry.stat().st_size
+                    except OSError:
+                        pass
         except OSError:
             pass
         return total
@@ -351,20 +393,17 @@ class DiskBudgetManager:
     def _evict_oldest_jpeg_files(self, bytes_to_free: int) -> int:
         candidates = []
         try:
-            for dirpath, _dirnames, filenames in os.walk(self._cache_dir):
-                if "dds_cache" in dirpath:
+            for entry in _iter_file_entries(self._cache_dir, "dds_cache"):
+                filename = entry.name
+                if not filename.lower().endswith((".jpg", ".jpeg")):
                     continue
-                for filename in filenames:
-                    if not filename.lower().endswith((".jpg", ".jpeg")):
-                        continue
-                    if self.protect_jpeg is not None and self.protect_jpeg(filename):
-                        continue
-                    path = os.path.join(dirpath, filename)
-                    try:
-                        stat = os.stat(path)
-                    except OSError:
-                        continue
-                    candidates.append((stat.st_mtime, path, stat.st_size))
+                if self.protect_jpeg is not None and self.protect_jpeg(filename):
+                    continue
+                try:
+                    stat = entry.stat()
+                except OSError:
+                    continue
+                candidates.append((stat.st_mtime, entry.path, stat.st_size))
         except OSError as exc:
             log.warning("JPEG cache eviction scan failed: %s", exc)
             return 0

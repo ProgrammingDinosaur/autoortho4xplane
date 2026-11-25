@@ -840,11 +840,15 @@ class StreamingBuilder:
         if not self._released and self._pool_ref is not None:
             # Reset before returning to the pool so decoded chunk buffers are
             # released now instead of sitting on this builder until reuse.
+            reusable = True
             try:
                 self._pool_ref._lib.aodds_builder_reset(self._handle, byref(self._config))
             except Exception as e:
-                log.warning(f"aodds_builder_reset failed on release, buffers may not be freed: {e}")
-            self._pool_ref._return_builder(self._handle)
+                # Its state is unknown now: hand it back to be destroyed
+                # rather than to the next build.
+                reusable = False
+                log.warning(f"aodds_builder_reset failed on release, discarding the builder: {e}")
+            self._pool_ref._return_builder(self._handle, reusable=reusable)
             self._released = True
             self._handle = None
             # Clear JPEG refs now that finalize has completed
@@ -904,11 +908,14 @@ class StreamingBuilderPool:
         self._pool_size = pool_size
         self._decode_pool = decode_pool
         self._lock = threading.Lock()
+        # Signalled when a builder comes back or room for a new one appears.
+        self._cv = threading.Condition(self._lock)
         self._available: list = []
         self._in_use: set = set()  # Track handles currently in use
-        self._total_created = 0  # Total builders ever created
+        self._total_created = 0  # Builders that exist now (idle or in use)
         self._lib = None
         self._initialized = False
+        self._closed = False
         
         log.debug(f"StreamingBuilderPool: created with pool_size={pool_size}")
     
@@ -1021,29 +1028,18 @@ class StreamingBuilderPool:
         )
         
         import time
-        start = time.monotonic()
-        
-        while True:
-            with self._lock:
+        deadline = time.monotonic() + timeout
+
+        with self._cv:
+            while True:
+                if self._closed:
+                    log.debug("StreamingBuilderPool: acquire on a closed pool")
+                    return None
                 if self._available:
-                    handle = self._available.pop()
-                    self._in_use.add(id(handle))  # Track in-use handle
-                    # Reset builder with new config
-                    self._lib.aodds_builder_reset(handle, byref(c_config))
-                    try:
-                        return StreamingBuilder(handle, self, self._lib, c_config)
-                    except Exception:
-                        # Constructor failed - return handle to available pool
-                        self._in_use.discard(id(handle))
-                        self._available.append(handle)
-                        raise
-            
-            # Pool exhausted - try to create new if under limit
-            with self._lock:
-                # Fix: Use actual count of created builders, not buggy calculation
-                current_count = self._total_created
-                if current_count < self._pool_size:
-                    # Create new builder
+                    return self._checkout_idle(self._available.pop(), c_config)
+
+                retry = self._WAIT_SLICE_S
+                if self._total_created < self._pool_size:
                     handle = self._lib.aodds_builder_create(
                         byref(c_config), self._decode_pool
                     )
@@ -1058,28 +1054,71 @@ class StreamingBuilderPool:
                             self._total_created -= 1
                             self._lib.aodds_builder_destroy(handle)
                             raise
-            
-            if time.monotonic() - start > timeout:
-                log.warning(f"StreamingBuilderPool: timeout waiting for builder")
-                return None
-            
-            time.sleep(0.001)
-    
-    def _return_builder(self, handle: c_void_p) -> None:
-        """Return a builder handle to the pool (destroyed if it shrank)."""
-        with self._lock:
+                    # The native side could not allocate one: no builder
+                    # coming back will change that, so just try again later.
+                    retry = self._CREATE_RETRY_S
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning(f"StreamingBuilderPool: timeout waiting for builder")
+                    return None
+                # Sleeps until a builder is returned (or room for one
+                # appears) instead of polling every millisecond. The slice
+                # bounds the damage should a wake-up ever be missed.
+                self._cv.wait(min(retry, remaining))
+
+    # Longest sleep between looks at the pool while waiting for a builder.
+    _WAIT_SLICE_S = 0.1
+    # Pause before asking the native side for a builder again after it failed.
+    _CREATE_RETRY_S = 0.05
+
+    def _checkout_idle(self, handle, c_config) -> StreamingBuilder:
+        """Hand out an idle builder, reset for ``c_config``. Lock held."""
+        self._in_use.add(id(handle))  # Track in-use handle
+        try:
+            self._lib.aodds_builder_reset(handle, byref(c_config))
+        except Exception:
+            # It was left counted as in use for good, one builder fewer for
+            # the rest of the session. Drop it so another can be created.
             self._in_use.discard(id(handle))
-            if self._total_created > self._pool_size:
+            self._total_created -= 1
+            self._cv.notify()
+            try:
+                self._lib.aodds_builder_destroy(handle)
+            except Exception:
+                log.exception("Failed to destroy a native DDS builder")
+            raise
+        try:
+            return StreamingBuilder(handle, self, self._lib, c_config)
+        except Exception:
+            # Constructor failed - return handle to available pool
+            self._in_use.discard(id(handle))
+            self._available.append(handle)
+            self._cv.notify()
+            raise
+
+    def _return_builder(self, handle: c_void_p, reusable: bool = True) -> None:
+        """Return a builder handle to the pool.
+
+        It is destroyed instead when the pool shrank or closed meanwhile, or
+        when it is not ``reusable`` (its reset failed).
+        """
+        with self._cv:
+            self._in_use.discard(id(handle))
+            if (self._closed or not reusable
+                    or self._total_created > self._pool_size):
                 self._total_created -= 1
                 destroy = True
             else:
                 self._available.append(handle)
                 destroy = False
+            # Either a builder to take or room to create one.
+            self._cv.notify()
         if destroy:
             try:
                 self._lib.aodds_builder_destroy(handle)
             except Exception:
-                pass
+                log.exception("Failed to destroy a native DDS builder")
 
     def resize(self, pool_size: int) -> int:
         """Change how many builders may exist (they are created on demand).
@@ -1089,11 +1128,15 @@ class StreamingBuilderPool:
         """
         target = max(1, int(pool_size))
         idle = []
-        with self._lock:
+        with self._cv:
+            if self._closed:
+                return self._pool_size
             self._pool_size = target
             while self._total_created > target and self._available:
                 idle.append(self._available.pop())
                 self._total_created -= 1
+            # A larger pool has room for the threads waiting on it.
+            self._cv.notify_all()
         for handle in idle:
             try:
                 self._lib.aodds_builder_destroy(handle)
@@ -1106,25 +1149,30 @@ class StreamingBuilderPool:
     def pool_size(self) -> int:
         with self._lock:
             return self._pool_size
-    
+
     def close(self) -> None:
-        """Destroy all builders in the pool."""
-        with self._lock:
-            # Destroy available builders
-            for handle in self._available:
-                try:
-                    self._lib.aodds_builder_destroy(handle)
-                except Exception:
-                    pass
+        """Destroy the idle builders and refuse further use.
+
+        Builders still in use are destroyed as they are released; threads
+        waiting for one are woken and get None.
+        """
+        with self._cv:
+            if self._closed:
+                return
+            self._closed = True
+            idle = self._available[:]
             self._available.clear()
-            
-            # Note: in-use builders will be cleaned up when released
-            # Log warning if any builders are still in use
-            if self._in_use:
-                log.warning(f"StreamingBuilderPool.close(): {len(self._in_use)} builders "
-                           f"still in use - they will leak if not released")
-            
-            self._total_created = 0
+            self._total_created -= len(idle)
+            outstanding = len(self._in_use)
+            self._cv.notify_all()
+        for handle in idle:
+            try:
+                self._lib.aodds_builder_destroy(handle)
+            except Exception:
+                log.exception("Failed to destroy an idle native DDS builder")
+        if outstanding:
+            log.warning(f"StreamingBuilderPool.close(): {outstanding} builders "
+                        f"still in use - destroyed when they are released")
     
     @property
     def available_count(self) -> int:

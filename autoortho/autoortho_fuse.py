@@ -702,6 +702,54 @@ class _DirectHandle:
         self.lock = threading.Lock()
 
 
+class _KeyLocks:
+    """One lock per key, kept only while a thread is using or awaiting it.
+
+    A plain ``defaultdict(threading.Lock)`` kept a lock for every texture
+    ever read, for the rest of the session. Here a lock is dropped once
+    every thread that checked it out has checked it back in, so two threads
+    working on the same key always share one lock and an idle key costs
+    nothing.
+
+    Each ``checkout()`` must be matched by exactly one ``checkin()``
+    (``release()`` does both the unlock and the check-in): one too many
+    would drop a lock another thread still holds.
+    """
+
+    def __init__(self):
+        self._mutex = threading.Lock()
+        self._entries = {}  # key -> [lock, threads using it]
+
+    def checkout(self, key) -> threading.Lock:
+        """The key's lock, not acquired, counted as in use by the caller."""
+        with self._mutex:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = self._entries[key] = [threading.Lock(), 0]
+            entry[1] += 1
+            return entry[0]
+
+    def checkin(self, key) -> None:
+        with self._mutex:
+            entry = self._entries.get(key)
+            if entry is None:
+                return
+            entry[1] -= 1
+            if entry[1] <= 0:
+                del self._entries[key]
+
+    def release(self, key, lock) -> None:
+        """Unlock a checked-out lock the caller holds, and check it in."""
+        try:
+            lock.release()
+        finally:
+            self.checkin(key)
+
+    def __len__(self) -> int:
+        with self._mutex:
+            return len(self._entries)
+
+
 class AutoOrtho(Operations):
 
     open_paths = []
@@ -782,7 +830,7 @@ class AutoOrtho(Operations):
         self.fh_locks = defaultdict(threading.Lock)
         self.startup = True
         self._lock = threading.RLock()
-        self._tile_locks = defaultdict(threading.Lock)
+        self._tile_locks = _KeyLocks()
         self._size_cache = OrderedDict()  # LRU cache for DDS sizes
         self._size_cache_max = 5000  # Max entries before LRU eviction
         self._negative_getattr_cache = OrderedDict()  # LRU cache for avoiding getattr probes for files that don't exist
@@ -1781,8 +1829,9 @@ class AutoOrtho(Operations):
             key = self._tile_key(row, col, maptype, zoom)
             tile_id = f"{row}_{col}_{maptype}_{zoom}"
             request_started = time.monotonic()
-            lock = self._tile_locks[key]
-            
+            lock = self._tile_locks.checkout(key)
+            lock_held = False
+
             # Calculate build_timeout dynamically from the tile budget (wait_bands)
             # This ensures the FUSE lock timeout is always >= the tile build time
             # Formula: tile budget + fallback_timeout (if enabled) + 15s buffer
@@ -1791,13 +1840,20 @@ class AutoOrtho(Operations):
             # - DDS read/write operations after tile is built
             # - Any processing overhead
             # - Margin of safety to prevent premature lock timeout
-            build_timeout = self._calculate_build_timeout()
-            request_deadline = request_started + build_timeout
+            try:
+                build_timeout = self._calculate_build_timeout()
+                request_deadline = request_started + build_timeout
 
-            lock_started = time.monotonic()
-            if not lock.acquire(
-                timeout=max(0.0, request_deadline - time.monotonic())
-            ):
+                lock_started = time.monotonic()
+                lock_held = lock.acquire(
+                    timeout=max(0.0, request_deadline - time.monotonic())
+                )
+            finally:
+                if not lock_held:
+                    # Timed out or failed before holding it: this read is
+                    # done with the lock either way.
+                    self._tile_locks.checkin(key)
+            if not lock_held:
                 lock_wait_ms = (time.monotonic() - lock_started) * 1000.0
                 record_stage(
                     "fuse.tile_lock_wait",
@@ -1846,17 +1902,18 @@ class AutoOrtho(Operations):
 
                 return self._fallback_dds(row, col, maptype, zoom, offset, length, "lock_timeout")
 
-            record_stage(
-                "fuse.tile_lock_wait",
-                (time.monotonic() - lock_started) * 1000.0,
-                tile_id=tile_id,
-            )
             read_outcome = "ok"
             admitted = False
             weight = 0
-            lock_held = True
             t = None
             try:
+                # Inside the try: the lock is held from here on, and only
+                # the finally below gives it back.
+                record_stage(
+                    "fuse.tile_lock_wait",
+                    (time.monotonic() - lock_started) * 1000.0,
+                    tile_id=tile_id,
+                )
                 with profile_span(
                     "tile.cache_lookup",
                     tile_id=tile_id,
@@ -1885,8 +1942,8 @@ class AutoOrtho(Operations):
                 # Tile/build coordinators provide the fine-grained safety below.
                 # Release the FUSE lookup lock before cache, network, decode, or
                 # compression work so disjoint row reads can proceed together.
-                lock.release()
                 lock_held = False
+                self._tile_locks.release(key, lock)
                 data = t.read_dds_bytes(offset, length)
                 if data is None:
                     read_outcome = "fallback"
@@ -1903,10 +1960,15 @@ class AutoOrtho(Operations):
                 log.exception("cause:", exc_info=e)
                 return self._fallback_dds(row, col, maptype, zoom, offset, length, "exception", tile=t)
             finally:
-                if admitted:
-                    getortho.release_live_tile_slot(weight=weight)
-                if lock_held:
-                    lock.release()
+                try:
+                    if admitted:
+                        getortho.release_live_tile_slot(weight=weight)
+                finally:
+                    # Even if giving the slot back failed: a tile lock left
+                    # held would time out every later read of this texture.
+                    if lock_held:
+                        lock_held = False
+                        self._tile_locks.release(key, lock)
                 record_stage(
                     "fuse.dds_read",
                     (time.monotonic() - request_started) * 1000.0,

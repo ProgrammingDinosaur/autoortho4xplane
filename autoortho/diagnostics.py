@@ -1912,6 +1912,41 @@ def _render_miss_causes(flight: dict) -> list:
     return lines
 
 
+# What a blurry read saw when prefetch had the tile down as ready
+# (prefetch_ledger.DONE_REASONS), in the report's words.
+_DONE_MISS_NAMES = {
+    "mm0_inexact_bytes": "Full-resolution rows held stand-in imagery",
+    "mm0_unobserved": "Full resolution wanted, its rows were not checked",
+    "coarser_tile_state": "The tile's sharpest real level was coarser than wanted",
+    "other": "Other",
+}
+
+
+def _render_done_misses(stats: dict) -> list:
+    """*Ready, yet blurry*: how those reads disagreed with prefetch."""
+    counts = {
+        reason: int(stats.get(f"near_miss_done_{reason}", 0) or 0)
+        for reason in _DONE_MISS_NAMES
+    }
+    if not any(counts.values()):
+        return []
+    lines = [
+        "",
+        "### Ready, yet blurry",
+        "",
+        "Prefetch had finished these tiles, but the read was not sharp. "
+        "This is what the read saw, not the cause.",
+        "",
+        "| What the read saw | Reads |",
+        "|---|---:|",
+    ]
+    lines.extend(
+        f"| {name} | {counts[reason]:,} |"
+        for reason, name in _DONE_MISS_NAMES.items() if counts[reason]
+    )
+    return lines
+
+
 def _render_flight(flight: dict) -> list:
     """The governor's verdict: fidelity by phase, guards, what was learned."""
     if not flight:
@@ -2007,6 +2042,7 @@ def _render_markdown(summary: dict) -> str:
     ]
     lines.extend(f"- {flag}" for flag in summary["diagnostic_flags"])
     lines.extend(_render_flight(summary.get("flight") or {}))
+    lines.extend(_render_done_misses(summary.get("stats_snapshot") or {}))
 
     delivery = summary.get("delivery", {})
     lines.extend(

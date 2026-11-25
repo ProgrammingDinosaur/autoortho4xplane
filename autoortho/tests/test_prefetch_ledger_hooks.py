@@ -279,6 +279,25 @@ def test_never_queued_while_paused_names_the_pause(near_tile, ledger, bumps, mon
     assert bumps == ["near_miss_paused_ram", "near_miss_never_paused"]
 
 
+@pytest.mark.parametrize("wanted, served_exact, real_from, reason", [
+    (0, False, 1, "mm0_inexact_bytes"),
+    (0, None, 1, "mm0_unobserved"),
+    (1, None, 2, "coarser_tile_state"),
+    (1, None, None, "other"),
+])
+def test_ready_but_blurry_names_what_the_read_saw(
+    near_tile, ledger, bumps, monkeypatch, wanted, served_exact, real_from, reason,
+):
+    _camera(monkeypatch, *near_tile.centre)
+    key = prefetch_ledger.ledger_key(near_tile.row, near_tile.col, near_tile.tilename_zoom)
+    ledger.note_queued(key, 0, "velocity", time.monotonic() - 30)
+    ledger.note_done(key, 0, time.monotonic() - 20)
+    near_tile._note_near_miss(
+        wanted, mm0_served_exact=served_exact, real_from_level=real_from)
+    assert bumps == ["near_miss_done", f"near_miss_done_{reason}"]
+    assert reason in prefetch_ledger.DONE_REASONS
+
+
 def test_starting_slow_or_no_position_counts_nothing(near_tile, ledger, bumps, monkeypatch):
     _camera(monkeypatch, *near_tile.centre)
     near_tile._read_starting = True

@@ -14789,7 +14789,8 @@ class Tile(object):
         if wanted is not None:
             # OrthoStreamXP's quality measure: the share of X-Plane's reads
             # answered with real imagery at the level it wanted.
-            real = self.real_from() <= wanted
+            real_from_level = self.real_from()
+            real = real_from_level <= wanted
             if not real and wanted == 0 and mm0_served_exact:
                 # Mipmap 0 streams row by row, so real_from() counts it only
                 # once every row is exact; this read's own rows were.
@@ -14804,7 +14805,12 @@ class Tile(object):
                 # with real imagery at the target zoom.
                 bump("near_reads_real" if real else "near_reads_standin")
                 if not real:
-                    self._note_near_miss(wanted, starting=read_starting)
+                    self._note_near_miss(
+                        wanted,
+                        starting=read_starting,
+                        mm0_served_exact=mm0_served_exact,
+                        real_from_level=real_from_level,
+                    )
                 if (
                     real
                     and not getattr(self, "_sharp_noted", False)
@@ -14982,13 +14988,19 @@ class Tile(object):
         self._maybe_persist_complete_dds()
         return True
 
-    def _note_near_miss(self, wanted, starting=None):
+    def _note_near_miss(self, wanted, starting=None, *,
+                        mm0_served_exact=None, real_from_level=None):
         """A near read was blurry in flight: count what prefetch had done for it.
 
         Bumps one ``near_miss_<kind>`` counter (prefetch_ledger.MISS_KINDS)
         for the governor. Skipped while a flight starts or X-Plane jumped
         (prefetch can't know where a flight begins), without a position, and
         below the prefetcher's own minimum speed (it does not run there).
+
+        A ``done`` miss contradicts the ledger: prefetch finished the tile,
+        yet the read was not sharp. ``mm0_served_exact`` and
+        ``real_from_level`` are what the read itself saw, and pick the
+        ``near_miss_done_<reason>`` counter that says how they disagree.
         """
         if starting is None:
             starting = getattr(self, "_read_starting", False)
@@ -15016,8 +15028,28 @@ class Tile(object):
                 if kind == "never_paused":
                     bump(f"near_miss_paused_{tile_ledger.paused_reason(now)}")
             bump(f"near_miss_{kind}")
+            if kind == "done":
+                bump("near_miss_done_" + self._done_miss_reason(
+                    wanted, mm0_served_exact, real_from_level))
         except Exception as exc:  # statistics only
             log.debug(f"Near miss note for {self.id} failed: {exc}")
+
+    @staticmethod
+    def _done_miss_reason(wanted, mm0_served_exact, real_from_level) -> str:
+        """How a blurry read disagrees with a ledger that says ``done``.
+
+        One of prefetch_ledger.DONE_REASONS. It says what the read saw, not
+        why: a build that never reached the DDS cache and a tile rebuilt
+        after eviction can both show as ``coarser_tile_state``.
+        """
+        if wanted == 0:
+            # Mipmap 0 is judged by the rows this read was given.
+            if mm0_served_exact is None:
+                return "mm0_unobserved"
+            return "mm0_inexact_bytes"
+        if real_from_level is not None and real_from_level > wanted:
+            return "coarser_tile_state"
+        return "other"
 
     def _note_late(self, wanted, read_started, band=None, starting=None):
         """A near or middle read stopped waiting: time its imagery's arrival.

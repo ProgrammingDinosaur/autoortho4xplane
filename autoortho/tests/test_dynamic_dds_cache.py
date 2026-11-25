@@ -2370,6 +2370,40 @@ class TestDDMv5PartialRows:
         assert sorted(persisted) == [(0, b"a"), (1, b"cc")]
         cache.close()
 
+    def test_partial_row_worker_survives_an_unexpected_error(
+        self, cache_dir, mock_tile,
+    ):
+        from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+
+        cache = DynamicDDSCache(cache_dir, max_size_mb=10)
+        completed = []
+
+        def append(tile_id, max_zoom, tile, row_index, data, total, **kwargs):
+            if row_index == 0:
+                raise KeyError("row_revisions")
+            return row_index == 2
+
+        cache.append_partial_row = append
+        try:
+            for row in range(3):
+                assert cache.enqueue_partial_row(
+                    mock_tile.id, mock_tile.max_zoom, mock_tile, row, b"r", 3,
+                    completion_callback=lambda ok, index: completed.append(
+                        (index, ok)),
+                )
+                # One batch per row: the failing row must not take the
+                # worker down for the batches that follow.
+                assert cache.flush_partial_rows(2)
+
+            assert completed == [(0, False), (1, False), (2, True)]
+            assert cache._partial_row_worker.is_alive()
+            stats = cache.stats
+            assert stats["partial_row_worker_exceptions"] == 1
+            assert stats["partial_row_not_persisted"] == 2
+            assert stats["partial_row_persisted"] == 1
+        finally:
+            cache.close()
+
 
 class TestHealingRestoresServableEntries:
     """Healing must update the row manifests that gate serving."""

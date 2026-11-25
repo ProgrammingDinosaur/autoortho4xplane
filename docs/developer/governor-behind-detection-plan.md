@@ -163,6 +163,23 @@ by more than 30° in the last 60 s, count the miss as
 `near_miss_never_turn` instead of `wide`. A wider radius is the wrong fix
 for a turn; SimBrief prefetch already covers planned turns.
 
+**Ready, yet blurry.** A `done` miss contradicts the ledger: prefetch
+finished the tile and the read was still not sharp. The read hook passes on
+what it saw and bumps one `near_miss_done_<reason>` counter
+(`prefetch_ledger.DONE_REASONS`) next to `near_miss_done`:
+
+- `mm0_inexact_bytes`: mipmap 0 was wanted and the rows this read was given
+  held stand-in imagery.
+- `mm0_unobserved`: mipmap 0 was wanted and this read's rows were not checked.
+- `coarser_tile_state`: a coarser level was wanted and the tile's finest
+  real level is coarser still.
+- `other`: none of the above.
+
+These say what the read saw, not why: a background build that never reached
+the DDS cache and a tile rebuilt after eviction can both show as
+`coarser_tile_state`. The governor does not read them; the flight report
+lists them under *Ready, yet blurry*.
+
 ### 4.3 Governor
 
 New `Sample` fields (cumulative counters, all workers summed, read like

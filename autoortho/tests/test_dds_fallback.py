@@ -222,7 +222,7 @@ def test_lock_timeout_serves_a_valid_header(monkeypatch, tmp_path):
     _module, ao = _fuse(monkeypatch, tmp_path, "ok")
     ao._calculate_build_timeout = lambda: 0.0
     key = ao._tile_key(24832, 12416, "BI", 16)
-    lock = ao._tile_locks[key]
+    lock = ao._tile_locks.checkout(key)
     lock.acquire()
     try:
         data = ao.read(PATH, 256, 0, 0)
@@ -345,7 +345,7 @@ def test_fallbacks_are_counted_by_reason(monkeypatch, tmp_path, behaviour, reaso
 def test_lock_timeout_and_shutdown_are_counted(monkeypatch, tmp_path):
     module, ao = _fuse(monkeypatch, tmp_path, "ok")
     ao._calculate_build_timeout = lambda: 0.0
-    lock = ao._tile_locks[ao._tile_key(24832, 12416, "BI", 16)]
+    lock = ao._tile_locks.checkout(ao._tile_key(24832, 12416, "BI", 16))
     lock.acquire()
     try:
         ao.read(PATH, 128, 0, 0)
@@ -379,7 +379,7 @@ def test_lock_timeout_finds_the_tile_in_memory(monkeypatch, tmp_path):
     tile = _MemoryTile(SIZE_8K_BC1)
     _with_memory_tile(ao, tile)
     ao._calculate_build_timeout = lambda: 0.0
-    lock = ao._tile_locks[ao._tile_key(24832, 12416, "BI", 16)]
+    lock = ao._tile_locks.checkout(ao._tile_key(24832, 12416, "BI", 16))
     lock.acquire()
     try:
         data = ao.read(PATH, 128, 0, 0)
@@ -410,3 +410,106 @@ def test_shutdown_does_not_touch_tiles(monkeypatch, tmp_path):
     module.getortho.is_shutdown_requested = lambda: True
     assert ao.read(PATH, 128, 0, 0)[:4] == b"DDS "
     assert tile.calls == []
+
+
+# ------------------------------------------------------ per-tile read locks
+
+
+def test_key_lock_is_shared_and_dropped_after_its_last_user(monkeypatch):
+    module, _fuse_error = _load_fuse(monkeypatch, None)
+    locks = module._KeyLocks()
+
+    first = locks.checkout("tile")
+    second = locks.checkout("tile")
+    assert first is second and len(locks) == 1
+
+    first.acquire()
+    locks.release("tile", first)
+    assert len(locks) == 1  # the second user still counts on it
+    locks.checkin("tile")
+    assert len(locks) == 0
+
+    assert locks.checkout("tile") is not first
+    locks.checkin("tile")
+    locks.checkin("tile")  # one too many is ignored once the key is gone
+    assert len(locks) == 0
+
+
+def test_key_lock_admits_one_thread_at_a_time(monkeypatch):
+    import threading
+
+    module, _fuse_error = _load_fuse(monkeypatch, None)
+    locks = module._KeyLocks()
+    state = {"inside": 0, "overlaps": 0, "passes": 0}
+
+    def worker():
+        for _ in range(200):
+            lock = locks.checkout("tile")
+            lock.acquire()
+            state["inside"] += 1
+            if state["inside"] > 1:
+                state["overlaps"] += 1
+            state["passes"] += 1
+            state["inside"] -= 1
+            locks.release("tile", lock)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+
+    assert state == {"inside": 0, "overlaps": 0, "passes": 1600}
+    assert len(locks) == 0
+
+
+@pytest.mark.parametrize("behaviour", ["ok", "none", "fuse_error", RuntimeError("boom")])
+def test_read_leaves_no_tile_lock_behind(monkeypatch, tmp_path, behaviour):
+    _module, ao = _fuse(monkeypatch, tmp_path, behaviour)
+    for _ in range(3):
+        ao.read(PATH, 256, 0, 0)
+    assert len(ao._tile_locks) == 0
+
+
+def test_lock_timeout_keeps_only_the_holders_lock(monkeypatch, tmp_path):
+    _module, ao = _fuse(monkeypatch, tmp_path, "ok")
+    ao._calculate_build_timeout = lambda: 0.0
+    key = ao._tile_key(24832, 12416, "BI", 16)
+    lock = ao._tile_locks.checkout(key)
+    lock.acquire()
+
+    ao.read(PATH, 256, 0, 0)
+    assert len(ao._tile_locks) == 1  # the holder's, not the timed-out read's
+
+    ao._tile_locks.release(key, lock)
+    assert len(ao._tile_locks) == 0
+
+
+def test_failure_before_the_lock_is_held_leaves_no_lock(monkeypatch, tmp_path):
+    _module, ao = _fuse(monkeypatch, tmp_path, "ok")
+
+    def broken_timeout():
+        raise RuntimeError("no timeout")
+
+    ao._calculate_build_timeout = broken_timeout
+    with pytest.raises(RuntimeError, match="no timeout"):
+        ao.read(PATH, 256, 0, 0)
+    assert len(ao._tile_locks) == 0
+
+
+def test_failed_slot_release_still_frees_the_tile_lock(monkeypatch, tmp_path):
+    module, ao = _fuse(monkeypatch, tmp_path, "ok")
+    tile = _Tile("ok")
+    tile.needs_live_slot = lambda offset, length: True
+    ao.tc = types.SimpleNamespace(_get_tile=lambda *args: tile)
+
+    def broken_release(weight=0):
+        raise RuntimeError("slot release failed")
+
+    module.getortho.release_live_tile_slot = broken_release
+    with pytest.raises(RuntimeError, match="slot release failed"):
+        ao.read(PATH, 256, 0, 0)
+
+    assert len(ao._tile_locks) == 0
+    module.getortho.release_live_tile_slot = lambda weight=0: None
+    assert ao.read(PATH, 256, 0, 0) == b"r" * 256  # not stuck behind a held lock

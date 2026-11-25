@@ -316,6 +316,10 @@ class DynamicDDSCache:
         self._partial_row_coalesced = 0
         self._partial_row_dropped = 0
         self._partial_row_persisted = 0
+        # Rows the cache did not take. Most are ordinary (the tile was
+        # completed or superseded meanwhile); worker exceptions are not.
+        self._partial_row_not_persisted = 0
+        self._partial_row_worker_exceptions = 0
         self._tile_locks = {}
         self._tile_locks_guard = threading.Lock()
 
@@ -1389,23 +1393,52 @@ class DynamicDDSCache:
                 self._partial_row_queue_bytes -= sum(
                     len(item["data"]) for item in pending["rows"].values())
                 self._partial_row_active = True
-            for row_index, item in pending["rows"].items():
-                success = self.append_partial_row(
-                        _key[0], _key[1], pending["tile"], row_index,
-                        item["data"], item["total"],
-                        manifest=item["manifest"])
-                if success:
+            try:
+                for row_index, item in pending["rows"].items():
+                    success = self._persist_queued_row(
+                        _key, pending["tile"], row_index, item)
                     with self._partial_row_condition:
-                        self._partial_row_persisted += 1
-                callback = item.get("completion_callback")
-                if callback is not None:
-                    try:
-                        callback(bool(success), row_index)
-                    except Exception:
-                        log.exception("Partial-row completion callback failed")
+                        if success:
+                            self._partial_row_persisted += 1
+                        else:
+                            self._partial_row_not_persisted += 1
+                    callback = item.get("completion_callback")
+                    if callback is not None:
+                        try:
+                            callback(success, row_index)
+                        except Exception:
+                            log.exception("Partial-row completion callback failed")
+            finally:
+                # Left set, flush_partial_rows() and close() would wait on a
+                # batch that is no longer running.
+                with self._partial_row_condition:
+                    self._partial_row_active = False
+                    self._partial_row_condition.notify_all()
+
+    def _persist_queued_row(self, key, tile, row_index: int, item: dict) -> bool:
+        """Persist one queued row; an unexpected error fails only that row.
+
+        ``append_partial_row()`` handles I/O errors itself. Anything else
+        (a .ddm with missing or mistyped fields, say) used to end the worker
+        thread: every later row then sat in the queue until it was dropped
+        and no completion callback ran again for the rest of the session.
+        """
+        try:
+            return bool(self.append_partial_row(
+                key[0], key[1], tile, row_index,
+                item["data"], item["total"],
+                manifest=item["manifest"]))
+        except Exception:
             with self._partial_row_condition:
-                self._partial_row_active = False
-                self._partial_row_condition.notify_all()
+                self._partial_row_worker_exceptions += 1
+                failures = self._partial_row_worker_exceptions
+            # The first one and every hundredth: a tile whose metadata is
+            # broken fails once per row.
+            if failures == 1 or failures % 100 == 0:
+                log.exception(
+                    "DDS partial-row persistence failed unexpectedly "
+                    "(%d so far)", failures)
+            return False
 
     def flush_partial_rows(self, timeout: Optional[float] = None) -> bool:
         """Wait for queued rows to persist, stopping after ``timeout`` seconds."""
@@ -2676,6 +2709,8 @@ class DynamicDDSCache:
             partial_coalesced = self._partial_row_coalesced
             partial_dropped = self._partial_row_dropped
             partial_persisted = self._partial_row_persisted
+            partial_not_persisted = self._partial_row_not_persisted
+            partial_worker_exceptions = self._partial_row_worker_exceptions
         return {
             "hits": self._hits,
             "misses": self._misses,
@@ -2691,6 +2726,8 @@ class DynamicDDSCache:
             "partial_row_coalesced": partial_coalesced,
             "partial_row_dropped": partial_dropped,
             "partial_row_persisted": partial_persisted,
+            "partial_row_not_persisted": partial_not_persisted,
+            "partial_row_worker_exceptions": partial_worker_exceptions,
         }
 
     # ------------------------------------------------------------------

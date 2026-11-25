@@ -50,6 +50,14 @@ MISS_KINDS = (
     "done",
 )
 PAUSE_REASONS = ("ram", "live", "gate")
+# What the read found when the ledger said ``done`` but the imagery served
+# was not at the wanted level (``near_miss_done_<reason>`` counters).
+DONE_REASONS = (
+    "mm0_inexact_bytes",   # the read's mipmap-0 rows held stand-in imagery
+    "mm0_unobserved",      # mipmap 0 wanted; this read's rows were not checked
+    "coarser_tile_state",  # the tile's finest real level is coarser than wanted
+    "other",
+)
 
 Key = Tuple[int, int, int]
 

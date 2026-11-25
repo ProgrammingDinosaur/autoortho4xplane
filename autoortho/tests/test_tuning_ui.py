@@ -70,6 +70,22 @@ def test_report_renders_blurry_moments_by_cause():
     assert "Queued at a coarser level only" not in text
 
 
+def test_report_renders_ready_yet_blurry_reads():
+    import diagnostics
+
+    text = "\n".join(diagnostics._render_done_misses({
+        "near_miss_done": 1215,
+        "near_miss_done_coarser_tile_state": 1200,
+        "near_miss_done_mm0_inexact_bytes": 15,
+        "near_miss_done_other": 0,
+    }))
+    assert "### Ready, yet blurry" in text
+    assert "| The tile's sharpest real level was coarser than wanted | 1,200 |" in text
+    assert "| Full-resolution rows held stand-in imagery | 15 |" in text
+    assert "| Other |" not in text and "not checked" not in text
+    assert diagnostics._render_done_misses({"near_miss_done": 3}) == []
+
+
 def test_mount_lifecycle_runs_and_summarises(tmp_path, monkeypatch):
     import autoortho as ao_module
     import aostats
