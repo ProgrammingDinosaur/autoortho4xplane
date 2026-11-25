@@ -19,9 +19,10 @@ derived from them below.
 import math
 
 try:
-    from autoortho import streaming_options
+    from autoortho import streaming_options, wait_policy
 except ImportError:
     import streaming_options
+    import wait_policy
 
 NEAR_MIPS = 1
 NEAR, MIDDLE, FAR = "near", "middle", "far"
@@ -57,12 +58,31 @@ def chunk_priority(band, mip):
     return 30.0
 
 
-def wait_seconds(band, starting):
+def configured_wait_seconds(band, starting):
+    """The wait the band settings give, before ``texture_wait_policy``.
+
+    For timeouts sized from the wait (HTTP reads, the live queue), which
+    must not drop to nothing under the ``smooth`` policy.
+    """
     if band == FAR:
         return max(0.0, streaming_options.number("far_wait_seconds"))
     if starting:
         return max(0.0, streaming_options.number("near_wait_seconds"))
     return max(0.0, streaming_options.number("band_max_wait_seconds"))
+
+
+def wait_seconds(band, starting):
+    """How long one read of ``band`` may wait (see wait_policy.py).
+
+    While a flight is starting every policy waits as configured. In flight
+    ``smooth`` waits for nothing and ``quality`` up to the strict deadline,
+    unless the band's setting was set by hand.
+    """
+    if not starting:
+        policy_wait = wait_policy.in_flight_wait(band == FAR)
+        if policy_wait is not None:
+            return policy_wait
+    return configured_wait_seconds(band, starting)
 
 
 # The bands are the only wait policy: the values below replace the retired
@@ -96,8 +116,9 @@ def tile_budget_seconds(initial_load=False):
 
 
 def http_read_timeout_seconds():
-    """Read timeout of one HTTP/1.1 download: an in-flight read's wait plus 1 s."""
-    return wait_seconds(NEAR, False) + 1.0
+    """Read timeout of one HTTP/1.1 download: an in-flight read's configured
+    wait plus 1 s (not the policy's: ``smooth`` would make it 1 s)."""
+    return configured_wait_seconds(NEAR, False) + 1.0
 
 
 # How long X-Plane's imagery actually took when a near or middle read gave

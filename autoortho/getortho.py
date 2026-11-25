@@ -79,11 +79,13 @@ except ImportError:
 
 try:
     from autoortho import colour_table, prefetch_ledger, texture_plan, wait_bands
+    from autoortho import wait_policy
 except ImportError:
     import colour_table
     import prefetch_ledger
     import texture_plan
     import wait_bands
+    import wait_policy
 
 try:
     from autoortho import disk_texture
@@ -1271,7 +1273,7 @@ def _live_queue_timeout_seconds():
     chunk for the whole provider queue timeout (60 s by default).
     """
     try:
-        near = wait_bands.wait_seconds(wait_bands.NEAR, False)
+        near = wait_bands.configured_wait_seconds(wait_bands.NEAR, False)
     except Exception:
         near = 6.0
     return max(10.0, 2.0 * float(near))
@@ -5867,6 +5869,9 @@ def _prefetch_quality_mode():
             PrefetchQualityMode.RESPONSIVE.value,
         )
     ).lower()
+    # [streaming] texture_wait_policy = quality makes it strict_target
+    # unless the mode was set by hand (wait_policy.py).
+    value = wait_policy.quality_mode(value)
     try:
         return PrefetchQualityMode(value)
     except ValueError:
@@ -14316,7 +14321,12 @@ class Tile(object):
                 )
 
                 fallback_level = self._get_fallback_level()
-                fallbacks_enabled = fallback_level > 0
+                # Under strict_target a chunk with no imagery still gets a
+                # lower zoom (_no_imagery_fallback_level): take the path
+                # that resolves fallbacks chunk by chunk.
+                fallbacks_enabled = (
+                    fallback_level > 0 or self._no_imagery_fallback_level() > 0
+                )
 
                 # ═══════════════════════════════════════════════════════════
                 # FAST CACHE PROBE: Determine warm vs cold cache (~1-5ms)
@@ -14796,6 +14806,9 @@ class Tile(object):
                 # once every row is exact; this read's own rows were.
                 real = True
             bump("reads_wanted_real" if real else "reads_wanted_standin")
+            if not real and wanted <= 1:
+                # Near reads answered with coarser imagery, by wait policy.
+                bump(f"wait_policy_{wait_policy.current()}_near_standins")
             if not real and streaming_options.flag("wait_bands"):
                 self._note_late(
                     wanted, read_started, band=read_band, starting=read_starting
@@ -14824,6 +14837,14 @@ class Tile(object):
                         int((time.monotonic() - self.first_request_time) * 1000),
                     )
                     bump("time_to_sharp_count")
+        if read_band is not None:
+            # Reads that could wait and how long they took, by wait policy.
+            policy = wait_policy.current()
+            bump(f"wait_policy_{policy}_reads")
+            bump(
+                f"wait_policy_{policy}_read_ms_total",
+                int((time.monotonic() - read_started) * 1000),
+            )
         return self._recolour(data, offset)
 
     def _recolour(self, data, offset):
@@ -15923,7 +15944,12 @@ class Tile(object):
         # they cost milliseconds and are the only alternative to missing
         # color. Only network fallbacks respect the budget below.
         local_resolver = None
-        if deferred_chunks and fallback_level >= 1:
+        # Under strict_target (fallback_level 0) only chunks with no imagery
+        # get a lower zoom; the rest wait for their real imagery.
+        no_imagery_only = fallback_level < 1
+        if deferred_chunks and (
+            fallback_level >= 1 or self._no_imagery_fallback_level() >= 1
+        ):
             # Neighbouring chunks share parents; decode each one once. After
             # the allowance only the closest lower zoom is searched, which
             # bounds the work on this read thread.
@@ -15931,6 +15957,8 @@ class Tile(object):
             local_budget = TimeBudget(_partial_fallback_resolve_seconds())
             for chunk, sx, sy in deferred_chunks:
                 if id(chunk) in chunks_with_images:
+                    continue
+                if no_imagery_only and not self._chunk_is_no_imagery(chunk):
                     continue
 
                 chunk_img = None
@@ -16928,6 +16956,8 @@ class Tile(object):
             memory_reader=self._fallback_memory_jpeg,
             secondary_reader=self._fallback_lt_jpeg,
             grid_origin=(col, row),
+            no_imagery=self._chunk_has_no_imagery,
+            no_imagery_level=self._no_imagery_fallback_level(),
         )
         resolver.set_mipmap_images(self.imgs)
         return resolver
@@ -16995,8 +17025,34 @@ class Tile(object):
         """
         if _prefetch_quality_mode() == PrefetchQualityMode.STRICT_TARGET:
             return 0
+        return self._configured_fallback_level()
+
+    def _no_imagery_fallback_level(self):
+        """The fallback level for chunks the provider has no imagery for.
+
+        ``strict_target`` (``texture_wait_policy = quality``) turns fallbacks
+        off so nothing coarser is served while the real chunk may still
+        come. A chunk with no imagery never comes: it gets the configured
+        lower-zoom fallbacks, as under the other policies, not
+        ``missing_color``.
+        """
+        return self._configured_fallback_level()
+
+    @staticmethod
+    def _chunk_is_no_imagery(chunk):
+        return getattr(chunk, "failure_reason", None) == "no_imagery"
+
+    def _chunk_has_no_imagery(self, col, row, zoom):
+        """``FallbackResolver``'s test: the chunk at (col, row, zoom) is one
+        the provider has no imagery for."""
+        grid = self.chunks.get(int(zoom)) if self.chunks else None
+        chunk = grid.peek(col, row) if grid is not None else None
+        return chunk is not None and self._chunk_is_no_imagery(chunk)
+
+    def _configured_fallback_level(self):
+        """``[autoortho] fallback_level`` as 0-2, whatever the quality mode."""
         fb_value = getattr(CFG.autoortho, 'fallback_level', 'cache')
-        
+
         # Handle string values
         if isinstance(fb_value, str):
             fb_lower = fb_value.lower().strip()
@@ -17779,6 +17835,19 @@ class Tile(object):
             return unresolved
 
         pending = [i for i, source in enumerate(sources) if source is None]
+        if pending and fallback_level <= 0 and self._no_imagery_fallback_level() > 0:
+            # strict_target: chunks with no imagery still get a lower zoom
+            # (the resolver gives them _no_imagery_fallback_level).
+            no_imagery = [
+                i for i in pending if self._chunk_is_no_imagery(row_chunks[i])
+            ]
+            if no_imagery:
+                unresolved = set(resolve(
+                    no_imagery,
+                    max(deadline - time.monotonic(), _partial_fallback_resolve_seconds()),
+                ))
+                resolved_now = set(no_imagery) - unresolved
+                pending = [i for i in pending if i not in resolved_now]
         if pending and fallback_level > 0:
             # The wait for target chunks has normally spent the row deadline
             # by now. Local lookups get their own short allowance.

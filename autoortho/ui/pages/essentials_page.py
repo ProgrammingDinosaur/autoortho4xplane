@@ -86,6 +86,19 @@ class EssentialsPage(QWidget):
         q_layout.addWidget(more, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(quality)
 
+        # -- When scenery is not ready ------------------------------------------
+        waiting = QGroupBox("When Scenery Is Not Ready")
+        self.waiting_group = waiting
+        w_layout = QFormLayout(waiting)
+        self.wait_policy_combo = QComboBox()
+        self.wait_policy_combo.setAccessibleName("When scenery is not ready")
+        self.wait_policy_label = QLabel()
+        self.wait_policy_label.setWordWrap(True)
+        self.wait_policy_label.setProperty("textRole", "secondary")
+        w_layout.addRow("In flight", self.wait_policy_combo)
+        w_layout.addRow("", self.wait_policy_label)
+        layout.addWidget(waiting)
+
         # -- Auto-tuning (governor) ----------------------------------------------
         tuning = QGroupBox("Auto-Tuning")
         self.tuning_group = tuning

@@ -545,6 +545,14 @@ real_from_index = True
 # level X-Plane wants now and every coarser one, though its full resolution was
 # never downloaded. A read of a finer level switches that open to a live tile.
 partial_direct_reads = True
+# When X-Plane reads scenery that is not built yet, in flight:
+# quality = wait for full quality (up to strict_target_deadline_sec);
+# balanced = near reads wait band_max_wait_seconds, far reads far_wait_seconds,
+# then lower-resolution imagery; smooth = never wait, show the best imagery at
+# hand at once (it stays until X-Plane loads that area again). Every policy
+# waits near_wait_seconds while a flight loads. Wait settings set by hand keep
+# their own value.
+texture_wait_policy = balanced
 
 [pydds]
 # ISPC or STB for dds file compression

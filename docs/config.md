@@ -494,12 +494,42 @@ rules against real flights.
 AutoOrtho includes advanced performance settings that allow you to balance image quality against loading times and stuttering. These settings are available under **Settings → Streaming**.
 
 Key settings include:
+- **When scenery is not ready** - What X-Plane gets in flight when it reads scenery that is not built yet (see below; also on the Essentials page)
 - **Wait for nearby imagery / Wait while a flight loads** - How long X-Plane's reads of nearby textures wait for real imagery (the wait bands; distant textures never wait)
 - **Fallback Level** - How aggressively to find replacement imagery for failed chunks
 - **Spatial Prefetching** - Proactively download tiles ahead of your aircraft
 - **Dynamic Zoom Levels** - Automatically adjust imagery quality based on altitude
 
 For detailed configuration options and recommended settings for different use cases, see the [Performance Tuning Guide](performance.md).
+
+### When scenery is not ready (`texture_wait_policy`)
+- **Type:** `quality`, `balanced` or `smooth`
+- **Default:** `balanced`
+- **Config file:** `[streaming]` `texture_wait_policy = balanced`
+- **UI:** Essentials → "When Scenery Is Not Ready", and Settings → Streaming
+
+One choice for what happens when X-Plane, in flight, reads a texture that is
+not built yet. It sets the existing wait settings together:
+
+| Choice | In flight | While a flight loads | Nearby scenery may be blurry |
+|---|---|---|---|
+| **Wait for full quality** (`quality`) | waits up to `strict_target_deadline_sec` (120 s) | waits `near_wait_seconds` (60 s) | no (`prefetch_quality_mode = strict_target`) |
+| **Balanced** (`balanced`) | nearby reads wait `band_max_wait_seconds` (6 s), far ones `far_wait_seconds` (0.5 s) | waits `near_wait_seconds` | yes, after the wait |
+| **Never wait in flight** (`smooth`) | no wait | waits `near_wait_seconds` | yes, at once |
+
+- *Wait for full quality* keeps a deadline, so a provider that stops answering
+  cannot freeze X-Plane for good. X-Plane may pause on a slow connection.
+  Where the provider has no imagery at your zoom at all (often open sea), the
+  lower-zoom fallbacks of `fallback_level` fill it, as under the other choices;
+  waiting would never bring anything there.
+- *Never wait in flight* answers at once with the best imagery at hand (built
+  levels, unbuilt ones upscaled from coarser ones); the downloads go on behind
+  it. X-Plane keeps what it read until it loads that area again, so a blurry
+  texture stays blurry until then, even after the sharp one is built.
+- Every choice waits on the loading screen: X-Plane is not drawing then.
+- Wait settings you set by hand (`band_max_wait_seconds`, `far_wait_seconds`,
+  and `prefetch_quality_mode` under *Wait for full quality*) keep their own
+  value. Auto-tuning's changes to the waits do not count as set by hand.
 
 ### Provider transport and working memory
 

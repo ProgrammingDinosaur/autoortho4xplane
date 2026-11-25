@@ -196,6 +196,7 @@ _ESSENTIAL = {
     "limits.bandwidth_mbps",
     "limits.cpu_cores",
     "limits.protect_sim_fps",
+    "streaming.texture_wait_policy",
 }
 
 # Settings whose value is "auto" or a number in their range.
@@ -293,6 +294,7 @@ _USER_SECTIONS = (
     "tuning", "governor", "windows",
 )
 _USER = {
+    "streaming.texture_wait_policy",
     "autoortho.maptype_override",
     "general.hide",
     "general.update_check",
@@ -303,6 +305,7 @@ _USER = {
 # write buffer, per-tile image cache for new tiles) or resized through
 # live_settings (phase 4 of the settings refactor).
 _LIVE = {
+    "streaming.texture_wait_policy",
     "streaming.near_wait_seconds",
     "streaming.band_max_wait_seconds",
     "streaming.paging_k",

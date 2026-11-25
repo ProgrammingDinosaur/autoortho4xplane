@@ -138,7 +138,9 @@ class FallbackResolver:
                  downloader = None,
                  memory_reader: Optional[ChunkReader] = None,
                  secondary_reader: Optional[ChunkReader] = None,
-                 grid_origin: Optional[tuple] = None):
+                 grid_origin: Optional[tuple] = None,
+                 no_imagery=None,
+                 no_imagery_level: Optional[int] = None):
         """
         Initialize fallback resolver.
         
@@ -157,6 +159,13 @@ class FallbackResolver:
                 the long-term cache (checked after the local disk cache)
             grid_origin: ``(col, row)`` of the tile's first chunk at
                 ``tile_zoom``; enables upscaling lower-detail mipmap images
+            no_imagery: ``(col, row, zoom) -> bool``, True for a chunk the
+                provider has no imagery for (it will never arrive)
+            no_imagery_level: the fallback level for such chunks when it is
+                higher than ``fallback_level``. ``texture_wait_policy =
+                quality`` turns fallbacks off so nothing coarser is served
+                while the real chunk may still come; for a chunk that never
+                will, the lower zoom is the only imagery there is.
         """
         self.cache_dir = cache_dir
         self.maptype = maptype
@@ -169,7 +178,9 @@ class FallbackResolver:
         self.memory_reader = memory_reader
         self.secondary_reader = secondary_reader
         self.grid_origin = grid_origin
-        
+        self.no_imagery = no_imagery
+        self.no_imagery_level = no_imagery_level
+
         # Reference to mipmap images for scaling fallback
         self._mipmap_images: Dict[int, Any] = {}
         # (col, row, zoom) -> decoded AoImage, or None for a known miss.
@@ -236,12 +247,13 @@ class FallbackResolver:
         Returns:
             RGBA bytes (256x256x4 = 262144 bytes) on success, None if all fallbacks fail
         """
-        if self.fallback_level <= 0:
+        level = self.level_for(chunk_col, chunk_row, chunk_zoom)
+        if level <= 0:
             self.stats['total_failed'] += 1
             return None
-        
+
         # Fallback 1: Disk cache search
-        if self.fallback_level >= 1:
+        if level >= 1:
             result = self._try_disk_cache_fallback(
                 chunk_col, chunk_row, chunk_zoom, target_mipmap, time_budget
             )
@@ -257,7 +269,7 @@ class FallbackResolver:
             return None
         
         # Fallback 2: Mipmap scaling
-        if self.fallback_level >= 1:
+        if level >= 1:
             result = self._try_mipmap_scale_fallback(chunk_col, chunk_row, chunk_zoom, target_mipmap)
             if result:
                 self.stats['mipmap_scale_hits'] += 1
@@ -271,7 +283,7 @@ class FallbackResolver:
             return None
         
         # Fallback 3: Network download (expensive)
-        if self.fallback_level >= 2 and self.downloader:
+        if level >= 2 and self.downloader:
             result = self._try_network_fallback(chunk_col, chunk_row, chunk_zoom, 
                                                  target_mipmap, time_budget)
             if result:
@@ -283,6 +295,21 @@ class FallbackResolver:
         self.stats['total_failed'] += 1
         return None
     
+    def level_for(self, chunk_col: int, chunk_row: int, chunk_zoom: int) -> int:
+        """The fallback level for this chunk (see ``no_imagery_level``)."""
+        level = self.fallback_level
+        if (
+            self.no_imagery is not None
+            and self.no_imagery_level is not None
+            and self.no_imagery_level > level
+        ):
+            try:
+                if self.no_imagery(chunk_col, chunk_row, chunk_zoom):
+                    return self.no_imagery_level
+            except Exception:
+                pass
+        return level
+
     def forget_misses(self) -> None:
         """Drop cached lookups that found nothing, so chunks downloaded since
         are seen."""

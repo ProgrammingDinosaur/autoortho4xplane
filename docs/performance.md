@@ -382,6 +382,11 @@ config files may still contain and which are now ignored.
 | **Middle** | A reduced level | the same as near |
 | **Far** | The base level (one low-zoom chunk) | `far_wait_seconds`: it gets the best data at hand, and the real data is fetched behind it |
 
+`[streaming] texture_wait_policy` ("When scenery is not ready") sets these in
+flight: `balanced` uses them as they are, `smooth` waits for nothing and
+`quality` waits up to `strict_target_deadline_sec`. Values set by hand keep
+their own value. See [When scenery is not ready](config.md#when-scenery-is-not-ready-texture_wait_policy).
+
 #### Wait for Nearby Imagery in Flight (`band_max_wait_seconds`)
 - **Type:** Float (seconds)
 - **Default:** 6

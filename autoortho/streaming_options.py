@@ -29,6 +29,7 @@ DEFAULTS = {
     "read_time_colours": True,
     "real_from_index": True,
     "partial_direct_reads": True,
+    "texture_wait_policy": "balanced",
 }
 
 
@@ -44,6 +45,11 @@ def flag(name):
     if isinstance(value, str):
         return value.strip().lower() in _TRUE
     return bool(value)
+
+
+def text(name):
+    value = _raw(name)
+    return str(DEFAULTS[name] if value is None else value).strip()
 
 
 def number(name):

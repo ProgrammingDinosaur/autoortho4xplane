@@ -74,6 +74,7 @@ if __package__ and __package__.startswith("autoortho."):
     from autoortho.ui.pages.tuning_page import TuningPage
     from autoortho import governor as governor_module
     from autoortho import home_snapshot as home_snapshot_module
+    from autoortho import wait_policy
     from autoortho.ui.widgets.limits_editor import LimitsEditor
     from autoortho.ui.widgets.connection_test_panel import ConnectionTestPanel
     from autoortho import guards, hardware
@@ -166,6 +167,7 @@ else:
     from ui.pages.tuning_page import TuningPage
     import governor as governor_module
     import home_snapshot as home_snapshot_module
+    import wait_policy
     from ui.widgets.limits_editor import LimitsEditor
     from ui.widgets.connection_test_panel import ConnectionTestPanel
     import guards
@@ -319,6 +321,7 @@ class ConfigUI(QMainWindow):
         "max_zoom_mode_combo",
         "max_zoom_slider",
         "max_zoom_near_airports_slider",
+        "texture_wait_policy_combo",
         "band_wait_slider",
         "near_wait_slider",
         "fallback_level_combo",
@@ -545,6 +548,7 @@ class ConfigUI(QMainWindow):
         "governor.allow_texture_cap",
         "streaming.band_max_wait_seconds",
         "streaming.near_wait_seconds",
+        "streaming.texture_wait_policy",
         "simbrief.userid",
         "time_exclusion.default_to_exclusion",
         "time_exclusion.enabled",
@@ -1922,8 +1926,10 @@ class ConfigUI(QMainWindow):
             mirror(self.simbrief_userid_edit, page.simbrief_edit),
             mirror(self.simbrief_use_flight_data_check, page.simbrief_check),
             mirror(self.hide_check, page.hide_check),
+            mirror(self.texture_wait_policy_combo, page.wait_policy_combo),
         ]
         page.update_mode_rows()
+        self._update_wait_policy_text()
 
         sliders = (
             self.spr_sat_slider,
@@ -1971,6 +1977,7 @@ class ConfigUI(QMainWindow):
             return
         for sync in getattr(self, "_essentials_syncs", ()):
             sync()
+        self._update_wait_policy_text()
         page.update_mode_rows()
         self._refresh_essentials_profile()
         self._refresh_essentials_limits()
@@ -2692,6 +2699,7 @@ class ConfigUI(QMainWindow):
                 "sun_day_threshold_spin": -10.0,
             },
             "Streaming": {
+                "texture_wait_policy_combo": wait_policy.LABELS[wait_policy.DEFAULT],
                 "band_wait_slider": 6,
                 "near_wait_slider": 60,
                 "fallback_level_combo": "Cache Only (Balanced)",
@@ -5029,6 +5037,38 @@ class ConfigUI(QMainWindow):
         perf_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #6da4e3; margin-bottom: 5px;")
         autoortho_layout.addWidget(perf_header)
 
+        # When scenery is not ready ([streaming] texture_wait_policy): one
+        # choice that sets the waits below for the pilot (wait_policy.py).
+        policy_layout = QHBoxLayout()
+        policy_title = QLabel("When scenery is not ready:")
+        policy_title.setToolTip(
+            "What X-Plane gets when it reads scenery that is not built yet,\n"
+            "in flight. The loading screen always waits for nearby scenery.\n"
+            "Wait settings you set by hand keep their own value."
+        )
+        policy_layout.addWidget(policy_title)
+        self.texture_wait_policy_combo = QComboBox()
+        for value in wait_policy.POLICIES:
+            self.texture_wait_policy_combo.addItem(wait_policy.LABELS[value], value)
+        self.texture_wait_policy_combo.setObjectName("texture_wait_policy")
+        self.texture_wait_policy_combo.setAccessibleName("When scenery is not ready")
+        policy_index = self.texture_wait_policy_combo.findData(
+            wait_policy.normalize(
+                getattr(self.cfg.streaming, "texture_wait_policy", wait_policy.DEFAULT)
+            )
+        )
+        self.texture_wait_policy_combo.setCurrentIndex(max(0, policy_index))
+        policy_layout.addWidget(self.texture_wait_policy_combo)
+        policy_layout.addStretch()
+        autoortho_layout.addLayout(policy_layout)
+        self.texture_wait_policy_label = QLabel()
+        self.texture_wait_policy_label.setWordWrap(True)
+        self.texture_wait_policy_label.setProperty("textRole", "secondary")
+        autoortho_layout.addWidget(self.texture_wait_policy_label)
+        self.texture_wait_policy_combo.currentIndexChanged.connect(
+            self._update_wait_policy_text
+        )
+
         # Waits: the [streaming] wait bands are the only wait policy (they
         # replaced the tile time budget, per-chunk wait and startup
         # extension). Auto-tuning may move both; a value set here is pinned.
@@ -5057,6 +5097,7 @@ class ConfigUI(QMainWindow):
         band_wait_layout.addWidget(self.band_wait_slider)
         band_wait_layout.addWidget(self.band_wait_value_label)
         autoortho_layout.addLayout(band_wait_layout)
+        self._update_wait_policy_text()
 
         near_wait_layout = QHBoxLayout()
         self.near_wait_label_title = QLabel("Wait while a flight loads (seconds):")
@@ -8515,6 +8556,42 @@ class ConfigUI(QMainWindow):
         self.predictive_dds_enabled_check.setEnabled(enabled)
         self._update_predictive_dds_controls()
 
+    def _update_wait_policy_text(self, *_args):
+        """The sentence under "When scenery is not ready", and which waits
+        apply under the chosen policy."""
+        combo = getattr(self, "texture_wait_policy_combo", None)
+        if combo is None:
+            return
+        policy = wait_policy.normalize(combo.currentData())
+        text = wait_policy.DESCRIPTIONS[policy]
+        keys = ["band_max_wait_seconds", "far_wait_seconds"]
+        if policy == wait_policy.QUALITY:
+            keys.append("prefetch_quality_mode")
+        hand = [
+            key for key in keys
+            if wait_policy.hand_set(
+                "autoortho" if key == "prefetch_quality_mode" else "streaming", key
+            )
+        ] if policy != wait_policy.BALANCED else []
+        if hand:
+            text += (
+                " Set by hand, so kept as they are: "
+                + ", ".join(hand) + "."
+            )
+        for label in (
+            getattr(self, "texture_wait_policy_label", None),
+            getattr(getattr(self, "essentials_page", None), "wait_policy_label", None),
+        ):
+            if label is not None:
+                label.setText(text)
+        # The in-flight wait slider only applies under Balanced (or when it
+        # was set by hand).
+        slider = getattr(self, "band_wait_slider", None)
+        if slider is not None:
+            slider.setEnabled(
+                policy == wait_policy.BALANCED or "band_max_wait_seconds" in hand
+            )
+
     def _update_quality_controls(self, *_args):
         enabled = self.prefetch_enabled_check.isChecked()
         mode = self.prefetch_quality_mode_combo.currentData()
@@ -10778,6 +10855,15 @@ class ConfigUI(QMainWindow):
             except ImportError:
                 pass  # Module not loaded yet, pool will be created correctly on first use
             
+            policy_combo = getattr(self, "texture_wait_policy_combo", None)
+            if policy_combo is not None:
+                policy = wait_policy.normalize(policy_combo.currentData())
+                before = wait_policy.normalize(
+                    getattr(self.cfg.streaming, "texture_wait_policy", None)
+                )
+                self.cfg.streaming.texture_wait_policy = policy
+                if policy != before:
+                    self._changed_live_waits.append("streaming.texture_wait_policy")
             # Waits (the [streaming] bands): published live when changed.
             for key, slider in (
                 ("band_max_wait_seconds", self.band_wait_slider),

@@ -380,3 +380,30 @@ def test_fix_can_change_limits(qt_app, config_ui):
     assert config_ui.limits_editor.values()["bandwidth_mbps"] == "40"
     config_ui._apply_guard_fix(guards.Fix("y", {"cache.file_cache_size": "55"}))
     assert config_ui.file_cache_slider.value() == 55
+
+
+def test_wait_policy_choice_is_mirrored_described_and_saved(qt_app, config_ui):
+    """"When scenery is not ready" (hybrid read path plan, N5)."""
+    import wait_policy
+
+    ess = config_ui.essentials_page
+    owner = config_ui.texture_wait_policy_combo
+    assert [owner.itemData(i) for i in range(owner.count())] == list(wait_policy.POLICIES)
+    assert owner.currentData() == "balanced"
+    assert ess.wait_policy_combo.count() == owner.count()
+    assert ess.wait_policy_label.text() == wait_policy.DESCRIPTIONS["balanced"]
+
+    ess.wait_policy_combo.setCurrentIndex(ess.wait_policy_combo.findData("smooth"))
+    qt_app.processEvents()
+    assert owner.currentData() == "smooth"
+    assert config_ui.texture_wait_policy_label.text() == wait_policy.DESCRIPTIONS["smooth"]
+    assert ess.wait_policy_label.text() == wait_policy.DESCRIPTIONS["smooth"]
+    assert not config_ui.band_wait_slider.isEnabled()
+    assert config_ui.settings_session.dirty is True
+
+    config_ui.save_config(persist=False, refresh_scenery=False)
+    assert config_ui.cfg.streaming.texture_wait_policy == "smooth"
+    assert "streaming.texture_wait_policy" in config_ui._changed_live_waits
+
+    config_ui.on_revert()
+    assert ess.wait_policy_combo.currentIndex() == owner.currentIndex()
