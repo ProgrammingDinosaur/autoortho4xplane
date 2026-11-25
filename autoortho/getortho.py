@@ -1813,6 +1813,60 @@ _shared_flight_state_lock = threading.Lock()
 _shared_flight_state_last_poll = 0.0
 _shared_flight_state_allowed = False
 _shared_flight_state_timestamp = 0.0
+# Why the worker has no flight position, for the log (one line a minute
+# while it lasts) and the flight_state_<reason> counters. A flight on
+# 2026-11-25 had none for 25 minutes with nothing in the log to say why.
+_FLIGHT_STATE_LOG_SECONDS = 60.0
+_flight_state_reason = None
+_flight_state_reason_logged_at = 0.0
+
+
+def _note_flight_state(reason, state=None, now=None):
+    """Record the outcome of a flight state sync: None when usable."""
+    global _flight_state_reason, _flight_state_reason_logged_at
+    now = time.monotonic() if now is None else now
+    if reason is None:
+        if _flight_state_reason is not None:
+            log.info("Flight position from the parent available again")
+        _flight_state_reason = None
+        return
+    try:
+        bump(f"flight_state_{reason}")
+    except Exception:
+        pass
+    if (
+        reason != _flight_state_reason
+        or now - _flight_state_reason_logged_at >= _FLIGHT_STATE_LOG_SECONDS
+    ):
+        detail = ""
+        if isinstance(state, dict):
+            try:
+                age = time.time() - float(state.get("timestamp", 0.0))
+                detail = (
+                    f" (age {age:.1f} s, connected={state.get('connected')}, "
+                    f"data_valid={state.get('data_valid')}, "
+                    f"has_ever_connected={state.get('has_ever_connected')})"
+                )
+            except (TypeError, ValueError):
+                pass
+        log.info(f"No flight position from the parent: {reason}{detail}")
+        _flight_state_reason_logged_at = now
+    _flight_state_reason = reason
+
+
+def _flight_state_problem(state, fresh):
+    """Why a parent flight state cannot be used, or None."""
+    if not isinstance(state, dict):
+        return "missing"
+    if not fresh:
+        return "stale"
+    if not state.get("connected"):
+        return "not_connected"
+    if not state.get("data_valid"):
+        return "invalid"
+    if not state.get("has_ever_connected"):
+        return "never_connected"
+    return None
 
 
 def _sync_shared_flight_state() -> bool:
@@ -1838,10 +1892,12 @@ def _sync_shared_flight_state() -> bool:
         state = get_stat("flight_state")
         if not isinstance(state, dict):
             _shared_flight_state_allowed = False
+            _note_flight_state("missing", state, now)
             return False
         try:
             state_timestamp = float(state.get("timestamp", 0.0))
             fresh = time.time() - state_timestamp <= 3.0
+            _note_flight_state(_flight_state_problem(state, fresh), state, now)
             connected = bool(state.get("connected")) and fresh
             data_valid = bool(state.get("data_valid")) and fresh
             has_connected = bool(state.get("has_ever_connected"))
@@ -1879,8 +1935,9 @@ def _sync_shared_flight_state() -> bool:
             _shared_flight_state_allowed = bool(
                 connected and data_valid and has_connected
             )
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError) as exc:
             _shared_flight_state_allowed = False
+            _note_flight_state(f"malformed_{type(exc).__name__.lower()}", state, now)
         return _shared_flight_state_allowed
 
 

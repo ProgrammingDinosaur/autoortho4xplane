@@ -716,8 +716,16 @@ class AOMount:
                         self._shared_store.set(
                             "flight_state", flight_state
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Workers then have no position (no prefetch ahead,
+                        # no partial cache entries): say so, once a minute.
+                        now_mono = time.monotonic()
+                        if now_mono - getattr(self, "_flight_state_error_at", -1e9) >= 60.0:
+                            self._flight_state_error_at = now_mono
+                            log.warning(
+                                "Could not publish the flight state to the mount "
+                                "workers: %s: %s", type(exc).__name__, exc,
+                            )
 
                     # Aggregate mm and partial-mm counters into averages and counts
                     try:

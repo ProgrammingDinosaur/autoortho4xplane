@@ -505,3 +505,56 @@ def test_mark_live_checks_coordinator_even_when_tile_is_already_live(
     tile.mark_live()
 
     assert promoted == [tile]
+
+
+def _parent_state(**overrides):
+    state = {
+        "connected": True, "data_valid": True, "has_ever_connected": True,
+        "lat": 20.5, "lon": -99.5, "alt": 1000.0, "hdg": 90.0, "spd": 80.0,
+        "local_time_sec": 36000.0, "pressure_alt": 5000.0, "sun_pitch": 20.0,
+        "timestamp": getortho.time.time(),
+    }
+    state.update(overrides)
+    return state
+
+
+def test_worker_says_why_it_has_no_flight_position(monkeypatch, caplog):
+    """Each reason the parent's flight state cannot be used is counted
+    (flight_state_<reason>) and logged, once a minute while it lasts."""
+    bumps = []
+    monkeypatch.setattr(getortho, "bump", lambda name, n=1: bumps.append(name))
+    monkeypatch.setattr(getortho.datareftracker, "running", False)
+    monkeypatch.setattr(getortho, "_flight_state_reason", None)
+    monkeypatch.setattr(getortho, "_flight_state_reason_logged_at", 0.0)
+    current = {"state": None}
+    monkeypatch.setattr(
+        getortho, "get_stat",
+        lambda key: current["state"] if key == "flight_state" else 0,
+    )
+
+    def sync(state):
+        current["state"] = state
+        monkeypatch.setattr(getortho, "_shared_flight_state_last_poll", 0.0)
+        return getortho._sync_shared_flight_state()
+
+    caplog.set_level("INFO", logger=getortho.log.name)
+    assert sync(None) is False
+    assert sync(_parent_state(timestamp=getortho.time.time() - 30)) is False
+    assert sync(_parent_state(connected=False)) is False
+    assert sync(_parent_state(data_valid=False)) is False
+    assert sync(_parent_state()) is True
+    assert bumps == [
+        "flight_state_missing", "flight_state_stale",
+        "flight_state_not_connected", "flight_state_invalid",
+    ]
+    text = caplog.text
+    assert "No flight position from the parent: missing" in text
+    assert "No flight position from the parent: stale (age 30" in text
+    assert "available again" in text
+
+    # The same reason again within a minute: counted, not logged again.
+    caplog.clear()
+    getortho._note_flight_state("stale", None, now=getortho._flight_state_reason_logged_at)
+    getortho._note_flight_state("stale", None, now=getortho._flight_state_reason_logged_at + 1)
+    assert caplog.text.count("No flight position") == 1
+    assert bumps[-2:] == ["flight_state_stale", "flight_state_stale"]
