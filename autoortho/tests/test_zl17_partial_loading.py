@@ -666,3 +666,21 @@ def test_bounded_native_partial_build_matches_default():
         bounded = AoDDS.build_partial_mipmap(sources, 4, 3, max_threads=threads)
         assert bounded.success
         assert bounded.data == default.data
+
+
+def test_chunk_grid_close_during_materialize_raises_nothing(monkeypatch, tmp_path):
+    """A tile closed while prefetch materializes its chunks: close() clears
+    the slots between their creation and the read back. That raised
+    KeyError ("Prefetch coordinator admission failed"); the chunks are now
+    read back under the lock that created them."""
+    grid = _grid(monkeypatch, tmp_path)
+    real_probe = grid._probe_chunks
+
+    def probe_then_close(chunks):
+        real_probe(chunks)
+        grid.close()  # what the tile's close does meanwhile
+
+    monkeypatch.setattr(grid, "_probe_chunks", probe_then_close)
+    chunks = grid.ensure_range(0, 32)
+    assert len(chunks) == 32
+    assert grid.materialized() == ()

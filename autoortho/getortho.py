@@ -10479,11 +10479,15 @@ class ChunkGrid:
                     chunk = self._new_chunk(index)
                     self._slots[index] = chunk
                     created.append(chunk)
+            # Read back under the same lock: a close() (the tile closed
+            # while prefetch admitted it) clears the slots, and a read
+            # after the lock raised KeyError.
+            chunks = [self._slots[index] for index in range(start, end)]
         if created:
             bump("logical_chunks_materialized", len(created))
             profile_gauge("chunk_grid.materialized", len(self._slots))
             self._probe_chunks(created)
-        return [self._slots[index] for index in range(start, end)]
+        return chunks
 
     def ensure_rows(self, start_row, end_row):
         start_row = max(0, int(start_row))
