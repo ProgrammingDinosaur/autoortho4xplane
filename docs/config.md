@@ -726,6 +726,23 @@ closer and reads a finer level, that open switches to a live tile, which costs
 what it would have cost without direct reads. When more than one partial open in
 ten switches, AutoOrtho asks partial files for one level finer.
 
+### Native direct reads (`native_direct_reads`)
+- **Type:** Boolean
+- **Default:** False
+- **Config file:** `[streaming]` `native_direct_reads = False`
+
+With this on, reads of a texture served from its cache file are answered by
+native code in the mount (part of the aopipeline library) instead of Python:
+complete files, partial files of far textures, and textures with season
+colours (applied in native code). A ready texture then costs X-Plane little
+more than a plain file, and stays fast when X-Plane reads many textures at
+once or AutoOrtho is busy building others. Native code answers only what
+Python declared when the texture was opened; a read of a level a partial file
+lacks, a row not yet checked, and any read it has a doubt about go through
+Python as before. Off, or with a library built before this feature, the mount reads
+through Python only. Takes effect at the next start; off while
+`AO_READ_TRACE` records a trace.
+
 ### Apple Maps Caveat
 
 When using Apple Maps (`APPLE`) as your imagery source, downloads **always use the Python HTTP client** instead of the native libcurl client. This is because Apple Maps requires:

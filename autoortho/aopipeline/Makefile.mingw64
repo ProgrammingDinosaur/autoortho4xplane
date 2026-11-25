@@ -25,7 +25,7 @@ LDFLAGS     := -shared -static-libgcc -fopenmp
 LIBS        := -L$(JPGT)/lib -lturbojpeg
 
 # Source files (no HTTP - uses Python requests instead)
-SOURCES     := aocache.c aodecode.c aodds.c aopipeline.c
+SOURCES     := aocache.c aodecode.c aodds.c aopipeline.c aofast.c
 OBJECTS     := $(SOURCES:.c=.o)
 
 .PHONY: all clean phase1 phase2 phase3 libjpeg-turbo-gcc64 windows-bundle
@@ -62,6 +62,10 @@ aodds.o: aodds.c aodds.h aodecode.h internal.h
 
 aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h internal.h
 	$(CC) $(CFLAGS_DLL) -c aopipeline.c -o $@
+
+# Native reads of textures served from disk (hybrid read path plan, S2).
+aofast.o: aofast.c aofast.h
+	$(CC) $(CFLAGS_DLL) -c aofast.c -o $@
 
 # Full library
 aopipeline.dll: $(OBJECTS) libjpeg-turbo-gcc64

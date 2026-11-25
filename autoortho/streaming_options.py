@@ -30,6 +30,7 @@ DEFAULTS = {
     "real_from_index": True,
     "partial_direct_reads": True,
     "texture_wait_policy": "balanced",
+    "native_direct_reads": False,
 }
 
 

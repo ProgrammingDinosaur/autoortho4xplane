@@ -21,7 +21,7 @@ CFLAGS      := -O3 -g -Wall -fPIC -fvisibility=hidden -fdiagnostics-color \
 LDFLAGS     := -shared -rdynamic -fopenmp -pthread
 
 # Source files (no HTTP - uses Python requests instead)
-SOURCES     := aocache.c aodecode.c aodds.c aopipeline.c
+SOURCES     := aocache.c aodecode.c aodds.c aopipeline.c aofast.c
 OBJECTS     := $(SOURCES:.c=.o)
 
 .PHONY: all clean phase1 phase2 phase3 release-bundle
@@ -56,6 +56,10 @@ aodds.o: aodds.c aodds.h aodecode.h internal.h
 
 aopipeline.o: aopipeline.c aopipeline.h aocache.h aodecode.h aodds.h internal.h
 	$(CC) $(CFLAGS) -c aopipeline.c -o $@
+
+# Native reads of textures served from disk (hybrid read path plan, S2).
+aofast.o: aofast.c aofast.h
+	$(CC) $(CFLAGS) -c aofast.c -o $@
 
 # Full library with static turbojpeg
 libaopipeline.so: $(OBJECTS) $(TJ_LIB)

@@ -533,6 +533,82 @@ def test_fallback_is_cut_at_the_end_too(monkeypatch, tmp_path):
     assert len(ao.read(PATH, 65536, SIZE_8K_BC1 - 10, 0)) == 10
 
 
+def test_native_reads_through_the_mount(monkeypatch, tmp_path):
+    """Tier 1 answers checked rows, tier 2 checks the others and tells tier
+    1, release frees the slot (hybrid read path plan, N7)."""
+    import ctypes
+    import os
+
+    from aopipeline import AoFast
+    from dds_manifest import MipmapSource, RowBuildManifest
+    from disk_texture import DiskTexture, mip_layout
+
+    lib = os.environ.get(AoFast.ENV_LIB) or None
+    native = AoFast.load(lib) if lib else AoFast.load()
+    if native is None:
+        pytest.skip("aopipeline library without native reads (aofast)")
+    module, ao = _fuse(monkeypatch, tmp_path, "ok", size=SIZE_4K_BC1)
+    levels = mip_layout(4096, 4096, "BC1")
+    data = bytearray(os.urandom(SIZE_4K_BC1))
+    data[:4] = b"DDS "
+    data = bytes(data)
+    dds = tmp_path / "tex.dds"
+    dds.write_bytes(data)
+    row_bytes = levels[0].length // 16
+    manifests = {
+        r: RowBuildManifest.create(
+            tile_id="t", target_zoom=16, mipmap=0, row_index=r, build_generation=1,
+            sources=bytes([int(MipmapSource.TARGET_PROVIDER)] * 16),
+            compressed_data=data[128 + r * row_bytes:128 + (r + 1) * row_bytes],
+        )
+        for r in range(16)
+    }
+    texture = DiskTexture(
+        {"key": "k", "tile_id": "t", "max_zoom": 16, "size": len(data), "width": 4096,
+         "height": 4096, "fmt": "BC1", "manifests": manifests, "finest_level": 0,
+         "dds_path": str(dds), "mtime_ns": os.stat(dds).st_mtime_ns},
+        unpin=lambda key: None, invalidate=lambda *a: None,
+    )
+    texture.colour_table_now = lambda: None
+    handle, _table = ao._register_native(native, texture)
+    assert handle & AoFast.TAG
+    ao._direct[handle] = module._DirectHandle(texture, native=handle, native_reads=native)
+
+    python_reads = []
+
+    def python_read(path, buf, size, offset, fi):  # what mfusepy's wrapper does
+        fh = ctypes.c_uint64.from_address(fi + 8).value
+        python_reads.append(offset)
+        got = ao.read(path.decode(), size, offset, fh)
+        ctypes.memmove(buf, got, len(got))
+        return len(got)
+
+    native.set_fh_offset(8)
+    mount = native.attach_callback(python_read)
+    fi = (ctypes.c_uint64 * 6)(0, handle)
+
+    def read(offset, size):
+        buf = ctypes.create_string_buffer(size)
+        n = native.read_mount(mount, PATH.encode(), buf, size, offset, ctypes.addressof(fi))
+        return buf.raw[:n]
+
+    try:
+        for offset in range(0, len(data), 65536):
+            size = min(65536, len(data) - offset)
+            assert read(offset, size) == data[offset:offset + size]
+        first_pass = len(python_reads)
+        assert first_pass > 0, "unchecked rows went to Python, which checked them"
+        for offset in range(0, len(data), 65536):
+            size = min(65536, len(data) - offset)
+            assert read(offset, size) == data[offset:offset + size]
+        assert len(python_reads) == first_pass, "every row checked: all native"
+    finally:
+        assert ao.release(PATH, handle) == 0
+        native.uninstall(mount)
+    assert handle not in ao._direct
+    assert native.stats()["active_slots"] == 0
+
+
 def test_reads_are_cut_only_at_a_size_an_open_recorded(monkeypatch, tmp_path):
     """getattr's estimate (from the configured zoom) never cuts a read: under
     dynamic or airport zoom it can be smaller than the real texture."""

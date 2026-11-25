@@ -300,7 +300,7 @@ class DiskTexture:
             return b""
         length = min(length, self.size - offset)
         end = offset + length
-        first_needed = self._note_read(offset, length)
+        first_needed = 0 if self.classified_natively else self._note_read(offset, length)
         try:
             if self.finest_level:
                 data = self._read_partial(offset, end, first_needed)
@@ -393,6 +393,48 @@ class DiskTexture:
                 self._invalidate(self.tile_id, self.max_zoom)
             except Exception as exc:
                 log.debug(f"Could not invalidate {self.tile_id}: {exc}")
+
+    def note_wanted_level(self, level: int) -> None:
+        """X-Plane wanted ``level`` of this texture (a sample native code
+        gathered): feed the paging model as a read in Python would."""
+        if self._note_wanted is None:
+            return
+        try:
+            self._note_wanted(int(level), max(1, self.width >> int(level)))
+        except Exception:  # statistics only
+            pass
+
+    def native_spec(self) -> Optional[dict]:
+        """What native reads need to answer this open, or None.
+
+        Complete and partial entries (hybrid read path plan, S2 and S3). The
+        season table is taken once, here: it changes only when the day does,
+        and the native code applies it to every answer of this open.
+        """
+        if self._closed or self._file.bad:
+            return None
+        block_size = 16 if str(self.fmt).upper() in ("BC3", "DXT5") else 8
+        if self.colour_table_now is None:
+            return None
+        try:
+            table = self.colour_table_now()
+        except Exception:
+            return None
+        if table is not None and int(self.colour_block_bytes) != block_size:
+            return None
+        return {
+            "path": self._file.path,
+            "size": self.size,
+            "mtime_ns": self._file.key[2],
+            "levels": self._levels,
+            "row_start": self._row_start,
+            "row_bytes": self._row_bytes,
+            "rows": self._rows,
+            "verified_rows": set(self._file.verified_rows),
+            "finest_level": self.finest_level,
+            "block_size": block_size,
+            "table": table,
+        }
 
     # ------------------------------------------------------------------
     def _note_read(self, offset, length) -> int:

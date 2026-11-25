@@ -89,6 +89,153 @@ except ImportError:
 _DDS_FAULTS = debug_faults.DdsFaults.from_env()
 
 
+# ---------------------------------------------------------------------------
+# Native reads (hybrid read path plan, S2; [streaming] native_direct_reads).
+#
+# The read callback of a mount's fuse_operations is swapped for native code
+# (aopipeline/aofast.c) that answers reads of complete textures served from
+# their cache file without Python. It hands every other read, and any read it
+# has a doubt about, to the Python callback it replaced. The swap happens in
+# mfusepy's call of fuse_main_real, which gets the struct.
+# ---------------------------------------------------------------------------
+
+_native_pending = threading.local()  # the AutoOrtho whose FUSE() is starting
+_native_hook_lock = threading.Lock()
+_native_hooked = set()  # ids of the mfusepy modules whose fuse_main_real is wrapped
+_native_registry = {}  # tagged handle -> DiskTexture, for the drained samples
+_native_registry_lock = threading.Lock()
+_native_drain_started = False
+
+
+def _aofast():
+    if __package__ and __package__.startswith("autoortho"):
+        from autoortho.aopipeline import AoFast
+    else:
+        from aopipeline import AoFast
+    return AoFast
+
+
+def _native_reads_setting():
+    value = getattr(getattr(CFG, "streaming", None), "native_direct_reads", False)
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+def _hook_fuse_main(module):
+    """Wrap ``module.fuse_main_real`` once: a FUSE() started inside
+    :func:`native_reads_for` gets its read callback swapped."""
+    with _native_hook_lock:
+        if id(module) in _native_hooked:
+            return
+        real = module.fuse_main_real
+
+        def fuse_main_real(argc, argv, ops_pointer, size, ctx):
+            ao = getattr(_native_pending, "ao", None)
+            _native_pending.ao = None
+            if ao is not None:
+                try:
+                    ao._attach_native(ops_pointer.contents)
+                except Exception as exc:
+                    log.warning(f"Native texture reads not installed: {exc}")
+            try:
+                return real(argc, argv, ops_pointer, size, ctx)
+            finally:
+                if ao is not None:
+                    ao._detach_native()
+
+        module.fuse_main_real = fuse_main_real
+        _native_hooked.add(id(module))
+
+
+class native_reads_for:
+    """Context manager around ``FUSE(ao, ...)``: native reads for that mount
+    when ``[streaming] native_direct_reads`` is on and the library has them.
+
+    With a read trace (``AO_READ_TRACE``) as well, native reads stay on: the
+    trace keeps opens (marked ``native``) and releases, and the reads native
+    code answers are not in it. A trace meant for replaying needs every read:
+    record it with native reads off.
+
+    Off, or anything missing: the mount behaves exactly as without it.
+    """
+
+    def __init__(self, ao, fuse_class=None):
+        self.ao = ao
+        self.fuse_class = fuse_class or FUSE
+
+    def __enter__(self):
+        ao = self.ao
+        if not _native_reads_setting():
+            return ao
+        try:
+            native = _aofast().load()
+            if native is None:
+                return ao
+            import sys
+            module = sys.modules.get(self.fuse_class.__module__)
+            if module is None or not hasattr(module, "fuse_main_real"):
+                return ao
+            native.set_fh_offset(module.fuse_file_info.fh.offset)
+            _hook_fuse_main(module)
+        except Exception as exc:
+            log.warning(f"Native texture reads unavailable: {exc}")
+            return ao
+        ao._native_candidate = native
+        _native_pending.ao = ao
+        return ao
+
+    def __exit__(self, *exc_info):
+        _native_pending.ao = None
+        return False
+
+
+def _start_native_drain(native):
+    """Once a second: wanted levels to the paging model, counters to STATS."""
+    global _native_drain_started
+    with _native_registry_lock:
+        if _native_drain_started:
+            return
+        _native_drain_started = True
+
+    def loop():
+        last = {}
+        while True:
+            time.sleep(1.0)
+            try:
+                _drain_native_once(native, last)
+            except Exception as exc:
+                log.debug(f"Native read drain failed: {exc}")
+
+    threading.Thread(target=loop, name="AO-native-reads", daemon=True).start()
+
+
+def _feed_native_samples(texture, samples):
+    for level, count in samples:
+        for _ in range(min(int(count), 4)):
+            texture.note_wanted_level(int(level))
+
+
+def _drain_native_once(native, last):
+    by_handle = {}
+    for handle, level, count in native.drain():
+        by_handle.setdefault(handle, []).append((level, count))
+    if by_handle:
+        with _native_registry_lock:
+            textures = {h: _native_registry.get(h) for h in by_handle}
+        for handle, samples in by_handle.items():
+            texture = textures.get(handle)
+            if texture is not None:
+                _feed_native_samples(texture, samples)
+    stats = native.stats()
+    for name in ("reads", "bytes", "deferred", "deferred_rows", "deferred_io",
+                 "deferred_closed", "deferred_level", "past_end"):
+        delta = stats.get(name, 0) - last.get(name, 0)
+        if delta > 0:
+            _bump_stat(f"dds_native_{name}", delta)
+    last.update(stats)
+
+
 def _bump_stat(name, value=1):
     """Count ``name`` in STATS; never fails a read."""
     try:
@@ -694,12 +841,17 @@ class _DirectHandle:
     served by a live tile (holding a tile reference until release).
     """
 
-    __slots__ = ("texture", "live", "lock")
+    __slots__ = ("texture", "live", "lock", "native", "native_reads", "native_table")
 
-    def __init__(self, texture):
+    def __init__(self, texture, native=0, native_reads=None, native_table=-1):
         self.texture = texture
         self.live = False
         self.lock = threading.Lock()
+        # The tagged handle when native code answers this open's reads, and
+        # the season table entry it uses (-1: none).
+        self.native = native
+        self.native_reads = native_reads
+        self.native_table = native_table
 
 
 class _KeyLocks:
@@ -1726,17 +1878,31 @@ class AutoOrtho(Operations):
                 getortho.register_discovered_maptype(maptype)
 
             tile_id = f"{row}_{col}_{maptype}_{zoom}"
-            if self._read_trace is not None:
-                self._read_trace.event("open", path)
+            trace_started = time.monotonic() if self._read_trace is not None else None
             getortho.note_texture_requested(row, col, zoom)
             # A finished texture is served from its cache file, with no
             # tile in memory (see disk_texture.py).
             direct = getortho.open_disk_texture(self.tc, row, col, maptype, zoom)
             if direct is not None:
-                fh = next(self._direct_fh)
+                native = self._native
+                fh, table = (
+                    self._register_native(native, direct) if native is not None else (0, -1)
+                )
+                if not fh:
+                    native = None
+                    fh = next(self._direct_fh)
                 with self._direct_lock:
-                    self._direct[fh] = _DirectHandle(direct)
+                    self._direct[fh] = _DirectHandle(
+                        direct, native=fh if native else 0, native_reads=native,
+                        native_table=table,
+                    )
                 self._set_dds_size_cached(row, col, maptype, zoom, direct.size)
+                if trace_started is not None:
+                    self._trace_open(
+                        path, trace_started,
+                        "partial" if getattr(direct, "finest_level", 0) else "direct",
+                        native=bool(native),
+                    )
                 return fh
             with profile_span(
                 "fuse.dds_open",
@@ -1749,6 +1915,8 @@ class AutoOrtho(Operations):
             except Exception:
                 log.debug(f"OPEN: Failed getting cache size for tile at {path}")
                 pass
+            if trace_started is not None:
+                self._trace_open(path, trace_started, "live")
             return 0
 
         if path.endswith('AOISWORKING'):
@@ -1793,6 +1961,17 @@ class AutoOrtho(Operations):
             return os.open(full_path, flags | os.O_BINARY)
         return os.open(full_path, flags)
 
+    def _trace_open(self, path, started, tier, native=False):
+        """A texture open in the read trace, timed like a read: ``t`` is when
+        it ended, ``ms`` how long it took, ``tier`` what will answer it."""
+        trace = self._read_trace
+        if trace is None:
+            return
+        trace.event(
+            "open", path, ms=round((time.monotonic() - started) * 1000.0, 3),
+            tier=tier, native=True if native else None, tid=threading.get_ident(),
+        )
+
     def _switch_direct_to_live(self, direct, row, col, maptype, zoom):
         """Serve the rest of a direct open from a live tile.
 
@@ -1802,9 +1981,74 @@ class AutoOrtho(Operations):
         with direct.lock:
             if direct.live:
                 return
+            if direct.native and direct.native_reads is not None:
+                # Native code must not answer from the file any more: one
+                # open is served from one source.
+                direct.native_reads.disable(direct.native)
             self.tc._open_tile(row, col, maptype, zoom)
             direct.live = True
         getortho.bump("dds_direct_fallbacks")
+
+    # -- native reads ---------------------------------------------------------
+
+    def _attach_native(self, ops):
+        native = self._native_candidate
+        if native is None:
+            return
+        mount = native.install(ops)
+        if mount < 0:
+            log.warning("Native texture reads: no free mount entry, reads stay in Python")
+            return
+        self._native = native
+        self._native_mount = mount
+        _start_native_drain(native)
+        log.info(f"Native texture reads on for {self.root} ({native.version})")
+
+    def _detach_native(self):
+        native, self._native = self._native, None
+        if native is not None:
+            native.uninstall(self._native_mount)
+            self._native_mount = -1
+
+    def _register_native(self, native, texture):
+        """``(tagged handle, season table entry)`` of a texture native code
+        can answer, or ``(0, -1)``."""
+        try:
+            spec = texture.native_spec()
+            if spec is None:
+                return 0, -1
+            handle, table = native.register(**spec)
+        except Exception as exc:
+            log.debug(f"Native registration of {texture.tile_id} failed: {exc}")
+            return 0, -1
+        if not handle:
+            _bump_stat("dds_native_register_failed")
+            return 0, -1
+        texture.classified_natively = True
+        texture.on_rows_verified = lambda rows, h=handle: native.mark_verified(h, rows)
+        with _native_registry_lock:
+            _native_registry[handle] = texture
+        _bump_stat("dds_native_opens")
+        if spec.get("finest_level"):
+            _bump_stat("dds_native_partial_opens")
+        if table >= 0:
+            _bump_stat("dds_native_season_opens")
+        return handle, table
+
+    def _unregister_native(self, direct):
+        native = direct.native_reads
+        if not direct.native or native is None:
+            return
+        try:
+            samples = native.unregister(direct.native)
+            native.release_table(direct.native_table)
+        except Exception as exc:
+            log.error(f"Native read slot release failed: {exc}")
+            samples = []
+        with _native_registry_lock:
+            _native_registry.pop(direct.native, None)
+        if samples:
+            _feed_native_samples(direct.texture, samples)
 
     def _create(self, path, mode, fi=None):
         uid, gid, pid = fuse_get_context()
@@ -2098,6 +2342,8 @@ class AutoOrtho(Operations):
                 with self._direct_lock:
                     direct = self._direct.pop(fh, None)
                 if direct is not None:
+                    # Waits for native reads in flight, then closes the slot.
+                    self._unregister_native(direct)
                     with direct.lock:
                         direct.texture.close()
                         live = direct.live
@@ -2162,7 +2408,8 @@ def run(ao, mountpoint, name="", nothreads=False):
             f"{', '.join(sorted(map(str, options.keys())))}")
 
     try:
-        FUSE(ao, os.path.abspath(mountpoint), **options)
+        with native_reads_for(ao, FUSE):
+            FUSE(ao, os.path.abspath(mountpoint), **options)
         log.info(f"FUSE: Exiting mount {mountpoint}")
         return
     except Exception as e:

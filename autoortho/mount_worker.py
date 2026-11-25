@@ -369,7 +369,8 @@ def _serve_shared(mounts, nothreads, runtime):
                         return  # another mount already failed
                     mounted[mountpoint] = path
                 log.info("Starting FUSE mount %s", mountpoint)
-                FUSE(ao, path, **fuse_option_profiles_by_os(nothreads, volname))
+                with _native_reads_for(ao, FUSE):
+                    FUSE(ao, path, **fuse_option_profiles_by_os(nothreads, volname))
             log.info("FUSE: Exiting mount %s", mountpoint)
         except BaseException as exc:  # one mount failing fails the worker
             log.error("FUSE mount %s failed: %s", mountpoint, exc)
@@ -499,11 +500,12 @@ def main():
             with setupmount(args.mountpoint, mount_systemtype) as mountpoint:
                 ao = AutoOrtho(args.root, use_ns=True)
                 _start_control_thread(os.path.abspath(mountpoint))
-                FUSE(
-                    ao,
-                    os.path.abspath(mountpoint),
-                    **additional_args,
-                )
+                with _native_reads_for(ao, FUSE):
+                    FUSE(
+                        ao,
+                        os.path.abspath(mountpoint),
+                        **additional_args,
+                    )
             log.info("FUSE: Exiting mount %s", args.mountpoint)
     except SystemExit:
         raise
@@ -532,3 +534,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _native_reads_for(ao, fuse_class):
+    """autoortho_fuse.native_reads_for, or a no-op when it cannot load."""
+    try:
+        from autoortho.autoortho_fuse import native_reads_for
+    except ImportError:
+        try:
+            from autoortho_fuse import native_reads_for
+        except ImportError:
+            import contextlib
+            return contextlib.nullcontext(ao)
+    return native_reads_for(ao, fuse_class)

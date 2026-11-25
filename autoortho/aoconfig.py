@@ -553,6 +553,10 @@ partial_direct_reads = True
 # waits near_wait_seconds while a flight loads. Wait settings set by hand keep
 # their own value.
 texture_wait_policy = balanced
+# Answer reads of complete textures served from their cache file in native
+# code, without Python (aopipeline/aofast.c): faster when X-Plane reads many
+# textures at once. Off, or a library without it: reads go through Python.
+native_direct_reads = False
 
 [pydds]
 # ISPC or STB for dds file compression

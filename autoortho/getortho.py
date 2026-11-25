@@ -7703,6 +7703,12 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
             note_wanted=note_wanted,
             metric=metric,
         )
+        def colour_table_now():
+            # The same lookup recolour() makes on every read.
+            return season_colour_table(row, col, zoom)
+
+        texture.colour_table_now = colour_table_now
+        texture.colour_block_bytes = block_bytes
     except disk_texture.DiskTextureFailed as exc:
         log.debug(f"Direct read unavailable for {row}_{col}_{zoom}: {exc}")
         return None
