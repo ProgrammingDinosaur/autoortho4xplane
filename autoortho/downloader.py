@@ -63,6 +63,25 @@ def do_url(url, headers={}):
     return resp.content
 
 
+# A release's info file, by URL, for the life of the process. Every refresh
+# of the catalog builds new Release objects and parses them again: without
+# this each refresh downloaded every region's info file once more (297
+# requests in one flight). A published release's assets do not change.
+_release_info_cache = {}
+_release_info_lock = threading.Lock()
+
+
+def _release_info_json(url):
+    with _release_info_lock:
+        cached = _release_info_cache.get(url)
+    if cached is not None:
+        return cached
+    data = do_url(url)
+    with _release_info_lock:
+        _release_info_cache[url] = data
+    return data
+
+
 cur_activity = {}
 
 
@@ -865,8 +884,7 @@ class Release(object):
         for a in self.release_dict.get('assets', []):
             asset_name = a.get('name')
             if asset_name.endswith("_info.json"):
-                resp = do_url(a.get('browser_download_url'))
-                info = json.loads(resp)
+                info = json.loads(_release_info_json(a.get('browser_download_url')))
                 #log.info(info)
 
         # Set attrs from info json

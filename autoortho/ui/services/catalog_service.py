@@ -1,9 +1,12 @@
 """Scenery catalog service."""
 
+import logging
 from dataclasses import dataclass
 from threading import Event
 
 from .common import ServiceError, ServiceErrorCode, ServiceResult
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,21 @@ class CatalogService:
                     str(exc),
                 )
             )
+        # Each region's latest release reads its info file from GitHub. That
+        # belongs here, on the worker: the window used to do it while drawing
+        # the list, on its main thread, where a slow answer froze it and a
+        # timeout went uncaught. A region whose info cannot be read is still
+        # listed, with what the release list says about it.
+        for region in list(self.manager.regions.values()):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            try:
+                region.get_latest_release().parse()
+            except Exception as exc:
+                log.warning(
+                    "Could not read the release info of %s: %s",
+                    getattr(region, "region_id", region), exc,
+                )
         if cancel_event is not None and cancel_event.is_set():
             return ServiceResult(
                 error=ServiceError(

@@ -6990,8 +6990,10 @@ class ConfigUI(QMainWindow):
                 child.widget().deleteLater()
 
         for r in self.dl.regions.values():
+            # Parsed by the catalog worker (it reads from GitHub); not here,
+            # on the window's thread. If that failed the release shows what
+            # the release list says: its name and version.
             latest = r.get_latest_release()
-            latest.parse()
 
             # Create scenery item frame
             item_frame = QFrame()
@@ -7032,6 +7034,7 @@ class ConfigUI(QMainWindow):
                     f"Available: v{latest.ver} | "
                     f"Size: {latest.totalsize/1048576:.2f} MB | "
                     f"Downloads: {latest.download_count}"
+                    if latest.parsed else f"Available: v{latest.ver}"
                 )
                 info_label.setStyleSheet("color: #BBB;")
                 item_layout.addWidget(info_label)
