@@ -2960,6 +2960,82 @@ def test_eviction_takes_small_entries_last(cache_dir):
         cache.close()
 
 
+def _mexico_tile(cache_dir, i):
+    """A tile whose row and column are real at its zoom (central Mexico)."""
+    tile = MockTile(row=28720 + 16 * i, col=14256, tilename_zoom=16, max_zoom=17)
+    tile.cache_dir = cache_dir
+    return tile
+
+
+def test_start_scan_takes_keys_from_paths(cache_dir, monkeypatch, sample_dds_bytes):
+    """The scan finds every entry under the key it was stored with, and reads
+    a .ddm only where the path does not settle the key."""
+    from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+    cache = _uncompressed_cache(cache_dir, monkeypatch)
+    whole, part = _mexico_tile(cache_dir, 0), _mexico_tile(cache_dir, 1)
+    odd = _tile_at(cache_dir, 0)  # row and column that fit no zoom
+    assert cache.store(whole.id, whole.max_zoom, sample_dds_bytes, whole)
+    _store_coarse_levels(cache, part)
+    _store_coarse_levels(cache, odd)
+    _settle(cache)
+    stored = {key: entry[:3] for key, entry in cache._entries.items()}
+    cache.close()
+    assert len(stored) == 3
+
+    read = []
+    real_read = DynamicDDSCache._read_ddm
+    monkeypatch.setattr(
+        DynamicDDSCache, "_read_ddm",
+        staticmethod(lambda path: read.append(path) or real_read(path)),
+    )
+    fresh = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=100, enabled=True)
+    try:
+        assert fresh.scan_existing() == 3
+        assert {key: entry[:3] for key, entry in fresh._entries.items()} == stored
+        assert fresh.get_disk_usage() == sum(entry[2] for entry in stored.values())
+        assert [os.path.basename(path) for path in read] == [
+            f"{odd.row}_{odd.col}_z{odd.max_zoom}.ddm"
+        ]
+    finally:
+        fresh.close()
+
+
+def test_key_from_path_needs_one_zoom_to_fit(dds_cache):
+    # 28720_14256 lies in +21-102 at zoom 16 and nowhere near it at any other.
+    assert dds_cache._key_from_path("28720_14256_z17.ddm", "BI", "+21-102") == (
+        "28720_14256_BI_16_z17"
+    )
+    assert dds_cache._key_from_path("28720_14256_z17.ddm", "BI", "+47-123") is None
+    assert dds_cache._key_from_path("28720_14256_z17.ddm", "", "+21-102") is None
+    assert dds_cache._key_from_path("notes.ddm", "BI", "+21-102") is None
+    # Near the corner of the map the same row and column fit several zooms.
+    assert dds_cache._key_from_path("0_0_z17.ddm", "BI", "+85-180") is None
+
+
+def test_start_scan_removes_what_is_left_over(cache_dir, monkeypatch):
+    from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+    cache = _uncompressed_cache(cache_dir, monkeypatch)
+    tile = _mexico_tile(cache_dir, 0)
+    _store_coarse_levels(cache, tile)
+    dds_path, ddm_path = cache._paths_for(
+        tile.row, tile.col, tile.maptype, tile.tilename_zoom, tile.max_zoom)
+    cache.close()
+    folder = os.path.dirname(dds_path)
+    for name in ("1_2_z17.dds", "3_4_z17.ddm.rows", "5_6_z17.ddm"):
+        with open(os.path.join(folder, name), "wb") as f:
+            f.write(b"left over")
+
+    fresh = DynamicDDSCache(cache_dir=cache_dir, max_size_mb=100, enabled=True)
+    try:
+        assert fresh.scan_existing() == 1
+        assert sorted(os.listdir(folder)) == sorted(
+            name for name in os.listdir(folder)
+            if name.startswith(f"{tile.row}_{tile.col}_"))
+        assert os.path.exists(dds_path) and os.path.exists(ddm_path)
+    finally:
+        fresh.close()
+
+
 def test_cache_counts_go_through_the_batched_counter(cache_dir, monkeypatch):
     """open_direct counts on every texture open: with getortho's counter set,
     none of those is a call to the parent's statistics store."""

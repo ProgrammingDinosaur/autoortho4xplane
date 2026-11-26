@@ -197,9 +197,11 @@ with K1 (the cache now counts through getortho's batched counter). Not
 measured yet how much of R7 it explains; other calls to the store on the
 open path, if any, are to be looked for with K0's timings.
 
-**Smaller.** The default `dds_budget_pct` in the code is 40, not 80
-(`getortho.py`, `start_predictive_dds`): a user on defaults has 12 GB for
-textures, about 270 complete ones at zoom 17. K1's "done when" does not
+**Smaller.** *Corrected 2026-11-26:* the default `dds_budget_pct` is 80,
+as on the PC of these flights (the config template in `aoconfig.py`). The
+40 first reported here was only the literal `getortho` falls back to when
+the setting is missing, which it never is; that literal is now 80 too.
+K1's "done when" does not
 need two flights at first: replaying `flight3.trace` twice against a
 running mount shows whether entries stay.
 
@@ -399,8 +401,8 @@ config template, with the setting kept as the way to turn it off.
 
 **Done when** a flight with a ready share above 50 % ends with
 `dds_native_reads` far above `dds_native_deferred`, no error, on CI's
-library; and the Linux and macOS runs are in
-`tools/bench/runs`.
+library. (The Linux and macOS runs were dropped on 2026-11-26: those
+platforms are beta, see "Decisions".)
 
 ### K6. Decide the native open (S5 of the hybrid plan)
 
@@ -474,8 +476,8 @@ Small, separate fixes; none blocks a stage above.
 3. An open that reads nothing costs under 0.5 ms at the median; the time
    in such opens is under 15 s per 25 minutes of flight.
 4. No read returns bytes that differ from today's.
-5. `native_direct_reads` is on by default, on libraries built by CI, and
-   the Linux and macOS runs are recorded.
+5. `native_direct_reads` is on by default on Windows, on libraries built
+   by CI (Linux and macOS: beta, see "Decisions").
 6. The native open (S5) is decided, with its numbers.
 
 ## Open questions
@@ -486,10 +488,28 @@ Small, separate fixes; none blocks a stage above.
   read (the tile radar on Home, the held-textures count the governor
   reads as graphics memory)?
 - Should the budget's default grow now that it will be real? 24 GB holds
-  about 550 complete zoom-17 textures, and the default share for
-  textures is 40 %, not the 80 % of the PC these flights ran on.
+  about 550 complete zoom-17 textures. *Decided, see below.*
 - Is the wait in R7 the interpreter lock (K0's switch-interval runs)?
-- How many mount workers does a usual setup run (R11)?
+
+## Decisions (2026-11-26)
+
+- **Linux and macOS are beta for this plan.** The Windows results decide
+  each stage. The recorded `read_cost` runs on Linux and macOS are no
+  longer part of K5 or of the definition of done, and the question of
+  one count per mount worker (R11, macOS only) is a known limit there,
+  not a blocker. Whether `native_direct_reads` is on by default on those
+  platforms is settled at K5, with the flight on Windows in hand; the
+  release note says the fast read path is not measured there.
+- **The texture share of the cache stays at 80 %.** It was asked to pick
+  the value best for performance and stability. The share cannot go up:
+  the imagery side (20 %, 6 GB of the default 30) held 4.6 GB after the
+  three flights of one route, so at 90 % (3 GB) the imagery a flight is
+  building from would be evicted during that flight and downloaded again.
+  It should not go down: a built texture is what a read is served from
+  with no work, and the plan's whole gain is in keeping those. To
+  revisit with the first flights after K1, when the texture side fills
+  for real: if evictions of complete textures start within one flight at
+  zoom 17, the answer is a larger `file_cache_size`, not another split.
 
 ## Implementation status
 
@@ -539,11 +559,20 @@ Updated as stages land. Nothing below is committed yet.
   with the count wrong meanwhile. An eviction pass over the 20,000
   entries took 0.03 s. Each partial entry used about 0.12 MB: NTFS
   allocates a sparse file in 64 KB pieces, so that is the floor however
-  little is written. **Follows:** the index file named under K1 is
-  needed before the cache grows; it is the next thing to build.
+  little is written.
 
-Not done in K1: that index (R12), the check with more than one worker
-(R11, macOS), the replay of flight 3 twice, the flight.
+- **R12 fixed without an index.** The scan now takes an entry's key,
+  size and age from the directory listing and its path: the file name
+  gives row, column and target zoom, the folder the map type and the
+  1 degree cell, and only one zoom of the tile's name puts that row and
+  column in that cell. The `.ddm` is read only for entries with row
+  records or whose path does not settle the key. The same 20,000
+  entries: **0.9 s** (was 62 s). No file to keep in step with the cache.
+  A `.ddm` that cannot be parsed is no longer deleted by the scan; the
+  open that finds it unusable stores over it.
+
+Not done in K1: the check with more than one worker (R11, macOS: beta),
+the replay of flight 3 twice, the flight.
 Not checked: `st_blocks` on macOS (APFS) and on ZFS, which may report
 late as NTFS does; the re-measure covers that case too.
 

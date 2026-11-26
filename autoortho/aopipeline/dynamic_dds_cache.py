@@ -20,6 +20,7 @@ import functools
 import hashlib
 import logging
 import os
+import re
 import struct
 import threading
 import time
@@ -214,6 +215,12 @@ _EVICT_SMALL_BYTES = 1024 * 1024
 # pay for). An entry is measured again for this long after each store
 # (``remeasure_recent``, called from the tile cacher's housekeeping loop).
 _REMEASURE_SECONDS = 60.0
+
+# A cache entry's metadata file: <row>_<col>_z<target zoom>.ddm
+# (utils/cache_paths.get_dds_cache_path).
+_ENTRY_FILE = re.compile(r"^(\d+)_(\d+)_z(\d+)\.ddm$")
+# The finest zoom a tile is named at, with room to spare.
+_MAX_TILE_ZOOM = 24
 
 
 def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
@@ -3167,10 +3174,21 @@ class DynamicDDSCache:
     def scan_existing(self) -> int:
         """
         Scan the DDS cache directory and populate the LRU tracking dict.
-        
+
         Called once at startup in a background thread. Discovers entries
-        written by previous sessions so they can be served immediately.
-        
+        written by previous sessions so they can be counted and evicted.
+
+        An entry's key, size and age come from the directory listing and
+        its path: the name gives row, column and target zoom, the folder
+        the map type and the 1 degree cell, and the cell with the row and
+        column gives the zoom of the tile's name. The ``.ddm`` is read only
+        for an entry with row records, or whose path does not say enough.
+        Reading every ``.ddm`` took 3 ms an entry: a minute for 20,000
+        entries, and a cache that counts disk space really used holds
+        tens of thousands (ready share plan, R12). A ``.ddm`` that cannot
+        be parsed is therefore no longer deleted here; whoever opens the
+        entry finds it unusable and stores over it.
+
         Returns:
             Number of entries discovered
         """
@@ -3179,78 +3197,67 @@ class DynamicDDSCache:
             return 0
 
         count = 0
+        read_meta = 0
+        started = time.monotonic()
         try:
-            for dirpath, _dirnames, filenames in os.walk(self._dds_root):
-                filename_set = set(filenames)
-                for fname in filenames:
+            for dirpath, files in self._scan_directories(self._dds_root):
+                for fname, entry in files.items():
+                    orphan_of = None
                     if fname.endswith(".dds"):
-                        ddm_name = fname[:-4] + ".ddm"
-                        if ddm_name not in filename_set:
-                            try:
-                                os.remove(os.path.join(dirpath, fname))
-                            except OSError:
-                                pass
+                        orphan_of = fname[:-4] + ".ddm"
                     elif fname.endswith(".ddm.rows"):
-                        ddm_name = fname[:-5]
-                        if ddm_name not in filename_set:
-                            try:
-                                os.remove(os.path.join(dirpath, fname))
-                            except OSError:
-                                pass
+                        orphan_of = fname[:-5]
+                    if orphan_of is not None and orphan_of not in files:
+                        try:
+                            os.remove(entry.path)
+                        except OSError:
+                            pass
 
-                for fname in filenames:
+                maptype = os.path.basename(dirpath)
+                cell = os.path.basename(os.path.dirname(dirpath))
+                for fname, ddm_entry in files.items():
                     if not fname.endswith(".ddm"):
                         continue
 
-                    ddm_path = os.path.join(dirpath, fname)
+                    ddm_path = ddm_entry.path
                     dds_path = ddm_path[:-4] + ".dds"
-                    rows_path = self._row_records_path(ddm_path)
-                    meta = self._read_ddm(ddm_path)
-                    if meta is None:
-                        self._delete_pair(dds_path, ddm_path)
-                        continue
+                    dds_entry = files.get(fname[:-4] + ".dds")
+                    rows_entry = files.get(fname + ".rows")
 
-                    has_dds = os.path.isfile(dds_path)
-                    if (
-                        os.path.isfile(rows_path)
-                        and not meta.get("partial_mipmaps")
-                    ):
+                    key = None
+                    if rows_entry is None:
+                        if dds_entry is None:
+                            # Metadata with nothing behind it.
+                            self._delete_pair(dds_path, ddm_path)
+                            continue
+                        key = self._key_from_path(fname, maptype, cell)
+                    if key is None:
+                        read_meta += 1
+                        key = self._scan_key_from_meta(
+                            dds_path, ddm_path, dds_entry is not None,
+                            rows_entry is not None,
+                        )
+                        if key is None:
+                            continue
+                        # The row records may have been removed just now.
+                        if rows_entry is not None and not os.path.isfile(rows_entry.path):
+                            rows_entry = None
+
+                    size = 0
+                    mtimes = []
+                    for path, listed in ((dds_path, dds_entry), (ddm_path, ddm_entry),
+                                         (self._row_records_path(ddm_path), rows_entry)):
+                        if listed is None:
+                            continue
                         try:
-                            os.remove(rows_path)
+                            st = listed.stat()
+                            size += allocated_size(path, st)
+                            mtimes.append(st.st_mtime)
                         except OSError:
                             pass
-                    has_partial_rows = (
-                        os.path.isfile(rows_path)
-                        and bool(meta.get("partial_mipmaps"))
-                    )
-                    if not has_dds and not has_partial_rows:
-                        self._delete_pair(dds_path, ddm_path)
-                        continue
-
-                    # Reconstruct the tile key from metadata
-                    row = meta.get("tile_row")
-                    col = meta.get("tile_col")
-                    maptype = meta.get("map", "")
-                    zl = meta.get("zl", 0)
-                    max_zl = meta.get("max_zl", 0)
-
-                    if row is None or col is None:
-                        continue
-
-                    tile_id = f"{row}_{col}_{maptype}_{zl}"
-                    key = self._tile_key(tile_id, max_zl)
-
-                    size = self._entry_disk_size(dds_path, ddm_path)
                     if size <= 0:
                         continue
-
                     # Use file mtime as access time for initial ordering
-                    mtimes = []
-                    for path in (dds_path, ddm_path, rows_path):
-                        try:
-                            mtimes.append(os.path.getmtime(path))
-                        except OSError:
-                            pass
                     atime = max(mtimes) if mtimes else time.time()
 
                     with self._lock:
@@ -3281,9 +3288,105 @@ class DynamicDDSCache:
                     self._entries[k] = v
 
             log.info(f"DDS cache scan: found {count} entries "
-                     f"({self._current_size / (1024*1024):.1f}MB)")
+                     f"({self._current_size / (1024*1024):.1f}MB) in "
+                     f"{time.monotonic() - started:.1f} s, "
+                     f"{read_meta} metadata files read")
 
         return count
+
+    @staticmethod
+    def _scan_directories(root: str):
+        """Yield ``(directory, {file name: DirEntry})`` for every directory
+        under ``root`` that has files. Linked directories are not entered.
+
+        A ``DirEntry`` carries the file's size, attributes and time from the
+        listing on Windows, so sizing an entry costs no call per file.
+        """
+        stack = [root]
+        while stack:
+            dirpath = stack.pop()
+            files = {}
+            try:
+                listing = os.scandir(dirpath)
+            except OSError:
+                continue
+            with listing:
+                for entry in listing:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            is_junction = getattr(entry, "is_junction", None)
+                            if not (is_junction is not None and is_junction()):
+                                stack.append(entry.path)
+                        else:
+                            files[entry.name] = entry
+                    except OSError:
+                        continue
+            if files:
+                yield dirpath, files
+
+    def _key_from_path(self, ddm_name: str, maptype: str, cell: str) -> Optional[str]:
+        """The tracking key of the entry ``<row>_<col>_z<max zoom>.ddm`` in
+        the folder ``<1 degree cell>/<maptype>``, or None when the path does
+        not settle it.
+
+        The key needs the zoom of the tile's name, which the path does not
+        spell out but does fix: the cell was computed from row, column and
+        that zoom (cache_paths.get_dds_cache_dir), and the same row and
+        column at any other zoom lie in another cell. None unless exactly
+        one zoom fits.
+        """
+        match = _ENTRY_FILE.match(ddm_name)
+        if match is None or not maptype:
+            return None
+        try:
+            from autoortho.utils.cache_paths import format_dsf_name, tile_to_dsf_coords
+        except ImportError:
+            from utils.cache_paths import format_dsf_name, tile_to_dsf_coords
+        row, col, max_zoom = (int(part) for part in match.groups())
+        fits = None
+        for zoom in range(max(row, col).bit_length(), _MAX_TILE_ZOOM + 1):
+            try:
+                name = format_dsf_name(*tile_to_dsf_coords(row, col, zoom))
+            except (ValueError, OverflowError):
+                continue
+            if name == cell:
+                if fits is not None:
+                    return None
+                fits = zoom
+        if fits is None:
+            return None
+        return self._tile_key(f"{row}_{col}_{maptype}_{fits}", max_zoom)
+
+    def _scan_key_from_meta(self, dds_path: str, ddm_path: str,
+                            has_dds: bool, has_rows: bool) -> Optional[str]:
+        """The tracking key of an entry, from its ``.ddm``; None when the
+        entry is not to be tracked. Removes what the metadata shows to be
+        left over: an entry whose ``.ddm`` cannot be read, row records
+        without partial levels, metadata with nothing behind it.
+        """
+        meta = self._read_ddm(ddm_path)
+        if meta is None:
+            self._delete_pair(dds_path, ddm_path)
+            return None
+
+        rows_path = self._row_records_path(ddm_path)
+        if has_rows and not meta.get("partial_mipmaps"):
+            try:
+                os.remove(rows_path)
+            except OSError:
+                pass
+            has_rows = False
+        if not has_dds and not has_rows:
+            self._delete_pair(dds_path, ddm_path)
+            return None
+
+        # Reconstruct the tile key from metadata
+        row = meta.get("tile_row")
+        col = meta.get("tile_col")
+        if row is None or col is None:
+            return None
+        tile_id = f"{row}_{col}_{meta.get('map', '')}_{meta.get('zl', 0)}"
+        return self._tile_key(tile_id, meta.get("max_zl", 0))
 
     def migrate_uncompressed(self) -> int:
         """Re-compress existing uncompressed DDS files in-place.

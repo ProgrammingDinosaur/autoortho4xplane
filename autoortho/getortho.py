@@ -10109,7 +10109,7 @@ def start_predictive_dds(tile_cacher=None) -> None:
             
             total_budget_gb = int(getattr(CFG.cache, 'file_cache_size', 30))
             total_budget_mb = total_budget_gb * 1024  # GB -> MB
-            dds_pct = int(getattr(CFG.autoortho, 'dds_budget_pct', 40))
+            dds_pct = int(getattr(CFG.autoortho, 'dds_budget_pct', 80))
             
             cache_dir = str(CFG.paths.cache_dir)
             disk_budget_manager = DiskBudgetManager(
