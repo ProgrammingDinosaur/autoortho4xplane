@@ -34,12 +34,19 @@ def stats(monkeypatch):
     monkeypatch.setattr(aostats, "_manager", None)
     monkeypatch.setattr(aostats, "_local_stats", {})
     monkeypatch.setattr(aostats.STATS, "_remote", None)
+    monkeypatch.setattr(aostats, "_remote_failures", 0)
+    monkeypatch.setattr(aostats, "_next_reconnect", 0.0)
+    monkeypatch.delenv("AO_STATS_ADDR", raising=False)
     return aostats
 
 
 @pytest.mark.parametrize("error", [EOFError, BrokenPipeError, ConnectionResetError])
 @pytest.mark.parametrize("operation", ["get", "set", "inc", "many", "delete", "items", "iter", "len"])
-def test_stats_manager_loss_falls_back_to_local_store(stats, error, operation):
+def test_stats_manager_loss_falls_back_to_local_store(stats, monkeypatch, error, operation):
+    # A store that keeps failing counts as down (here at once).
+    monkeypatch.setattr(stats, "_REMOTE_DOWN_FAILURES", 1)
+    monkeypatch.setattr(stats, "_REMOTE_DOWN_SECONDS", 0.0)
+
     class DeadStore:
         def __getattr__(self, name):
             def fail(*args):
@@ -309,3 +316,127 @@ def test_tile_cleaner_stop_wakes_sleeping_thread(cpu_budget):
     cacher.clean_t.start()
     cacher.stop()
     assert not cacher.clean_t.is_alive()
+
+
+class _FlakyStore:
+    """A store whose calls fail while ``failing`` is set."""
+
+    def __init__(self):
+        self.failing = False
+        self.data = {}
+
+    def get(self, key, default=None):
+        if self.failing:
+            raise ConnectionRefusedError("refused")
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        if self.failing:
+            raise ConnectionRefusedError("refused")
+        self.data[key] = value
+
+
+def test_one_failed_stats_call_keeps_the_shared_store(stats):
+    """A thread's connection refused while X-Plane starts loading cost the
+    worker its shared store for the rest of the flight (no flight state,
+    no position). Now it costs that call only."""
+    store = _FlakyStore()
+    store.data["flight_state"] = {"connected": True}
+    stats.bind_local_store(store)
+    store.failing = True
+    assert stats.get_stat("flight_state") == 0  # this call: local fallback
+    store.failing = False
+    assert stats._store is store and stats.STATS._remote is store
+    assert stats.get_stat("flight_state") == {"connected": True}
+    stats.set_stat("count", 3)
+    assert store.data["count"] == 3
+
+
+def test_a_store_that_stays_down_is_reconnected(stats, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(stats.time, "monotonic", lambda: clock[0])
+    monkeypatch.setenv("AO_STATS_ADDR", "127.0.0.1:1")
+    monkeypatch.setenv("AO_STATS_AUTH", "x")
+    dead = _FlakyStore()
+    dead.failing = True
+    stats.bind_local_store(dead)
+    for _ in range(3):
+        assert stats.get_stat("flight_state") == 0
+        clock[0] += 1.0
+    assert stats._store is None and stats.STATS._remote is None  # down
+
+    fresh = _FlakyStore()
+    fresh.data["flight_state"] = {"connected": True}
+    attempts = []
+
+    def connect():
+        attempts.append(clock[0])
+        return object(), fresh
+
+    monkeypatch.setattr(stats, "_connect_manager_from_env", connect)
+    assert stats.get_stat("flight_state") == 0  # too soon to reconnect
+    assert attempts == []
+    clock[0] += stats._RECONNECT_SECONDS
+    assert stats.get_stat("flight_state") == {"connected": True}
+    assert attempts and stats._store is fresh and stats.STATS._remote is fresh
+
+
+def test_a_failed_call_drops_that_threads_connection(stats):
+    class Proxy:
+        def __init__(self):
+            self._tls = threading.local()
+            self._tls.connection = "broken"
+
+        def get(self, *args):
+            raise EOFError("reset")
+
+    proxy = Proxy()
+    stats.bind_local_store(proxy)
+    stats.get_stat("anything")
+    assert not hasattr(proxy._tls, "connection")
+
+
+def test_worker_threads_share_one_stats_connection(stats):
+    """A proxy connects once per thread; short-lived worker threads then
+    opened connection after connection to the same port (WinError 10048 on
+    Windows). The worker's store shares one connection between threads and
+    drops it after a failure, so the next call connects once again."""
+    connects = []
+
+    class FakeProxy:
+        def __init__(self):
+            self._tls = threading.local()
+            self.fail = False
+
+        def _connection(self):
+            try:
+                return self._tls.connection
+            except AttributeError:
+                conn = SimpleNamespace(closed=False)
+                conn.close = lambda c=conn: setattr(c, "closed", True)
+                connects.append(conn)
+                self._tls.connection = conn
+                return conn
+
+        def get(self, key, default=None):
+            self._connection()
+            if self.fail:
+                raise ConnectionResetError("reset")
+            return key
+
+    proxy = FakeProxy()
+    store = stats._SharedConnectionStore(proxy)
+    threads = [threading.Thread(target=store.get, args=("k",)) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(connects) == 1
+
+    proxy.fail = True
+    with pytest.raises(ConnectionResetError):
+        store.get("k")
+    assert connects[0].closed and not hasattr(store._tls, "connection")
+    proxy.fail = False
+    assert store.get("k") == "k"
+    assert len(connects) == 2

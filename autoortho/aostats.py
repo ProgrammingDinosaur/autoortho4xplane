@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import threading
+import types
 import collections
 import ctypes
 from collections.abc import MutableMapping
@@ -30,23 +31,149 @@ _manager = None
 _store = None
 _REMOTE_UNAVAILABLE = object()
 
+# A mount worker reaches the parent's store through a manager proxy, one
+# connection per thread. One failed call (a thread's connection refused or
+# reset while X-Plane starts loading and dozens of threads connect at once)
+# used to switch the whole worker to local statistics for good: it then never
+# saw the parent's flight state again (no position, no prefetch, no partial
+# cache entries; flights of 2026-11-25). Now a failure costs that call and
+# that thread's connection; the store counts as down only after failures
+# with no success between them for a while, and is reconnected while down.
+_REMOTE_DOWN_FAILURES = 3
+_REMOTE_DOWN_SECONDS = 2.0
+_RECONNECT_SECONDS = 10.0
+_remote_failures = 0  # failed calls since the last success
+_remote_first_failure = 0.0
+_next_reconnect = 0.0
+
+
+def _remote_from_env():
+    return bool(os.getenv("AO_STATS_ADDR") and os.getenv("AO_STATS_AUTH"))
+
+
+def _forget_thread_connection(store):
+    """Drop the calling thread's connection of a manager proxy, so its next
+    call connects again instead of reusing a broken one."""
+    tls = getattr(store, "_tls", None)
+    if tls is not None:
+        try:
+            del tls.connection
+        except AttributeError:
+            pass
+
+
+def _active_store():
+    """The shared store, reconnected (every _RECONNECT_SECONDS at most) while
+    it is down. None without one."""
+    global _store, _manager, _next_reconnect
+    store = _store
+    if store is not None or not _remote_from_env():
+        return store
+    now = time.monotonic()
+    with _local_lock:
+        if _store is not None:
+            return _store
+        if now < _next_reconnect:
+            return None
+        _next_reconnect = now + _RECONNECT_SECONDS
+    try:
+        manager, store = _connect_manager_from_env()
+    except Exception as exc:
+        log.debug(f"Shared stats reconnect failed: {type(exc).__name__}: {exc}")
+        return None
+    if store is None:
+        return None
+    with _local_lock:
+        _manager, _store = manager, store
+        STATS._remote = store
+    log.warning("Shared stats connection restored")
+    return store
+
 
 def _remote_call(store, method, *args):
     """Telemetry must not kill filesystem/prefetch threads if its manager dies."""
-    global _store, _manager
+    global _store, _manager, _remote_failures, _remote_first_failure, _next_reconnect
     if store is None:
-        return _REMOTE_UNAVAILABLE
+        store = _active_store()
+        if store is None:
+            return _REMOTE_UNAVAILABLE
     try:
-        return getattr(store, method)(*args)
-    except (EOFError, OSError):
+        result = getattr(store, method)(*args)
+    except (EOFError, OSError) as exc:
+        _forget_thread_connection(store)
+        now = time.monotonic()
         with _local_lock:
-            if _store is store:
+            if _remote_failures == 0:
+                _remote_first_failure = now
+                log.debug(f"Shared stats call failed ({type(exc).__name__}: {exc}); retrying")
+            _remote_failures += 1
+            down = (
+                _remote_failures >= _REMOTE_DOWN_FAILURES
+                and now - _remote_first_failure >= _REMOTE_DOWN_SECONDS
+            )
+            if down and _store is store:
                 _store = None
                 _manager = None
-                log.warning("Shared stats connection lost; using local statistics")
-            if getattr(STATS, "_remote", None) is store:
+                _next_reconnect = now + _RECONNECT_SECONDS
+                log.warning(
+                    "Shared stats connection lost (%s: %s); using local statistics "
+                    "and reconnecting every %.0f s",
+                    type(exc).__name__, exc, _RECONNECT_SECONDS,
+                )
+            if down and getattr(STATS, "_remote", None) is store:
                 STATS._remote = None
         return _REMOTE_UNAVAILABLE
+    if _remote_failures:
+        with _local_lock:
+            _remote_failures = 0
+    return result
+
+
+class _SharedConnectionStore:
+    """A manager proxy whose calls all use one connection, one at a time.
+
+    A ``BaseProxy`` opens a connection per thread. A mount worker's threads
+    come and go, and every new one that read or wrote a statistic opened
+    another connection to the same server port; on Windows the closed ones
+    linger in TIME_WAIT, and connecting then failed with WinError 10048
+    ("only one usage of each socket address"), every second at times during
+    a flight on 2026-11-25. Statistics calls are small and few, so one
+    connection behind a lock costs nothing that matters.
+    """
+
+    def __init__(self, proxy):
+        self._proxy = proxy
+        self._lock = threading.Lock()
+        # Shared by every thread instead of thread-local: _callmethod
+        # connects into it once and reuses it.
+        self._tls = types.SimpleNamespace()
+        proxy._tls = self._tls
+
+    def _drop_connection(self):
+        conn = getattr(self._tls, "connection", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                del self._tls.connection
+            except AttributeError:
+                pass
+
+    def __getattr__(self, name):
+        method = getattr(self._proxy, name)
+
+        def call(*args):
+            with self._lock:
+                try:
+                    return method(*args)
+                except (EOFError, OSError):
+                    # A request without its reply leaves the stream out of
+                    # step: the next call connects again.
+                    self._drop_connection()
+                    raise
+        return call
 
 
 def _connect_manager_from_env():
@@ -64,7 +191,7 @@ def _connect_manager_from_env():
     )
     m = _StatsManager(address=(host, int(port)), authkey=auth.encode('utf-8'))
     m.connect()
-    return m, m.get_store()
+    return m, _SharedConnectionStore(m.get_store())
 
 
 def bind_local_store(store):
@@ -88,70 +215,79 @@ except Exception as e:
 
 
 class _StatsMapping(MutableMapping):
+    """The shared store when there is one, else this process's statistics.
+
+    A call the store cannot answer falls back to the local dict for that
+    call only; _remote_call decides when the store is down and reconnects.
+    """
+
     def __init__(self, remote_store=None):
         self._remote = remote_store
 
+    def _remote_store(self):
+        return self._remote if self._remote is not None else _active_store()
+
     def __getitem__(self, key):
-        if self._remote:
-            val = _remote_call(self._remote, "get", key, None)
+        remote = self._remote_store()
+        if remote is not None:
+            val = _remote_call(remote, "get", key, None)
             if val is not _REMOTE_UNAVAILABLE:
                 if val is None: raise KeyError(key)
                 return val
-            self._remote = None
         with _local_lock:
             return _local_stats[key]
 
     def __setitem__(self, key, value):
-        if self._remote:
-            if _remote_call(self._remote, "set", key, value) is not _REMOTE_UNAVAILABLE:
+        remote = self._remote_store()
+        if remote is not None:
+            if _remote_call(remote, "set", key, value) is not _REMOTE_UNAVAILABLE:
                 return
-            self._remote = None
         with _local_lock:
             _local_stats[key] = value
 
     def __delitem__(self, key):
-        if self._remote:
-            if _remote_call(self._remote, "delete", key) is not _REMOTE_UNAVAILABLE:
+        remote = self._remote_store()
+        if remote is not None:
+            if _remote_call(remote, "delete", key) is not _REMOTE_UNAVAILABLE:
                 return
-            self._remote = None
         with _local_lock:
             del _local_stats[key]
 
     def __iter__(self):
-        if self._remote:
+        remote = self._remote_store()
+        if remote is not None:
             # Remote has no native iter; snapshot for iteration
-            snap = _remote_call(self._remote, "snapshot")
+            snap = _remote_call(remote, "snapshot")
             if snap is not _REMOTE_UNAVAILABLE:
                 return iter(snap)
-            self._remote = None
         with _local_lock:
             return iter(dict(_local_stats).keys())
 
     def __len__(self):
-        if self._remote:
-            keys = _remote_call(self._remote, "keys")
+        remote = self._remote_store()
+        if remote is not None:
+            keys = _remote_call(remote, "keys")
             if keys is not _REMOTE_UNAVAILABLE:
                 return len(keys)
-            self._remote = None
         with _local_lock:
             return len(_local_stats)
 
     # Provide dict-like helpers
     def get(self, key, default=None):
-        if self._remote:
-            val = _remote_call(self._remote, "get", key, None)
+        remote = self._remote_store()
+        if remote is not None:
+            val = _remote_call(remote, "get", key, None)
             if val is not _REMOTE_UNAVAILABLE:
                 return default if val is None else val
-            self._remote = None
         with _local_lock:
             return _local_stats.get(key, default)
 
     def items(self):
-        if self._remote:
-            snap = _remote_call(self._remote, "snapshot")
+        remote = self._remote_store()
+        if remote is not None:
+            snap = _remote_call(remote, "snapshot")
             if snap is not _REMOTE_UNAVAILABLE:
                 return snap.items()
-            self._remote = None
         with _local_lock:
             return dict(_local_stats).items()
 
@@ -168,8 +304,9 @@ def get_stat(stat):
 
 
 def inc_stat(stat, amount=1):
-    if _store:
-        result = _remote_call(_store, "inc", stat, amount)
+    store = _active_store()
+    if store:
+        result = _remote_call(store, "inc", stat, amount)
         if result is not _REMOTE_UNAVAILABLE:
             return result
     with _local_lock:
@@ -179,8 +316,9 @@ def inc_stat(stat, amount=1):
 
 def inc_many(items: dict):
     """Batch increment for workers; falls back to local dict when no manager."""
-    if _store and hasattr(_store, "inc_many"):
-        if _remote_call(_store, "inc_many", items) is not _REMOTE_UNAVAILABLE:
+    store = _active_store()
+    if store and hasattr(store, "inc_many"):
+        if _remote_call(store, "inc_many", items) is not _REMOTE_UNAVAILABLE:
             return
     with _local_lock:
         for k, v in items.items():
@@ -189,8 +327,9 @@ def inc_many(items: dict):
 
 def delete_stat(stat: str):
     """Delete a stat from the shared store or local fallback."""
-    if _store:
-        if _remote_call(_store, "delete", stat) is not _REMOTE_UNAVAILABLE:
+    store = _active_store()
+    if store:
+        if _remote_call(store, "delete", stat) is not _REMOTE_UNAVAILABLE:
             return
     with _local_lock:
         _local_stats.pop(stat, None)
