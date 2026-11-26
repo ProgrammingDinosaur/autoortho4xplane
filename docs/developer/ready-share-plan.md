@@ -1,9 +1,14 @@
 # Ready share plan: keep what was flown, and make an open cost nothing
 
-Date: 2026-11-25. Status: reviewed against the code and the traces on
-2026-11-26 (findings R7 to R12 below, which change K0, K1, K2 and K6);
-K1 and the cheap parts of K0 are being built. See "Implementation
-status" at the end.
+Date: 2026-11-25. **Status (2026-11-26): everything that can be built
+and measured without X-Plane is built, replayed and committed. What is
+left waits for flights; the list is "What waits for flights" at the
+end.** K1, K3, K4, the no-flight parts of K0 and the side fixes are in;
+on a replay of flight 3 a second pass serves 96 % of the textures from
+the cache file (0.6 % in the flight). K2 has its likely fix in (R13)
+and needs a flight to confirm it; K5 and K6 are decided on a flight.
+Findings R7 to R13 and "Implementation status" at the end record what
+changed from the plan as first written.
 
 Follows [hybrid-read-path-plan.md](hybrid-read-path-plan.md), which is
 closed: a texture that is ready is now served at close to the speed of a
@@ -139,6 +144,12 @@ confirm (K0).
 What follows: removing work from the open (both designs of K2 as first
 written) cannot bring it under 0.5 ms while the open is still a Python
 callback. See K2.
+
+*Corrected the same day by the replays ("Implementation status", K2):
+the opens do wait rather than work, but not for the worker's
+interpreter. The same opens cost 0.02 ms in a replay with the builders
+busy, and a shorter switch interval changes nothing. What is left is
+R13.*
 
 In flight 3, 14,637 of the 16,412 opens that read nothing (102 of 112 s)
 came before the first position: this is loading-screen time.
@@ -620,6 +631,100 @@ It is now stored when its last row lands (`partial_levels_kept`). The
 store runs on the read that completed the level: one write of the level
 (8 MB for level 1 of an 8,192 px texture), once per texture and level.
 
+**2026-11-26: flight 3 replayed, cold and warm.** The whole app from
+this checkout (parent, one worker, brokers, CI's library), an isolated
+home with a copy of the PC's config and an empty scratch cache, Bing,
+the fake X-Plane feeding the trace's positions; `flight3.trace` (7 min,
+18,984 opens of 2,140 textures that were read, 12,834 reads) at its own
+pace. Loading-screen behaviour for the first 75 s, as in the flight.
+
+| Pass | Cache before | Textures served from the cache file alone | Reads p50 / p95 / max | CPU | Entries after, on disk | Evicted |
+|---|---|---|---|---|---|---|
+| cold | empty | 0 % | 8.2 / 152 ms / 39 s | 236 s | 294, 1.3 GB | 0 |
+| warm 1 | imagery only | 8.4 % | 5.3 / 43 / 472 ms | 156 s | 2,265, 3.5 GB | 0 |
+| **warm 2** | the route | **95.8 %** (2,050 of 2,140; 3.6 % partly; 0.6 % live) | **0.05 / 1.7 / 143 ms** | **37 s** | 2,270, 3.5 GB | 0 |
+
+- **K1 holds.** The 2,270 entries are 81.7 GB by file size and 3.5 GB
+  on disk. By the old count they are 3.4 times the 24 GB budget; by the
+  new one nothing was evicted in any pass.
+- **A cold pass keeps little, rightly.** With no imagery on disk the
+  reads of the cold pass came before the downloads and were answered
+  with stand-ins (`reads_wanted_standin` 2,396 against 216 real), which
+  are never stored. The first pass with imagery at hand (warm 1) built
+  the real levels and stored them; the pass after it is the one served
+  from the cache. In a flight the prefetch does the work of warm 1.
+- **K4 was most of "no entry".** Warm 1 kept 2,227 levels that reads
+  had completed in pieces (`partial_levels_kept`); before the fix those
+  2,227 would have been built and dropped. After warm 1, 1,941 of the
+  1,954 textures whose level could be told held the level they were read
+  at. In warm 2, 201 opens were refused as too coarse (1.1 % of opens;
+  the stage asks for under 5 %).
+- **K3.** Warm 2: 16,420 partial entries opened on the loading screen
+  with no level named, none fell back to a live tile;
+  `dds_direct_skip_partial_no_level` 28 (755 in the cold pass).
+- **Native reads** (K5's numbers, on the replay): 18,188 of 18,984
+  opens registered natively, `dds_native_reads` 11,218 against
+  `dds_native_deferred` 910, of which 863 are first reads of rows checked
+  once per process. No error. 87 % of all reads never reached Python.
+- **The definition of done, on the replay:** point 1 asks for 90 % of
+  the opens that read to find an entry and 60 % served from the cache
+  file; warm 2 has 99 % and 96 % (per texture). Point 2 holds. These are
+  to be confirmed on a flight, where X-Plane sets the pace and the
+  prefetch replaces warm 1.
+- `read_trace.summarize` now also answers per texture
+  (`ready_texture_share`). With native reads on, an open answered
+  natively counts as one that read, so X-Plane's probes of a ready
+  texture lift the per-open share (99.5 % in warm 2); the per-texture
+  number is the one to quote.
+
+**2026-11-26: K2 and the experiments of K0. The replay does not show
+the cost; a flight has to.** Four more passes over the same trace (all
+in `tools/bench/runs/replay-flight3-20261126.json`):
+
+| Pass | Opens that read nothing, median | Open of a ready texture, p50 / p95 | getattr / release, median |
+|---|---|---|---|
+| cold | 0.022 ms (2.0 s in all) | | 0.004 / 0.006 ms |
+| cold, counters not batched (before the R13 fix) | 0.022 ms (4.5 s in all) | | 0.004 / 0.006 ms |
+| warm 2 | 0.023 ms | 0.23 / 0.57 ms | 0.004 / 0.041 ms |
+| warm, switch interval 1 ms | 0.023 ms | 0.23 / 0.55 ms | 0.004 / 0.041 ms |
+| warm, every CPU busy (31.5 cores of other work) | 0.25 ms | 0.36 / 1.76 ms | 0.005 / 0.067 ms |
+| the same, switch interval 1 ms | 0.52 ms | 0.37 / 1.62 ms | 0.005 / 0.071 ms |
+
+In flight 3 the same opens took 6.7 ms. What the passes say:
+
+- **R7's inference was wrong.** The worker's interpreter is not what the
+  opens wait for: with the builders at work (cold pass) an open that
+  reads nothing costs 0.02 ms, and a 1 ms switch interval changes
+  nothing, idle or under load. `AO_SWITCH_INTERVAL_MS` stays as a switch
+  for the next flight and is to be removed when K2 closes.
+- **CPU pressure is not it either.** With every logical CPU taken by
+  other processes the opens cost ten times more, 0.25 ms, not 300 times.
+- **R13 is the explanation left standing, not proven here.** Before the
+  fix every open with no entry and no open tile made a call to the
+  parent's statistics store. In the replay the parent has no window and
+  answers in about 0.3 ms (the cold pass with the fix removed: 2.5 s
+  more over 8,646 such calls). In a flight the parent runs the window,
+  and a call waits for the parent's interpreter, about one switch
+  interval: the 5 ms the flights show. It also fits flight 1, where the
+  opens that cost 0.24 ms came after the worker had lost its connection
+  and counted locally. The replay cannot show this: its parent is
+  headless.
+- **So K2 has no more code to write until a flight is read.** The fix
+  is in. The next trace times `open`, `getattr` and `release` and names
+  the calling process, with the window open and X-Plane loading. If the
+  opens that read nothing are under 0.5 ms there, K2 is closed by R13.
+  If not, that trace shows which of the three calls waits, and the
+  native answer described under K2 is the fallback.
+
+**K6, on the replay: do not build the native open (S5).** Condition 1
+holds (96 % of textures ready on a second pass). Condition 2 does not:
+the open of a ready texture is 0.23 ms at the median and 0.57 ms at p95
+(1.76 ms with every CPU busy), under the 2 ms the stage asks for, and
+5 s in all for the 18,187 such opens of the pass.
+`ready_open_time_share` cannot be read with native reads on (the reads
+are not in the trace). To be confirmed with the flight's
+`ready_open_ms`; if it holds, S5 is closed for good.
+
 **2026-11-26: the side fixes.**
 
 - The config file is written only when its text changes. One load saved
@@ -638,3 +743,34 @@ build run on it (`workflow_dispatch`; a push alone does not start it, it
 runs for pull requests to `develop` that touch the C sources). Its commit
 `ad397b51` is merged here and the local Windows build discarded; the
 native-read tests pass on CI's `aopipeline.dll`.
+
+## What waits for flights
+
+Everything below needs X-Plane. Nothing else is open.
+
+**The flights.** The central Mexico route of 2026-11-25 twice in a row
+(about 25 minutes each), AutoOrtho started from this checkout with
+`AO_READ_TRACE` set to a new file for each flight. Then, for the rule
+that numbers come from two routes, a second route twice at max zoom 16.
+The first pair is enough to close or reopen every stage; the second
+pair makes the result general.
+
+**What is read from them, and what follows.**
+
+| Stage | Read from the second flight of a pair | Then |
+|---|---|---|
+| K1 | under 10 % of the opens that read find no entry; `dds_cache_evicted` stays 0 until `dds_cache_bytes` reaches the budget | closed, or the count is wrong somewhere a replay did not reach |
+| K2 | opens that read nothing under 0.5 ms at the median and 15 s per 25 minutes; `getattr_ms`, `release_ms`; the `pid` and `flags` of those opens | closed by R13 and `AO_SWITCH_INTERVAL_MS` removed, or the native answer is built |
+| K3 | `dds_direct_skip_partial_no_level` near zero; `dds_direct_loading_fallbacks` under a tenth of `dds_direct_loading_opens` | closed |
+| K4 | under 5 % of the opens that read refused as too coarse | closed |
+| K5 | `ready_texture_share` above 50 %, `dds_native_reads` far above `dds_native_deferred`, no error, on CI's library (already in this checkout) | `native_direct_reads = True` by default on Windows |
+| K6 | `ready_open_ms` | S5 closed (expected) or built |
+| Budget | whether complete textures are evicted within one flight at zoom 17 | keep `file_cache_size`, or raise its default |
+
+Also from a flight, not blocking: what the opens that read nothing are
+(K0's question; the trace now names the process and the open flags), and
+`Shared stats` warnings in the log, of which there should be none.
+
+After that, outside this plan: P0 of the prediction plan again, on a
+cache that now holds a route, and the comparison flights against
+OrthoStudio XP.

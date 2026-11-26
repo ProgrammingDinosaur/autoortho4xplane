@@ -1,0 +1,1362 @@
+{
+ "date": "2026-11-26",
+ "scenario": "flight3.trace (recorded 2026-11-25, central Mexico, max zoom 17): 438 s, 18,984 opens, 12,834 reads, 2,140 textures read",
+ "setup": "whole app from source (parent + one worker + brokers, CI's aopipeline.dll), isolated home with a copy of the PC's config, scratch cache, Bing, fake X-Plane feed, native_direct_reads on, texture_wait_policy smooth",
+ "plan": "docs/developer/ready-share-plan.md (K0, K1, K3, K4)",
+ "runs": {
+  "cold": {
+   "what": "empty scratch cache",
+   "wall_s": 435.41,
+   "other_cores": 0.12,
+   "reads": {
+    "opens": 18984,
+    "reads": 12834,
+    "errors": 0,
+    "bytes_read": 2779011568,
+    "read_ms_p50": 8.2,
+    "read_ms_p95": 151.87,
+    "read_ms_p99": 281.15,
+    "read_ms_max": 39214.15,
+    "read_ms_total": 504167.6,
+    "slowest_reads": [
+     {
+      "ms": 39214.1,
+      "path": "/textures/28912_14528_BI16.dds",
+      "offset": 5242880,
+      "t": 72.5791
+     },
+     {
+      "ms": 606.9,
+      "path": "/textures/28896_14512_BI16.dds",
+      "offset": 40894464,
+      "t": 70.575
+     },
+     {
+      "ms": 585.9,
+      "path": "/textures/28912_14496_BI16.dds",
+      "offset": 36700160,
+      "t": 70.4274
+     },
+     {
+      "ms": 565.9,
+      "path": "/textures/28816_14512_BI16.dds",
+      "offset": 44171264,
+      "t": 70.076
+     },
+     {
+      "ms": 549.8,
+      "path": "/textures/28944_14512_BI16.dds",
+      "offset": 44040192,
+      "t": 71.9012
+     },
+     {
+      "ms": 518.1,
+      "path": "/textures/28896_14464_BI16.dds",
+      "offset": 42369024,
+      "t": 69.1708
+     },
+     {
+      "ms": 498.2,
+      "path": "/textures/28832_14544_BI16.dds",
+      "offset": 44171264,
+      "t": 70.0808
+     },
+     {
+      "ms": 495.5,
+      "path": "/textures/28928_14544_BI16.dds",
+      "offset": 44040192,
+      "t": 71.3867
+     },
+     {
+      "ms": 481.7,
+      "path": "/textures/28912_14512_BI16.dds",
+      "offset": 35651584,
+      "t": 72.9287
+     },
+     {
+      "ms": 480.1,
+      "path": "/textures/28880_14512_BI16.dds",
+      "offset": 42172416,
+      "t": 69.906
+     },
+     {
+      "ms": 464.5,
+      "path": "/textures/28912_14560_BI16.dds",
+      "offset": 41943040,
+      "t": 73.4501
+     },
+     {
+      "ms": 456.3,
+      "path": "/textures/28912_14480_BI16.dds",
+      "offset": 42172416,
+      "t": 69.9722
+     },
+     {
+      "ms": 451.5,
+      "path": "/textures/115728_58112_BI18.dds",
+      "offset": 8388608,
+      "t": 69.9579
+     },
+     {
+      "ms": 437.2,
+      "path": "/textures/28928_14496_BI16.dds",
+      "offset": 38797312,
+      "t": 71.093
+     },
+     {
+      "ms": 423.9,
+      "path": "/textures/28928_14544_BI16.dds",
+      "offset": 38797312,
+      "t": 70.4786
+     },
+     {
+      "ms": 419.0,
+      "path": "/textures/28688_14208_BI16.dds",
+      "offset": 44564480,
+      "t": 3.2387
+     },
+     {
+      "ms": 416.6,
+      "path": "/textures/28960_14496_BI16.dds",
+      "offset": 42762240,
+      "t": 69.9728
+     },
+     {
+      "ms": 412.7,
+      "path": "/textures/29152_14896_BI16.dds",
+      "offset": 44564480,
+      "t": 32.0603
+     },
+     {
+      "ms": 407.3,
+      "path": "/textures/28896_14240_BI16.dds",
+      "offset": 44630016,
+      "t": 38.0365
+     },
+     {
+      "ms": 397.9,
+      "path": "/textures/28912_14512_BI16.dds",
+      "offset": 819200,
+      "t": 71.1641
+     }
+    ]
+   },
+   "cpu_s": 236.265,
+   "counters": {},
+   "cache_after": {
+    "entries": 294,
+    "by_file_size_gb": 5.2,
+    "on_disk_gb": 1.286
+   },
+   "worker_trace": {
+    "opens": 18984,
+    "opens_with_reads": 2588,
+    "opens_without_reads": 16396,
+    "native_opens": 32,
+    "textures_read": 2140,
+    "ready_textures": 0,
+    "ready_texture_share": 0.0,
+    "empty_open_ms": {
+     "n": 16396,
+     "total_s": 2.0,
+     "p50": 0.022
+    },
+    "getattr_ms": {
+     "n": 37968,
+     "total_s": 0.2,
+     "p50": 0.004
+    },
+    "release_ms": {
+     "n": 18984,
+     "total_s": 0.2,
+     "p50": 0.006
+    },
+    "ready_open_ms": {
+     "p50": 3.749,
+     "p95": 6.305,
+     "mean": 2.713,
+     "n": 24
+    },
+    "reads_by_tier": {
+     "live": 12813,
+     "partial_to_live": 8
+    }
+   }
+  },
+  "oldcold": {
+   "what": "empty scratch cache, the cache's counters not batched (as before the R13 fix)",
+   "wall_s": 435.41,
+   "other_cores": 0.42,
+   "reads": {
+    "opens": 18984,
+    "reads": 12834,
+    "errors": 0,
+    "bytes_read": 2779011568,
+    "read_ms_p50": 13.05,
+    "read_ms_p95": 118.75,
+    "read_ms_p99": 238.15,
+    "read_ms_max": 884.22,
+    "read_ms_total": 329485.5,
+    "slowest_reads": [
+     {
+      "ms": 884.2,
+      "path": "/textures/28928_14512_BI16.dds",
+      "offset": 65536,
+      "t": 72.1531
+     },
+     {
+      "ms": 522.5,
+      "path": "/textures/28912_14528_BI16.dds",
+      "offset": 65536,
+      "t": 72.3645
+     },
+     {
+      "ms": 501.9,
+      "path": "/textures/28992_14464_BI16.dds",
+      "offset": 44302336,
+      "t": 70.8414
+     },
+     {
+      "ms": 458.8,
+      "path": "/textures/28880_14496_BI16.dds",
+      "offset": 42172416,
+      "t": 71.0324
+     },
+     {
+      "ms": 438.0,
+      "path": "/textures/28960_14528_BI16.dds",
+      "offset": 42172416,
+      "t": 70.9784
+     },
+     {
+      "ms": 427.3,
+      "path": "/textures/28912_14464_BI16.dds",
+      "offset": 42762240,
+      "t": 71.0875
+     },
+     {
+      "ms": 426.1,
+      "path": "/textures/29008_14512_BI16.dds",
+      "offset": 44040192,
+      "t": 70.8568
+     },
+     {
+      "ms": 407.1,
+      "path": "/textures/28976_14496_BI16.dds",
+      "offset": 42762240,
+      "t": 71.143
+     },
+     {
+      "ms": 397.4,
+      "path": "/textures/28944_14480_BI16.dds",
+      "offset": 41943040,
+      "t": 70.9358
+     },
+     {
+      "ms": 389.6,
+      "path": "/textures/28928_14528_BI16.dds",
+      "offset": 33554432,
+      "t": 72.3931
+     },
+     {
+      "ms": 385.1,
+      "path": "/textures/28928_14544_BI16.dds",
+      "offset": 42991616,
+      "t": 71.3246
+     },
+     {
+      "ms": 370.9,
+      "path": "/textures/28832_14576_BI16.dds",
+      "offset": 65536,
+      "t": 356.8594
+     },
+     {
+      "ms": 359.6,
+      "path": "/textures/28928_14464_BI16.dds",
+      "offset": 42762240,
+      "t": 70.1252
+     },
+     {
+      "ms": 351.7,
+      "path": "/textures/28912_14496_BI16.dds",
+      "offset": 42991616,
+      "t": 71.5315
+     },
+     {
+      "ms": 349.9,
+      "path": "/textures/28928_14528_BI16.dds",
+      "offset": 44040192,
+      "t": 73.2915
+     },
+     {
+      "ms": 349.6,
+      "path": "/textures/28912_14512_BI16.dds",
+      "offset": 65536,
+      "t": 70.9637
+     },
+     {
+      "ms": 348.8,
+      "path": "/textures/28944_14528_BI16.dds",
+      "offset": 40894464,
+      "t": 69.9494
+     },
+     {
+      "ms": 346.7,
+      "path": "/textures/28864_14576_BI16.dds",
+      "offset": 65536,
+      "t": 275.9272
+     },
+     {
+      "ms": 343.9,
+      "path": "/textures/28832_14464_BI16.dds",
+      "offset": 44302336,
+      "t": 70.1142
+     },
+     {
+      "ms": 343.0,
+      "path": "/textures/28832_14544_BI16.dds",
+      "offset": 44040192,
+      "t": 69.9864
+     }
+    ]
+   },
+   "cpu_s": 282.235,
+   "counters": {
+    "dds_direct_opens": -18262,
+    "dds_direct_partial_opens": -17806,
+    "dds_direct_fallbacks": 11,
+    "bytes_dl": 1242774292,
+    "dds_native_opens": -18262,
+    "dds_native_reads": -11242,
+    "dds_native_deferred": -684,
+    "dds_native_deferred_rows": -927,
+    "dds_native_deferred_level": 11,
+    "dds_direct_skip_no_entry": 7062,
+    "dds_direct_skip_partial_no_level": 891,
+    "dds_direct_skip_partial_coarse": 919,
+    "dds_direct_skip_live_tile": 8571,
+    "reads_wanted_real": 193,
+    "reads_wanted_standin": 2285,
+    "dds_direct_loading_opens": -16476,
+    "dds_direct_loading_fallbacks": 8
+   },
+   "cache_after": {
+    "entries": 2054,
+    "by_file_size_gb": 77.43,
+    "on_disk_gb": 2.966
+   },
+   "worker_trace": {
+    "opens": 18984,
+    "opens_with_reads": 2610,
+    "opens_without_reads": 16374,
+    "native_opens": 58,
+    "textures_read": 2140,
+    "ready_textures": 0,
+    "ready_texture_share": 0.0,
+    "empty_open_ms": {
+     "n": 16374,
+     "total_s": 4.5,
+     "p50": 0.022
+    },
+    "getattr_ms": {
+     "n": 37968,
+     "total_s": 0.2,
+     "p50": 0.004
+    },
+    "release_ms": {
+     "n": 18984,
+     "total_s": 0.2,
+     "p50": 0.006
+    },
+    "ready_open_ms": {
+     "p50": 0.37,
+     "p95": 8.172,
+     "mean": 2.051,
+     "n": 47
+    },
+    "reads_by_tier": {
+     "live": 12794,
+     "partial_to_live": 11
+    }
+   }
+  },
+  "warm1": {
+   "what": "after cold: imagery in the chunk store, few textures in the cache",
+   "wall_s": 435.41,
+   "other_cores": 0.31,
+   "reads": {
+    "opens": 18984,
+    "reads": 12834,
+    "errors": 0,
+    "bytes_read": 2779011568,
+    "read_ms_p50": 5.26,
+    "read_ms_p95": 43.09,
+    "read_ms_p99": 119.37,
+    "read_ms_max": 471.69,
+    "read_ms_total": 147203.1,
+    "slowest_reads": [
+     {
+      "ms": 471.7,
+      "path": "/textures/28848_14576_BI16.dds",
+      "offset": 44564480,
+      "t": 8.0084
+     },
+     {
+      "ms": 413.2,
+      "path": "/textures/28816_14608_BI16.dds",
+      "offset": 44564480,
+      "t": 7.9894
+     },
+     {
+      "ms": 381.3,
+      "path": "/textures/28848_14592_BI16.dds",
+      "offset": 44564480,
+      "t": 7.8133
+     },
+     {
+      "ms": 349.1,
+      "path": "/textures/28816_14576_BI16.dds",
+      "offset": 44564480,
+      "t": 8.0501
+     },
+     {
+      "ms": 334.9,
+      "path": "/textures/28912_14544_BI16.dds",
+      "offset": 33554432,
+      "t": 69.7876
+     },
+     {
+      "ms": 309.3,
+      "path": "/textures/28848_14624_BI16.dds",
+      "offset": 0,
+      "t": 8.199
+     },
+     {
+      "ms": 304.0,
+      "path": "/textures/28768_14624_BI16.dds",
+      "offset": 0,
+      "t": 8.1986
+     },
+     {
+      "ms": 289.2,
+      "path": "/textures/28832_14592_BI16.dds",
+      "offset": 44564480,
+      "t": 7.9607
+     },
+     {
+      "ms": 289.0,
+      "path": "/textures/28928_14544_BI16.dds",
+      "offset": 33554432,
+      "t": 69.1977
+     },
+     {
+      "ms": 288.0,
+      "path": "/textures/28928_14560_BI16.dds",
+      "offset": 41943040,
+      "t": 72.2418
+     },
+     {
+      "ms": 285.9,
+      "path": "/textures/28864_14576_BI16.dds",
+      "offset": 44564480,
+      "t": 41.4676
+     },
+     {
+      "ms": 284.5,
+      "path": "/textures/28832_14576_BI16.dds",
+      "offset": 44564480,
+      "t": 7.7956
+     },
+     {
+      "ms": 283.9,
+      "path": "/textures/28704_14576_BI16.dds",
+      "offset": 0,
+      "t": 8.1625
+     },
+     {
+      "ms": 279.7,
+      "path": "/textures/28864_14592_BI16.dds",
+      "offset": 44564480,
+      "t": 41.4195
+     },
+     {
+      "ms": 277.4,
+      "path": "/textures/28880_14560_BI16.dds",
+      "offset": 41943040,
+      "t": 72.1787
+     },
+     {
+      "ms": 258.0,
+      "path": "/textures/28912_14560_BI16.dds",
+      "offset": 44040192,
+      "t": 154.3697
+     },
+     {
+      "ms": 255.7,
+      "path": "/textures/28896_14528_BI16.dds",
+      "offset": 33554432,
+      "t": 68.9895
+     },
+     {
+      "ms": 239.6,
+      "path": "/textures/28896_14576_BI16.dds",
+      "offset": 41943040,
+      "t": 72.1703
+     },
+     {
+      "ms": 238.2,
+      "path": "/textures/28816_14592_BI16.dds",
+      "offset": 44564480,
+      "t": 8.2362
+     },
+     {
+      "ms": 234.6,
+      "path": "/textures/28880_14576_BI16.dds",
+      "offset": 0,
+      "t": 41.6103
+     }
+    ]
+   },
+   "cpu_s": 156.422,
+   "counters": {
+    "dds_direct_opens": 3276,
+    "dds_direct_partial_opens": 3204,
+    "dds_direct_fallbacks": 195,
+    "bytes_dl": 129746967,
+    "dds_native_opens": 3276,
+    "dds_native_reads": 1655,
+    "dds_native_deferred": 1575,
+    "dds_native_deferred_rows": 105,
+    "dds_native_deferred_level": 195,
+    "dds_direct_skip_no_entry": 6388,
+    "dds_direct_skip_partial_no_level": 217,
+    "dds_direct_skip_partial_coarse": 383,
+    "dds_direct_skip_live_tile": 7231,
+    "reads_wanted_real": 249,
+    "reads_wanted_standin": 2048,
+    "dds_direct_loading_opens": 3190,
+    "dds_direct_loading_fallbacks": 193
+   },
+   "cache_after": {
+    "entries": 2265,
+    "by_file_size_gb": 81.71,
+    "on_disk_gb": 3.456
+   },
+   "worker_trace": {
+    "opens": 18984,
+    "opens_with_reads": 5433,
+    "opens_without_reads": 13551,
+    "native_opens": 3330,
+    "textures_read": 2140,
+    "ready_textures": 180,
+    "ready_texture_share": 0.0841,
+    "empty_open_ms": {
+     "n": 13551,
+     "total_s": 1.8,
+     "p50": 0.023
+    },
+    "getattr_ms": {
+     "n": 37968,
+     "total_s": 0.2,
+     "p50": 0.004
+    },
+    "release_ms": {
+     "n": 18984,
+     "total_s": 0.9,
+     "p50": 0.008
+    },
+    "ready_open_ms": {
+     "p50": 0.26,
+     "p95": 1.816,
+     "mean": 0.645,
+     "n": 3138
+    },
+    "reads_by_tier": {
+     "live": 10830,
+     "direct": 105,
+     "partial_to_live": 195
+    }
+   }
+  },
+  "warm2": {
+   "what": "after warm1: the route is in the cache",
+   "wall_s": 435.41,
+   "other_cores": 0.23,
+   "reads": {
+    "opens": 18984,
+    "reads": 12834,
+    "errors": 0,
+    "bytes_read": 2779011568,
+    "read_ms_p50": 0.05,
+    "read_ms_p95": 1.72,
+    "read_ms_p99": 10.43,
+    "read_ms_max": 143.19,
+    "read_ms_total": 6806.8,
+    "slowest_reads": [
+     {
+      "ms": 143.2,
+      "path": "/textures/28928_14560_BI16.dds",
+      "offset": 33554432,
+      "t": 114.818
+     },
+     {
+      "ms": 122.1,
+      "path": "/textures/28896_14576_BI16.dds",
+      "offset": 65536,
+      "t": 234.3662
+     },
+     {
+      "ms": 65.4,
+      "path": "/textures/28832_14560_BI16.dds",
+      "offset": 34373632,
+      "t": 317.0927
+     },
+     {
+      "ms": 30.0,
+      "path": "/textures/28848_14608_BI16.dds",
+      "offset": 40894464,
+      "t": 341.1462
+     },
+     {
+      "ms": 29.3,
+      "path": "/textures/28928_14560_BI16.dds",
+      "offset": 44040192,
+      "t": 115.0065
+     },
+     {
+      "ms": 28.2,
+      "path": "/textures/28896_14576_BI16.dds",
+      "offset": 44040192,
+      "t": 235.08
+     },
+     {
+      "ms": 25.1,
+      "path": "/textures/28816_14560_BI16.dds",
+      "offset": 40894464,
+      "t": 381.1842
+     },
+     {
+      "ms": 24.0,
+      "path": "/textures/28800_14608_BI16.dds",
+      "offset": 40894464,
+      "t": 422.9499
+     },
+     {
+      "ms": 23.6,
+      "path": "/textures/28800_14592_BI16.dds",
+      "offset": 34373632,
+      "t": 409.7295
+     },
+     {
+      "ms": 23.3,
+      "path": "/textures/28832_14560_BI16.dds",
+      "offset": 40894464,
+      "t": 317.2234
+     },
+     {
+      "ms": 23.0,
+      "path": "/textures/28816_14624_BI16.dds",
+      "offset": 40894464,
+      "t": 428.1355
+     },
+     {
+      "ms": 22.8,
+      "path": "/textures/28896_14576_BI16.dds",
+      "offset": 40894464,
+      "t": 235.0754
+     },
+     {
+      "ms": 22.7,
+      "path": "/textures/28800_14592_BI16.dds",
+      "offset": 40894464,
+      "t": 409.8544
+     },
+     {
+      "ms": 22.7,
+      "path": "/textures/28864_14544_BI16.dds",
+      "offset": 40894464,
+      "t": 214.5948
+     },
+     {
+      "ms": 22.6,
+      "path": "/textures/28800_14576_BI16.dds",
+      "offset": 40894464,
+      "t": 413.0996
+     },
+     {
+      "ms": 22.2,
+      "path": "/textures/28832_14624_BI16.dds",
+      "offset": 40894464,
+      "t": 415.1744
+     },
+     {
+      "ms": 22.1,
+      "path": "/textures/28928_14560_BI16.dds",
+      "offset": 40894464,
+      "t": 115.0022
+     },
+     {
+      "ms": 20.4,
+      "path": "/textures/28816_14560_BI16.dds",
+      "offset": 36700160,
+      "t": 381.0954
+     },
+     {
+      "ms": 20.3,
+      "path": "/textures/28800_14576_BI16.dds",
+      "offset": 39845888,
+      "t": 413.0758
+     },
+     {
+      "ms": 19.9,
+      "path": "/textures/28816_14560_BI16.dds",
+      "offset": 39845888,
+      "t": 381.1571
+     }
+    ]
+   },
+   "cpu_s": 36.718,
+   "counters": {
+    "dds_direct_opens": 13740,
+    "dds_direct_partial_opens": 13386,
+    "dds_direct_fallbacks": -194,
+    "bytes_dl": -91345535,
+    "dds_native_opens": 13740,
+    "dds_native_reads": 8865,
+    "dds_native_deferred": -695,
+    "dds_native_deferred_rows": 728,
+    "dds_native_deferred_level": -194,
+    "dds_direct_skip_no_entry": -7107,
+    "dds_direct_skip_partial_no_level": -199,
+    "dds_direct_skip_partial_coarse": -215,
+    "dds_direct_skip_live_tile": -8020,
+    "reads_wanted_real": -224,
+    "reads_wanted_standin": -2120,
+    "dds_direct_loading_opens": 13230,
+    "dds_direct_loading_fallbacks": -193
+   },
+   "cache_after": {
+    "entries": 2270,
+    "by_file_size_gb": 81.71,
+    "on_disk_gb": 3.527
+   },
+   "worker_trace": {
+    "opens": 18984,
+    "opens_with_reads": 18278,
+    "opens_without_reads": 706,
+    "native_opens": 18188,
+    "textures_read": 2140,
+    "ready_textures": 2050,
+    "ready_texture_share": 0.9579,
+    "empty_open_ms": {
+     "n": 706,
+     "total_s": 0.1,
+     "p50": 0.023
+    },
+    "getattr_ms": {
+     "n": 37968,
+     "total_s": 0.2,
+     "p50": 0.004
+    },
+    "release_ms": {
+     "n": 18984,
+     "total_s": 1.2,
+     "p50": 0.041
+    },
+    "ready_open_ms": {
+     "p50": 0.231,
+     "p95": 0.57,
+     "mean": 0.289,
+     "n": 18187
+    },
+    "reads_by_tier": {
+     "live": 752,
+     "direct": 863,
+     "partial_to_live": 1
+    }
+   }
+  },
+  "sw1": {
+   "what": "as warm2, AO_SWITCH_INTERVAL_MS=1",
+   "wall_s": 435.41,
+   "other_cores": 0.2,
+   "reads": {
+    "opens": 18984,
+    "reads": 12834,
+    "errors": 0,
+    "bytes_read": 2779011568,
+    "read_ms_p50": 0.04,
+    "read_ms_p95": 1.57,
+    "read_ms_p99": 9.73,
+    "read_ms_max": 53.36,
+    "read_ms_total": 6028.5,
+    "slowest_reads": [
+     {
+      "ms": 53.4,
+      "path": "/textures/28848_14640_BI16.dds",
+      "offset": 42172416,
+      "t": 351.3772
+     },
+     {
+      "ms": 25.6,
+      "path": "/textures/28864_14544_BI16.dds",
+      "offset": 40894464,
+      "t": 214.5948
+     },
+     {
+      "ms": 25.5,
+      "path": "/textures/28816_14704_BI16.dds",
+      "offset": 0,
+      "t": 397.3846
+     },
+     {
+      "ms": 24.9,
+      "path": "/textures/28720_14560_BI16.dds",
+      "offset": 0,
+      "t": 397.3868
+     },
+     {
+      "ms": 24.8,
+      "path": "/textures/28848_14608_BI16.dds",
+      "offset": 40894464,
+      "t": 341.1462
+     },
+     {
+      "ms": 24.6,
+      "path": "/textures/28832_14560_BI16.dds",
+      "offset": 40894464,
+      "t": 317.2234
+     },
+     {
+      "ms": 23.6,
+      "path": "/textures/28800_14576_BI16.dds",
+      "offset": 40894464,
+      "t": 413.0996
+     },
+     {
+      "ms": 23.5,
+      "path": "/textures/28816_14560_BI16.dds",
+      "offset": 40894464,
+      "t": 381.1842
+     },
+     {
+      "ms": 23.4,
+      "path": "/textures/28816_14624_BI16.dds",
+      "offset": 40894464,
+      "t": 428.1355
+     },
+     {
+      "ms": 23.3,
+      "path": "/textures/28720_14608_BI16.dds",
+      "offset": 0,
+      "t": 397.3865
+     },
+     {
+      "ms": 22.8,
+      "path": "/textures/28800_14608_BI16.dds",
+      "offset": 40894464,
+      "t": 422.9499
+     },
+     {
+      "ms": 22.7,
+      "path": "/textures/28800_14592_BI16.dds",
+      "offset": 40894464,
+      "t": 409.8544
+     },
+     {
+      "ms": 21.8,
+      "path": "/textures/28832_14624_BI16.dds",
+      "offset": 40894464,
+      "t": 415.1744
+     },
+     {
+      "ms": 21.7,
+      "path": "/textures/28864_14544_BI16.dds",
+      "offset": 38797312,
+      "t": 214.5514
+     },
+     {
+      "ms": 20.9,
+      "path": "/textures/28864_14544_BI16.dds",
+      "offset": 35651584,
+      "t": 214.4919
+     },
+     {
+      "ms": 20.8,
+      "path": "/textures/28864_14544_BI16.dds",
+      "offset": 37748736,
+      "t": 214.5312
+     },
+     {
+      "ms": 20.7,
+      "path": "/textures/28864_14544_BI16.dds",
+      "offset": 39845888,
+      "t": 214.571
+     },
+     {
+      "ms": 20.5,
+      "path": "/textures/28864_14544_BI16.dds",
+      "offset": 36700160,
+      "t": 214.5109
+     },
+     {
+      "ms": 20.1,
+      "path": "/textures/28816_14560_BI16.dds",
+      "offset": 39845888,
+      "t": 381.1571
+     },
+     {
+      "ms": 19.8,
+      "path": "/textures/28832_14560_BI16.dds",
+      "offset": 39845888,
+      "t": 317.1994
+     }
+    ]
+   },
+   "cpu_s": 29.188,
+   "counters": {
+    "dds_direct_opens": -1008,
+    "dds_direct_partial_opens": -1032,
+    "dds_direct_fallbacks": -1,
+    "bytes_dl": -29260706,
+    "dds_native_opens": -1008,
+    "dds_native_reads": -600,
+    "dds_native_deferred": -13,
+    "dds_native_deferred_rows": 34,
+    "dds_native_deferred_level": -1,
+    "dds_direct_skip_no_entry": -160,
+    "dds_direct_skip_partial_no_level": -4,
+    "dds_direct_skip_partial_coarse": -63,
+    "dds_direct_skip_live_tile": -407,
+    "reads_wanted_real": -2,
+    "reads_wanted_standin": -16,
+    "dds_direct_loading_opens": 88
+   },
+   "cache_after": {
+    "entries": 2270,
+    "by_file_size_gb": 81.71,
+    "on_disk_gb": 3.527
+   },
+   "worker_trace": {
+    "opens": 18984,
+    "opens_with_reads": 18380,
+    "opens_without_reads": 604,
+    "native_opens": 18304,
+    "textures_read": 2140,
+    "ready_textures": 2064,
+    "ready_texture_share": 0.9645,
+    "empty_open_ms": {
+     "n": 604,
+     "total_s": 0.1,
+     "p50": 0.023
+    },
+    "getattr_ms": {
+     "n": 37968,
+     "total_s": 0.2,
+     "p50": 0.004
+    },
+    "release_ms": {
+     "n": 18984,
+     "total_s": 1.2,
+     "p50": 0.041
+    },
+    "ready_open_ms": {
+     "p50": 0.229,
+     "p95": 0.554,
+     "mean": 0.286,
+     "n": 18304
+    },
+    "reads_by_tier": {
+     "direct": 927,
+     "live": 636
+    }
+   }
+  },
+  "load": {
+   "what": "as warm2, every logical CPU kept busy by other processes",
+   "wall_s": 435.42,
+   "other_cores": 31.49,
+   "reads": {
+    "opens": 18984,
+    "reads": 12451,
+    "errors": 1605,
+    "bytes_read": 2755932200,
+    "read_ms_p50": 0.6,
+    "read_ms_p95": 14.33,
+    "read_ms_p99": 450.67,
+    "read_ms_max": 1580.11,
+    "read_ms_total": 144305.8,
+    "slowest_reads": [
+     {
+      "ms": 1580.1,
+      "path": "/textures/28768_14608_BI16.dds",
+      "offset": 44040192,
+      "t": 424.9341
+     },
+     {
+      "ms": 1481.2,
+      "path": "/textures/28736_14656_BI16.dds",
+      "offset": 44564480,
+      "t": 408.0307
+     },
+     {
+      "ms": 1466.2,
+      "path": "/textures/28800_14640_BI16.dds",
+      "offset": 44040192,
+      "t": 407.5771
+     },
+     {
+      "ms": 1374.9,
+      "path": "/textures/28800_14624_BI16.dds",
+      "offset": 44040192,
+      "t": 375.3466
+     },
+     {
+      "ms": 1333.5,
+      "path": "/textures/28800_14544_BI16.dds",
+      "offset": 44040192,
+      "t": 346.1278
+     },
+     {
+      "ms": 1306.2,
+      "path": "/textures/28832_14704_BI16.dds",
+      "offset": 0,
+      "t": 387.9702
+     },
+     {
+      "ms": 1299.1,
+      "path": "/textures/28736_14592_BI16.dds",
+      "offset": 0,
+      "t": 347.2294
+     },
+     {
+      "ms": 1289.8,
+      "path": "/textures/28768_14688_BI16.dds",
+      "offset": 0,
+      "t": 408.9307
+     },
+     {
+      "ms": 1283.7,
+      "path": "/textures/28720_14608_BI16.dds",
+      "offset": 44564480,
+      "t": 397.4028
+     },
+     {
+      "ms": 1230.6,
+      "path": "/textures/28816_14704_BI16.dds",
+      "offset": 44564480,
+      "t": 397.4032
+     },
+     {
+      "ms": 1221.0,
+      "path": "/textures/28720_14576_BI16.dds",
+      "offset": 44564480,
+      "t": 391.2666
+     },
+     {
+      "ms": 1219.7,
+      "path": "/textures/28736_14512_BI16.dds",
+      "offset": 44564480,
+      "t": 424.5154
+     },
+     {
+      "ms": 1218.8,
+      "path": "/textures/28784_14592_BI16.dds",
+      "offset": 44040192,
+      "t": 374.5737
+     },
+     {
+      "ms": 1213.8,
+      "path": "/textures/28784_14544_BI16.dds",
+      "offset": 44040192,
+      "t": 424.8757
+     },
+     {
+      "ms": 1206.1,
+      "path": "/textures/28784_14608_BI16.dds",
+      "offset": 44040192,
+      "t": 387.498
+     },
+     {
+      "ms": 1202.0,
+      "path": "/textures/28720_14560_BI16.dds",
+      "offset": 0,
+      "t": 397.3868
+     },
+     {
+      "ms": 1190.0,
+      "path": "/textures/28800_14576_BI16.dds",
+      "offset": 44040192,
+      "t": 413.1046
+     },
+     {
+      "ms": 1178.8,
+      "path": "/textures/28784_14624_BI16.dds",
+      "offset": 44040192,
+      "t": 406.6776
+     },
+     {
+      "ms": 1168.0,
+      "path": "/textures/28720_14592_BI16.dds",
+      "offset": 44564480,
+      "t": 391.3299
+     },
+     {
+      "ms": 1154.0,
+      "path": "/textures/28752_14656_BI16.dds",
+      "offset": 0,
+      "t": 375.3515
+     }
+    ]
+   },
+   "cpu_s": 33.109,
+   "counters": {
+    "dds_direct_opens": 15971,
+    "dds_direct_partial_opens": 15515,
+    "dds_direct_fallbacks": -11,
+    "bytes_dl": -1284717547,
+    "dds_native_opens": 15971,
+    "dds_native_reads": 10206,
+    "dds_native_deferred": 654,
+    "dds_native_deferred_rows": 897,
+    "dds_native_deferred_level": -11,
+    "dds_direct_skip_no_entry": -7937,
+    "dds_direct_skip_partial_no_level": -912,
+    "dds_direct_skip_partial_coarse": -960,
+    "dds_direct_skip_live_tile": -9793,
+    "reads_wanted_real": -193,
+    "reads_wanted_standin": -2449,
+    "dds_direct_loading_opens": 15323,
+    "dds_direct_loading_fallbacks": -8
+   },
+   "cache_after": {
+    "entries": 2271,
+    "by_file_size_gb": 81.72,
+    "on_disk_gb": 3.537
+   },
+   "worker_trace": {
+    "opens": 17831,
+    "opens_with_reads": 17227,
+    "opens_without_reads": 604,
+    "native_opens": 17151,
+    "textures_read": 2065,
+    "ready_textures": 1989,
+    "ready_texture_share": 0.9632,
+    "empty_open_ms": {
+     "n": 604,
+     "total_s": 0.3,
+     "p50": 0.254
+    },
+    "getattr_ms": {
+     "n": 35662,
+     "total_s": 0.2,
+     "p50": 0.005
+    },
+    "release_ms": {
+     "n": 17831,
+     "total_s": 3.2,
+     "p50": 0.067
+    },
+    "ready_open_ms": {
+     "p50": 0.355,
+     "p95": 1.759,
+     "mean": 0.579,
+     "n": 17151
+    },
+    "reads_by_tier": {
+     "direct": 927,
+     "live": 636
+    }
+   }
+  },
+  "loadsw1": {
+   "what": "as load, AO_SWITCH_INTERVAL_MS=1",
+   "wall_s": 435.43,
+   "other_cores": 31.68,
+   "reads": {
+    "opens": 18984,
+    "reads": 11358,
+    "errors": 5116,
+    "bytes_read": 2689846320,
+    "read_ms_p50": 0.57,
+    "read_ms_p95": 15.37,
+    "read_ms_p99": 516.66,
+    "read_ms_max": 1918.2,
+    "read_ms_total": 137470.1,
+    "slowest_reads": [
+     {
+      "ms": 1918.2,
+      "path": "/textures/28784_14672_BI16.dds",
+      "offset": 44564480,
+      "t": 346.2057
+     },
+     {
+      "ms": 1852.1,
+      "path": "/textures/28800_14544_BI16.dds",
+      "offset": 44040192,
+      "t": 346.1278
+     },
+     {
+      "ms": 1565.7,
+      "path": "/textures/28752_14512_BI16.dds",
+      "offset": 0,
+      "t": 347.5136
+     },
+     {
+      "ms": 1430.4,
+      "path": "/textures/28768_14608_BI16.dds",
+      "offset": 44040192,
+      "t": 424.9341
+     },
+     {
+      "ms": 1389.6,
+      "path": "/textures/28800_14640_BI16.dds",
+      "offset": 44040192,
+      "t": 407.5771
+     },
+     {
+      "ms": 1384.4,
+      "path": "/textures/28736_14656_BI16.dds",
+      "offset": 44564480,
+      "t": 408.0307
+     },
+     {
+      "ms": 1298.8,
+      "path": "/textures/28736_14592_BI16.dds",
+      "offset": 0,
+      "t": 347.2294
+     },
+     {
+      "ms": 1242.4,
+      "path": "/textures/28848_14624_BI16.dds",
+      "offset": 44040192,
+      "t": 294.1258
+     },
+     {
+      "ms": 1211.4,
+      "path": "/textures/28832_14704_BI16.dds",
+      "offset": 0,
+      "t": 387.9702
+     },
+     {
+      "ms": 1186.4,
+      "path": "/textures/28816_14560_BI16.dds",
+      "offset": 44040192,
+      "t": 381.189
+     },
+     {
+      "ms": 1170.3,
+      "path": "/textures/28784_14560_BI16.dds",
+      "offset": 44040192,
+      "t": 381.3716
+     },
+     {
+      "ms": 1164.4,
+      "path": "/textures/28736_14592_BI16.dds",
+      "offset": 44564480,
+      "t": 347.2424
+     },
+     {
+      "ms": 1157.9,
+      "path": "/textures/28816_14704_BI16.dds",
+      "offset": 44564480,
+      "t": 397.4032
+     },
+     {
+      "ms": 1115.1,
+      "path": "/textures/28736_14560_BI16.dds",
+      "offset": 44564480,
+      "t": 346.0858
+     },
+     {
+      "ms": 1108.3,
+      "path": "/textures/28784_14608_BI16.dds",
+      "offset": 44040192,
+      "t": 387.498
+     },
+     {
+      "ms": 1096.6,
+      "path": "/textures/28784_14544_BI16.dds",
+      "offset": 44040192,
+      "t": 424.8757
+     },
+     {
+      "ms": 1075.3,
+      "path": "/textures/28784_14672_BI16.dds",
+      "offset": 0,
+      "t": 346.1923
+     },
+     {
+      "ms": 1053.3,
+      "path": "/textures/28768_14688_BI16.dds",
+      "offset": 0,
+      "t": 408.9307
+     },
+     {
+      "ms": 1043.7,
+      "path": "/textures/28752_14560_BI16.dds",
+      "offset": 0,
+      "t": 295.2797
+     },
+     {
+      "ms": 1031.1,
+      "path": "/textures/28800_14608_BI16.dds",
+      "offset": 44040192,
+      "t": 422.9549
+     }
+    ]
+   },
+   "cpu_s": 28.264,
+   "counters": {
+    "dds_direct_opens": -2747,
+    "dds_direct_partial_opens": -2693,
+    "bytes_dl": -3691315,
+    "dds_native_opens": -2747,
+    "dds_native_reads": -1672,
+    "dds_direct_skip_no_entry": -153,
+    "dds_direct_skip_partial_coarse": -11,
+    "dds_direct_skip_live_tile": -350,
+    "dds_direct_loading_opens": -2433
+   },
+   "cache_after": {
+    "entries": 2271,
+    "by_file_size_gb": 81.72,
+    "on_disk_gb": 3.537
+   },
+   "worker_trace": {
+    "opens": 15344,
+    "opens_with_reads": 14740,
+    "opens_without_reads": 604,
+    "native_opens": 14664,
+    "textures_read": 1889,
+    "ready_textures": 1813,
+    "ready_texture_share": 0.9598,
+    "empty_open_ms": {
+     "n": 604,
+     "total_s": 0.5,
+     "p50": 0.524
+    },
+    "getattr_ms": {
+     "n": 30688,
+     "total_s": 0.2,
+     "p50": 0.005
+    },
+    "release_ms": {
+     "n": 15344,
+     "total_s": 2.5,
+     "p50": 0.071
+    },
+    "ready_open_ms": {
+     "p50": 0.366,
+     "p95": 1.616,
+     "mean": 0.562,
+     "n": 14664
+    },
+    "reads_by_tier": {
+     "direct": 927,
+     "live": 636
+    }
+   }
+  }
+ }
+}

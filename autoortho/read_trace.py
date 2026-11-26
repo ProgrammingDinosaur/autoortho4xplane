@@ -20,7 +20,8 @@ An open's or a read's ``t`` is when it ended (it started ``ms`` earlier);
 the same for a release and for a ``getattr`` of a texture, which the file
 system asks for every open (traces before 2026-11-26 have neither timing).
 ``pid`` is the process that asked, where the file system tells: X-Plane's
-opens apart from an antivirus's or the indexer's.
+opens apart from an antivirus's or the indexer's. An open also carries the
+``flags`` the file system passed.
 An open's ``tier`` is what will answer it (``direct``, ``partial``, ``live``;
 ``native`` when native reads do). A read's ``tier`` is the
 path that answered it: ``direct`` or ``partial`` (the cache file),
@@ -195,6 +196,14 @@ def summarize(events: list, fast_ms: float = 2.0) -> dict:
       the two calls around every open (ready share plan, R2, R5 and R8).
       Reads are paired with opens by path, so with several opens of one
       texture at once these counts are close, not exact.
+    * ``textures_read``, ``ready_textures``, ``ready_texture_share``: the
+      same question per texture, which is the number to judge a flight by:
+      the textures that were read (or opened natively), and those served
+      from the cache file alone. With native reads on, an open answered
+      natively counts as one that read, since its reads are not in the
+      trace: X-Plane's probes of a ready texture are then counted among
+      ``opens_with_reads`` and lift ``ready_share_of_reading``; a texture
+      counts once however often it is opened.
     """
     opens = 0
     native_opens = 0
@@ -211,6 +220,7 @@ def summarize(events: list, fast_ms: float = 2.0) -> dict:
     getattr_ms = []
     release_ms = []
     first_pos = None  # when the aircraft's position was first known
+    texture_tiers = {}  # path -> tiers that served it (reads, native opens)
 
     def _ms(event):
         try:
@@ -228,6 +238,8 @@ def summarize(events: list, fast_ms: float = 2.0) -> dict:
             native = bool(event.get("native")) and event.get("tier") in ("direct", "partial")
             native_opens += native
             open_native.append(native)
+            if native:
+                texture_tiers.setdefault(path, set()).add(event["tier"])
             open_tiers.append({event["tier"]} if native else set())
             try:
                 open_ms.append(float(event["ms"]) if "ms" in event else None)
@@ -238,6 +250,7 @@ def summarize(events: list, fast_ms: float = 2.0) -> dict:
             reads += 1
             tier = event.get("tier", "unknown")
             by_tier[tier] = by_tier.get(tier, 0) + 1
+            texture_tiers.setdefault(path, set()).add(tier)
             index = current.get(path)
             if index is not None:
                 open_tiers[index].add(tier)
@@ -330,6 +343,10 @@ def summarize(events: list, fast_ms: float = 2.0) -> dict:
                 "ready_share_of_reading": share_of_reading(phase_reading),
             }
 
+    ready_textures = sum(
+        1 for tiers in texture_tiers.values() if tiers <= {"direct", "partial"}
+    )
+
     all_hist = overlaps(intervals)
     return {
         "opens": opens,
@@ -338,6 +355,11 @@ def summarize(events: list, fast_ms: float = 2.0) -> dict:
         "opens_with_reads": len(reading),
         "opens_without_reads": len(empty),
         "ready_share_of_reading": share_of_reading(reading),
+        "textures_read": len(texture_tiers),
+        "ready_textures": ready_textures,
+        "ready_texture_share": (
+            round(ready_textures / len(texture_tiers), 4) if texture_tiers else None
+        ),
         "empty_open_ms": timing(open_ms[i] for i in empty),
         "by_phase": by_phase,
         "getattr_ms": timing(getattr_ms),

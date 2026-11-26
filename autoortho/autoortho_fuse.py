@@ -1912,7 +1912,7 @@ class AutoOrtho(Operations):
                     self._trace_open(
                         path, trace_started,
                         "partial" if getattr(direct, "finest_level", 0) else "direct",
-                        native=bool(native),
+                        native=bool(native), flags=flags,
                     )
                 return fh
             with profile_span(
@@ -1927,7 +1927,7 @@ class AutoOrtho(Operations):
                 log.debug(f"OPEN: Failed getting cache size for tile at {path}")
                 pass
             if trace_started is not None:
-                self._trace_open(path, trace_started, "live")
+                self._trace_open(path, trace_started, "live", flags=flags)
             return 0
 
         if path.endswith('AOISWORKING'):
@@ -1972,16 +1972,18 @@ class AutoOrtho(Operations):
             return os.open(full_path, flags | os.O_BINARY)
         return os.open(full_path, flags)
 
-    def _trace_open(self, path, started, tier, native=False):
+    def _trace_open(self, path, started, tier, native=False, flags=None):
         """A texture open in the read trace, timed like a read: ``t`` is when
-        it ended, ``ms`` how long it took, ``tier`` what will answer it."""
+        it ended, ``ms`` how long it took, ``tier`` what will answer it,
+        ``flags`` the open flags the file system passed and ``pid`` the
+        process that asked (what the opens that read nothing are, and whose)."""
         trace = self._read_trace
         if trace is None:
             return
         trace.event(
             "open", path, ms=round((time.monotonic() - started) * 1000.0, 3),
             tier=tier, native=True if native else None, tid=threading.get_ident(),
-            pid=_get_fuse_pid_for_log(),
+            pid=_get_fuse_pid_for_log(), flags=flags,
         )
 
     def _switch_direct_to_live(self, direct, row, col, maptype, zoom):

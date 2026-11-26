@@ -156,6 +156,9 @@ def test_trace_summary_gives_the_ready_share_over_opens_that_read():
         "flight": {"opens_with_reads": 1, "opens_without_reads": 0,
                    "ready_share_of_reading": 1.0},
     }
+    # Per texture: a was read from the cache only; b once live, once from it.
+    assert summary["textures_read"] == 2 and summary["ready_textures"] == 1
+    assert summary["ready_texture_share"] == 0.5
     assert summary["getattr_ms"] == {"n": 1, "total_s": 0.0, "p50": 2.0}
     # Releases without a time (older traces) are left out.
     assert summary["release_ms"] == {"n": 2, "total_s": 0.0, "p50": 3.0}
