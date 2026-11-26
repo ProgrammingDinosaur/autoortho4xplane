@@ -1991,7 +1991,14 @@ def main():
         run_headless = True
 
 
-    import flighttrack
+    # Both ways of starting: "python autoortho" (these are top-level modules)
+    # and "python -m autoortho" (they are in the package), as everywhere
+    # else in this file. The second failed here with "No module named
+    # flighttrack".
+    try:
+        from autoortho import flighttrack
+    except ImportError:
+        import flighttrack
     ftrack = threading.Thread(
         target=flighttrack.run,
         daemon=True
@@ -2000,7 +2007,10 @@ def main():
     # Start helper threads
     ftrack.start()
 
-    from datareftrack import dt
+    try:
+        from autoortho.datareftrack import dt
+    except ImportError:
+        from datareftrack import dt
     dt.start()
     
     # Run things
