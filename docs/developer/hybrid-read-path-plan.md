@@ -1,11 +1,13 @@
 # Hybrid read path: plain-file speed for ready textures, a choice for the others
 
-Date: 2026-11-24. Status: stage M0 (the measurement) is done, on Windows; its
-results and the order of work they lead to are in "M0 results" below. Items
-N1 to N8 of that order are implemented, and stage S3 with them
-(2026-11-25, uncommitted on `fix/prefetch-loop-and-dds-staging`); what was
-built, what it measured and what is still open is in "Implementation status"
-right below.
+Date: 2026-11-24. **Status: closed on 2026-11-25.** Every stage that was to
+be built is built, measured and committed on
+`fix/prefetch-loop-and-dds-staging` (M0, N1 to N8, S1 to S3); S6 was closed
+by gate B, S5 is not built (gate C, see "Flights and closure"), S4 is
+deferred. What was built and measured is in "Implementation status" right
+below; what the flights showed and what carries over is in "Flights and
+closure". The work continues in
+[ready-share-plan.md](ready-share-plan.md).
 
 ## Implementation status (2026-11-25)
 
@@ -258,11 +260,62 @@ slots back after releasing its lock, so a tile closed meanwhile raises
 times per replay). The candidate was for a closed tile, so nothing is lost
 but the log line; still a race to fix.
 
-Not done: the recorded flight (N6, gate C, the first real use of native
-reads), runs on Linux and macOS (the native tests pass there, under
-AddressSanitizer too), S4 (deferred), S5 (gate C), turning
-`native_direct_reads` on by default (after CI has rebuilt the libraries and
-a flight has used it).
+### Flights and closure (2026-11-25)
+
+Three flights over the same route (central Mexico, max zoom 17, WinFsp),
+with `AO_READ_TRACE` and `native_direct_reads` on, the third under `smooth`.
+
+| | Flight 1 | Flight 2 | Flight 3 |
+|---|---|---|---|
+| Traced minutes | 26 | 25 | 7 |
+| Texture opens / textures | 31,326 / 3,583 | 48,316 / 3,562 | 18,984 / 2,245 |
+| Opens served from the cache file | 0 | 4 | 16, all native (147 reads, 101 MB) |
+| Worker had the aircraft position | no | no | yes |
+| Errors from the mount or native reads | none | none | none |
+
+- **Native reads are stable** in real flights: installed in every session
+  ("Native texture reads on"), no crash, no fallback, and the opens they
+  served took 0.8 ms (p50).
+- **They had almost nothing to serve.** Two causes, neither in the read
+  path. (1) *The mount worker lost the parent's statistics store* 30 to
+  40 s into flights 1 and 2 and never got it back, so it had no aircraft
+  position: no prefetch ahead, no partial entries. Found with new log lines
+  (`14c21f52`) and fixed (`447c5a59`: WinError 10048, one connection per
+  short-lived thread; the worker now shares one and reconnects). (2) *The
+  cache does not hold the route*: in flight 3, with the position back,
+  89 % of the opens found no cache entry for a route flown twice an hour
+  before. That is the subject of
+  [ready-share-plan.md](ready-share-plan.md).
+- **Gate C: closed on its numbers, but they do not mean what the gate
+  meant.** Ready share 0.08 % (criterion 1 needs 50 %), so by the gate S5
+  is not built. The flights showed the gate asks the wrong question twice
+  over: the ready share is low because of the cache, not because few
+  textures could be ready; and the opens that cost X-Plane time are not
+  the ready ones but the 85 % of opens that read nothing (5 to 7 ms each,
+  112 to 254 s per flight). The new plan measures those and decides there.
+
+**Definition of done, as closed:**
+
+1. Done: `texture_wait_policy` in the UI and docs; `smooth` has no
+   in-flight read above 100 ms on the replay; `quality` fills no-imagery
+   chunks from a lower zoom (decided 2026-11-25).
+2. Done at levels 0 and 1, idle and busy (within 20 % of the C file
+   system). Level 3 with many readers is bound by the Python open.
+3. 92 % on the warm replay, 99.5 % within one process: the rest are first
+   reads of rows checked once per process, by design. Accepted.
+4. Done: byte equality on every run, native off and on.
+5. Done: with the library missing or the setting off, tests and behaviour
+   are as before.
+6. Done: flights flown, no crash, no unexpected fallback. Gate C read, see
+   above.
+7. Done: gate B closed (M0), gate C closed (above).
+
+**Carried over to [ready-share-plan.md](ready-share-plan.md):** the cache
+budget, the opens that read nothing, partial entries on the loading
+screen and live-built levels (prediction plan F11, F12), turning
+`native_direct_reads` on by default (needs CI's libraries and a flight on
+them), recorded runs on Linux and macOS, and S5 under a new gate. S4 (the
+OrthoStudio comparison) stays deferred.
 
 This follows [performance-gap-plan.md](performance-gap-plan.md) and
 [resource-usage-plan.md](resource-usage-plan.md), and uses the terms of

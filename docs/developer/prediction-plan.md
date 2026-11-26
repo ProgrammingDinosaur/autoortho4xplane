@@ -3,7 +3,9 @@
 Status: proposal (2026-11-24). Nothing here is implemented.
 Related: [hybrid-read-path-plan.md](hybrid-read-path-plan.md) (how cheap a ready
 texture is to serve), [governor-behind-detection-plan.md](governor-behind-detection-plan.md)
-(the miss causes the governor reads today), [performance-gap-plan.md](performance-gap-plan.md).
+(the miss causes the governor reads today), [performance-gap-plan.md](performance-gap-plan.md),
+[ready-share-plan.md](ready-share-plan.md) (2026-11-25: the cache could not hold a route and most
+opens read nothing; do its K1 before P0, and F11 and F12 below are its K4 and K3).
 
 The hybrid read-path plan makes a ready texture cost almost nothing to serve.
 This plan decides how many textures are ready. If prediction is wrong, the fast

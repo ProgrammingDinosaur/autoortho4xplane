@@ -1,0 +1,574 @@
+# Ready share plan: keep what was flown, and make an open cost nothing
+
+Date: 2026-11-25. Status: reviewed against the code and the traces on
+2026-11-26 (findings R7 to R12 below, which change K0, K1, K2 and K6);
+K1 and the cheap parts of K0 are being built. See "Implementation
+status" at the end.
+
+Follows [hybrid-read-path-plan.md](hybrid-read-path-plan.md), which is
+closed: a texture that is ready is now served at close to the speed of a
+plain file. Comes before the building stages of
+[prediction-plan.md](prediction-plan.md): that plan decides what to build
+ahead; this one makes sure what was already built is still there the next
+time, and that asking for it is cheap.
+
+## The idea in short
+
+Three flights over the same route on 2026-11-25 showed the fast read path
+working and almost unused: 16 of 18,984 opens were served from the cache.
+The reads are no longer the problem. Three things in front of them are:
+
+| | Today | This plan |
+|---|---|---|
+| A route flown an hour ago | 89 % of its opens find nothing in the cache: the cache thinks it is full and evicts what the flight just stored | the cache counts the disk space it really uses, and holds whole routes |
+| An open that reads nothing (85 % of all opens) | 5 to 7 ms of Python each, 2 to 4 minutes of X-Plane's loader threads per flight | well under a millisecond |
+| A texture on the loading screen, or one a live read built | built again, though its levels are or were at hand | served from the cache file |
+
+## What the flights showed
+
+Central Mexico, max zoom 17 (8,192 px textures), WinFsp, read traces in
+`D:\ao-traces\flight1..3.trace`. All 2,245 textures of flight 3 were also
+opened in flight 1.
+
+| | Flight 1 | Flight 2 | Flight 3 |
+|---|---|---|---|
+| Traced minutes | 26 | 25 | 7 |
+| Texture opens | 31,326 | 48,316 | 18,984 |
+| Different textures | 3,583 | 3,562 | 2,245 |
+| Opens with at least one read | 4,543 (15 %) | 7,057 (15 %) | 2,578 (14 %) |
+| Opens that read nothing | 26,783 | 41,259 | 16,406 |
+| Time in opens that read nothing | 121 s | 254 s | 112 s |
+| Opens served from the cache file | 0 | 4 | 16 |
+| Cache entries evicted during the flight | 3,164 | 3,520 | 4,197 |
+| Worker had the aircraft position | no | no | yes |
+
+Why an open was not served from the cache in flight 3
+(`dds_direct_skip_*`): no entry 16,812; partial entry but no level named
+(loading screen) 645; live tile already open 360; partial entry too coarse
+99.
+
+## Findings
+
+Each names its evidence. R1 and R2 are new; R3 and R4 are F12 and F11 of
+the prediction plan, measured here on a real flight.
+
+**R1. The cache budget counts sizes that are not on disk.** A partial
+entry is a sparse file: its nominal size is the whole texture (44.7 MB at
+8,192 px), but only the coarse levels are written.
+`DynamicDDSCache._entry_disk_size` and
+`DiskBudgetManager._scan_dir_size` both add up `st_size`. After flight 3
+the cache held 581 entries: 22.6 GB by that count, against a DDS budget of
+24 GB (80 % of `file_cache_size` = 30), and **1.5 GB on disk**. The 462
+partial ZL17 entries alone count as 19.25 GB and use 0.05 GB. So the cache
+is always "full", and every store evicts about 60 entries to "free"
+2.5 GB that were never used: 4,197 entries in the seven traced minutes of
+flight 3, more than the flight has textures. A route cannot stay.
+
+**R2. 85 % of texture opens read nothing, and each costs 5 to 7 ms.**
+X-Plane (or Windows on its behalf) opens every texture about seven times
+without reading, each held about 1 ms, beside the one open that reads.
+Each of them runs AutoOrtho's whole open: the load-ahead note, the cache
+lookup, and for a texture not in the cache `TileCacher._open_tile`, which
+creates a live tile, all in Python with X-Plane's other loader threads
+taking turns. Median 4.6 ms in flight 1 and 6.7 ms in flight 3; the opens
+that do read took 0.4 and 4.8 ms. Per texture that is about 40 ms of
+waiting before its first byte: as much as all the reads of a ready
+level-0 texture took through Python, with eight readers, before the
+hybrid plan (41.8 ms). Not known yet: what makes these
+opens (an attribute query that WinFsp turns into open and release, or
+X-Plane's own probing), and whether Linux and macOS see them.
+
+This is what gate C of the hybrid plan was reaching for, measured on the
+wrong opens: it timed the opens of ready textures and never looked at the
+ones that read nothing.
+
+**R3 (prediction F12). Partial entries are not served on the loading
+screen.** A partial entry is served only at the level the paging model
+names, and with no camera it names none. In flight 3, 2,142 of the 2,578
+opens that read happened in the first 75 s, before the first position:
+the loading screen is where most textures are read, and there every
+partial entry is refused (645 opens, and far more once R1 lets entries
+stay).
+
+**R4 (prediction F11). Levels a live read builds are often not kept.** On
+the synthetic replay the warm pass found entries starting at level 4
+where the cold pass had read level 1 (106 of 239 opens). 99 opens in
+flight 3. Likely cause: `Tile._try_incremental_dds_store` keeps only
+levels whose whole buffer was built, and level-1 reads are answered by
+row-range builds that never complete a level. To confirm before fixing.
+
+**R5. The ready share was measured over the wrong opens.**
+`read_trace.summarize` divides ready opens by all opens. With 85 % of
+opens reading nothing, a flight where every texture came from the cache
+would still show about 15 %. The share must be over opens that read, and
+given for the loading screen and the flight apart.
+
+**R6. A complete texture at zoom 17 is 44.7 MB.** The 24 GB budget holds
+about 550 of them, a quarter of this route. That is real disk space, not
+an accounting error, and R1 does not change it. X-Plane reads most
+textures only at coarse levels, so a route is mostly partial entries of
+about 0.1 MB; the complete ones are the textures under the aircraft. What
+to evict first when the real budget is reached (level 0 of far-away
+textures before any coarse level) is item 9 of the prediction plan; here
+only the count is fixed.
+
+### Added by the review of 2026-11-26
+
+**R7. An open that reads nothing waits; it does not work.** The same
+traces, with the opens that read nothing split by how many other opens
+were in flight when each began (median time):
+
+| | Flight 1 (worker idle) | Flight 3 (worker building) |
+|---|---|---|
+| Alone, tile already in memory | 0.24 ms (6,275) | 3.7 ms (1,266) |
+| Alone, creates the tile | 1.0 ms (785) | 6.0 ms (101) |
+| 2 to 4 opens in flight | 2.4 ms | 6.4 ms |
+| 5 to 16 opens in flight | 6.1 to 6.7 ms | 6.9 ms |
+
+The open's own work is a quarter of a millisecond, one millisecond when
+it creates the tile. 87 % of the time is in opens of a texture whose tile
+already exists (104 of 121 s in flight 1, 98 of 112 s in flight 3), so
+the tile's constructor is not the cost. The rest is waiting for a turn:
+the open is a Python callback, and with sixteen file system threads, or
+with one busy builder thread, each waits about one interpreter switch
+interval (5 ms by default; nothing in the repository sets it). That it is
+the interpreter lock and not `tc_lock` is an inference from these
+numbers: flight 3's opens wait 3.7 ms with no other open in flight. To
+confirm (K0).
+
+What follows: removing work from the open (both designs of K2 as first
+written) cannot bring it under 0.5 ms while the open is still a Python
+callback. See K2.
+
+In flight 3, 14,637 of the 16,412 opens that read nothing (102 of 112 s)
+came before the first position: this is loading-screen time.
+
+**R8. The cost in R2 is a lower bound.** Only `open` is timed. `release`
+is recorded without a duration and `getattr` is not recorded at all, and
+each is a Python callback that waits the same way; the file system calls
+`getattr` at least once for every open. The 121 to 254 s per flight count
+one of three or more callbacks.
+
+**R9. The trace cannot tell which open a read belongs to.**
+`read_trace.summarize` pairs by path: a read counts for the last open of
+its path, and the first release of that path ends the pairing. Several
+opens of one path overlap in the traces (three within 6 ms at the start
+of flight 3), and every live open returns handle 0, so `release` cannot
+say which open it ends. The 85 % is therefore approximate (it cannot be
+far off: 8 to 10 opens per texture against about 1.2 that read). The
+trace has no process id either, so X-Plane's opens cannot be told from an
+antivirus's or the indexer's.
+
+**R10. Eviction by real size would delete what costs nothing.**
+`evict_lru` deletes entries oldest first until it has freed enough bytes.
+Once sizes are real (K1) a partial entry frees about 0.1 MB, so a pass
+that must free 2.4 GB (10 % of the budget) deletes every partial entry
+older than about the 54th-oldest complete texture: thousands of entries,
+for nothing. The route would be lost again every time the cache really
+fills, which at zoom 17 is after about 550 complete textures.
+
+**R11. Every mount worker keeps its own count.** Each worker builds its
+own `DynamicDDSCache` and `DiskBudgetManager` over the same folder
+(`getortho.start_predictive_dds`), counts what it found at start and then
+only what it stores itself, each against the whole budget. With nominal
+sizes this was hidden by constant eviction. With real sizes, N workers
+can together hold more than the budget, and one worker evicts by an order
+that knows nothing of what the others read. On Windows and Linux the
+parent serves several mounts from one shared worker ("Serving N mounts
+from one shared worker"), and this PC has one mount, so this is a
+question for macOS, where each mount has its own worker. Not checked
+yet: whether anything scans again.
+
+**R12. The cache will hold a hundred times more entries.** 581 today;
+about 3,500 per route once they stay, three files each. The start scan
+reads every `.ddm` in every worker, K1 adds one system call per sparse
+file, and Windows Defender looks at each file. Nothing here has been
+measured above a few hundred entries.
+
+**R13. Every open with no cache entry called the parent process.**
+`DynamicDDSCache._bump` counted with `inc_stat`, which in a mount worker
+is a call to the parent's statistics store, and since `447c5a59` all of
+a worker's calls share one connection, one at a time. `open_direct`
+counts why it refused on every open: 16,812 such calls in flight 3, each
+made from a file system thread that then waits for its turn again. This
+is at least part of why an open alone took 3.7 ms in flight 3 and 0.24 ms
+in flight 1, where the connection was lost and counts stayed local. Fixed
+with K1 (the cache now counts through getortho's batched counter). Not
+measured yet how much of R7 it explains; other calls to the store on the
+open path, if any, are to be looked for with K0's timings.
+
+**Smaller.** The default `dds_budget_pct` in the code is 40, not 80
+(`getortho.py`, `start_predictive_dds`): a user on defaults has 12 GB for
+textures, about 270 complete ones at zoom 17. K1's "done when" does not
+need two flights at first: replaying `flight3.trace` twice against a
+running mount shows whether entries stay.
+
+**Fixed on the way, for the record.** The worker lost the parent's
+statistics store, and with it the aircraft position, in every flight
+(`447c5a59`). Native builds were stored 16 bytes short and never served
+(`fff86acd`); the 45 complete entries now in the cache are whole.
+Entries stored short before that fix are refused until evicted; no repair
+is planned.
+
+## The plan
+
+| # | Stage | What it buys | Size | Risk | Depends on |
+|---|---|---|---|---|---|
+| K0 | Measure the right things | the numbers every stage below is judged by | S | low | nothing |
+| K1 | The budget counts disk space really used | routes stay in the cache | S | low | K0 |
+| K2 | An open that reads nothing costs nothing | 2 to 4 minutes of loader time per flight | M | medium | K0 |
+| K3 | Partial entries on the loading screen | the loading screen served from the cache | S | low | K1 |
+| K4 | Keep the levels live reads build | second passes need no build | S to M | medium | K1 |
+| K5 | Native reads on by default | the hybrid plan's gain for every user | S | low | CI libraries, K1 |
+| K6 | Decide the native open (S5) | closes or opens the last stage of the hybrid plan | - | - | K1 to K3 |
+
+K1 first: without it nothing else can be measured on a second flight. K2
+is independent of the cache and can run beside it. K3 and K4 only show
+once K1 lets entries stay.
+
+### K0. Measure the right things
+
+- `read_trace.summarize`: opens with reads, opens that read nothing and
+  their total and median time; the ready share over opens with reads, for
+  the loading screen and the flight apart (R5).
+- The read trace's `open` event gains the open flags the file system
+  passes, to tell an attribute probe from a real open if the driver lets
+  them be told apart (R2). One short session with WinFsp's own debug log
+  to see what X-Plane asks for.
+- STATS gauges of the DDS cache: entries, counted bytes, bytes on disk,
+  entries evicted. Today eviction is only in DEBUG lines.
+- A profile of `open` for a texture not in the cache, with sixteen
+  threads opening at once (py-spy `--gil`, and the in-process timing used
+  for N3), to see where the 5 ms go: the tile's constructor, `tc_lock`,
+  or waiting for a turn. *Answered in part by R7: it is waiting. What is
+  left is to confirm what for.*
+- `release` and `getattr` of textures timed in the trace like `open`
+  (R8), and every trace event of an open carrying an id of that open and
+  the process id of the caller (R9). Live opens get a handle of their own
+  for this, which K2 needs anyway.
+- **The switch-interval experiment** (R7): the same replay with
+  `sys.setswitchinterval` at 5 ms (today), 1 ms and 0.5 ms in the mount
+  worker, read from an environment variable so no code path changes. If
+  the opens that read nothing fall with it, the wait is the interpreter
+  lock; the run also shows what a shorter interval costs the builders
+  (CPU, build time).
+
+**Done when** the three flight traces are summarized with the new
+numbers in this file, the profile names the parts of the 5 ms, and the
+switch-interval runs are in `tools/bench/runs`.
+
+### K1. The budget counts disk space really used
+
+- One helper, `allocated_size(path, stat)`: on Windows
+  `GetCompressedFileSizeW`, called only for files whose attributes carry
+  `FILE_ATTRIBUTE_SPARSE_FILE` (the `stat` already has them, so other
+  files cost no extra call); on Linux and macOS `st_blocks * 512`; where
+  that is unavailable, `st_size`.
+- Used by `DynamicDDSCache._entry_disk_size` (and so `_current_size`, the
+  LRU eviction and the startup scan) and by
+  `DiskBudgetManager._scan_dir_size`. An entry is measured again when
+  `store_incremental` adds levels to it, since it grows.
+- Eviction frees what the entry really used; the log line and the Home
+  and Settings figures show disk space, as the user's file manager does.
+- On a volume without sparse files (FAT32, exFAT) the two sizes are the
+  same and nothing changes.
+- **Eviction keeps what frees nothing (R10).** A pass first deletes only
+  entries that use at least 1 MB, oldest first, and stops when it has
+  freed enough. Smaller entries are deleted, oldest first, only if that
+  was not enough. A partial entry of a far texture then outlives the
+  complete textures around it, which is the order item 9 of the
+  prediction plan wants; the rest of item 9 (drop level 0 and keep the
+  coarse levels) stays there.
+- **More than one worker (R11).** To settle before the second flight:
+  count the workers of a usual setup. If more than one, the smallest fix
+  is that a worker scans the folder again before it evicts (the scan is
+  the truth; its own count is a guess), and evicts by file time rather
+  than by its own order.
+- **Many entries (R12).** Time the start scan on a cache of 50,000
+  entries (made by a script) before the stage is called done; if it
+  takes more than a few seconds, the count moves into one index file
+  written at shutdown.
+
+**To check while implementing.** What `_extend_sparse` leaves allocated on
+NTFS after rows are written in the middle of a file (allocation is in
+64 KB units); that the JPEG side of the budget has no sparse files; that
+a cache which was "full" at 24 GB and is found to use 1.5 GB does not
+trigger anything at start.
+
+**Tests.** A sparse entry of nominal 44 MB with 100 KB written counts as
+about 100 KB on every platform that has sparse files; storing 1,000 such
+entries under a 1 GB budget evicts nothing; a complete entry counts in
+full; the budget manager's scan agrees with the cache's own count.
+
+**Done when** the route is flown twice in a row and, on the second
+flight, fewer than 10 % of the opens that read find no entry (89 % of all
+opens today), with evictions only when the disk space used reaches the
+budget.
+
+### K2. An open that reads nothing costs nothing
+
+**Changed by R7.** The open's work is not what costs; its turn is. The
+two designs below, as first written, still answer every open from
+Python, and neither can reach the target under load. The choice is now
+among three, to be made on K0's switch-interval runs:
+
+- **A shorter switch interval** in the mount worker. One line. Enough on
+  its own only if the runs show the opens falling near 0.5 ms without
+  the builders paying for it.
+- **Answer the empty callbacks in native code.** `aofast.c` intercepts
+  only `read` today. It would also answer a texture's `open`, `release`
+  and `getattr` without Python: `open` hands out a handle and notes the
+  path; the first `read` calls Python once to do the real open ("open
+  late", below, with the lateness in C); a `release` without a read ends
+  there. `getattr` needs the texture's size in native code: a table
+  Python fills, or the size rule itself. This is stage S5 of the hybrid
+  plan in a smaller shape, so K6 is decided here and not after.
+- **Both**, if the first helps the opens that read and the builders
+  tolerate it.
+
+The two designs as first written remain what the Python side does at the
+first read:
+
+1. **Open late.** `open` answers at once with a handle and does the real
+   work (cache lookup, native registration, or creating the live tile) at
+   the first read. An open that is released without a read never did
+   anything. The load-ahead note and the "X-Plane is loading here" focus
+   move to the first read too, which is when X-Plane really loads the
+   texture.
+2. **Open cheaply.** Keep the order of work and remove what the profile
+   finds: for example a tile created at open but its chunk grid and
+   buffers only at the first read.
+
+**To check before choosing.** What `getattr` must answer between such an
+open and the first read: today the open records the texture's real size
+(`_set_dds_size_cached`), and X-Plane sizes its reads from `getattr`. A
+late open must not make `getattr` answer a different size than the read
+will serve; under dynamic or airport zoom the estimate and the real size
+differ (see N1 of the hybrid plan). Whether WinFsp calls `getattr` after
+every open (it fills the file information of the create from it).
+Whether the first read of a late open may run on a different thread than
+the open (it may; the handle table already allows it).
+
+**Risks.** The open is where one texture is kept to one source (direct
+or live) and where a live tile's reference is counted; doing that at the
+first read must keep `release` balanced for opens that never read. Tests
+for every order: open and release; open, read, release; two opens of one
+texture, one reading.
+
+**Done when** in a recorded flight an open that reads nothing takes
+under 0.5 ms at the median and the time in such opens is under 15 s per
+25 minutes of flight (121 to 254 s today), with byte equality and the
+fallback tests unchanged.
+
+### K3. Partial entries on the loading screen (R3)
+
+With no camera, `open_direct` is given no level and refuses every partial
+entry. Serve it from its finest stored level instead; a read of a finer
+level already hands that open to a live tile (`_switch_direct_to_live`),
+which costs one extra open in the worst case. Such fallbacks must not
+count against `_PartialDirectStats` (the margin that makes in-flight
+partial opens ask for one level finer). Once the start position is known
+(prediction plan, item 8) the level can come from the distance to it;
+not in this plan.
+
+**Done when** `dds_direct_skip_partial_no_level` is near zero on a second
+flight and fewer than one in ten of those opens falls back to a live
+tile.
+
+### K4. Keep the levels live reads build (R4)
+
+First confirm the cause on the replay: which levels a cold pass builds by
+row ranges, and what `_try_incremental_dds_store` then stores. Then
+persist a level when its last row is built, as a whole level is today.
+Levels 1 and coarser only; level 0 keeps its own path with row
+manifests.
+
+**Done when** on a second pass over a route fewer than 5 % of the opens
+that read are refused as "partial entry too coarse" (44 % on the replay,
+4 % in flight 3, where few entries survived to be refused).
+
+### K5. Native reads on by default
+
+Push the branch so CI rebuilds the libraries on the three platforms with
+`aofast.c` (before pulling CI's commit, discard the local Windows build:
+`git checkout -- autoortho/aopipeline/lib/windows/aopipeline.dll`). One
+flight on CI's Windows library after K1, when the cache has something to
+serve. The `read_cost` run on Linux and on macOS, recorded as N8 asked.
+Then `native_direct_reads = True` in `streaming_options.DEFAULTS` and the
+config template, with the setting kept as the way to turn it off.
+
+**Done when** a flight with a ready share above 50 % ends with
+`dds_native_reads` far above `dds_native_deferred`, no error, on CI's
+library; and the Linux and macOS runs are in
+`tools/bench/runs`.
+
+### K6. Decide the native open (S5 of the hybrid plan)
+
+After K1 to K3, from one recorded flight. Build S5 only if both hold:
+
+1. at least half of the opens that read are ready (R5's share, not the
+   old one);
+2. the open is still a large part of a ready texture's time:
+   `ready_open_time_share` above 0.25, or the p95 of `ready_open_ms`
+   above 2 ms.
+
+If K2 opens late, S5 shrinks to the lookup at the first read and may not
+be worth a stage at all. Record the decision here either way.
+
+*After R7:* if K2 answers `open`, `release` and `getattr` in native code,
+that is S5, and this stage only records it. The two conditions above then
+judge what is left: whether the first read's call into Python is still a
+large part of a ready texture's time.
+
+## Found on the way, outside this plan
+
+Small, separate fixes; none blocks a stage above.
+
+- **The window fetches the scenery list on its main thread.**
+  `_render_scenery_list` calls `downloader.parse`, which downloads from
+  GitHub: 297 requests during flight 1, and a read timeout that went
+  uncaught and wrote a crash report (`crash_20261125_164614.log`). Move
+  it to a worker thread, cache the result for the session, catch the
+  timeout.
+- **Loading the config saves it.** `AOConfig.__init__` calls `save()` in
+  every process that is not a mount worker, so running the tests or any
+  tool that imports `aoconfig` rewrites the user's `~/.autoortho` (same
+  values). Save only when a default was added or a value migrated.
+- **`python -m autoortho` from the repository root fails**
+  (`import flighttrack` in `autoortho.main`), while `python autoortho`
+  works and the mount worker is started with `-m autoortho`. One import
+  style for both.
+- **Watch for `Shared stats` warnings** in flight logs: the connection
+  fix (`447c5a59`) should leave none.
+
+## Not in this plan
+
+- What to build ahead and when: the prediction plan (its P0 should be
+  run again after K1, since its baseline was taken with a cache that
+  could not hold a route).
+- What to evict first once the real budget is reached (R6): prediction
+  plan, item 9.
+- The comparison flights against OrthoStudio XP (S4 of the hybrid plan):
+  deferred, worth doing after K1 to K3, when a second flight is served
+  from the cache.
+
+## Risks across the plan
+
+- **A larger cache in real terms.** After K1 the cache will fill to its
+  true budget for the first time. Users who sized `file_cache_size`
+  against what they saw used on disk will see it grow to the number they
+  set. The release note should say so.
+- **K2 touches the one place every texture passes.** It ships behind a
+  setting for one release, like `native_direct_reads`.
+- **Numbers from one route and one PC.** K0's summaries and each
+  stage's "done when" are read on at least two routes, one of them at
+  zoom 16, before a stage is called done.
+
+## Definition of done
+
+1. On a second flight over a route, at least 90 % of the opens that read
+   find a cache entry, and at least 60 % are served from the cache file
+   (0.6 % today). The rest is the prediction plan's.
+2. Evictions happen only when the disk space really used reaches the
+   budget.
+3. An open that reads nothing costs under 0.5 ms at the median; the time
+   in such opens is under 15 s per 25 minutes of flight.
+4. No read returns bytes that differ from today's.
+5. `native_direct_reads` is on by default, on libraries built by CI, and
+   the Linux and macOS runs are recorded.
+6. The native open (S5) is decided, with its numbers.
+
+## Open questions
+
+- What makes the opens that read nothing, and do Linux and macOS have
+  them (K0)?
+- Does anything rely on a live tile existing between `open` and the first
+  read (the tile radar on Home, the held-textures count the governor
+  reads as graphics memory)?
+- Should the budget's default grow now that it will be real? 24 GB holds
+  about 550 complete zoom-17 textures, and the default share for
+  textures is 40 %, not the 80 % of the PC these flights ran on.
+- Is the wait in R7 the interpreter lock (K0's switch-interval runs)?
+- How many mount workers does a usual setup run (R11)?
+
+## Implementation status
+
+Updated as stages land. Nothing below is committed yet.
+
+**2026-11-26: K1 built, not yet flown or replayed.**
+
+- `aopipeline/disk_usage.py`, `allocated_size(path, stat)`: as planned,
+  and never more than the file's size, so files that are not sparse count
+  exactly as before. Used by `DynamicDDSCache._entry_disk_size`,
+  `DiskBudgetManager._scan_dir_size` and the cache inventory the window
+  shows (`cache_inventory._scan_dds`).
+- **Found while implementing: NTFS reports late.** Right after a write
+  to a sparse file, `GetCompressedFileSizeW` says 0, and the real figure
+  only once the data has left the system's write cache: more than 8 s in
+  one measurement, 6 s in another, at once after a flush (0.8 ms on this
+  SSD). The store path does not flush. Instead every stored entry is
+  measured again for a minute (`remeasure_recent`, called from the tile
+  cacher's housekeeping loop every 1 to 10 s), and the count, the budget
+  manager and the eviction check follow. The start scan sees the truth in
+  any case. If a flight shows the count lagging more than that, the
+  alternative is a flush at each store.
+- **Eviction takes small entries last (R10):** `evict_lru` deletes
+  entries of 1 MB or more first, oldest first, and smaller ones only if
+  that was not enough.
+- **Counts are batched (R13).**
+- **K0, the cache part:** gauges `dds_cache_entries:<pid>` and
+  `dds_cache_bytes:<pid>` per worker, and the counter
+  `dds_cache_evicted`.
+- **On this PC's cache** (read only, nothing changed in it): 581
+  textures, 536 of them sparse; 22.57 GB by file size, **1.55 GB by the
+  new count**. The budget manager's scan of its 1,163 files took 77 ms,
+  which at 50,000 entries would be several seconds (R12, still to
+  measure).
+- Tests: `test_dynamic_dds_cache.py` (ten new), all green on Windows
+  (NTFS), with the other cache, inventory, direct-read and native-read
+  test files.
+
+- **R12 measured** on 20,000 synthetic partial entries (8,192 px, coarse
+  levels only, made and deleted in a scratch folder on the same SSD):
+  `scan_existing` took **62 s**, 3.1 ms an entry; the budget manager's
+  scan of the same 40,000 files took 0.7 s, so the new size call is not
+  the cost: reading each `.ddm` is (the files were minutes old, so an
+  antivirus's first look is in that figure; an older cache may read
+  faster). The scan runs in the background and reads are served without
+  it, but at 50,000 entries it is minutes of disk work at every start
+  with the count wrong meanwhile. An eviction pass over the 20,000
+  entries took 0.03 s. Each partial entry used about 0.12 MB: NTFS
+  allocates a sparse file in 64 KB pieces, so that is the floor however
+  little is written. **Follows:** the index file named under K1 is
+  needed before the cache grows; it is the next thing to build.
+
+Not done in K1: that index (R12), the check with more than one worker
+(R11, macOS), the replay of flight 3 twice, the flight.
+Not checked: `st_blocks` on macOS (APFS) and on ZFS, which may report
+late as NTFS does; the re-measure covers that case too.
+
+**2026-11-26: K0, the parts that need no flight.**
+
+- The trace times `release` and `getattr` of textures and records the
+  caller's process id on opens and getattrs (R8, R9). Not done: an id per
+  open, which needs live opens to have their own handle (with K2).
+- `read_trace.summarize` gives the opens with and without reads, the
+  ready share over the opens that read, loading screen and flight apart,
+  and the cost of empty opens, getattrs and releases (R5):
+
+  | | Flight 1 | Flight 2 | Flight 3 |
+  |---|---|---|---|
+  | Opens that read | 4,541 | 6,705 | 2,588 |
+  | Opens that read nothing | 26,785 | 41,611 | 16,396 |
+  | Their time, median | 121 s, 4.6 ms | 256 s, 5.7 ms | 112 s, 6.7 ms |
+  | Ready share of the opens that read | 0 | 0.06 % | 0.62 % |
+  | The same, loading screen / flight | no positions | 0 / 0.14 % | 0 / 3.6 % |
+
+  (A few opens differ from the first table: an open served by native
+  reads now counts as one that read.)
+- `AO_SWITCH_INTERVAL_MS` in the mount worker's environment sets the
+  interpreter's switch interval, for the experiment of R7. Off unless
+  set.
+
+K0 still open: the switch-interval runs, a trace with the new timings
+(any flight or replay from now on has them), the id per open.
