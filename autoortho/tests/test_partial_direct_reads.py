@@ -112,8 +112,68 @@ def test_not_served_when_the_wanted_level_is_not_stored(cache, monkeypatch):
     _store_partial(cache, _full_dds(), 4)
     _wants(monkeypatch, 3)
     assert getortho.open_disk_texture(_Cacher(), ROW, COL, "BI", ZOOM) is None
-    _wants(monkeypatch, None)  # no aircraft position: full entries only
+
+
+def _no_position(monkeypatch):
+    """X-Plane is loading: no aircraft position, so the model names no level."""
+    monkeypatch.setattr(getortho, "current_camera", lambda: None)
+
+
+def test_loading_screen_serves_a_partial_entry_from_what_it_holds(cache, monkeypatch):
+    dds = _full_dds()
+    _store_partial(cache, dds, 4)
+    _no_position(monkeypatch)
+    bumps = []
+    real = getortho.bump
+    monkeypatch.setattr(getortho, "bump", lambda name, *a, **k: (bumps.append(name), real(name, *a, **k)))
+    texture = getortho.open_disk_texture(_Cacher(), ROW, COL, "BI", ZOOM)
+    assert texture is not None
+    levels = _levels()
+    try:
+        assert texture.finest_level == 4
+        start = levels[4].startpos
+        assert texture.read(start, len(dds) - start) == dds[start:]
+        # A finer level is not there: that open goes to a live tile.
+        with pytest.raises(disk_texture.DiskTextureLevelMissing):
+            texture.read(levels[2].startpos, levels[2].length)
+    finally:
+        texture.close()
+    assert "dds_direct_loading_opens" in bumps
+    assert "dds_direct_loading_fallbacks" in bumps
+    assert "dds_direct_partial_fallbacks" in bumps
+    # The paging model made no guess here: its margin is not judged by it.
+    stats = getortho._partial_direct_stats
+    assert stats.opens == 0 and stats.fallbacks == 0
+
+
+def test_loading_screen_rule_needs_no_position_and_the_setting(cache, monkeypatch):
+    _store_partial(cache, _full_dds(), 4)
+    # In flight the model's level decides, even when it is mipmap 0.
+    monkeypatch.setattr(getortho, "current_camera", lambda: (19.4, -99.1, 900.0, 90.0, 80.0))
+    _wants(monkeypatch, None)
     assert getortho.open_disk_texture(_Cacher(), ROW, COL, "BI", ZOOM) is None
+    _wants(monkeypatch, 0)
+    assert getortho.open_disk_texture(_Cacher(), ROW, COL, "BI", ZOOM) is None
+    # Off with partial direct reads.
+    _no_position(monkeypatch)
+    monkeypatch.setattr(getortho.streaming_options, "flag",
+                        lambda name: False if name == "partial_direct_reads" else True)
+    assert getortho.open_disk_texture(_Cacher(), ROW, COL, "BI", ZOOM) is None
+
+
+def test_loading_screen_never_serves_level_zero_from_a_partial_entry(cache, monkeypatch):
+    """Level 0 without its row manifest is not served from the file: level 1
+    is the finest a partial entry gives, loading or not."""
+    dds = _full_dds()
+    _store_partial(cache, dds, 1)
+    _no_position(monkeypatch)
+    texture = getortho.open_disk_texture(_Cacher(), ROW, COL, "BI", ZOOM)
+    try:
+        assert texture.finest_level == 1
+        with pytest.raises(disk_texture.DiskTextureLevelMissing):
+            texture.read(_levels()[0].startpos + 65536, 65536)
+    finally:
+        texture.close()
 
 
 def test_off_switch(cache, monkeypatch):

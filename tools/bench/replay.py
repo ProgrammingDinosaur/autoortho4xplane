@@ -71,6 +71,8 @@ COUNTERS = (
     "dds_direct_skip_healing", "dds_direct_skip_partial_no_level",
     "dds_direct_skip_partial_coarse", "dds_direct_skip_size", "dds_direct_skip_live_tile",
     "reads_wanted_real", "reads_wanted_standin",
+    # Ready share plan: the cache's evictions, partial entries while loading.
+    "dds_cache_evicted", "dds_direct_loading_opens", "dds_direct_loading_fallbacks",
     *(f"wait_policy_{p}_{k}" for p in ("quality", "balanced", "smooth")
       for k in ("reads", "read_ms_total", "near_standins")),
 )

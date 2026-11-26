@@ -7745,10 +7745,12 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
         max_zoom = tile_cacher._get_target_zoom_level(zoom, row=row, col=col)
         width, height = _tile_dimensions(zoom, max_zoom)
         wanted = _partial_direct_level(row, col, zoom, max_zoom)
+        any_level = wanted is None and _partial_at_any_level()
         entry = cache.open_direct(
             row, col, maptype, zoom, max_zoom,
             _expected_dds_size(width, height),
             min_level=wanted,
+            any_level=any_level,
         )
         if entry is None:
             return None
@@ -7756,6 +7758,8 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
             cache.unpin(entry["key"])
             return None
         partial = bool(entry.get("finest_level"))
+        # A partial entry opened without a level to ask for (loading screen).
+        loading = partial and any_level
         no_imagery = bool(entry.get("no_imagery_chunks"))
 
         dxt_format = CFG.pydds.format
@@ -7776,7 +7780,13 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
 
         def metric(name, *args, **kwargs):
             if name == "dds_direct_partial_fallbacks":
-                _partial_direct_stats.note_fallback()
+                if loading:
+                    # Not a guess of the paging model: it made none. Counted
+                    # apart and kept out of the margin its guesses are
+                    # judged by.
+                    bump("dds_direct_loading_fallbacks")
+                else:
+                    _partial_direct_stats.note_fallback()
             bump(name, *args, **kwargs)
 
         texture = disk_texture.DiskTexture(
@@ -7805,7 +7815,10 @@ def open_disk_texture(tile_cacher, row, col, map_type, zoom):
         bump("dds_direct_no_imagery_opens")
     if partial:
         bump("dds_direct_partial_opens")
-        _partial_direct_stats.note_open()
+        if loading:
+            bump("dds_direct_loading_opens")
+        else:
+            _partial_direct_stats.note_open()
     return texture
 
 
@@ -7865,6 +7878,19 @@ def _partial_direct_level(row, col, zoom, max_zoom):
         return None
     level = int(mip) - _partial_direct_stats.margin()
     return level if level >= 1 else None
+
+
+def _partial_at_any_level():
+    """Whether a partial entry may be served from whatever levels it holds.
+
+    With no aircraft position the paging model names no level, and partial
+    entries used to be refused: on the loading screen, where most textures
+    are read (2,142 of the 2,578 opens that read in one flight came before
+    the first position). They are served from their finest stored level
+    instead; a read of a finer one moves that open to a live tile, which
+    costs one extra open (ready share plan, K3).
+    """
+    return bool(streaming_options.flag("partial_direct_reads")) and current_camera() is None
 
 
 def _start_terrain_load_ahead():

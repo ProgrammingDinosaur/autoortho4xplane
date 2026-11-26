@@ -193,7 +193,13 @@ def test_a_rewritten_sidecar_is_read_again(cache):
     meta["mipmaps"][0]["complete"] = False
     time.sleep(0.02)
     cache._write_ddm(ddm_path, meta)
-    assert _open() is None, "mipmap 0 no longer servable"
+    # Mipmap 0 is no longer servable. With no aircraft position the entry is
+    # still served, from the levels it has left (ready share plan, K3).
+    texture = _open()
+    try:
+        assert texture.finest_level == 1
+    finally:
+        texture.close()
 
 
 def test_sidecar_rewritten_during_an_open_hands_the_read_to_the_live_path(cache):

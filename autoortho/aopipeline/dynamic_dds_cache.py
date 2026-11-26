@@ -1601,7 +1601,8 @@ class DynamicDDSCache:
     def open_direct(self, row: int, col: int, maptype: str,
                     tilename_zoom: int, max_zoom: int,
                     expected_size: int,
-                    min_level: Optional[int] = None) -> Optional[dict]:
+                    min_level: Optional[int] = None,
+                    any_level: bool = False) -> Optional[dict]:
         """The cache entry of a texture that can be served as a plain file.
 
         Returns ``None`` unless the entry is at ``max_zoom``, not stale,
@@ -1616,6 +1617,10 @@ class DynamicDDSCache:
           ``store_incremental`` wrote into the sparse file are enough
           (performance plan, item 4). A read finer than ``finest_level``
           falls back to a live tile.
+        * when ``any_level`` is set and ``min_level`` is None (no aircraft
+          position, so the paging model names no level: X-Plane's loading
+          screen), populated from any level to the last (ready share plan,
+          K3).
 
         A compressed entry that is otherwise servable is rewritten
         uncompressed in the background, so a later open can be direct.
@@ -1648,19 +1653,27 @@ class DynamicDDSCache:
                 if info.needs_healing:
                     self._bump("dds_direct_skip_healing")
                     return None
-                if min_level is None or min_level <= 0:
+                finest = info.finest_run
+                if min_level is None and any_level:
+                    # No level is known: X-Plane is loading and there is no
+                    # aircraft position yet. Most textures are read then, so
+                    # the entry is served from whatever it holds; a read of
+                    # a finer level moves that open to a live tile.
+                    if finest is None:
+                        self._bump("dds_direct_skip_partial_coarse")
+                        return None
+                elif min_level is None or min_level <= 0:
                     # Partial entry, and the paging model has no level for
-                    # it (no camera) or wants mipmap 0.
+                    # it or wants mipmap 0.
                     self._bump("dds_direct_skip_partial_no_level")
                     return None
-                finest = info.finest_run
-                if finest is None or finest > int(min_level):
+                elif finest is None or finest > int(min_level):
                     self._bump("dds_direct_skip_partial_coarse")
                     return None
                 # Mipmap 0 without its exact row manifest is never served
                 # from the file: level 1 is the finest a partial entry gives.
                 finest_level = max(1, finest)
-                if finest_level > int(min_level):
+                if min_level is not None and finest_level > int(min_level):
                     return None
             if info.disk_compression != "none":
                 self._schedule_promote(tile_id, max_zoom, dds_path, ddm_path,
