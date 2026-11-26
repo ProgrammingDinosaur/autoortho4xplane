@@ -424,6 +424,33 @@ def _serve_shared(mounts, nothreads, runtime):
         raise RuntimeError(f"FUSE mount {mountpoint} failed: {exc}") from exc
 
 
+def _apply_switch_interval():
+    """``AO_SWITCH_INTERVAL_MS``: an experiment switch, off unless set.
+
+    How long a thread keeps the interpreter before another may ask for it;
+    Python's default is 5 ms. Every texture open, release and getattr is a
+    Python callback on one of the file system's threads, and in the flight
+    traces each waits about that long while builders or other opens run
+    (docs/developer/ready-share-plan.md, R7). Running a replay at 5, 1 and
+    0.5 ms shows whether that wait is the interpreter and what a shorter
+    interval costs the builders.
+    """
+    value = os.getenv("AO_SWITCH_INTERVAL_MS")
+    if not value:
+        return
+    try:
+        ms = float(value)
+        if not 0.05 <= ms <= 100.0:
+            raise ValueError(value)
+        sys.setswitchinterval(ms / 1000.0)
+    except ValueError:
+        log.warning(
+            "AO_SWITCH_INTERVAL_MS=%r ignored: give milliseconds from 0.05 to 100", value
+        )
+        return
+    log.info("Interpreter switch interval: %.2f ms (AO_SWITCH_INTERVAL_MS)", ms)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
@@ -454,6 +481,7 @@ def main():
         args.volname or os.path.basename(os.path.abspath(args.mountpoint))
     )
     configure_worker_logging(mount_name, args.loglevel)
+    _apply_switch_interval()
     try:
         try:
             from autoortho.diagnostics import start_worker_profiler_from_env

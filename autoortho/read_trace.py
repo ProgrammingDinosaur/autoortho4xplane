@@ -13,7 +13,14 @@ feeds back through a fake X-Plane.
      "tier": "direct", "tid": 1234, "got": 65536}
     {"t": 13.000, "op": "pos", "lat": 62.06, "lon": -7.27, "agl_m": 950, "hdg": 88, "gs": 120}
 
-An open's or a read's ``t`` is when it ended (it started ``ms`` earlier).
+    {"t": 12.400, "op": "release", "path": "...", "ms": 0.2, "tid": 1234}
+    {"t": 12.344, "op": "getattr", "path": "...", "ms": 0.1, "tid": 1234, "pid": 4321}
+
+An open's or a read's ``t`` is when it ended (it started ``ms`` earlier);
+the same for a release and for a ``getattr`` of a texture, which the file
+system asks for every open (traces before 2026-11-26 have neither timing).
+``pid`` is the process that asked, where the file system tells: X-Plane's
+opens apart from an antivirus's or the indexer's.
 An open's ``tier`` is what will answer it (``direct``, ``partial``, ``live``;
 ``native`` when native reads do). A read's ``tier`` is the
 path that answered it: ``direct`` or ``partial`` (the cache file),
@@ -176,6 +183,18 @@ def summarize(events: list, fast_ms: float = 2.0) -> dict:
       left out of ``ready_open_time_share``, which is then the share over
       textures read in Python (reads slower than native ones, so a lower
       bound of the share with native reads).
+    * ``opens_with_reads``, ``opens_without_reads``: X-Plane (or Windows for
+      it) opens a texture about eight times and reads through one of them.
+      ``ready_share_of_reading`` is the ready share over the opens that
+      read, the one that says how much of a flight came from the cache
+      (``ready_share`` is over all opens and cannot pass about 0.15).
+      ``by_phase`` gives the same before the first aircraft position
+      (``loading``) and after (``flight``); None in a trace without
+      positions. ``empty_open_ms``, ``getattr_ms`` and ``release_ms``:
+      count, total seconds and median of the opens that read nothing and of
+      the two calls around every open (ready share plan, R2, R5 and R8).
+      Reads are paired with opens by path, so with several opens of one
+      texture at once these counts are close, not exact.
     """
     opens = 0
     native_opens = 0
@@ -188,12 +207,24 @@ def summarize(events: list, fast_ms: float = 2.0) -> dict:
     intervals = []
     fast = []
     reads = 0
+    open_end = []  # per open: when it ended
+    getattr_ms = []
+    release_ms = []
+    first_pos = None  # when the aircraft's position was first known
+
+    def _ms(event):
+        try:
+            return float(event["ms"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
     for event in events:
         op = event.get("op")
         path = event.get("path")
         if op == "open":
             opens += 1
             current[path] = len(open_tiers)
+            open_end.append(float(event.get("t", 0.0)))
             native = bool(event.get("native")) and event.get("tier") in ("direct", "partial")
             native_opens += native
             open_native.append(native)
@@ -223,6 +254,11 @@ def summarize(events: list, fast_ms: float = 2.0) -> dict:
                 fast.append(interval)
         elif op == "release":
             current.pop(path, None)
+            release_ms.append(_ms(event))
+        elif op == "getattr":
+            getattr_ms.append(_ms(event))
+        elif op == "pos" and first_pos is None:
+            first_pos = float(event.get("t", 0.0))
     ready_indices = [
         i for i, tiers in enumerate(open_tiers)
         if tiers and tiers <= {"direct", "partial"}
@@ -260,11 +296,52 @@ def summarize(events: list, fast_ms: float = 2.0) -> dict:
                 histogram[depth] = histogram.get(depth, 0) + 1
         return histogram
 
+    def timing(values):
+        """Count, total seconds and median of some calls' times, or None."""
+        values = sorted(v for v in values if v is not None)
+        if not values:
+            return None
+        return {
+            "n": len(values), "total_s": round(sum(values) / 1000.0, 1),
+            "p50": round(values[len(values) // 2], 3),
+        }
+
+    # An open read something when a read was paired with it, or when native
+    # code answers it (its reads are not in the trace).
+    reading = [i for i in range(opens) if open_tiers[i]]
+    empty = [i for i in range(opens) if not open_tiers[i]]
+    ready_set = set(ready_indices)
+
+    def share_of_reading(indices):
+        indices = list(indices)
+        if not indices:
+            return None
+        return round(sum(1 for i in indices if i in ready_set) / len(indices), 4)
+
+    by_phase = None
+    if first_pos is not None:
+        by_phase = {}
+        for name, keep in (("loading", lambda i: open_end[i] <= first_pos),
+                           ("flight", lambda i: open_end[i] > first_pos)):
+            phase_reading = [i for i in reading if keep(i)]
+            by_phase[name] = {
+                "opens_with_reads": len(phase_reading),
+                "opens_without_reads": sum(1 for i in empty if keep(i)),
+                "ready_share_of_reading": share_of_reading(phase_reading),
+            }
+
     all_hist = overlaps(intervals)
     return {
         "opens": opens,
         "ready_opens": ready,
         "ready_share": round(ready / opens, 4) if opens else None,
+        "opens_with_reads": len(reading),
+        "opens_without_reads": len(empty),
+        "ready_share_of_reading": share_of_reading(reading),
+        "empty_open_ms": timing(open_ms[i] for i in empty),
+        "by_phase": by_phase,
+        "getattr_ms": timing(getattr_ms),
+        "release_ms": timing(release_ms),
         "reads": reads,
         "reads_by_tier": by_tier,
         "max_overlap": max(all_hist) if all_hist else 0,

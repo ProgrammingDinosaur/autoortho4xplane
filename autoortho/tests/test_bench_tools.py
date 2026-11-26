@@ -120,6 +120,54 @@ def test_trace_summary_counts_native_opens_as_ready():
     assert summary["ready_open_time_share"] == 0.25
 
 
+def test_trace_summary_gives_the_ready_share_over_opens_that_read():
+    """Most opens read nothing: the share that says how much came from the
+    cache is over the ones that read, on the loading screen and in flight
+    apart, with the cost of the empty opens and of the calls around them."""
+    a, b = "/textures/1_2_BI16.dds", "/textures/3_4_BI16.dds"
+    events = [
+        # Loading: two probes of a, then a read from the cache; b read live.
+        {"t": 0.001, "op": "getattr", "path": a, "ms": 2.0},
+        {"t": 0.006, "op": "open", "path": a, "ms": 5.0, "tier": "live"},
+        {"t": 0.007, "op": "release", "path": a, "ms": 1.0},
+        {"t": 0.012, "op": "open", "path": a, "ms": 7.0, "tier": "live"},
+        {"t": 0.013, "op": "release", "path": a, "ms": 3.0},
+        {"t": 0.020, "op": "open", "path": a, "ms": 1.0, "tier": "direct"},
+        {"t": 0.024, "op": "read", "path": a, "ms": 3.0, "tier": "direct"},
+        {"t": 0.025, "op": "release", "path": a},
+        {"t": 0.030, "op": "open", "path": b, "ms": 2.0, "tier": "live"},
+        {"t": 0.500, "op": "read", "path": b, "ms": 400.0, "tier": "live"},
+        {"t": 0.501, "op": "release", "path": b},
+        {"t": 1.0, "op": "pos", "lat": 19.4, "lon": -99.1},
+        # In flight: b again, from the cache this time.
+        {"t": 2.001, "op": "open", "path": b, "ms": 1.0, "tier": "partial"},
+        {"t": 2.004, "op": "read", "path": b, "ms": 3.0, "tier": "partial"},
+        {"t": 2.005, "op": "release", "path": b},
+    ]
+    summary = read_trace.summarize(events)
+
+    assert summary["opens"] == 5 and summary["ready_share"] == 0.4
+    assert summary["opens_with_reads"] == 3 and summary["opens_without_reads"] == 2
+    assert summary["ready_share_of_reading"] == round(2 / 3, 4)
+    assert summary["empty_open_ms"] == {"n": 2, "total_s": 0.0, "p50": 7.0}
+    assert summary["by_phase"] == {
+        "loading": {"opens_with_reads": 2, "opens_without_reads": 2,
+                    "ready_share_of_reading": 0.5},
+        "flight": {"opens_with_reads": 1, "opens_without_reads": 0,
+                   "ready_share_of_reading": 1.0},
+    }
+    assert summary["getattr_ms"] == {"n": 1, "total_s": 0.0, "p50": 2.0}
+    # Releases without a time (older traces) are left out.
+    assert summary["release_ms"] == {"n": 2, "total_s": 0.0, "p50": 3.0}
+
+    # A trace without positions has no phases; one without the new timings
+    # says so with None.
+    old = [e for e in events if e["op"] in ("open", "read")]
+    summary = read_trace.summarize(old)
+    assert summary["by_phase"] is None
+    assert summary["getattr_ms"] is None and summary["release_ms"] is None
+
+
 def test_trace_from_environment_is_off_by_default(monkeypatch):
     monkeypatch.delenv(read_trace.ENV, raising=False)
     assert read_trace.from_environment() is None

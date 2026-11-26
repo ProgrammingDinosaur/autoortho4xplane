@@ -1320,7 +1320,18 @@ class AutoOrtho(Operations):
         m = self.dds_re.match(path)
         if m:
             # DDS files are virtual - use cached size calculation but fresh timestamps
-            return self._getattr_dds(path, m, now)
+            trace = getattr(self, "_read_trace", None)
+            if trace is None:
+                return self._getattr_dds(path, m, now)
+            # Timed like an open: the file system asks this for every open,
+            # and it waits for its turn the same way (ready share plan, R8).
+            started = time.monotonic()
+            attrs = self._getattr_dds(path, m, now)
+            trace.event(
+                "getattr", path, ms=round((time.monotonic() - started) * 1000.0, 3),
+                tid=threading.get_ident(), pid=_get_fuse_pid_for_log(),
+            )
+            return attrs
         elif path.endswith(".poison"):
             return self._getattr_poison(now)
         elif path.endswith("AOISWORKING"):
@@ -1970,6 +1981,7 @@ class AutoOrtho(Operations):
         trace.event(
             "open", path, ms=round((time.monotonic() - started) * 1000.0, 3),
             tier=tier, native=True if native else None, tid=threading.get_ident(),
+            pid=_get_fuse_pid_for_log(),
         )
 
     def _switch_direct_to_live(self, direct, row, col, maptype, zoom):
@@ -2341,27 +2353,20 @@ class AutoOrtho(Operations):
         
         dds_match = self.dds_re.match(path)
         if dds_match:
-            if self._read_trace is not None:
-                self._read_trace.event("release", path)
-            row, col, maptype, zoom = dds_match.groups()
-            row = int(row)
-            col = int(col)
-            zoom = int(zoom)
-            maptype = self._resolve_dds_maptype(maptype)
-            if fh:
-                with self._direct_lock:
-                    direct = self._direct.pop(fh, None)
-                if direct is not None:
-                    # Waits for native reads in flight, then closes the slot.
-                    self._unregister_native(direct)
-                    with direct.lock:
-                        direct.texture.close()
-                        live = direct.live
-                    if live:
-                        self.tc._close_tile(row, col, maptype, zoom)
-                    return 0
-            self.tc._close_tile(row, col, maptype, zoom)
-            return 0
+            trace = self._read_trace
+            if trace is None:
+                return self._release_dds(dds_match, fh)
+            # ``t`` is when the release ended and ``ms`` how long it took,
+            # as for an open.
+            started = time.monotonic()
+            try:
+                return self._release_dds(dds_match, fh)
+            finally:
+                trace.event(
+                    "release", path,
+                    ms=round((time.monotonic() - started) * 1000.0, 3),
+                    tid=threading.get_ident(),
+                )
         if fh in self._virtual_files:
             with self._virtual_lock:
                 self._virtual_files.pop(fh, None)
@@ -2370,6 +2375,28 @@ class AutoOrtho(Operations):
             return os.close(fh)
         finally:
             self.fh_locks.pop(fh, None)
+
+    def _release_dds(self, dds_match, fh):
+        """Release one open of a texture: its cache file or its live tile."""
+        row, col, maptype, zoom = dds_match.groups()
+        row = int(row)
+        col = int(col)
+        zoom = int(zoom)
+        maptype = self._resolve_dds_maptype(maptype)
+        if fh:
+            with self._direct_lock:
+                direct = self._direct.pop(fh, None)
+            if direct is not None:
+                # Waits for native reads in flight, then closes the slot.
+                self._unregister_native(direct)
+                with direct.lock:
+                    direct.texture.close()
+                    live = direct.live
+                if live:
+                    self.tc._close_tile(row, col, maptype, zoom)
+                return 0
+        self.tc._close_tile(row, col, maptype, zoom)
+        return 0
 
     # X-Plane never writes to files in the FUSE mount
     def _fsync(self, path, fdatasync, fh):
