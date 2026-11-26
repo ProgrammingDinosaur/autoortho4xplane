@@ -2717,3 +2717,262 @@ def test_lru_eviction_skips_kept_tiles(cache_dir, monkeypatch):
     assert freed == 1004
     assert os.path.exists(kept) and not os.path.exists(other)
     assert list(cache._entries) == ["kept"]
+
+
+# ============================================================================
+# The budget counts disk space really used (ready share plan, K1)
+# ============================================================================
+
+MB = 1024 * 1024
+
+
+def _sparse_files_here(folder):
+    """Whether a file in ``folder`` can be sparse (NTFS, ext4, APFS: yes;
+    FAT32, exFAT: no)."""
+    from autoortho.aopipeline.disk_usage import allocated_size
+    from autoortho.aopipeline.dynamic_dds_cache import _extend_sparse
+    probe = os.path.join(str(folder), "sparse.probe")
+    with open(probe, "wb") as f:
+        _extend_sparse(f, 4 * MB)
+    try:
+        return allocated_size(probe) < 4 * MB
+    finally:
+        os.remove(probe)
+
+
+def _uncompressed_cache(cache_dir, monkeypatch, max_size_mb=100):
+    """A cache that stores textures as they are served (direct reads on)."""
+    from autoortho.aopipeline.dynamic_dds_cache import DynamicDDSCache
+    monkeypatch.setattr(_mock_cfg_module.CFG.pydds, 'serve_from_disk', True)
+    return DynamicDDSCache(cache_dir=cache_dir, max_size_mb=max_size_mb, enabled=True)
+
+
+def _store_coarse_levels(cache, tile, first_level=3):
+    """A partial entry: levels ``first_level`` to the last, as a far texture
+    gets them. Returns the bytes written."""
+    levels = tile.dds.mipmap_list[first_level:]
+    data = {mm.idx: bytes([mm.idx + 1]) * mm.length for mm in levels}
+    offsets = {mm.idx: (mm.startpos, mm.length) for mm in levels}
+    assert cache.store_incremental(
+        tile.id, tile.max_zoom, tile.row, tile.col, tile.maptype,
+        tile.tilename_zoom, b"DDS " + b"\x00" * 124, tile.dds.total_size,
+        tile.dds.width, tile.dds.height, tile.dds.mipMapCount, data, offsets,
+    )
+    return sum(len(d) for d in data.values())
+
+
+def _tile_at(cache_dir, i):
+    tile = MockTile(row=21728 + 16 * i)
+    tile.cache_dir = cache_dir
+    return tile
+
+
+def _settle(cache):
+    """What a few seconds do in a flight: the textures' data leaves the
+    system's write cache, and the cache measures its recent entries again."""
+    for dirpath, _dirs, files in os.walk(cache._dds_root):
+        for name in files:
+            if name.endswith(".dds"):
+                with open(os.path.join(dirpath, name), "r+b") as f:
+                    os.fsync(f.fileno())
+    return cache.remeasure_recent()
+
+
+def test_allocated_size_of_a_plain_file_is_its_size(tmp_path):
+    from autoortho.aopipeline.disk_usage import allocated_size
+    path = str(tmp_path / "plain.dds")
+    with open(path, "wb") as f:
+        f.write(b"x" * 1000)
+
+    assert allocated_size(path) == 1000
+    assert allocated_size(path, os.stat(path)) == 1000
+    entry = next(e for e in os.scandir(str(tmp_path)) if e.name == "plain.dds")
+    assert allocated_size(entry.path, entry.stat()) == 1000
+    with pytest.raises(OSError):
+        allocated_size(str(tmp_path / "missing.dds"))
+
+
+def test_allocated_size_of_a_sparse_file_is_what_was_written(tmp_path):
+    from autoortho.aopipeline.disk_usage import allocated_size
+    from autoortho.aopipeline.dynamic_dds_cache import _extend_sparse
+    if not _sparse_files_here(tmp_path):
+        pytest.skip("no sparse files on this volume")
+    path = str(tmp_path / "partial.dds")
+    with open(path, "wb") as f:
+        _extend_sparse(f, 44 * MB)
+        f.seek(30 * MB)
+        f.write(b"\xab" * 100_000)
+        f.flush()
+        os.fsync(f.fileno())  # NTFS counts the data once it is on disk
+
+    assert os.path.getsize(path) == 44 * MB
+    assert 100_000 <= allocated_size(path) <= MB
+    entry = next(e for e in os.scandir(str(tmp_path)) if e.name == "partial.dds")
+    assert allocated_size(entry.path, entry.stat()) == allocated_size(path)
+
+
+def test_partial_entry_counts_what_it_uses(cache_dir, monkeypatch):
+    if not _sparse_files_here(cache_dir):
+        pytest.skip("no sparse files on this volume")
+    cache = _uncompressed_cache(cache_dir, monkeypatch)
+    try:
+        tile = _tile_at(cache_dir, 0)
+        written = _store_coarse_levels(cache, tile)
+        dds_path, _ddm = cache._paths_for(
+            tile.row, tile.col, tile.maptype, tile.tilename_zoom, tile.max_zoom)
+
+        assert os.path.getsize(dds_path) == tile.dds.total_size > 10 * MB
+        assert cache.get_disk_usage() < MB
+        _settle(cache)
+        assert written <= cache.get_disk_usage() < MB
+    finally:
+        cache.close()
+
+
+def test_recent_entries_are_measured_again(cache_dir, monkeypatch):
+    """The size taken at the store may miss what was just written; the count
+    and the budget manager's follow once the file system reports it."""
+    from autoortho.aopipeline import dynamic_dds_cache as ddc
+    if not _sparse_files_here(cache_dir):
+        pytest.skip("no sparse files on this volume")
+    cache = _uncompressed_cache(cache_dir, monkeypatch)
+    accounted = []
+    cache._budget_manager = types.SimpleNamespace(account_dds=accounted.append)
+    try:
+        tile = _tile_at(cache_dir, 0)
+        key = cache._tile_key(tile.id, tile.max_zoom)
+        written = _store_coarse_levels(cache, tile)
+        # As NTFS answers right after a write: nothing allocated yet.
+        with cache._lock:
+            path, ddm, _size, used = cache._entries[key]
+            cache._current_size -= _size
+            cache._entries[key] = (path, ddm, 0, used)
+        accounted.clear()
+
+        changed = _settle(cache)
+
+        assert changed == cache.get_disk_usage() >= written
+        assert sum(accounted) == changed
+        assert list(cache._entries) == [key]
+        # Nothing new to count: the second look changes nothing, and after
+        # a minute the entry is no longer looked at.
+        assert cache.remeasure_recent() == 0
+        assert key in cache._recent_stores
+        monkeypatch.setattr(ddc, "_REMEASURE_SECONDS", 0.0)
+        assert cache.remeasure_recent() == 0
+        assert cache._recent_stores == {}
+    finally:
+        cache.close()
+
+
+def test_entry_is_measured_again_when_levels_are_added(cache_dir, monkeypatch):
+    if not _sparse_files_here(cache_dir):
+        pytest.skip("no sparse files on this volume")
+    cache = _uncompressed_cache(cache_dir, monkeypatch)
+    try:
+        tile = _tile_at(cache_dir, 0)
+        _store_coarse_levels(cache, tile, first_level=4)
+        _settle(cache)
+        coarse = cache.get_disk_usage()
+        _store_coarse_levels(cache, tile, first_level=2)
+        _settle(cache)
+
+        # Level 2 of a 4096 px BC1 texture is 512 KB.
+        assert cache.get_disk_usage() >= coarse + 512 * 1024
+        assert cache.stats["entries"] == 1
+    finally:
+        cache.close()
+
+
+def test_partial_entries_do_not_fill_the_budget(cache_dir, monkeypatch):
+    """Thirty partial textures are 336 MB by their sizes and about 6 MB on
+    disk: a 64 MB budget holds them all."""
+    if not _sparse_files_here(cache_dir):
+        pytest.skip("no sparse files on this volume")
+    cache = _uncompressed_cache(cache_dir, monkeypatch, max_size_mb=64)
+    try:
+        written = 0
+        for i in range(30):
+            written += _store_coarse_levels(cache, _tile_at(cache_dir, i))
+        _settle(cache)
+
+        stats = cache.stats
+        assert stats["entries"] == 30
+        assert stats["evictions"] == 0
+        assert written / MB <= stats["disk_usage_mb"] < 10
+    finally:
+        cache.close()
+
+
+def test_complete_entry_counts_in_full(cache_dir, monkeypatch, sample_dds_bytes):
+    cache = _uncompressed_cache(cache_dir, monkeypatch)
+    try:
+        tile = _tile_at(cache_dir, 0)
+        assert cache.store(tile.id, tile.max_zoom, sample_dds_bytes, tile)
+
+        assert cache.get_disk_usage() >= len(sample_dds_bytes)
+    finally:
+        cache.close()
+
+
+def test_budget_scan_agrees_with_the_cache(cache_dir, monkeypatch, sample_dds_bytes):
+    from autoortho.aopipeline.disk_budget_manager import DiskBudgetManager
+    cache = _uncompressed_cache(cache_dir, monkeypatch)
+    try:
+        whole = _tile_at(cache_dir, 0)
+        assert cache.store(whole.id, whole.max_zoom, sample_dds_bytes, whole)
+        _store_coarse_levels(cache, _tile_at(cache_dir, 1))
+        _settle(cache)
+
+        scanned = DiskBudgetManager._scan_dir_size(
+            cache._dds_root, (".dds", ".ddm", ".ddm.rows"))
+        assert scanned == cache.get_disk_usage()
+    finally:
+        cache.close()
+
+
+def test_eviction_takes_small_entries_last(cache_dir):
+    """A partial entry frees nothing: it goes only when no larger entry is
+    left to evict, however old it is."""
+    from autoortho.aopipeline import dynamic_dds_cache as ddc
+    cache = ddc.DynamicDDSCache(cache_dir=cache_dir, max_size_mb=10, enabled=True)
+    root = os.path.join(cache_dir, "dds_cache", "+40-130", "+47-123", "BI")
+    os.makedirs(root)
+    sizes = {"old_small": 1000, "big": 2 * MB, "new_small": 1000, "newest_big": 3 * MB}
+    with cache._lock:
+        for age, (name, size) in enumerate(sizes.items()):
+            path = os.path.join(root, name + ".dds")
+            with open(path, "wb") as fh:
+                fh.write(b"DDS ")
+            cache._entries[name] = (path, path[:-4] + ".ddm", size, age)
+            cache._current_size += size
+    try:
+        assert cache.evict_lru(1) == 2 * MB
+        assert list(cache._entries) == ["old_small", "new_small", "newest_big"]
+        assert not os.path.exists(os.path.join(root, "big.dds"))
+
+        # More than the large entries hold: they go first, then the oldest
+        # small one.
+        assert cache.evict_lru(3 * MB + 1) == 3 * MB + 1000
+        assert list(cache._entries) == ["new_small"]
+        assert cache.get_disk_usage() == 1000
+    finally:
+        cache.close()
+
+
+def test_cache_counts_go_through_the_batched_counter(cache_dir, monkeypatch):
+    """open_direct counts on every texture open: with getortho's counter set,
+    none of those is a call to the parent's statistics store."""
+    from autoortho.aopipeline import dynamic_dds_cache as ddc
+    counted = []
+    monkeypatch.setattr(ddc, "bump_stat", lambda name, n=1: counted.append((name, n)))
+    cache = _uncompressed_cache(cache_dir, monkeypatch)
+    try:
+        tile = _tile_at(cache_dir, 0)
+        assert cache.open_direct(
+            tile.row, tile.col, tile.maptype, tile.tilename_zoom,
+            tile.max_zoom, tile.dds.total_size) is None
+
+        assert counted == [("dds_direct_skip_no_entry", 1)]
+    finally:
+        cache.close()

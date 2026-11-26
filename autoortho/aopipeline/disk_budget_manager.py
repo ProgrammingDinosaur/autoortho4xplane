@@ -16,6 +16,8 @@ import threading
 import time
 from typing import Optional
 
+from .disk_usage import allocated_size
+
 log = logging.getLogger(__name__)
 
 
@@ -312,7 +314,13 @@ class DiskBudgetManager:
 
     @staticmethod
     def _scan_dir_size(root: str, extensions) -> int:
-        """Sum file sizes under ``root`` matching one or more extensions."""
+        """Disk space used by the files under ``root`` with these extensions.
+
+        What is allocated, not the files' sizes, so a sparse partial texture
+        counts as what was written to it (see disk_usage.py). The same
+        measure as ``DynamicDDSCache._entry_disk_size``: the two counts of
+        the DDS cache must agree.
+        """
         if isinstance(extensions, str):
             extensions = (extensions,)
         else:
@@ -322,7 +330,7 @@ class DiskBudgetManager:
             for entry in _iter_file_entries(root):
                 if entry.name.endswith(extensions):
                     try:
-                        total += entry.stat().st_size
+                        total += allocated_size(entry.path, entry.stat())
                     except OSError:
                         pass
         except OSError:

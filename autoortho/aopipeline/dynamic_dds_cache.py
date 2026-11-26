@@ -53,6 +53,8 @@ try:
 except ImportError:
     import chunk_store
 
+from .disk_usage import allocated_size
+
 try:
     import zstandard
     _HAS_ZSTD = True
@@ -193,6 +195,25 @@ protect_jpeg = None
 # Predicate on a DDS path: True for built textures of tiles whose imagery
 # is kept (kept_imagery.dds_protector). LRU eviction skips them.
 protect_dds = None
+# ``bump_stat(name, n)``: getortho's batched counter. Without it every count
+# is a round trip to the parent's statistics store, one at a time over the
+# worker's single connection, and open_direct counts on every texture open
+# (ready share plan, R13).
+bump_stat = None
+
+# Eviction deletes entries smaller than this only when deleting every
+# larger one was not enough. A partial entry is a sparse file that uses
+# about 0.1 MB (its coarse levels): deleting it frees nothing and loses a
+# texture X-Plane reads at those levels on every pass over the route, while
+# one complete 8,192 px texture is 44.7 MB (ready share plan, R10).
+_EVICT_SMALL_BYTES = 1024 * 1024
+
+# NTFS says what a sparse file uses only once its data has left the system's
+# write cache: 0 right after the write, the real figure seconds later (6 s
+# and more measured; at once after a flush, which the store path does not
+# pay for). An entry is measured again for this long after each store
+# (``remeasure_recent``, called from the tile cacher's housekeeping loop).
+_REMEASURE_SECONDS = 60.0
 
 
 def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
@@ -362,6 +383,9 @@ class DynamicDDSCache:
         # Protected by self._lock for thread safety.
         self._network_healing_in_progress: set = set()
 
+        # key -> when it was last stored, for remeasure_recent. Under _lock.
+        self._recent_stores: Dict[object, float] = {}
+
         # Statistics
         self._hits = 0
         self._misses = 0
@@ -403,14 +427,21 @@ class DynamicDDSCache:
 
     @staticmethod
     def _safe_file_size(path: str) -> int:
+        """Disk space ``path`` uses, 0 when it is not there."""
         try:
-            return os.path.getsize(path)
+            return allocated_size(path)
         except OSError:
             return 0
 
     @classmethod
     def _entry_disk_size(cls, dds_path: str, ddm_path: str) -> int:
-        """Return the complete logical size of one compiled-cache entry."""
+        """Disk space one entry uses: its texture, metadata and row records.
+
+        What is allocated, not the files' sizes: a partial entry's texture
+        is a sparse file as large as the whole texture with only its coarse
+        levels written (see disk_usage.py). It grows as levels and rows are
+        added, so every store measures it again (``_record_store``).
+        """
         return sum(
             cls._safe_file_size(path)
             for path in (
@@ -437,6 +468,8 @@ class DynamicDDSCache:
             self._entries[key] = (dds_path, ddm_path, size, time.time())
             self._entries.move_to_end(key)
             self._current_size += size
+            # What was just written may not be counted yet.
+            self._recent_stores[key] = time.monotonic()
             if count_store:
                 self._stores += 1
             over_limit = (
@@ -446,6 +479,56 @@ class DynamicDDSCache:
             self._budget_manager.account_dds(size - old_size)
         if over_limit:
             self._evict_lru_async()
+
+    def remeasure_recent(self) -> int:
+        """Measure again the entries stored in the last minute.
+
+        The size taken at the store can be too small (``_REMEASURE_SECONDS``).
+        Cheap: a few file queries per recent entry, nothing for the rest.
+        Returns the bytes the count changed by.
+        """
+        now = time.monotonic()
+        with self._lock:
+            recent = list(self._recent_stores.items())
+        changed = 0
+        for key, stored_at in recent:
+            with self._lock:
+                entry = self._entries.get(key)
+            size = (
+                self._entry_disk_size(entry[0], entry[1])
+                if entry is not None else 0
+            )
+            delta = 0
+            with self._lock:
+                current = self._entries.get(key)
+                # Stored again meanwhile: that store's size is newer than
+                # this one, and the entry stays on the list.
+                unchanged = self._recent_stores.get(key) == stored_at
+                if (
+                    unchanged and entry is not None and current is not None
+                    and current[:2] == entry[:2]
+                ):
+                    delta = size - current[2]
+                    if delta:
+                        # Assigning to a key that exists keeps its place in
+                        # the eviction order.
+                        self._entries[key] = current[:2] + (size, current[3])
+                        self._current_size = max(0, self._current_size + delta)
+                if unchanged and (
+                    current is None or now - stored_at >= _REMEASURE_SECONDS
+                ):
+                    del self._recent_stores[key]
+            if delta:
+                changed += delta
+                if self._budget_manager is not None:
+                    self._budget_manager.account_dds(delta)
+        with self._lock:
+            over_limit = (
+                self._max_size > 0 and self._current_size > self._max_size
+            )
+        if over_limit:
+            self._evict_lru_async()
+        return changed
 
     def _remove_entry_files(
         self,
@@ -2228,7 +2311,20 @@ class DynamicDDSCache:
             return False
 
     @staticmethod
-    def _bump(name):
+    def _bump(name, n=1):
+        """Count ``name`` in STATS; never fails the caller.
+
+        Through ``bump_stat`` when getortho has set it: its counts are
+        batched. Without it each count is a call to the parent's statistics
+        store, and ``open_direct`` counts on every open X-Plane makes.
+        """
+        hook = bump_stat
+        if hook is not None:
+            try:
+                hook(name, n)
+            except Exception:
+                pass
+            return
         try:
             from autoortho.aostats import inc_stat
         except ImportError:
@@ -2237,7 +2333,7 @@ class DynamicDDSCache:
             except ImportError:
                 return
         try:
-            inc_stat(name)
+            inc_stat(name, n)
         except Exception:
             pass
 
@@ -2972,7 +3068,11 @@ class DynamicDDSCache:
     def evict_lru(self, bytes_to_free: int) -> int:
         """
         Evict oldest entries until ``bytes_to_free`` bytes are reclaimed.
-        
+
+        Entries under ``_EVICT_SMALL_BYTES`` go last: they are evicted only
+        when every larger entry that may be evicted is gone and space is
+        still short.
+
         Args:
             bytes_to_free: Number of bytes to free up
         
@@ -2983,29 +3083,37 @@ class DynamicDDSCache:
         to_delete = []
 
         with self._lock:
-            # Entries open for direct reads are kept: on Windows their delete
-            # would fail and orphan the file, elsewhere it wastes the work.
-            skipped = []
-            while freed < bytes_to_free and self._entries:
-                key, entry = self._entries.popitem(last=False)
-                if key in self._pins or (
-                    protect_dds is not None and protect_dds(entry[0])
-                ):
-                    skipped.append((key, entry))
-                    continue
-                dds_path, ddm_path, size, _ = entry
-                self._current_size -= size
-                freed += size
-                self._evictions += 1
-                to_delete.append((dds_path, ddm_path))
-            for key, entry in skipped:
-                self._entries[key] = entry
+            # Oldest first, in two passes: entries that free something, then,
+            # only if that was not enough, the small ones (see
+            # _EVICT_SMALL_BYTES). Entries open for direct reads are kept: on
+            # Windows their delete would fail and orphan the file, elsewhere
+            # it wastes the work. So are textures of tiles whose imagery is
+            # kept.
+            for small_too in (False, True):
+                if freed >= bytes_to_free:
+                    break
+                for key in list(self._entries):
+                    if freed >= bytes_to_free:
+                        break
+                    dds_path, ddm_path, size, _ = self._entries[key]
+                    if not small_too and size < _EVICT_SMALL_BYTES:
+                        continue
+                    if key in self._pins or (
+                        protect_dds is not None and protect_dds(dds_path)
+                    ):
+                        continue
+                    del self._entries[key]
+                    self._current_size -= size
+                    freed += size
+                    self._evictions += 1
+                    to_delete.append((dds_path, ddm_path))
 
         # Delete files outside the lock
         for dds_path, ddm_path in to_delete:
             self._delete_pair(dds_path, ddm_path)
 
         if freed > 0:
+            self._bump("dds_cache_evicted", len(to_delete))
             log.debug(f"DDS cache evicted {len(to_delete)} entries, freed {freed / (1024*1024):.1f}MB")
             if self._budget_manager is not None:
                 self._budget_manager.account_dds(-freed)

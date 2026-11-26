@@ -6115,6 +6115,27 @@ def _publish_graphics_memory():
         log.debug(f"Home gauges failed: {exc}")
 
 
+def _publish_dds_cache():
+    """This worker's count of the DDS cache, for the flight logs.
+
+    Entries and the disk space they use (ready share plan, K0); entries
+    evicted are the counter ``dds_cache_evicted``. Also where entries stored
+    in the last minute are measured again: the file system reports what a
+    sparse file uses some seconds after the write.
+    """
+    cache = dynamic_dds_cache
+    if cache is None:
+        return
+    pid = os.getpid()
+    try:
+        cache.remeasure_recent()
+        stats = cache.stats
+        set_stat(f"dds_cache_entries:{pid}", int(stats["entries"]))
+        set_stat(f"dds_cache_bytes:{pid}", int(stats["disk_usage_mb"] * 1024 * 1024))
+    except Exception as exc:  # statistics only
+        log.debug(f"DDS cache gauges failed: {exc}")
+
+
 def _initial_load():
     """X-Plane is loading the first flight: it has never connected yet."""
     return not getattr(datareftracker, "has_ever_connected", False)
@@ -10018,6 +10039,7 @@ def start_predictive_dds(tile_cacher=None) -> None:
         except ImportError:
             from aopipeline import dynamic_dds_cache as _ddc_module
         _ddc_module.writes_allowed = disk_brake.writes_allowed
+        _ddc_module.bump_stat = bump
         dynamic_dds_cache = DynamicDDSCache(
             cache_dir=cache_dir,
             max_size_mb=persistent_dds_mb,
@@ -19539,6 +19561,7 @@ class TileCacher(object):
             except Exception:
                 pass
             _publish_graphics_memory()
+            _publish_dds_cache()
             self._publish_radar()
 
             self.show_stats()
@@ -20056,7 +20079,8 @@ def shutdown():
         except ImportError:
             from aostats import delete_stat
         for gauge in ("graphics_memory_bytes", "building_now", "prefetch_horizon_m",
-                      "tile_radar", "load_ahead_waiting", "load_ahead_waiting_max"):
+                      "tile_radar", "load_ahead_waiting", "load_ahead_waiting_max",
+                      "dds_cache_entries", "dds_cache_bytes"):
             delete_stat(f"{gauge}:{os.getpid()}")
     except Exception:
         pass

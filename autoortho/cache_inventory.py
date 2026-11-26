@@ -30,9 +30,11 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 if __package__:
     from . import chunk_store, tile_stream
+    from .aopipeline.disk_usage import allocated_size
 else:  # running from inside the autoortho folder
     import chunk_store
     import tile_stream
+    from aopipeline.disk_usage import allocated_size
 
 log = logging.getLogger(__name__)
 
@@ -364,7 +366,8 @@ def _scan_dds(inv: CacheInventory, cache_dir: str,
                         continue
                     if usage is None:
                         usage = inv.cell(cell)
-                    usage.dds_bytes += st.st_size
+                    # Disk space used: a partial texture is a sparse file.
+                    usage.dds_bytes += allocated_size(f.path, st)
                     usage.dds_files += 1
                     usage.maptypes.add(maptype.name)
                     m = DDS_ZOOM_RE.search(f.name)
