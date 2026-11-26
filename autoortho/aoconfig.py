@@ -775,6 +775,13 @@ route_prefetch_radius_nm = 40
         return settings_registry()
 
     def load(self):
+        self._loading = True
+        try:
+            return self._load()
+        finally:
+            self._loading = False
+
+    def _load(self):
         self._baseline = {}
         self.config.read_string(self._defaults)
         file_exists = os.path.isfile(self.conf_file)
@@ -1186,7 +1193,10 @@ route_prefetch_radius_nm = 40
         # If we patched any values during load, persist them now so next run is stable.
         # Only save in the main process - workers must not write config files.
         if getattr(self, "_patched_during_load", False):
-            if not is_mount_worker_mode():
+            # Not from load(): the values are not final there (the hardware
+            # baseline comes after), so that save wrote one text and the
+            # constructor's save right after wrote another, at every start.
+            if not is_mount_worker_mode() and not getattr(self, "_loading", False):
                 try:
                     self.save()
                 except Exception as e:
@@ -1237,12 +1247,20 @@ route_prefetch_radius_nm = 40
                 log.warning(f"Could not create scenery dir {self.ao_scenery_path}: {e}")
 
     def save(self):
-        log.info("Saving config ... ")
         self.set_config()
 
         text = self.render_config_text()
-        with open(self.conf_file, 'w', encoding='utf-8') as h:
-            h.write(text)
+        if self._text_on_disk() == text:
+            # Every process that loads the config saves it, to add new
+            # defaults: the window, the tests, any tool that imports this
+            # module. When nothing changed the file is left alone, so those
+            # do not rewrite the user's file.
+            log.debug(f"Config file unchanged: {self.conf_file}")
+        else:
+            log.info("Saving config ... ")
+            with open(self.conf_file, 'w', encoding='utf-8') as h:
+                h.write(text)
+            log.info(f"Wrote config file: {self.conf_file}")
         # What was written is now the user's explicit choice.
         self._loaded_explicit = {
             (spec.section, spec.key): _normalized(
@@ -1253,7 +1271,14 @@ route_prefetch_radius_nm = 40
             if spec.tier is not Tier.RETIRED
             and self.is_custom(spec.section, spec.key)
         }
-        log.info(f"Wrote config file: {self.conf_file}")
+
+    def _text_on_disk(self):
+        """The config file's text as ``save`` would compare it, or None."""
+        try:
+            with open(self.conf_file, 'r', encoding='utf-8') as h:
+                return h.read()
+        except (OSError, UnicodeError):
+            return None
 
     def render_config_text(self):
         """Render the config using the packaged template's layout.

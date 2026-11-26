@@ -277,3 +277,24 @@ def test_fresh_config_starts_at_current_revision(tmp_path):
     cfg = aoconfig.AOConfig(str(tmp_path / ".autoortho"))
     assert cfg.general.config_revision == aoconfig.CONFIG_REVISION
     assert cfg.autoortho.native_partial_allow_incomplete is True
+
+
+def test_loading_a_config_that_needs_no_change_does_not_rewrite_it(tmp_path):
+    """Every process that imports the config saves it. A file that already
+    says what would be written is left alone: same bytes, same time."""
+    path = tmp_path / ".autoortho"
+    path.write_text("[autoortho]\nprefetch_interval = 4.0\n", encoding="utf-8")
+    aoconfig.AOConfig(str(path))  # brings the file to the current layout
+    text = path.read_text()
+    old = 1_600_000_000
+    os.utime(path, (old, old))
+
+    config = aoconfig.AOConfig(str(path))
+    assert os.path.getmtime(path) == old
+    assert path.read_text() == text
+
+    # A change is still written.
+    config.set_value("autoortho", "prefetch_interval", "5.0")
+    config.save()
+    assert os.path.getmtime(path) != old
+    assert "prefetch_interval = 5.0" in path.read_text()
