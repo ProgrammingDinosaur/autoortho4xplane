@@ -14796,6 +14796,7 @@ class Tile(object):
                 revision,
                 build_succeeded,
             )
+            level_completed = False
             if build_succeeded and self.dds is not None:
                 with self._dds_write_lock:
                     mm = self.dds.mipmap_list[mipmap]
@@ -14812,7 +14813,17 @@ class Tile(object):
                             complete=True,
                         )
                         bump("sparse_to_dense_promotions")
+                        level_completed = True
                 self._maybe_persist_complete_dds()
+                if level_completed and mipmap > 0:
+                    # X-Plane reads a level in pieces, so most levels are
+                    # built here, a few rows at a time, and not by
+                    # get_mipmap, the only place that kept them: the cache
+                    # entry stayed coarser than what was read, and the next
+                    # pass over the route built the level again (ready
+                    # share plan, K4).
+                    bump("partial_levels_kept")
+                    self._try_incremental_dds_store(mipmap)
             tile_time = time.monotonic() - start_time
             partial_stats.set(mipmap, tile_time)
             bump_many({

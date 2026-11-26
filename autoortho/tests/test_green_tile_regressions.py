@@ -730,6 +730,33 @@ def test_incremental_store_skips_green_lower_mipmaps(tmp_path, monkeypatch):
     assert 2 not in stored
 
 
+def test_level_completed_by_row_reads_is_kept(tmp_path, monkeypatch):
+    """X-Plane reads a level in pieces. Once the pieces make the whole level
+    it is stored like one built in one go, so the next pass over the route
+    finds it in the cache (ready share plan, K4)."""
+    cache = _RecordingCache()
+    monkeypatch.setattr(getortho, "dynamic_dds_cache", cache)
+    monkeypatch.setattr(getortho, "_persist_partial_dds", True)
+    tile = _tile(tmp_path, 18, 17)  # 2048 px: level 2 is two rows of 64 KB
+    mipmap, row_bytes = 2, 65536
+    mm = tile.dds.mipmap_list[mipmap]
+    assert mm.length == 2 * row_bytes
+    img = AoImage.new(
+        "RGBA", (tile.dds.width >> mipmap, tile.dds.height >> mipmap), (10, 200, 10)
+    )
+    with tile._lock:
+        assert tile._cache_image(mipmap, (img, 0, 0, 17 - mipmap))
+
+    assert tile.get_bytes(mm.startpos, row_bytes)
+    assert cache.incremental == []  # half a level is not kept
+
+    assert tile.get_bytes(mm.startpos + row_bytes, row_bytes)
+    assert mm.retrieved
+    assert len(cache.incremental) == 1
+    stored = cache.incremental[0][-2]
+    assert stored[mipmap] == tile.dds.read_at(mm.startpos, mm.length)
+
+
 def test_clean_rebuild_clears_green_mark(tmp_path):
     tile = _tile(tmp_path, 16, 16)
     tile._note_mipmaps_built([2, 3], {2, 3})

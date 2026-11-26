@@ -601,3 +601,40 @@ late as NTFS does; the re-measure covers that case too.
 
 K0 still open: the switch-interval runs, a trace with the new timings
 (any flight or replay from now on has them), the id per open.
+
+**2026-11-26: K3 built.** With no aircraft position a partial entry is
+served from the levels it holds (`open_direct(any_level=True)`); a read of
+a finer level moves that open to a live tile as before. Counted as
+`dds_direct_loading_opens` and `dds_direct_loading_fallbacks`, and kept
+out of `_PartialDirectStats`. Its "done when" is read on a flight.
+
+**2026-11-26: K4, cause confirmed in the code and fixed.** A read of
+level 1 or coarser that is shorter than the level (X-Plane reads in
+pieces) is built by `Tile.get_bytes` a few rows at a time into a sparse
+buffer. When the rows make the whole level it is promoted to a dense,
+retrieved level, and then only `_maybe_persist_complete_dds` ran, which
+stores complete textures. `_try_incremental_dds_store`, the only thing
+that keeps single levels, was called from `get_mipmap` and from the
+derive-from-level-0 path alone. So a level read in pieces was never kept.
+It is now stored when its last row lands (`partial_levels_kept`). The
+store runs on the read that completed the level: one write of the level
+(8 MB for level 1 of an 8,192 px texture), once per texture and level.
+
+**2026-11-26: the side fixes.**
+
+- The config file is written only when its text changes. One load saved
+  twice with two different texts (before and after the hardware values
+  were applied), which is why the file was rewritten at every start; the
+  save in the middle of the load is gone.
+- `python -m autoortho` starts the app (`flighttrack` and `datareftrack`
+  are imported both ways in `main`, as the rest of that file does).
+- The catalog worker parses the latest releases; drawing the scenery
+  list does no I/O; a release's info file is downloaded once per
+  process. A release that cannot be read is listed with its name and
+  version.
+
+**2026-11-26: CI's libraries.** The branch was pushed and the library
+build run on it (`workflow_dispatch`; a push alone does not start it, it
+runs for pull requests to `develop` that touch the C sources). Its commit
+`ad397b51` is merged here and the local Windows build discarded; the
+native-read tests pass on CI's `aopipeline.dll`.
